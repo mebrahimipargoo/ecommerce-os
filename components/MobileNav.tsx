@@ -12,6 +12,7 @@ import {
   Menu,
   X,
 } from "lucide-react";
+import { useUserRole } from "./UserRoleContext";
 
 const navLinks = [
   {
@@ -31,6 +32,7 @@ const navLinks = [
 ];
 
 export function MobileNav() {
+  const { role } = useUserRole();
   const [isOpen, setIsOpen] = useState(false);
   // Portal requires the DOM to be mounted — avoid SSR mismatch
   const [mounted, setMounted] = useState(false);
@@ -110,16 +112,18 @@ export function MobileNav() {
         </nav>
 
         {/* Footer */}
-        <div className="shrink-0 border-t border-slate-800 px-3 py-3">
-          <Link
-            href="/settings/adapters"
-            onClick={closeMenu}
-            className="flex min-h-[44px] w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm font-medium text-slate-400 transition hover:bg-slate-900/80 hover:text-slate-100"
-          >
-            <Settings className="h-4 w-4 shrink-0 text-slate-500" />
-            Settings
-          </Link>
-        </div>
+        {role === "admin" && (
+          <div className="shrink-0 border-t border-slate-800 px-3 py-3">
+            <Link
+              href="/settings/adapters"
+              onClick={closeMenu}
+              className="flex min-h-[44px] w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm font-medium text-slate-400 transition hover:bg-slate-900/80 hover:text-slate-100"
+            >
+              <Settings className="h-4 w-4 shrink-0 text-slate-500" />
+              Settings
+            </Link>
+          </div>
+        )}
       </div>
     </>
   );

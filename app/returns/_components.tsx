@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { usePhysicalScanner } from "../../hooks/usePhysicalScanner";
 import { createPortal } from "react-dom";
 import Link from "next/link";
 import {
@@ -23,9 +24,92 @@ import {
   listReturnsByPackage,
 } from "./actions";
 import { itemMatchesPackageExpectation } from "../../lib/package-expectations";
-import { getOpenAIApiKeyFromStorage } from "../../lib/openai-settings";
+import { getOpenAIApiKeyFromStorage, getBarcodeModeFromStorage } from "../../lib/openai-settings";
 import { fetchPackingSlipLinesWithOpenAI } from "../../lib/packing-slip-vision";
 import { supabase as supabaseBrowser } from "../../src/lib/supabase";
+
+// ─── Contextual Scan Button ────────────────────────────────────────────────────
+//
+// Physical / keyboard-wedge mode (e.g. Netum C750):
+//   Clicking the button does NOT open a camera modal. It shows a "ready" badge
+//   on the input and waits — the wedge scanner types characters into the page
+//   at high speed and the global usePhysicalScanner hook captures the barcode.
+//
+// Web / Camera mode:
+//   Clicking the button opens the BarcodeScannerModal with a live camera feed.
+
+interface ContextualScanButtonProps {
+  /** Called with the scanned code — consumed by both modes. */
+  onDetected: (code: string) => void;
+  /** Title shown in the camera modal. */
+  modalTitle?: string;
+  /** Extra class names on the trigger button. */
+  className?: string;
+}
+
+function ContextualScanButton({ onDetected, modalTitle = "Scan Barcode", className = "" }: ContextualScanButtonProps) {
+  const [modalOpen,  setModalOpen]  = useState(false);
+  const [scanReady,  setScanReady]  = useState(false);  // physical-mode ready state
+
+  // Read barcode mode fresh from localStorage each click (avoids stale closure).
+  function handleClick() {
+    const mode = getBarcodeModeFromStorage();
+    if (mode === "physical") {
+      // Show "ready" indicator — wedge will fire into whatever input has focus.
+      setScanReady(true);
+      // Auto-dismiss after 10 seconds if no scan detected.
+      const t = setTimeout(() => setScanReady(false), 10_000);
+      return () => clearTimeout(t);
+    } else {
+      setModalOpen(true);
+    }
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={handleClick}
+        title={scanReady ? "Point scanner and pull trigger" : "Scan barcode"}
+        className={[
+          "inline-flex h-12 items-center gap-1.5 rounded-xl border px-3 text-xs font-semibold transition",
+          scanReady
+            ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-600/60 dark:bg-emerald-950/30 dark:text-emerald-300 animate-pulse"
+            : "border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300",
+          className,
+        ].join(" ")}
+      >
+        <ScanLine className="h-4 w-4" />
+        {scanReady ? "Ready…" : "Scan"}
+      </button>
+
+      {/* Physical-mode: small floating badge under the input */}
+      {scanReady && (
+        <div className="mt-1 flex items-center gap-1.5 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-medium text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-300">
+          <ScanLine className="h-3.5 w-3.5 shrink-0 animate-pulse" />
+          Point &amp; pull trigger — scanner will fill the field automatically.
+          <button
+            type="button"
+            onClick={() => setScanReady(false)}
+            className="ml-auto rounded-full p-0.5 hover:bg-emerald-100 dark:hover:bg-emerald-900"
+            aria-label="Cancel scan ready state"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      )}
+
+      {/* Camera mode: live QR modal */}
+      {modalOpen && (
+        <BarcodeScannerModal
+          title={modalTitle}
+          onDetected={(code) => { onDetected(code); setModalOpen(false); setScanReady(false); }}
+          onClose={() => setModalOpen(false)}
+        />
+      )}
+    </>
+  );
+}
 
 // ─── RBAC ──────────────────────────────────────────────────────────────────────
 
@@ -1818,10 +1902,19 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   const [ocrLoad, setOcrLoad] = useState(false);
   const [ocrBanner, setOcrBanner] = useState<{ ok: boolean; msg: string } | null>(null);
   const ocrFileRef = useRef<HTMLInputElement>(null);
-  const [barcodeModalOpen, setBarcodeModalOpen] = useState(false);
   // Scanner keyboard-nav refs
   const rmaRef      = useRef<HTMLInputElement>(null);
   const itemNameRef = useRef<HTMLInputElement>(null);
+
+  // ── Physical hardware scanner — fills product_identifier automatically ────
+  const { scannedBarcode: itemScannedBarcode, clearScan: clearItemScan } = usePhysicalScanner();
+  useEffect(() => {
+    if (itemScannedBarcode) {
+      up("product_identifier", itemScannedBarcode);
+      clearItemScan();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [itemScannedBarcode]);
 
   async function handleLabelOcr(file: File) {
     setOcrLoad(true); setOcrBanner(null);
@@ -1895,22 +1988,11 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
               onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); rmaRef.current?.focus(); } }}
             />
           </div>
-          <button
-            type="button"
-            onClick={() => setBarcodeModalOpen(true)}
-            title="Scan barcode with camera"
-            className="inline-flex h-12 items-center gap-1.5 rounded-xl border border-sky-200 bg-sky-50 px-3 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
-          >
-            <ScanLine className="h-4 w-4" />Scan
-          </button>
-        </div>
-        {barcodeModalOpen && (
-          <BarcodeScannerModal
-            title="Scan Product Barcode"
-            onDetected={(code) => { up("product_identifier", code); setBarcodeModalOpen(false); }}
-            onClose={() => setBarcodeModalOpen(false)}
+          <ContextualScanButton
+            onDetected={(code) => up("product_identifier", code)}
+            modalTitle="Scan Product Barcode"
           />
-        )}
+        </div>
       </div>
       {!hasPackageLink && (
         <div>
@@ -2194,12 +2276,20 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
   const [tracking, setTracking] = useState(""); const [carrier, setCarrier] = useState(""); const [expected, setExpected] = useState(""); const [palletId, setPalletId] = useState("");
   const [ocrFile, setOcrFile] = useState<File | null>(null); const [ocrLoad, setOcrLoad] = useState(false); const [ocrDone, setOcrDone] = useState(false);
   const [saving, setSaving] = useState(false); const [error, setError] = useState("");
-  const [trackingScanOpen, setTrackingScanOpen] = useState(false);
   const [photoUrl, setPhotoUrl] = useState<string | null>(null);
   const [photoUploading, setPhotoUploading] = useState(false);
   const photoRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const palletOptions = openPallets.map((p) => ({ id: p.id, label: p.pallet_number, sublabel: `${p.item_count} items` }));
+
+  // ── Physical hardware scanner — fills tracking_number automatically ───────
+  const { scannedBarcode: pkgScannedBarcode, clearScan: clearPkgScan } = usePhysicalScanner();
+  useEffect(() => {
+    if (pkgScannedBarcode) {
+      setTracking(pkgScannedBarcode);
+      clearPkgScan();
+    }
+  }, [pkgScannedBarcode, clearPkgScan]);
 
   async function handleOcr(file: File) { setOcrFile(file); setOcrLoad(true); setOcrDone(false); const res = await mockPackageOcr(file); setOcrLoad(false); if (res.ok && res.data) { setExpected(String(res.data.expected_item_count)); setCarrier(res.data.carrier_name); setTracking(res.data.tracking_number); setOcrDone(true); } else setError(res.error ?? "OCR failed."); }
   async function handleManifestUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -2273,22 +2363,11 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
                   onKeyDown={(e) => { if (e.key === "Enter" && pkgNum.trim() && !saving) { e.preventDefault(); handleCreate(); } }}
                 />
               </div>
-              <button
-                type="button"
-                onClick={() => setTrackingScanOpen(true)}
-                title="Scan tracking barcode"
-                className="inline-flex h-12 items-center gap-1.5 rounded-xl border border-sky-200 bg-sky-50 px-3 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
-              >
-                <ScanLine className="h-4 w-4" />Scan
-              </button>
-            </div>
-            {trackingScanOpen && (
-              <BarcodeScannerModal
-                title="Scan Tracking Number"
-                onDetected={(code) => { setTracking(code); setTrackingScanOpen(false); }}
-                onClose={() => setTrackingScanOpen(false)}
+              <ContextualScanButton
+                onDetected={(code) => setTracking(code)}
+                modalTitle="Scan Tracking Number"
               />
-            )}
+            </div>
           </div>
           <div><label className={LABEL}>Expected Items</label><input type="number" min="0" className={INPUT} placeholder="0" value={expected} onChange={(e) => setExpected(e.target.value)} /></div>
           <ComboboxField label="Link to Pallet" hint="(optional)" icon={Boxes} options={palletOptions} value={palletId} onChange={setPalletId} onClear={() => setPalletId("")} placeholder="Search pallets…" />
@@ -2323,7 +2402,6 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
   const [bolFile, setBolFile] = useState<File | null>(null);
   const [ocrLoad, setOcrLoad] = useState(false); const [ocrResult, setOcrResult] = useState<{ pallet_number: string; total_items: number; confidence: number } | null>(null);
   const [saving, setSaving] = useState(false); const [error, setError] = useState("");
-  const [palletScanOpen, setPalletScanOpen] = useState(false);
   const [photoUrl, setPhotoUrl] = useState<string | null>(null);
   const [photoUploading, setPhotoUploading] = useState(false);
   const photoRef = useRef<HTMLInputElement>(null);
@@ -2383,22 +2461,11 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
                 autoFocus
                 onKeyDown={(e) => { if (e.key === "Enter" && palletNum.trim() && !saving) { e.preventDefault(); handleCreate(); } }}
               />
-              <button
-                type="button"
-                onClick={() => setPalletScanOpen(true)}
-                title="Scan pallet barcode"
-                className="inline-flex h-12 items-center gap-1.5 rounded-xl border border-sky-200 bg-sky-50 px-3 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
-              >
-                <ScanLine className="h-4 w-4" />Scan
-              </button>
-            </div>
-            {palletScanOpen && (
-              <BarcodeScannerModal
-                title="Scan Pallet Number"
-                onDetected={(code) => { setPalletNum(code); setPalletScanOpen(false); }}
-                onClose={() => setPalletScanOpen(false)}
+              <ContextualScanButton
+                onDetected={(code) => setPalletNum(code)}
+                modalTitle="Scan Pallet Number"
               />
-            )}
+            </div>
           </div>
           <div>
             <label className={LABEL}>Bill of Lading (BoL) <span className="text-xs font-normal text-slate-400">(optional)</span></label>

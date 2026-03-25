@@ -113,3 +113,80 @@ export function getLabelPrinterFromStorage(): LabelPrinter {
 export function setLabelPrinterInStorage(printer: LabelPrinter): void {
   localStorage.setItem(LABEL_PRINTER_STORAGE_KEY, printer);
 }
+
+// ── Multi-API configurations ──────────────────────────────────────────────────
+
+export const AI_CONFIGS_STORAGE_KEY        = "ecommerce_os_ai_configs";
+export const AI_GLOBAL_PROVIDER_STORAGE_KEY = "ecommerce_os_ai_global_provider_id";
+export const AI_ROLE_ASSIGNMENTS_STORAGE_KEY = "ecommerce_os_ai_role_assignments";
+
+/** Role assigned to each saved API connection. */
+export type AIRole = "default" | "ocr_vision";
+
+/** Connection health / test status. */
+export type AIConfigStatus = "untested" | "active" | "testing" | "error";
+
+/** A single saved API connection entry. */
+export interface AIConfig {
+  id: string;
+  /** User-defined friendly label (e.g. "Gemini Flash — Chat", "GPT-4o Vision"). */
+  providerName: string;
+  provider: AIProvider;
+  baseURL: string;
+  apiKey: string;
+  /** Legacy per-entry role tag — superseded by AIRoleAssignments but kept for compat. */
+  role: AIRole;
+  status?: AIConfigStatus;
+  /** When true this entry acts as the sole API for all tasks — overrides role assignments. */
+  isGlobalOverride?: boolean;
+}
+
+/** Explicit role-based routing: which saved config handles each task type. */
+export interface AIRoleAssignments {
+  defaultGeneral: string | null; // config id
+  defaultVision:  string | null; // config id
+}
+
+export function getAIConfigsFromStorage(): AIConfig[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(AI_CONFIGS_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as AIConfig[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function setAIConfigsInStorage(configs: AIConfig[]): void {
+  localStorage.setItem(AI_CONFIGS_STORAGE_KEY, JSON.stringify(configs));
+}
+
+export function clearAIConfigsFromStorage(): void {
+  localStorage.removeItem(AI_CONFIGS_STORAGE_KEY);
+}
+
+export function getAIRoleAssignmentsFromStorage(): AIRoleAssignments {
+  if (typeof window === "undefined") return { defaultGeneral: null, defaultVision: null };
+  try {
+    const raw = localStorage.getItem(AI_ROLE_ASSIGNMENTS_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as AIRoleAssignments) : { defaultGeneral: null, defaultVision: null };
+  } catch {
+    return { defaultGeneral: null, defaultVision: null };
+  }
+}
+
+export function setAIRoleAssignmentsInStorage(assignments: AIRoleAssignments): void {
+  localStorage.setItem(AI_ROLE_ASSIGNMENTS_STORAGE_KEY, JSON.stringify(assignments));
+}
+
+/** Returns the config that should be used for a given role, respecting the global override. */
+export function resolveAIConfig(
+  configs: AIConfig[],
+  assignments: AIRoleAssignments,
+  role: "general" | "vision",
+): AIConfig | null {
+  const globalOverride = configs.find((c) => c.isGlobalOverride);
+  if (globalOverride) return globalOverride;
+  const id = role === "vision" ? assignments.defaultVision : assignments.defaultGeneral;
+  return configs.find((c) => c.id === id) ?? configs[0] ?? null;
+}
