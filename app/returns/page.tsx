@@ -289,7 +289,7 @@ export default function ReturnsPage() {
             allReturns={visibleReturns}
             onClose={closeDrawer}
             onPackageUpdated={(p) => { updatePackage_(p); setDrawerStack((prev) => prev.map((d) => d.type === "package" && d.record.id === p.id ? { type: "package", record: p } : d)); }}
-            onItemAdded={(r) => { addReturn(r); showToast(`✓ Item logged — ${r.product_identifier ?? r.rma_number}`); }}
+            onItemAdded={(r) => { addReturn(r); showToast(`✓ Item logged — ${r.product_identifier ?? r.item_name}`); }}
             onPackageDeleted={(id) => { removePackage(id); closeDrawer(); showToast("Package deleted.", "warning"); }}
             onOpenItem={(r) => pushDrawer({ type: "item", record: r })}
             showToast={showToast as (msg: string, kind?: ToastKind) => void}
@@ -315,7 +315,7 @@ export default function ReturnsPage() {
       {wizardOpen && (
         <SingleItemWizardModal
           onClose={() => { setWizardOpen(false); setWizardInherited(undefined); }}
-          onSuccess={(r, photos) => { addReturn(r, photos); showToast(`✓ Return logged — ${r.product_identifier ?? r.rma_number}`); }}
+          onSuccess={(r, photos) => { addReturn(r, photos); showToast(`✓ Return logged — ${r.product_identifier ?? r.item_name}`); }}
           actor={actor}
           openPackages={openPackages}
           openPallets={openPallets}

@@ -3,7 +3,9 @@
 /**
  * usePhysicalScanner
  *
- * Detects hardware barcode-scanner input by monitoring global keydown events.
+ * Detects hardware barcode-scanner input by monitoring keydown events on a
+ * SPECIFIC input element — NOT globally on document/window.
+ *
  * Physical scanners emulate a keyboard but fire keystrokes extremely fast
  * (typically 1–5 ms apart) and terminate the sequence with Enter.
  *
@@ -14,18 +16,22 @@
  *    Enter itself arrives within ENTER_INTERVAL_MS of the last character, the
  *    accumulated string is treated as a scanned barcode.
  *  • The Enter keydown event is prevented (stops accidental form submissions).
- *  • If keystrokes are too slow (human typing), the buffer resets with the
- *    latest character — normal keyboard input is unaffected.
+ *  • If keystrokes are too slow (human typing), the buffer resets — normal
+ *    keyboard input in Notes / Search fields is completely unaffected.
  *
- * Usage:
- *   const { scannedBarcode, clearScan } = usePhysicalScanner({
+ * Usage — attach onKeyDown directly to a designated barcode or tracking input:
+ *
+ *   const { onKeyDown } = usePhysicalScanner({
  *     onScan: (code) => handleBarcode(code),
  *   });
  *
- *   // Or watch scannedBarcode in a useEffect if onScan isn't convenient.
+ *   <input onKeyDown={(e) => { onKeyDown(e); /* your other handlers *\/ }} />
+ *
+ * Only inputs that explicitly receive onKeyDown participate in scanner
+ * detection. Notes fields, search boxes, etc. are never affected.
  */
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 
 /** Max milliseconds between consecutive characters to consider scanner input. */
 const CHAR_INTERVAL_MS = 30;
@@ -43,14 +49,19 @@ const MIN_LENGTH = 3;
 export interface UsePhysicalScannerOptions {
   /** Callback fired when a barcode is successfully detected. */
   onScan?: (barcode: string) => void;
-  /** Set to false to temporarily disable the listener. Defaults to true. */
+  /** Set to false to temporarily disable the scanner logic. Defaults to true. */
   enabled?: boolean;
 }
 
 export interface UsePhysicalScannerResult {
   /**
+   * Attach this handler directly to the onKeyDown of a barcode / tracking
+   * <input>. Do NOT spread it onto Notes or Search fields.
+   */
+  onKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => void;
+  /**
    * The most recently scanned barcode string, or null if none since last clear.
-   * Inputs / forms can watch this value with useEffect to auto-fill.
+   * Usually you consume the value via the onScan callback instead.
    */
   scannedBarcode: string | null;
   /** Call this to reset scannedBarcode back to null after you've consumed it. */
@@ -63,37 +74,38 @@ export function usePhysicalScanner({
 }: UsePhysicalScannerOptions = {}): UsePhysicalScannerResult {
   const [scannedBarcode, setScannedBarcode] = useState<string | null>(null);
 
-  // Keep onScan ref-stable so the effect doesn't re-register on every render.
+  // Keep onScan ref-stable so the handler doesn't go stale across renders.
   const onScanRef = useRef(onScan);
   useEffect(() => { onScanRef.current = onScan; });
 
-  useEffect(() => {
-    if (!enabled) return;
+  // Buffer lives in refs so it persists between keydown calls without
+  // triggering re-renders or creating stale closures.
+  const bufferRef      = useRef("");
+  const lastKeyTimeRef = useRef(0);
 
-    let buffer      = "";
-    let lastKeyTime = 0;   // timestamp of last captured character (0 = none yet)
-
-    function handleKeyDown(e: KeyboardEvent) {
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (!enabled) return;
       const now = Date.now();
 
       if (e.key === "Enter") {
-        const gap = lastKeyTime > 0 ? now - lastKeyTime : Infinity;
+        const gap = lastKeyTimeRef.current > 0 ? now - lastKeyTimeRef.current : Infinity;
 
-        if (buffer.length >= MIN_LENGTH && gap <= ENTER_INTERVAL_MS) {
+        if (bufferRef.current.length >= MIN_LENGTH && gap <= ENTER_INTERVAL_MS) {
           // Rapid sequence ending with Enter → barcode scan detected
           e.preventDefault();
           e.stopPropagation();
 
-          const barcode = buffer;
-          buffer      = "";
-          lastKeyTime = 0;
+          const barcode = bufferRef.current;
+          bufferRef.current      = "";
+          lastKeyTimeRef.current = 0;
 
           setScannedBarcode(barcode);
           onScanRef.current?.(barcode);
         } else {
           // Normal Enter (human typing) — do not interfere
-          buffer      = "";
-          lastKeyTime = 0;
+          bufferRef.current      = "";
+          lastKeyTimeRef.current = 0;
         }
         return;
       }
@@ -101,24 +113,22 @@ export function usePhysicalScanner({
       // Only track printable single characters (ignore Shift, Ctrl, F-keys, etc.)
       if (e.key.length !== 1) return;
 
-      const gap = lastKeyTime > 0 ? now - lastKeyTime : Infinity;
+      const gap = lastKeyTimeRef.current > 0 ? now - lastKeyTimeRef.current : Infinity;
 
       if (gap <= CHAR_INTERVAL_MS) {
         // Fast enough → scanner mode, extend buffer
-        buffer += e.key;
+        bufferRef.current += e.key;
       } else {
         // Too slow for a scanner → human keystroke, start fresh
-        buffer = e.key;
+        bufferRef.current = e.key;
       }
 
-      lastKeyTime = now;
-    }
-
-    document.addEventListener("keydown", handleKeyDown, { capture: true });
-    return () => document.removeEventListener("keydown", handleKeyDown, { capture: true });
-  }, [enabled]);
+      lastKeyTimeRef.current = now;
+    },
+    [enabled],
+  );
 
   const clearScan = useCallback(() => setScannedBarcode(null), []);
 
-  return { scannedBarcode, clearScan };
+  return { onKeyDown: handleKeyDown, scannedBarcode, clearScan };
 }

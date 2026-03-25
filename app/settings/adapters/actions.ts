@@ -320,6 +320,38 @@ export async function deleteMarketplace(
   }
 }
 
+// ── Stores (stores table — higher-level than marketplace credentials) ─────────
+
+export type StorePublicRow = {
+  id: string;
+  name: string;
+  platform: string;
+  is_active: boolean;
+  marketplace_id: string | null;
+  organization_id: string;
+  created_at: string;
+};
+
+export async function listStores(
+  ctx?: RbacContext | null
+): Promise<{ ok: boolean; data?: StorePublicRow[]; error?: string }> {
+  const rbac = getRbacContext(ctx);
+  try {
+    const { data, error } = await supabaseServer
+      .from("stores")
+      .select("id, name, platform, is_active, marketplace_id, organization_id, created_at")
+      .eq("organization_id", rbac.organization_id)
+      .order("created_at", { ascending: false });
+
+    if (error) throw new Error(error.message);
+    return { ok: true, data: (data ?? []) as StorePublicRow[] };
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to load stores.";
+    return { ok: false, error: message };
+  }
+}
+
 export async function listMarketplaces(
   ctx?: RbacContext | null
 ): Promise<{

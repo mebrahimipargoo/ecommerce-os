@@ -119,6 +119,8 @@ export type PalletRecord = {
   /** Last actor who updated this row — HR / performance analytics */
   updated_by?: string | null;
   created_at: string; updated_at: string;
+  /** UUID of the connected store — added in 20260325_pallets_store_id.sql */
+  store_id?: string | null;
   /** Live counts from `listPallets` relation embeds (optional). */
   child_packages_count?: number;
   child_returns_count?: number;
@@ -128,6 +130,7 @@ export type PalletInsertPayload = {
   pallet_number: string; manifest_photo_url?: string;
   bol_photo_url?: string;
   photo_url?: string;
+  store_id?: string;
   notes?: string; organization_id?: string; created_by?: string;
 };
 
@@ -142,6 +145,8 @@ export type PackageRecord = {
   id: string; organization_id: string;
   package_number: string; tracking_number: string | null;
   carrier_name: string | null;
+  /** RMA number at the package level — added in 20260325_packages_rma_number.sql */
+  rma_number?: string | null;
   expected_item_count: number; actual_item_count: number;
   pallet_id: string | null; status: PackageStatus;
   discrepancy_note: string | null;
@@ -151,6 +156,14 @@ export type PackageRecord = {
   manifest_url?: string | null;
   /** General box/package photo — added in 20260324_media_photo_urls.sql */
   photo_url?: string | null;
+  /** Claim evidence: closed-box photo — added in 20260325_claims_evidence_expiry.sql */
+  photo_closed_url?: string | null;
+  /** Claim evidence: opened-box photo — added in 20260325_claims_evidence_expiry.sql */
+  photo_opened_url?: string | null;
+  /** Claim evidence: return-label photo — added in 20260325_packages_return_label_photo.sql */
+  photo_return_label_url?: string | null;
+  /** UUID of the connected store — added in 20260325_saas_stores_usage.sql */
+  store_id?: string | null;
   created_by: string;
   /** Last actor who updated this row — HR / performance analytics */
   updated_by?: string | null;
@@ -159,15 +172,18 @@ export type PackageRecord = {
 
 export type PackageInsertPayload = {
   package_number: string; tracking_number?: string;
-  carrier_name?: string; expected_item_count?: number;
-  pallet_id?: string; organization_id?: string; created_by?: string;
+  carrier_name?: string; rma_number?: string; expected_item_count?: number;
+  pallet_id?: string; store_id?: string; organization_id?: string; created_by?: string;
   manifest_url?: string;
   photo_url?: string;
+  photo_closed_url?: string;
+  photo_opened_url?: string;
+  photo_return_label_url?: string;
 };
 
 export type PackageUpdatePayload = Partial<Pick<
   PackageRecord,
-  "carrier_name" | "tracking_number" | "expected_item_count" | "status" | "discrepancy_note" | "pallet_id" | "manifest_url" | "photo_url"
+  "carrier_name" | "tracking_number" | "rma_number" | "expected_item_count" | "status" | "discrepancy_note" | "pallet_id" | "manifest_url" | "photo_url" | "photo_closed_url" | "photo_opened_url" | "photo_return_label_url"
 >>;
 
 // ─── Return Types ─────────────────────────────────────────────────────────────
@@ -177,11 +193,16 @@ export type ReturnInsertPayload = {
   lpn?: string;
   /** ASIN / UPC / FNSKU — primary product identifier at item level. */
   product_identifier?: string;
-  rma_number: string; marketplace: string; item_name: string;
+  marketplace: string; item_name: string;
   conditions: string[];
   notes?: string; photo_evidence?: Record<string, number>;
   expiration_date?: string; batch_number?: string;
+  /** Claim evidence photo URLs — added in 20260325_claims_evidence_expiry.sql */
+  photo_item_url?: string;
+  photo_expiry_url?: string;
   pallet_id?: string; package_id?: string;
+  /** UUID of the connected store — added in 20260325_saas_stores_usage.sql */
+  store_id?: string;
   /** External IDs for API / lifecycle / scoring (optional). */
   order_id?: string | null;
   customer_id?: string | null;
@@ -195,11 +216,15 @@ export type ReturnRecord = {
   product_identifier?: string | null;
   inherited_tracking_number?: string | null;
   inherited_carrier?: string | null;
-  rma_number: string;
   marketplace: string; item_name: string;
   conditions: string[]; status: string;
   notes: string | null; photo_evidence: Record<string, number> | null;
   expiration_date: string | null; batch_number: string | null;
+  /** Claim evidence URLs — added in 20260325_claims_evidence_expiry.sql */
+  photo_item_url?: string | null;
+  photo_expiry_url?: string | null;
+  /** UUID of the connected store — added in 20260325_saas_stores_usage.sql */
+  store_id?: string | null;
   pallet_id: string | null; package_id: string | null;
   // Post-migration fields — null/undefined until 20250324_returns_order_customer_ids.sql is applied
   order_id?: string | null;
@@ -212,10 +237,10 @@ export type ReturnRecord = {
 
 export type ReturnUpdatePayload = Partial<Pick<
   ReturnRecord,
-  | "lpn" | "rma_number" | "item_name" | "notes" | "status"
+  | "lpn" | "item_name" | "notes" | "status"
   | "conditions" | "expiration_date" | "batch_number"
   | "package_id" | "pallet_id"
-  | "photo_evidence"
+  | "photo_evidence" | "photo_item_url" | "photo_expiry_url"
 >>;
 
 // ─── Audit Log Types ──────────────────────────────────────────────────────────
@@ -236,9 +261,10 @@ export type AuditLogRecord = {
 //       → migration: 20250325_returns_product_inherited_tracking.sql
 //   • order_id / customer_id
 //       → migration: 20250324_returns_order_customer_ids.sql
-const PALLET_SELECT = "id,organization_id,pallet_number,manifest_photo_url,status,notes,item_count,created_by,updated_by,created_at,updated_at";
-const PKG_SELECT    = "id,organization_id,package_number,tracking_number,carrier_name,expected_item_count,actual_item_count,pallet_id,status,discrepancy_note,manifest_url,created_by,updated_by,created_at,updated_at";
-const RETURN_SELECT = "id,organization_id,lpn,rma_number,marketplace,item_name,conditions,status,notes,photo_evidence,expiration_date,batch_number,pallet_id,package_id,created_by,updated_by,created_at,updated_at";
+// NOTE: store_id in PALLET_SELECT requires migration 20260325_pallets_store_id.sql to be applied first.
+const PALLET_SELECT = "id,organization_id,pallet_number,manifest_photo_url,store_id,status,notes,item_count,created_by,updated_by,created_at,updated_at";
+const PKG_SELECT    = "id,organization_id,package_number,tracking_number,carrier_name,rma_number,expected_item_count,actual_item_count,pallet_id,store_id,status,discrepancy_note,manifest_url,photo_closed_url,photo_opened_url,photo_return_label_url,created_by,updated_by,created_at,updated_at";
+const RETURN_SELECT = "id,organization_id,lpn,marketplace,item_name,conditions,status,notes,photo_evidence,expiration_date,batch_number,photo_item_url,photo_expiry_url,store_id,pallet_id,package_id,created_by,updated_by,created_at,updated_at";
 
 /** Supabase relation embeds: live child counts (avoids stale actual_item_count / item_count). */
 const PKG_LIST_SELECT = `${PKG_SELECT},returns(count)`;
@@ -285,9 +311,10 @@ export async function createPallet(
       status: "open",
       created_by: actor,
     };
-    // bol_photo_url / photo_url only inserted if migration has been applied
+    // bol_photo_url / photo_url / store_id only inserted if migration has been applied
     if (payload.bol_photo_url) insertRow.bol_photo_url = payload.bol_photo_url;
     if (payload.photo_url)     insertRow.photo_url     = payload.photo_url;
+    if (payload.store_id)      insertRow.store_id      = payload.store_id;
     const { data, error } = await supabaseServer.from("pallets")
       .insert(insertRow)
       .select(PALLET_LIST_SELECT).single();
@@ -370,10 +397,15 @@ export async function createPackage(
         package_number:      payload.package_number.trim(),
         tracking_number:     payload.tracking_number?.trim() || null,
         carrier_name:        payload.carrier_name?.trim() || null,
+        rma_number:          payload.rma_number?.trim() || null,
         expected_item_count: payload.expected_item_count ?? 0,
         pallet_id:           payload.pallet_id ?? null,
+        ...(payload.store_id         ? { store_id:         payload.store_id         } : {}),
         manifest_url:        payload.manifest_url ?? null,
-        ...(payload.photo_url ? { photo_url: payload.photo_url } : {}),
+        ...(payload.photo_url        ? { photo_url:        payload.photo_url        } : {}),
+        ...(payload.photo_closed_url        ? { photo_closed_url:        payload.photo_closed_url        } : {}),
+        ...(payload.photo_opened_url        ? { photo_opened_url:        payload.photo_opened_url        } : {}),
+        ...(payload.photo_return_label_url  ? { photo_return_label_url:  payload.photo_return_label_url  } : {}),
         status:              "open",
         created_by:          actor,
       })
@@ -513,7 +545,6 @@ export async function insertReturn(
     const insertRow: Record<string, unknown> = {
       organization_id: orgId,
       lpn:             payload.lpn?.trim() || null,
-      rma_number:      payload.rma_number.trim(),
       marketplace:     payload.marketplace,
       item_name:       payload.item_name.trim(),
       conditions:      payload.conditions,
@@ -532,8 +563,11 @@ export async function insertReturn(
     // Trying to INSERT it causes a PostgREST 400 / schema cache error.
     // Re-enable after running the migration:
     //   if (payload.product_identifier) insertRow.product_identifier = payload.product_identifier.trim();
-    if (payload.order_id)    insertRow.order_id    = payload.order_id.trim();
-    if (payload.customer_id) insertRow.customer_id = payload.customer_id.trim();
+    if (payload.store_id)         insertRow.store_id         = payload.store_id;
+    if (payload.order_id)        insertRow.order_id        = payload.order_id.trim();
+    if (payload.customer_id)    insertRow.customer_id    = payload.customer_id.trim();
+    if (payload.photo_item_url)   insertRow.photo_item_url   = payload.photo_item_url;
+    if (payload.photo_expiry_url) insertRow.photo_expiry_url = payload.photo_expiry_url;
 
     const { data, error } = await supabaseServer.from("returns")
       .insert(insertRow).select(RETURN_SELECT).single();

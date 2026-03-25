@@ -24,9 +24,11 @@ import {
   listReturnsByPackage,
 } from "./actions";
 import { itemMatchesPackageExpectation } from "../../lib/package-expectations";
-import { getOpenAIApiKeyFromStorage, getBarcodeModeFromStorage } from "../../lib/openai-settings";
-import { fetchPackingSlipLinesWithOpenAI } from "../../lib/packing-slip-vision";
+import { getBarcodeModeFromStorage, getDefaultStoreIdFromStorage } from "../../lib/openai-settings";
+import { parseBarcodeSource } from "../../lib/utils/barcode-parser";
 import { supabase as supabaseBrowser } from "../../src/lib/supabase";
+import { uploadToStorage } from "../../lib/supabase/storage";
+import { fetchProductFromAmazon } from "../../lib/api/amazon-mock";
 
 // ─── Contextual Scan Button ────────────────────────────────────────────────────
 //
@@ -385,7 +387,7 @@ function physicalItemMatchesExpectedLine(it: ReturnRecord, exp: SlipExpectedItem
   );
 }
 
-type LabelOcrResult = { lpn: string; product_identifier?: string; rma_number: string; marketplace: string; confidence: number };
+type LabelOcrResult = { lpn: string; product_identifier?: string; marketplace: string; confidence: number };
 
 export async function mockLabelOcr(_f: File): Promise<{ ok: boolean; data?: LabelOcrResult; error?: string }> {
   await new Promise((r) => setTimeout(r, 1900));
@@ -395,7 +397,6 @@ export async function mockLabelOcr(_f: File): Promise<{ ok: boolean; data?: Labe
     data: {
       lpn:        `LPN${Math.random().toString(36).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 9)}`,
       product_identifier: `B0${String(Math.floor(Math.random() * 1e7)).padStart(7, "0")}`,
-      rma_number: `RMA-${Date.now().toString(36).toUpperCase()}`,
       marketplace: "amazon",
       confidence:  0.82 + Math.random() * 0.16,
     },
@@ -416,20 +417,27 @@ export type WizardState = {
   lpn: string;
   /** ASIN / UPC / FNSKU — required product identity at item level. */
   product_identifier: string;
-  rma_number: string; marketplace: Marketplace | ""; item_name: string;
+  marketplace: Marketplace | ""; item_name: string;
   /** Multi-select condition keys — see {@link CONDITION_CHIP_DEFS}. */
   condition_keys: string[];
   expiration_date: string; batch_number: string;
   /** Items link to Packages only. Pallet is inherited from the Package. */
   package_link_id: string;
   notes: string; photos: Record<string, File[]>;
+  /** Claim evidence photo URLs — uploaded to Supabase Storage during Step 2. */
+  photo_item_url: string;
+  photo_expiry_url: string;
+  /** Connected store UUID — links this item to a specific marketplace store account. */
+  store_id: string;
 };
 
 export const EMPTY_WIZARD: WizardState = {
-  lpn: "", product_identifier: "", rma_number: "", marketplace: "", item_name: "",
+  lpn: "", product_identifier: "", marketplace: "", item_name: "",
   condition_keys: [],
   expiration_date: "", batch_number: "", package_link_id: "",
   notes: "", photos: {},
+  photo_item_url: "", photo_expiry_url: "",
+  store_id: "",
 };
 
 // ─── Toast ─────────────────────────────────────────────────────────────────────
@@ -555,7 +563,6 @@ function sortKeyItem(
     case "inherited_tracking_number":
     case "tracking_effective": return trackEff.toLowerCase();
     case "lpn": return (r.lpn ?? "").toLowerCase();
-    case "rma_number": return r.rma_number.toLowerCase();
     case "marketplace": return r.marketplace.toLowerCase();
     case "item_name": return r.item_name.toLowerCase();
     case "item_conditions": return [...r.conditions].sort().join(",");
@@ -759,13 +766,13 @@ export function BulkMoveModal({ selectedIds, packages: allPkgs, pallets: allPlts
   }
 
   return (
-    <div className="fixed inset-0 z-[400] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-md overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950">
-        <div className="flex items-center justify-between border-b border-slate-200 p-6 dark:border-slate-700">
+    <div className="fixed inset-0 z-[400] flex items-center justify-center bg-black/50 p-2 sm:p-4 backdrop-blur-sm">
+      <div className="w-[95vw] max-w-lg overflow-hidden rounded-2xl sm:rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950">
+        <div className="flex items-center justify-between border-b border-slate-200 p-4 sm:p-6 dark:border-slate-700">
           <div><p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Bulk Action</p><h2 className="mt-0.5 text-xl font-bold text-foreground">Move {selectedIds.length} Items</h2></div>
           <button onClick={onClose} className="rounded-full p-2 text-slate-400 hover:bg-accent hover:text-accent-foreground"><X className="h-5 w-5" /></button>
         </div>
-        <div className="p-6 space-y-5">
+        <div className="p-4 sm:p-6 space-y-5">
           <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 dark:border-sky-700/60 dark:bg-sky-950/30">
             <p className="text-xs text-sky-700 dark:text-sky-300"><span className="font-bold">{selectedIds.length} items</span> will be reassigned. Fields left blank are unchanged.</p>
           </div>
@@ -809,16 +816,16 @@ export function BulkAssignPackagesModal({ selectedIds, pallets: allPlts, actor, 
   }
 
   return (
-    <div className="fixed inset-0 z-[400] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-md overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950">
-        <div className="flex items-center justify-between border-b border-slate-200 p-6 dark:border-slate-700">
+    <div className="fixed inset-0 z-[400] flex items-center justify-center bg-black/50 p-2 sm:p-4 backdrop-blur-sm">
+      <div className="w-[95vw] max-w-lg overflow-hidden rounded-2xl sm:rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950">
+        <div className="flex items-center justify-between border-b border-slate-200 p-4 sm:p-6 dark:border-slate-700">
           <div>
             <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Bulk Action</p>
             <h2 className="mt-0.5 text-xl font-bold text-foreground">Assign {selectedIds.length} Packages to Pallet</h2>
           </div>
           <button type="button" onClick={onClose} className="rounded-full p-2 text-slate-400 hover:bg-accent hover:text-accent-foreground"><X className="h-5 w-5" /></button>
         </div>
-        <div className="space-y-5 p-6">
+        <div className="space-y-5 p-4 sm:p-6">
           <div className="rounded-2xl border border-violet-200 bg-violet-50 p-3 dark:border-violet-700/60 dark:bg-violet-950/30">
             <p className="text-xs text-violet-800 dark:text-violet-200">
               <span className="font-bold">{selectedIds.length} package(s)</span> will get the same <span className="font-semibold">pallet_id</span> in the database (same as editing a single package).
@@ -975,7 +982,7 @@ function ItemsSubTable({ items, role, actor, onItemClick, onItemDeleted, showToa
     let d = [...items];
     if (search) {
       const q = search.toLowerCase();
-      d = d.filter((r) => [r.lpn ?? "", r.rma_number, r.item_name, r.product_identifier ?? "", r.id].some((v) => v.toLowerCase().includes(q)));
+      d = d.filter((r) => [r.lpn ?? "", r.item_name, r.product_identifier ?? "", r.id].some((v) => v.toLowerCase().includes(q)));
     }
     if (statusF) d = d.filter((r) => r.status === statusF);
     return d;
@@ -1084,7 +1091,6 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   const [err,        setErr]        = useState("");
   const [editLpn,    setEditLpn]    = useState(record.lpn ?? "");
   const [editProductId, setEditProductId] = useState(record.product_identifier ?? "");
-  const [editRma,    setEditRma]    = useState(record.rma_number);
   const [editItem,   setEditItem]   = useState(record.item_name);
   const [editNotes,  setEditNotes]  = useState(record.notes ?? "");
   const [editStatus, setEditStatus] = useState(record.status);
@@ -1098,16 +1104,90 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     record.photo_evidence ?? {},
   );
   const [editNewPhotos, setEditNewPhotos] = useState<Record<string, File[]>>({});
+  const [editCatalogStatus, setEditCatalogStatus] = useState<"idle" | "loading" | "local" | "amazon" | "unknown">("idle");
+  const [editCatalogPreview, setEditCatalogPreview] = useState<{ name: string; price?: number; image_url?: string } | null>(null);
+  const [editExpiryDate,     setEditExpiryDate]     = useState(record.expiration_date ?? "");
+  const [editPhotoItemUrl,   setEditPhotoItemUrl]   = useState(record.photo_item_url ?? "");
+  const [editPhotoExpiryUrl, setEditPhotoExpiryUrl] = useState(record.photo_expiry_url ?? "");
+  const [itemPhotoUploading,   setItemPhotoUploading]   = useState(false);
+  const [expiryPhotoUploading, setExpiryPhotoUploading] = useState(false);
 
   useEffect(() => {
     setEditLpn(record.lpn ?? "");
     setEditProductId(record.product_identifier ?? "");
-    setEditRma(record.rma_number);
     setEditItem(record.item_name);
     setEditNotes(record.notes ?? "");
     setEditStatus(record.status);
     setEditPhotoEvidence(record.photo_evidence ?? {});
-  }, [record.id, record.lpn, record.product_identifier, record.rma_number, record.item_name, record.notes, record.status, record.photo_evidence]);
+    setEditExpiryDate(record.expiration_date ?? "");
+    setEditPhotoItemUrl(record.photo_item_url ?? "");
+    setEditPhotoExpiryUrl(record.photo_expiry_url ?? "");
+    setEditCatalogStatus("idle");
+    setEditCatalogPreview(null);
+  }, [record.id, record.lpn, record.product_identifier, record.item_name, record.notes, record.status, record.photo_evidence, record.expiration_date, record.photo_item_url, record.photo_expiry_url]);
+
+  async function handleItemEvidencePhoto(
+    e: React.ChangeEvent<HTMLInputElement>,
+    field: "photo_item_url" | "photo_expiry_url",
+  ) {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    const setUploading = field === "photo_item_url" ? setItemPhotoUploading : setExpiryPhotoUploading;
+    const setUrl       = field === "photo_item_url" ? setEditPhotoItemUrl   : setEditPhotoExpiryUrl;
+    setUploading(true);
+    try {
+      const ext  = f.name.split(".").pop() ?? "jpg";
+      const path = `evidence/${field}/${record.id}_${Date.now()}.${ext}`;
+      const { error: upErr } = await supabaseBrowser.storage.from("media").upload(path, f, { upsert: true });
+      if (upErr) throw new Error(upErr.message);
+      const { data: urlData } = supabaseBrowser.storage.from("media").getPublicUrl(path);
+      setUrl(urlData.publicUrl);
+    } catch {
+      setErr("Photo upload failed. Try again.");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function handleEditBarcodeLookup(barcode: string) {
+    if (!barcode.trim()) { setEditCatalogStatus("idle"); return; }
+    setEditCatalogStatus("loading");
+    setEditCatalogPreview(null);
+
+    const { data: local } = await supabaseBrowser
+      .from("products")
+      .select("*")
+      .eq("barcode", barcode.trim())
+      .maybeSingle();
+
+    if (local) {
+      setEditItem(local.name);
+      setEditCatalogPreview({ name: local.name, price: local.price, image_url: local.image_url });
+      setEditCatalogStatus("local");
+      return;
+    }
+
+    const amazon = await fetchProductFromAmazon(barcode.trim());
+    if (amazon) {
+      setEditItem(amazon.name);
+      setEditCatalogPreview({ name: amazon.name, price: amazon.price, image_url: amazon.image_url });
+      setEditCatalogStatus("amazon");
+      await supabaseBrowser
+        .from("products")
+        .insert({ barcode: barcode.trim(), name: amazon.name, price: amazon.price, image_url: amazon.image_url, source: "Amazon" })
+        .then(() => {})
+        .catch(() => {});
+      return;
+    }
+
+    setEditCatalogStatus("unknown");
+  }
+
+  const { onKeyDown: editBarcodeKeyDown } = usePhysicalScanner({
+    enabled: editing,
+    onScan: (code) => { setEditProductId(code); void handleEditBarcodeLookup(code); },
+  });
 
   function removeExistingPhotoSlot(cat: string) {
     setEditPhotoEvidence((prev) => {
@@ -1134,9 +1214,12 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     });
     const res = await updateReturn(record.id, {
       lpn: editLpn || undefined,
-      rma_number: editRma, item_name: editItem,
+      item_name: editItem,
       notes: editNotes || undefined, status: editStatus,
-      photo_evidence: Object.keys(mergedPhotoEvidence).length ? mergedPhotoEvidence : undefined,
+      expiration_date:  editExpiryDate  || undefined,
+      photo_evidence:   Object.keys(mergedPhotoEvidence).length ? mergedPhotoEvidence : undefined,
+      photo_item_url:   editPhotoItemUrl   || undefined,
+      photo_expiry_url: editPhotoExpiryUrl || undefined,
     }, actor);
     setSaving(false);
     if (res.ok && res.data) { onUpdated(res.data); setEditing(false); setEditNewPhotos({}); }
@@ -1151,7 +1234,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   }
 
   return (
-    <div className="p-6 space-y-5">
+    <div className="p-4 sm:p-6 space-y-5">
       <div className="flex flex-wrap gap-2">
         <StatusBadge status={record.status} />
         <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-semibold capitalize text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">{record.marketplace}</span>
@@ -1161,12 +1244,100 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
 
       {editing ? (
         <div className="space-y-4">
-          <div><label className={LABEL}>Product barcode (ASIN / UPC)</label><input className={INPUT} value={editProductId} onChange={(e) => setEditProductId(e.target.value)} placeholder="Product identifier…" /></div>
+          <div>
+            <label className={LABEL}>Product barcode (ASIN / UPC)</label>
+            <input
+              className={`${INPUT} transition-all ${editCatalogStatus === "unknown" ? "border-yellow-400 ring-2 ring-yellow-300 focus:border-yellow-400 focus:ring-yellow-300" : ""}`}
+              value={editProductId}
+              onChange={(e) => { setEditProductId(e.target.value); setEditCatalogStatus("idle"); }}
+              placeholder="Product identifier…"
+              onKeyDown={editBarcodeKeyDown}
+              onBlur={(e) => { if (e.target.value.trim()) void handleEditBarcodeLookup(e.target.value); }}
+            />
+            {editCatalogStatus === "loading" && (
+              <div className="mt-1.5 flex items-center gap-2 text-xs text-slate-400">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />Looking up barcode…
+              </div>
+            )}
+            {editCatalogStatus === "local" && editCatalogPreview && (
+              <div className="mt-1.5 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-300">
+                <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />Found in Catalog — {editCatalogPreview.name}
+              </div>
+            )}
+            {editCatalogStatus === "amazon" && editCatalogPreview && (
+              <div className="mt-1.5 flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-700 dark:border-sky-700/50 dark:bg-sky-950/30 dark:text-sky-300">
+                <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />Found on Amazon — {editCatalogPreview.name}{editCatalogPreview.price != null ? ` · $${editCatalogPreview.price.toFixed(2)}` : ""}
+              </div>
+            )}
+            {editCatalogStatus === "unknown" && (
+              <div className="mt-1.5 rounded-xl border-2 border-yellow-400 bg-yellow-50 px-3 py-2 text-xs font-bold text-yellow-800 dark:border-yellow-500/60 dark:bg-yellow-950/20 dark:text-yellow-300">
+                ⚠️ Unknown Item — Not found locally or on Amazon.
+              </div>
+            )}
+          </div>
           {!record.package_id && (
             <div><label className={LABEL}>LPN <span className="text-xs font-normal text-slate-400">(optional)</span></label><input className={INPUT} value={editLpn} onChange={(e) => setEditLpn(e.target.value)} placeholder="Orphan label scan…" /></div>
           )}
-          <div><label className={LABEL}>RMA</label><input className={INPUT} value={editRma} onChange={(e) => setEditRma(e.target.value)} /></div>
           <div><label className={LABEL}>Item Name</label><input className={INPUT} value={editItem} onChange={(e) => setEditItem(e.target.value)} /></div>
+
+          {/* ── Expiry Date (FEFO) ──────────────────────────────────────────── */}
+          <div className="rounded-2xl border border-orange-200 bg-orange-50 p-4 space-y-3 dark:border-orange-700/40 dark:bg-orange-950/30">
+            <p className="flex items-center gap-2 text-sm font-bold text-orange-700 dark:text-orange-400">
+              <CalendarX2 className="h-4 w-4" />Expiry Date
+              <span className="ml-auto rounded-full border border-orange-300 bg-orange-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-orange-600 dark:border-orange-700/60 dark:bg-orange-950/50 dark:text-orange-400">FEFO Tracking</span>
+            </p>
+            <input
+              type="date"
+              className={INPUT}
+              value={editExpiryDate}
+              onChange={(e) => setEditExpiryDate(e.target.value)}
+            />
+            {editExpiryDate && (
+              <p className="text-xs text-orange-600 dark:text-orange-400 flex items-center gap-1">
+                <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                Expiry date set — upload a photo of the label below for claim evidence.
+              </p>
+            )}
+          </div>
+
+          {/* ── Item Condition & Evidence ───────────────────────────────────── */}
+          <div className="rounded-2xl border-2 border-sky-200 bg-sky-50 p-4 space-y-3 dark:border-sky-700/50 dark:bg-sky-950/20">
+            <div className="flex items-center gap-2">
+              <Camera className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+              <p className="text-sm font-bold text-sky-800 dark:text-sky-200">Item Condition &amp; Evidence</p>
+            </div>
+
+            {/* Item photo */}
+            {editPhotoItemUrl ? (
+              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Item photo saved ✓</span>
+                <button type="button" onClick={() => setEditPhotoItemUrl("")} className="text-xs text-slate-400 underline">Remove</button>
+              </div>
+            ) : (
+              <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${itemPhotoUploading ? "border-sky-300 text-sky-500" : "border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:border-sky-700/60 dark:bg-sky-950/30 dark:text-sky-300"}`}>
+                {itemPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                {itemPhotoUploading ? "Uploading…" : "📸 Upload Item Photo"}
+                <input type="file" accept="image/*" capture="environment" className="hidden" disabled={itemPhotoUploading} onChange={(e) => handleItemEvidencePhoto(e, "photo_item_url")} />
+              </label>
+            )}
+
+            {/* Expiry label photo */}
+            {editPhotoExpiryUrl ? (
+              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Expiry date photo saved ✓</span>
+                <button type="button" onClick={() => setEditPhotoExpiryUrl("")} className="text-xs text-slate-400 underline">Remove</button>
+              </div>
+            ) : (
+              <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${expiryPhotoUploading ? "border-orange-300 text-orange-500" : editExpiryDate ? "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100 dark:border-rose-700/60 dark:bg-rose-950/30 dark:text-rose-300" : "border-orange-300 bg-orange-50 text-orange-700 hover:bg-orange-100 dark:border-orange-700/60 dark:bg-orange-950/30 dark:text-orange-300"}`}>
+                {expiryPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                {expiryPhotoUploading ? "Uploading…" : "📸 Upload Expiry Date Photo"}
+                <input type="file" accept="image/*" capture="environment" className="hidden" disabled={expiryPhotoUploading} onChange={(e) => handleItemEvidencePhoto(e, "photo_expiry_url")} />
+              </label>
+            )}
+          </div>
+
           {canEdit(role) && (
             <div><label className={LABEL}>Status</label>
               <select className={INPUT} value={editStatus} onChange={(e) => setEditStatus(e.target.value)}>
@@ -1248,8 +1419,22 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div className="col-span-2"><p className="text-xs text-slate-400">Product ID</p><p className="font-mono font-bold text-foreground">{record.product_identifier ?? "—"}</p></div>
             {record.lpn && <div><p className="text-xs text-slate-400">LPN</p><p className="font-mono font-bold text-foreground">{record.lpn}</p></div>}
-            <div><p className="text-xs text-slate-400">RMA</p><p className="font-mono font-bold text-foreground">{record.rma_number}</p></div>
             <div className="col-span-2"><p className="text-xs text-slate-400">Item</p><p className="font-semibold text-foreground">{record.item_name}</p></div>
+            {record.expiration_date && (
+              <div className="col-span-2 rounded-xl border border-orange-200 bg-orange-50 px-3 py-2 dark:border-orange-700/40 dark:bg-orange-950/30">
+                <p className="text-[10px] font-bold uppercase tracking-wide text-orange-500 mb-0.5">Expiry (FEFO)</p>
+                <p className="font-mono font-bold text-orange-700 dark:text-orange-300">{record.expiration_date}</p>
+              </div>
+            )}
+            {(record.photo_item_url || record.photo_expiry_url) && (
+              <div className="col-span-2">
+                <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1.5">Evidence Photos</p>
+                <div className="flex flex-wrap gap-2">
+                  {record.photo_item_url && <span className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 py-1 text-xs font-medium text-sky-700 dark:border-sky-700/60 dark:bg-sky-950/40 dark:text-sky-300"><Camera className="h-3 w-3" />Item Photo ✓</span>}
+                  {record.photo_expiry_url && <span className="inline-flex items-center gap-1 rounded-full border border-orange-200 bg-orange-50 px-2.5 py-1 text-xs font-medium text-orange-700 dark:border-orange-700/60 dark:bg-orange-950/30 dark:text-orange-300"><Camera className="h-3 w-3" />Expiry Photo ✓</span>}
+                </div>
+              </div>
+            )}
             {(record.inherited_tracking_number || linkedPkg?.tracking_number) && (
               <div className="col-span-2">
                 <p className="text-xs text-slate-400">Tracking (from package)</p>
@@ -1341,7 +1526,7 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
   const currentIds = useMemo(() => new Set(currentItems.map((i) => i.id)), [currentItems]);
   const candidates = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return allReturns.filter((r) => !currentIds.has(r.id) && (!q || [r.item_name, r.rma_number, r.product_identifier ?? ""].join(" ").toLowerCase().includes(q)));
+    return allReturns.filter((r) => !currentIds.has(r.id) && (!q || [r.item_name, r.product_identifier ?? ""].join(" ").toLowerCase().includes(q)));
   }, [allReturns, currentIds, search]);
 
   async function handleAssign(item: ReturnRecord) {
@@ -1357,8 +1542,8 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
   }
 
   return (
-    <div className="fixed inset-0 z-[500] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
-      <div className="flex w-full max-w-sm flex-col overflow-hidden rounded-3xl border border-border bg-background shadow-2xl">
+    <div className="fixed inset-0 z-[500] flex items-center justify-center bg-black/60 p-2 sm:p-4 backdrop-blur-sm">
+      <div className="flex w-[95vw] max-w-lg flex-col overflow-hidden rounded-2xl sm:rounded-3xl border border-border bg-background shadow-2xl">
         <div className="flex items-center justify-between border-b border-border px-5 py-4">
           <h3 className="font-bold text-foreground">Assign Existing Item</h3>
           <button onClick={onClose} className="rounded-lg p-1 hover:bg-accent"><X className="h-4 w-4 text-muted-foreground" /></button>
@@ -1375,7 +1560,7 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
                 className="flex w-full items-start gap-3 rounded-xl border border-border px-3 py-2.5 text-left hover:bg-accent transition">
                 <div className="flex-1 min-w-0">
                   <p className="truncate text-sm font-semibold text-foreground">{r.item_name}</p>
-                  <p className="font-mono text-xs text-muted-foreground">{r.rma_number}</p>
+                  <p className="font-mono text-xs text-muted-foreground">{r.product_identifier ?? "—"}</p>
                 </div>
                 {r.package_id && r.package_id !== pkg.id
                   ? <span className="shrink-0 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">Move from other pkg</span>
@@ -1427,11 +1612,71 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
   const [editing,    setEditing]    = useState(false);
   const [editCarrier,   setEditCarrier]   = useState(initPkg.carrier_name ?? "");
   const [editTracking,  setEditTracking]  = useState(initPkg.tracking_number ?? "");
+  const [editRmaNumber, setEditRmaNumber] = useState(initPkg.rma_number ?? "");
   const [editExpected,  setEditExpected]  = useState(String(initPkg.expected_item_count));
   const [editPalletId,  setEditPalletId]  = useState(initPkg.pallet_id ?? "");
   const slipCameraRef = useRef<HTMLInputElement>(null);
   const [saveErr,    setSaveErr]    = useState("");
   const [saving,     setSaving]     = useState(false);
+
+  const [editPhotoClosedUrl,        setEditPhotoClosedUrl]        = useState(initPkg.photo_closed_url        ?? "");
+  const [editPhotoOpenedUrl,        setEditPhotoOpenedUrl]        = useState(initPkg.photo_opened_url        ?? "");
+  const [editPhotoReturnLabelUrl,   setEditPhotoReturnLabelUrl]   = useState(initPkg.photo_return_label_url  ?? "");
+  const [editPhotoClosedUploading,  setEditPhotoClosedUploading]  = useState(false);
+  const [editPhotoOpenedUploading,  setEditPhotoOpenedUploading]  = useState(false);
+  const [editPhotoReturnLabelUploading, setEditPhotoReturnLabelUploading] = useState(false);
+
+  // ── Auto-fill carrier from pallet's existing packages (skip initial mount) ─
+  const pkgPalletMounted = useRef(false);
+  useEffect(() => {
+    if (!pkgPalletMounted.current) { pkgPalletMounted.current = true; return; }
+    if (!editPalletId) return;
+    supabaseBrowser
+      .from("packages")
+      .select("carrier_name")
+      .eq("pallet_id", editPalletId)
+      .not("carrier_name", "is", null)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data?.carrier_name) setEditCarrier(data.carrier_name as string);
+      });
+  }, [editPalletId]);
+
+  // ── Physical scanner for the RMA field (edit mode only) ──────────────────
+  const { onKeyDown: pkgRmaKeyDown } = usePhysicalScanner({
+    enabled: editing,
+    onScan: (code) => setEditRmaNumber(code),
+  });
+
+  async function handlePkgClaimPhoto(
+    e: React.ChangeEvent<HTMLInputElement>,
+    field: "closed" | "opened" | "return_label",
+  ) {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    const setUploading = field === "closed"        ? setEditPhotoClosedUploading
+                       : field === "opened"        ? setEditPhotoOpenedUploading
+                       : setEditPhotoReturnLabelUploading;
+    const setUrl       = field === "closed"        ? setEditPhotoClosedUrl
+                       : field === "opened"        ? setEditPhotoOpenedUrl
+                       : setEditPhotoReturnLabelUrl;
+    setUploading(true);
+    try {
+      const ext  = f.name.split(".").pop() ?? "jpg";
+      const path = `packages/claim_${field}/${pkg.id}_${Date.now()}.${ext}`;
+      const { error: upErr } = await supabaseBrowser.storage.from("media").upload(path, f, { upsert: true });
+      if (upErr) throw new Error(upErr.message);
+      const { data: urlData } = supabaseBrowser.storage.from("media").getPublicUrl(path);
+      setUrl(urlData.publicUrl);
+    } catch {
+      setSaveErr("Photo upload failed. Try again.");
+    } finally {
+      setUploading(false);
+    }
+  }
   /** AI-read expected lines from a real camera/file upload — drives reconciliation. */
   const [expectedItems, setExpectedItems]   = useState<SlipExpectedItem[] | null>(null);
   const [ocrRunning,    setOcrRunning]      = useState(false);
@@ -1446,6 +1691,18 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
 
   useEffect(() => { listReturnsByPackage(pkg.id).then((r) => { if (r.ok) setItems(r.data); setLoading(false); }); }, [pkg.id]);
 
+  /**
+   * Mock OCR: simulates reading a packing-slip photo without any real API call.
+   * Returns the two fixed test barcodes used for green/yellow/red reconciliation testing.
+   */
+  async function mockManifestOcr(_file: File): Promise<SlipExpectedItem[]> {
+    await new Promise((r) => setTimeout(r, 1400)); // realistic scanning delay
+    return [
+      { barcode: "111", name: "Item 111", expected_qty: 1 },
+      { barcode: "222", name: "Item 222", expected_qty: 2 },
+    ];
+  }
+
   /** Native camera / gallery: `<input type="file" accept="image/*" capture="environment" />` */
   async function handleImageUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
@@ -1455,53 +1712,16 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
       return;
     }
 
-    const apiKey = getOpenAIApiKeyFromStorage();
-    if (!apiKey) {
-      setOcrErr("NO_KEY");
-      return;
-    }
-
     setOcrRunning(true);
     setOcrErr("");
     setOcrConfidence(null);
     setLastSlipName(file.name);
 
     try {
-      // 1. Upload image to Supabase Storage → manifests bucket
-      const ext = file.name.split(".").pop() ?? "jpg";
-      const storagePath = `${pkg.id}/${Date.now()}.${ext}`;
-      const { error: uploadErr } = await supabaseBrowser.storage
-        .from("manifests")
-        .upload(storagePath, file, { upsert: true });
-
-      if (!uploadErr) {
-        const { data: urlData } = supabaseBrowser.storage
-          .from("manifests")
-          .getPublicUrl(storagePath);
-        // Persist manifest_url on the package record (fire-and-forget)
-        void updatePackage(pkg.id, { manifest_url: urlData.publicUrl }, actor);
-      }
-
-      // 2. Call OpenAI Vision via server-side proxy (avoids CORS)
-      const ocrResult = await getOcrResults(file, apiKey);
-
-      if (!ocrResult.ok) {
-        setOcrErr(ocrResult.error);
-        setOcrRunning(false);
-        return;
-      }
-
-      // 3. Map PackingSlipLine[] → SlipExpectedItem[]
-      const mapped: SlipExpectedItem[] = ocrResult.lines.map((l) => ({
-        barcode: l.barcode,
-        name: l.barcode,
-        expected_qty: l.expected_qty,
-      }));
-
-      setExpectedItems(mapped.length > 0 ? mapped : null);
-      setOcrConfidence(mapped.length > 0 ? 0.92 : 0);
-
-      if (mapped.length === 0) {
+      const items = await mockManifestOcr(file);
+      setExpectedItems(items.length > 0 ? items : null);
+      setOcrConfidence(items.length > 0 ? 1 : 0);
+      if (items.length === 0) {
         setOcrErr("No items detected on the packing slip — try a clearer photo.");
       }
     } catch (err) {
@@ -1509,14 +1729,6 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
     } finally {
       setOcrRunning(false);
     }
-  }
-
-  /** Calls OpenAI Vision via the /api/openai/packing-slip proxy route. */
-  async function getOcrResults(
-    imageFile: File,
-    apiKey: string,
-  ): Promise<{ ok: true; lines: { barcode: string; expected_qty: number }[] } | { ok: false; error: string }> {
-    return fetchPackingSlipLinesWithOpenAI(imageFile, apiKey);
   }
 
   function handleItemAdded(r: ReturnRecord) { setItems((p) => [r, ...p]); setPkg((p) => ({ ...p, actual_item_count: p.actual_item_count + 1 })); onItemAdded(r); }
@@ -1527,8 +1739,12 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
     const res = await updatePackage(pkg.id, {
       carrier_name:         editCarrier    || undefined,
       tracking_number:      editTracking   || undefined,
+      rma_number:           editRmaNumber  || null,
       expected_item_count:  parseInt(editExpected, 10) || 0,
-      ...(editPalletId ? { pallet_id: editPalletId } : {}),
+      ...(editPalletId           ? { pallet_id:              editPalletId           } : {}),
+      ...(editPhotoClosedUrl      ? { photo_closed_url:       editPhotoClosedUrl      } : {}),
+      ...(editPhotoOpenedUrl      ? { photo_opened_url:       editPhotoOpenedUrl      } : {}),
+      ...(editPhotoReturnLabelUrl ? { photo_return_label_url: editPhotoReturnLabelUrl } : {}),
     }, actor);
     setSaving(false);
     if (res.ok && res.data) { setPkg(res.data); onPackageUpdated(res.data); setEditing(false); }
@@ -1544,11 +1760,12 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
   }
 
   return (
-    <div className="p-6 space-y-5">
+    <div className="p-4 sm:p-6 space-y-5">
       <div className="flex flex-wrap gap-2">
         <PkgStatusBadge status={pkg.status} />
         {pkg.carrier_name && <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"><Truck className="h-3 w-3" />{pkg.carrier_name}</span>}
         {pkg.tracking_number && <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 font-mono text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400"><QrCode className="h-3 w-3" />{pkg.tracking_number}</span>}
+        {pkg.rma_number && <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 font-mono text-xs text-amber-700 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-300"><Tag className="h-3 w-3" />{pkg.rma_number}</span>}
       </div>
 
       {/* Count KPI */}
@@ -1592,9 +1809,77 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
               <input className={`${INPUT} pl-11`} value={editTracking} onChange={(e) => setEditTracking(e.target.value)} placeholder="Scan or type tracking number…" />
             </div>
           </div>
+          <div>
+            <label className={LABEL}>RMA # <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <Tag className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
+                <input
+                  className={`${INPUT} pl-11`} value={editRmaNumber}
+                  onChange={(e) => setEditRmaNumber(e.target.value)}
+                  placeholder="Scan or type RMA…"
+                  onKeyDown={pkgRmaKeyDown}
+                />
+              </div>
+              <ContextualScanButton
+                onDetected={(code) => setEditRmaNumber(code)}
+                modalTitle="Scan RMA Number"
+              />
+            </div>
+          </div>
           <div><label className={LABEL}>Expected Item Count</label>
             <input type="number" min="0" className={INPUT} value={editExpected} onChange={(e) => setEditExpected(e.target.value)} placeholder="0" />
           </div>
+
+          {/* ── Claim Evidence Photos ──────────────────────────────────── */}
+          <div className="rounded-2xl border-2 border-rose-200 bg-rose-50 p-4 space-y-3 dark:border-rose-700/50 dark:bg-rose-950/20">
+            <div className="flex items-center gap-2">
+              <Camera className="h-4 w-4 text-rose-600 dark:text-rose-400" />
+              <p className="text-sm font-bold text-rose-800 dark:text-rose-200">Claim Evidence Photos</p>
+            </div>
+            {editPhotoClosedUrl ? (
+              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Closed box photo saved ✓</span>
+                <button type="button" onClick={() => setEditPhotoClosedUrl("")} className="text-xs text-slate-400 underline">Remove</button>
+              </div>
+            ) : (
+              <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${editPhotoClosedUploading ? "border-rose-300 text-rose-500" : "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100 dark:border-rose-700/60 dark:bg-rose-950/30 dark:text-rose-300"}`}>
+                {editPhotoClosedUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                {editPhotoClosedUploading ? "Uploading…" : "📸 Upload Closed Box Photo"}
+                <input type="file" accept="image/*" capture="environment" className="hidden" disabled={editPhotoClosedUploading} onChange={(e) => handlePkgClaimPhoto(e, "closed")} />
+              </label>
+            )}
+            {editPhotoOpenedUrl ? (
+              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Opened box photo saved ✓</span>
+                <button type="button" onClick={() => setEditPhotoOpenedUrl("")} className="text-xs text-slate-400 underline">Remove</button>
+              </div>
+            ) : (
+              <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${editPhotoOpenedUploading ? "border-amber-300 text-amber-500" : "border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-300"}`}>
+                {editPhotoOpenedUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                {editPhotoOpenedUploading ? "Uploading…" : "📸 Upload Opened Box Photo"}
+                <input type="file" accept="image/*" capture="environment" className="hidden" disabled={editPhotoOpenedUploading} onChange={(e) => handlePkgClaimPhoto(e, "opened")} />
+              </label>
+            )}
+
+            {/* Return shipping label */}
+            {editPhotoReturnLabelUrl ? (
+              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Return label photo saved ✓</span>
+                <button type="button" onClick={() => setEditPhotoReturnLabelUrl("")} className="text-xs text-slate-400 underline">Remove</button>
+              </div>
+            ) : (
+              <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${editPhotoReturnLabelUploading ? "border-violet-300 text-violet-500" : "border-violet-300 bg-violet-50 text-violet-700 hover:bg-violet-100 dark:border-violet-700/60 dark:bg-violet-950/30 dark:text-violet-300"}`}>
+                {editPhotoReturnLabelUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                {editPhotoReturnLabelUploading ? "Uploading…" : "📸 Upload Return Label Photo"}
+                <input type="file" accept="image/*" capture="environment" className="hidden" disabled={editPhotoReturnLabelUploading} onChange={(e) => handlePkgClaimPhoto(e, "return_label")} />
+              </label>
+            )}
+          </div>
+
           <div className="rounded-xl border border-violet-200 bg-violet-50 px-3 py-2 text-xs text-violet-700 dark:border-violet-700/50 dark:bg-violet-950/20 dark:text-violet-300">
             💡 Use the <strong>Scan Packing Slip</strong> button above (outside edit mode) to load the manifest and enable reconciliation.
           </div>
@@ -1608,8 +1893,21 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
         </div>
       ) : (
         <div className="grid grid-cols-2 gap-3 text-sm">
+          {pkg.rma_number && (
+            <div className="col-span-2">
+              <p className="text-xs text-slate-400">RMA #</p>
+              <p className="font-mono font-bold text-foreground">{pkg.rma_number}</p>
+            </div>
+          )}
           <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{pkg.created_by}</p></div>
           <div><p className="text-xs text-slate-400">Created</p><p className="font-semibold text-foreground">{fmt(pkg.created_at)}</p></div>
+          {(pkg.photo_closed_url || pkg.photo_opened_url || pkg.photo_return_label_url) && (
+            <div className="col-span-2 flex flex-wrap gap-1.5 pt-1">
+              {pkg.photo_closed_url && <a href={pkg.photo_closed_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2.5 py-0.5 text-[10px] font-bold text-rose-700 hover:bg-rose-200 dark:bg-rose-900/40 dark:text-rose-300"><Camera className="h-3 w-3" />Closed Box ✓</a>}
+              {pkg.photo_opened_url && <a href={pkg.photo_opened_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2.5 py-0.5 text-[10px] font-bold text-amber-700 hover:bg-amber-200 dark:bg-amber-900/40 dark:text-amber-300"><Camera className="h-3 w-3" />Opened Box ✓</a>}
+              {pkg.photo_return_label_url && <a href={pkg.photo_return_label_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-full bg-violet-100 px-2.5 py-0.5 text-[10px] font-bold text-violet-700 hover:bg-violet-200 dark:bg-violet-900/40 dark:text-violet-300"><Camera className="h-3 w-3" />Return Label ✓</a>}
+            </div>
+          )}
         </div>
       )}
 
@@ -1660,43 +1958,128 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
           </div>
         ) : expectedItems ? (
           <p className="text-xs text-emerald-700 dark:text-emerald-400">
-            ✓ <strong>{expectedItems.length}</strong> expected line-items from {lastSlipName ? <span className="font-mono">{lastSlipName}</span> : "your photo"}. Compare with scanned items below.
+            ✓ <strong>{expectedItems.length}</strong> expected line-items from{" "}
+            {lastSlipName ? <span className="font-mono">{lastSlipName}</span> : "your photo"}.
+            {" "}Reconciliation table shown below.
           </p>
         ) : (
-          <button
-            type="button"
-            onClick={() => slipCameraRef.current?.click()}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-violet-600 py-3.5 text-sm font-semibold text-white shadow-sm transition hover:bg-violet-700"
-          >
-            📸 Take Photo of List
-          </button>
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={() => slipCameraRef.current?.click()}
+              className="flex w-full items-center justify-center gap-2 rounded-xl bg-violet-600 py-3.5 text-sm font-semibold text-white shadow-sm transition hover:bg-violet-700"
+            >
+              📸 Take Photo of List
+            </button>
+            {/* Mock data button — loads demo manifest to test the reconciliation table */}
+            <button
+              type="button"
+              onClick={() => {
+                const mockItems: SlipExpectedItem[] = [
+                  { barcode: "111", name: "Item 111", expected_qty: 1 },
+                  { barcode: "222", name: "Item 222", expected_qty: 2 },
+                ];
+                setExpectedItems(mockItems);
+                setOcrConfidence(1);
+                setLastSlipName("mock-manifest.json");
+                setOcrErr("");
+              }}
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-violet-300 bg-violet-50 py-2.5 text-xs font-semibold text-violet-700 transition hover:bg-violet-100 dark:border-violet-700/50 dark:bg-violet-950/30 dark:text-violet-300"
+            >
+              🧪 Load Mock Manifest (Test Green/Yellow/Red)
+            </button>
+          </div>
         )}
 
         {!ocrRunning && !expectedItems && (
           <p className="text-center text-[11px] text-muted-foreground">
-            On a phone or scanner, this opens the <strong>rear camera</strong> to photograph the slip inside the box.
+            Upload or photograph a packing slip — mock OCR will return test barcodes{" "}
+            <span className="font-mono">111</span> &amp; <span className="font-mono">222</span> and render the reconciliation table below.
           </p>
         )}
 
         {ocrErr && (
           <p className="text-xs text-rose-600 dark:text-rose-400">
-            {ocrErr === "NO_KEY" ? (
-              <>
-                Add your OpenAI API key in{" "}
-                <Link href="/settings" className="font-semibold underline">
-                  Settings
-                </Link>{" "}
-                to use packing-slip vision.
-              </>
-            ) : (
-              <>
-                {ocrErr}{" "}
-                <button type="button" className="font-semibold underline" onClick={() => slipCameraRef.current?.click()}>
-                  Try again
-                </button>
-              </>
-            )}
+            {ocrErr}{" "}
+            <button type="button" className="font-semibold underline" onClick={() => slipCameraRef.current?.click()}>
+              Try again
+            </button>
           </p>
+        )}
+
+        {/* ── Reconciliation Table — rendered directly below the upload button ── */}
+        {expectedItems && !loading && (
+          <div className="mt-4 space-y-2">
+            <div className="flex items-center gap-2">
+              <p className="text-xs font-bold uppercase tracking-widest text-slate-400">Reconciliation</p>
+              <span className="inline-flex items-center gap-1 rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-bold text-violet-700 dark:bg-violet-900/40 dark:text-violet-300">
+                <Sparkles className="h-2.5 w-2.5" />Manifest vs Scanned
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-3 text-[10px] font-semibold uppercase tracking-wide">
+              <span className="flex items-center gap-1 text-emerald-600">🟢 On slip + scanned</span>
+              <span className="flex items-center gap-1 text-rose-600">🔴 On slip, not scanned</span>
+              <span className="flex items-center gap-1 text-amber-600">🟡 Scanned, not on slip</span>
+            </div>
+            <div className="overflow-hidden rounded-2xl border border-border">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900">
+                    <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-slate-400">Barcode / Name</th>
+                    <th className="px-3 py-2 text-center font-bold uppercase tracking-wide text-slate-400">On Slip</th>
+                    <th className="px-3 py-2 text-center font-bold uppercase tracking-wide text-slate-400">Scanned</th>
+                    <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-slate-400">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {expectedItems.map((exp, slipIdx) => {
+                    const need = exp.expected_qty ?? 1;
+                    const matched = items.filter((it) => physicalItemMatchesExpectedLine(it, exp));
+                    const isMatch = matched.length >= need;
+                    return (
+                      <tr key={`slip-${slipIdx}-${exp.barcode}`} className={isMatch ? "bg-emerald-50/70 dark:bg-emerald-950/20" : "bg-rose-50/70 dark:bg-rose-950/20"}>
+                        <td className="px-3 py-2.5">
+                          <p className="font-mono font-semibold text-slate-700 dark:text-slate-300">{exp.barcode}</p>
+                          <p className="text-slate-500">{exp.name}</p>
+                        </td>
+                        <td className="px-3 py-2.5 text-center font-bold text-slate-600 dark:text-slate-300">{need}</td>
+                        <td className="px-3 py-2.5 text-center font-bold">
+                          {matched.length > 0
+                            ? <span className="text-emerald-600">{matched.length}</span>
+                            : <span className="text-rose-500">0</span>}
+                        </td>
+                        <td className="px-3 py-2.5">
+                          {isMatch
+                            ? <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">🟢 Match</span>
+                            : <span className="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-bold text-rose-700 dark:bg-rose-900/40 dark:text-rose-300">🔴 Missing</span>}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {items
+                    .filter((it) => !expectedItems.some((exp) => physicalItemMatchesExpectedLine(it, exp)))
+                    .map((it) => (
+                      <tr key={it.id} className="bg-amber-50/70 dark:bg-amber-950/20">
+                        <td className="px-3 py-2.5">
+                          <p className="font-semibold text-slate-700 dark:text-slate-300">{it.item_name}</p>
+                          <p className="font-mono text-slate-400">{it.product_identifier ?? "—"}</p>
+                        </td>
+                        <td className="px-3 py-2.5 text-center text-slate-400">—</td>
+                        <td className="px-3 py-2.5 text-center font-bold text-amber-600">1</td>
+                        <td className="px-3 py-2.5">
+                          <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">🟡 Unexpected</span>
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+              {items.length === 0 && expectedItems.length > 0 && (
+                <p className="py-4 text-center text-xs text-slate-400">
+                  No items scanned yet — all {expectedItems.length} expected line-items are missing.
+                </p>
+              )}
+            </div>
+          </div>
         )}
       </div>
 
@@ -1709,69 +2092,6 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
           <ItemsSubTable items={items} role={role} actor={actor} onItemClick={onOpenItem} onItemDeleted={handleItemDeleted} showToast={showToast} />
         )}
       </div>
-
-      {/* Smart Diff — AI Reconciliation Table */}
-      {expectedItems && !loading && (
-        <div>
-          <div className="mb-2 flex items-center gap-2">
-            <p className="text-xs font-bold uppercase tracking-widest text-slate-400">Reconciliation</p>
-            <span className="inline-flex items-center gap-1 rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-bold text-violet-700 dark:bg-violet-900/40 dark:text-violet-300"><Sparkles className="h-2.5 w-2.5" />AI vs Scanned</span>
-          </div>
-          <div className="mb-2 flex items-center gap-3 text-[10px] font-semibold uppercase tracking-wide">
-            <span className="flex items-center gap-1 text-emerald-600">🟢 On slip + scanned</span>
-            <span className="flex items-center gap-1 text-rose-600">🔴 On slip, not scanned</span>
-            <span className="flex items-center gap-1 text-amber-600">🟡 Scanned, not on slip</span>
-          </div>
-          <div className="overflow-hidden rounded-2xl border border-border">
-            <table className="w-full text-xs">
-              <thead><tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900">
-                <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-slate-400">Barcode / Name (slip)</th>
-                <th className="px-3 py-2 text-center font-bold uppercase tracking-wide text-slate-400">On slip</th>
-                <th className="px-3 py-2 text-center font-bold uppercase tracking-wide text-slate-400">Scanned</th>
-                <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-slate-400">Status</th>
-              </tr></thead>
-              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                {expectedItems.map((exp, slipIdx) => {
-                  const need = exp.expected_qty ?? 1;
-                  const matched = items.filter((it) => physicalItemMatchesExpectedLine(it, exp));
-                  const isMatch = matched.length >= need;
-                  return (
-                    <tr key={`slip-${slipIdx}-${exp.barcode}`} className={isMatch ? "bg-emerald-50/70 dark:bg-emerald-950/20" : "bg-rose-50/70 dark:bg-rose-950/20"}>
-                      <td className="px-3 py-2.5">
-                        <p className="font-mono font-semibold text-slate-700 dark:text-slate-300">{exp.barcode}</p>
-                        <p className="text-slate-500">{exp.name}</p>
-                      </td>
-                      <td className="px-3 py-2.5 text-center font-bold text-slate-600 dark:text-slate-300">{need}</td>
-                      <td className="px-3 py-2.5 text-center font-bold">{matched.length > 0 ? <span className="text-emerald-600">{matched.length}</span> : <span className="text-rose-500">0</span>}</td>
-                      <td className="px-3 py-2.5">
-                        {isMatch
-                          ? <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-bold text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">🟢 Match</span>
-                          : <span className="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-bold text-rose-700 dark:bg-rose-900/40 dark:text-rose-300">🔴 Missing</span>}
-                      </td>
-                    </tr>
-                  );
-                })}
-                {items.filter((it) => !expectedItems.some((exp) => physicalItemMatchesExpectedLine(it, exp))).map((it) => (
-                  <tr key={it.id} className="bg-amber-50/70 dark:bg-amber-950/20">
-                    <td className="px-3 py-2.5">
-                      <p className="font-semibold text-slate-700 dark:text-slate-300">{it.item_name}</p>
-                      <p className="font-mono text-slate-400">{it.product_identifier ?? it.rma_number}</p>
-                    </td>
-                    <td className="px-3 py-2.5 text-center text-slate-400">—</td>
-                    <td className="px-3 py-2.5 text-center font-bold text-amber-600">1</td>
-                    <td className="px-3 py-2.5">
-                      <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">🟡 Unexpected</span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {items.length === 0 && expectedItems.length > 0 && (
-              <p className="py-4 text-center text-xs text-slate-400">No items scanned yet — all {expectedItems.length} expected line-items are missing.</p>
-            )}
-          </div>
-        </div>
-      )}
 
       {wizardOpen && (() => {
         // Merge session-local expectedItems into the package so the wizard's
@@ -1787,7 +2107,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
         return (
           <SingleItemWizardModal
             onClose={() => setWizardOpen(false)}
-            onSuccess={(r) => { handleItemAdded(r); showToast(`✓ Item logged to ${pkg.package_number} — ${r.product_identifier ?? r.rma_number}`); }}
+            onSuccess={(r) => { handleItemAdded(r); showToast(`✓ Item logged to ${pkg.package_number} — ${r.product_identifier ?? r.item_name}`); }}
             actor={actor}
             openPackages={[pkgWithExpected]}
             openPallets={[]}
@@ -1822,7 +2142,7 @@ export function PalletDrawerContent({ pallet, role, actor, packages, onClose, on
   }
 
   return (
-    <div className="p-6 space-y-5">
+    <div className="p-4 sm:p-6 space-y-5">
       <PalletStatusBadge status={plt.status} />
       <div className="grid grid-cols-2 gap-3 text-sm">
         <div><p className="text-xs text-slate-400">Total Items</p><p className="text-3xl font-extrabold text-foreground">{plt.item_count}</p></div>
@@ -1862,8 +2182,8 @@ export function DiscrepancyModal({ pkg, onConfirm, onCancel }: {
   const [note, setNote] = useState("");
   const diff = pkg.actual_item_count - pkg.expected_item_count;
   return (
-    <div className="fixed inset-0 z-[400] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-sm overflow-hidden rounded-3xl border border-amber-200 bg-white shadow-2xl dark:border-amber-700/50 dark:bg-slate-950">
+    <div className="fixed inset-0 z-[400] flex items-center justify-center bg-black/60 p-2 sm:p-4 backdrop-blur-sm">
+      <div className="w-[95vw] max-w-lg overflow-hidden rounded-2xl sm:rounded-3xl border border-amber-200 bg-white shadow-2xl dark:border-amber-700/50 dark:bg-slate-950">
         <div className="bg-amber-50 p-6 dark:bg-amber-950/40">
           <div className="flex items-center gap-3 mb-4"><div className="flex h-12 w-12 items-center justify-center rounded-full bg-amber-100 dark:bg-amber-900/60"><AlertTriangle className="h-6 w-6 text-amber-600 dark:text-amber-400" /></div><div><h3 className="text-lg font-bold text-foreground">Count Discrepancy</h3><p className="text-sm text-amber-700 dark:text-amber-300">Package will be flagged</p></div></div>
           <div className="grid grid-cols-3 gap-2">
@@ -1903,18 +2223,105 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   const [ocrBanner, setOcrBanner] = useState<{ ok: boolean; msg: string } | null>(null);
   const ocrFileRef = useRef<HTMLInputElement>(null);
   // Scanner keyboard-nav refs
-  const rmaRef      = useRef<HTMLInputElement>(null);
   const itemNameRef = useRef<HTMLInputElement>(null);
 
-  // ── Physical hardware scanner — fills product_identifier automatically ────
-  const { scannedBarcode: itemScannedBarcode, clearScan: clearItemScan } = usePhysicalScanner();
+  // ── Connected stores for the Store ID dropdown (fetched from stores table) ─
+  const [connectedStores, setConnectedStores] = useState<
+    { id: string; name: string; platform: string }[]
+  >([]);
+  const [storeInherited, setStoreInherited] = useState(false);
   useEffect(() => {
-    if (itemScannedBarcode) {
-      up("product_identifier", itemScannedBarcode);
-      clearItemScan();
+    supabaseBrowser
+      .from("stores")
+      .select("id, name, platform")
+      .eq("is_active", true)
+      .order("created_at", { ascending: false })
+      .then(({ data }) => { if (data) setConnectedStores(data as { id: string; name: string; platform: string }[]); })
+      .catch(() => {});
+  }, []);
+
+  // ── Auto-fill store_id from linked package (Package → Item inheritance) ───
+  useEffect(() => {
+    const pkgId = state.package_link_id || inherited?.packageId;
+    if (!pkgId) { setStoreInherited(false); return; }
+    const pkg = openPackages.find((p) => p.id === pkgId);
+    if (pkg?.store_id) {
+      up("store_id", pkg.store_id);
+      setStoreInherited(true);
+    } else {
+      setStoreInherited(false);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [itemScannedBarcode]);
+  }, [state.package_link_id, inherited?.packageId]);
+
+  // ── Catalog lookup state ──────────────────────────────────────────────────
+  const [catalogStatus, setCatalogStatus] = useState<"idle" | "loading" | "local" | "amazon" | "unknown">("idle");
+  const [catalogPreview, setCatalogPreview] = useState<{ name: string; price?: number; image_url?: string } | null>(null);
+
+  async function handleBarcodeLookup(barcode: string) {
+    if (!barcode.trim()) { setCatalogStatus("idle"); return; }
+    setCatalogStatus("loading");
+    setCatalogPreview(null);
+
+    // Auto-detect marketplace from barcode prefix (Amazon FNSKU: X00… / B00…)
+    const detectedSource = parseBarcodeSource(barcode.trim(), state.marketplace);
+    if (detectedSource && detectedSource !== state.marketplace && (detectedSource === "amazon" || detectedSource === "walmart" || detectedSource === "ebay")) {
+      up("marketplace", detectedSource);
+    }
+
+    // Smart store_id fallback — only for standalone items (no parent package)
+    const isStandalone = !state.package_link_id && !inherited?.packageId;
+    if (isStandalone) {
+      const upper = barcode.trim().toUpperCase();
+      if (upper.startsWith("X00") || upper.startsWith("B00")) {
+        // Amazon FNSKU → find first active Amazon store, else use default
+        const amazonStore = connectedStores.find(
+          (s) => s.platform.toLowerCase() === "amazon",
+        );
+        up("store_id", amazonStore?.id ?? getDefaultStoreIdFromStorage());
+      } else if (!state.store_id) {
+        // No known prefix → fallback to operator's saved default store
+        const fallback = getDefaultStoreIdFromStorage();
+        if (fallback) up("store_id", fallback);
+      }
+    }
+
+    // Step A: check local products cache first
+    const { data: local } = await supabaseBrowser
+      .from("products")
+      .select("*")
+      .eq("barcode", barcode.trim())
+      .maybeSingle();
+
+    if (local) {
+      up("item_name", local.name);
+      setCatalogPreview({ name: local.name, price: local.price, image_url: local.image_url });
+      setCatalogStatus("local");
+      return;
+    }
+
+    // Step B: call the Amazon adapter
+    const amazon = await fetchProductFromAmazon(barcode.trim());
+    if (amazon) {
+      up("item_name", amazon.name);
+      setCatalogPreview({ name: amazon.name, price: amazon.price, image_url: amazon.image_url });
+      setCatalogStatus("amazon");
+      // Cache the result locally so the next scan is instant
+      await supabaseBrowser
+        .from("products")
+        .insert({ barcode: barcode.trim(), name: amazon.name, price: amazon.price, image_url: amazon.image_url, source: "Amazon" })
+        .then(() => {})
+        .catch(() => {});
+      return;
+    }
+
+    setCatalogStatus("unknown");
+  }
+
+  // ── Physical hardware scanner — attached directly to the barcode input only ─
+  const { onKeyDown: barcodeKeyDown } = usePhysicalScanner({
+    onScan: (code) => { up("product_identifier", code); void handleBarcodeLookup(code); },
+  });
 
   async function handleLabelOcr(file: File) {
     setOcrLoad(true); setOcrBanner(null);
@@ -1925,7 +2332,6 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
         ...p,
         lpn: res.data!.lpn,
         product_identifier: res.data!.product_identifier ?? p.product_identifier,
-        rma_number: res.data!.rma_number,
         marketplace: res.data!.marketplace as typeof p.marketplace,
       }));
       setOcrBanner({ ok: true, msg: `AI Scan — ${Math.round(res.data.confidence * 100)}% confidence. Verify fields below.` });
@@ -1982,17 +2388,47 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
           <div className="relative flex-1">
             <QrCode className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
             <input
-              type="text" className={`${INPUT} pl-11`} placeholder="Scan or type product identifier…"
-              value={state.product_identifier} onChange={(e) => up("product_identifier", e.target.value)}
+              type="text"
+              className={`${INPUT} pl-11 transition-all ${catalogStatus === "unknown" ? "border-yellow-400 ring-2 ring-yellow-300 focus:border-yellow-400 focus:ring-yellow-300" : ""}`}
+              placeholder="Scan or type product identifier…"
+              value={state.product_identifier}
+              onChange={(e) => { up("product_identifier", e.target.value); setCatalogStatus("idle"); }}
               autoFocus
-              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); rmaRef.current?.focus(); } }}
+              onKeyDown={(e) => {
+                barcodeKeyDown(e);
+                if (!e.defaultPrevented && e.key === "Enter") { e.preventDefault(); rmaRef.current?.focus(); }
+              }}
+              onBlur={(e) => { if (e.target.value.trim()) void handleBarcodeLookup(e.target.value); }}
             />
           </div>
           <ContextualScanButton
-            onDetected={(code) => up("product_identifier", code)}
+            onDetected={(code) => { up("product_identifier", code); void handleBarcodeLookup(code); }}
             modalTitle="Scan Product Barcode"
           />
         </div>
+        {/* Catalog lookup feedback */}
+        {catalogStatus === "loading" && (
+          <div className="mt-1.5 flex items-center gap-2 text-xs text-slate-400">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />Looking up barcode…
+          </div>
+        )}
+        {catalogStatus === "local" && catalogPreview && (
+          <div className="mt-1.5 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-300">
+            <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+            Found in Catalog — {catalogPreview.name}
+          </div>
+        )}
+        {catalogStatus === "amazon" && catalogPreview && (
+          <div className="mt-1.5 flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-700 dark:border-sky-700/50 dark:bg-sky-950/30 dark:text-sky-300">
+            <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+            Found on Amazon — {catalogPreview.name}{catalogPreview.price != null ? ` · $${catalogPreview.price.toFixed(2)}` : ""}
+          </div>
+        )}
+        {catalogStatus === "unknown" && (
+          <div className="mt-1.5 rounded-xl border-2 border-yellow-400 bg-yellow-50 px-3 py-2 text-xs font-bold text-yellow-800 dark:border-yellow-500/60 dark:bg-yellow-950/20 dark:text-yellow-300">
+            ⚠️ Unknown Item — Not found locally or on Amazon.
+          </div>
+        )}
       </div>
       {!hasPackageLink && (
         <div>
@@ -2005,17 +2441,54 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
           Tracking and carrier apply at the <span className="font-semibold">package</span> level — this item inherits them when saved.
         </p>
       )}
-      <div className="grid grid-cols-2 gap-4">
-        <div>
-          <label className={LABEL}>RMA # <span className="text-rose-500">*</span></label>
-          <input
-            ref={rmaRef} type="text" className={INPUT} placeholder="Return auth #…"
-            value={state.rma_number} onChange={(e) => up("rma_number", e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); itemNameRef.current?.focus(); } }}
-          />
-        </div>
-        <div><label className={LABEL}>Marketplace <span className="text-rose-500">*</span></label><select className={INPUT} value={state.marketplace} onChange={(e) => up("marketplace", e.target.value)}><option value="">Select…</option>{MARKETPLACES.map((m) => <option key={m} value={m}>{MP_LABELS[m]}</option>)}</select></div>
+      <div>
+        <label className={LABEL}>Marketplace <span className="text-rose-500">*</span></label>
+        <select className={INPUT} value={state.marketplace} onChange={(e) => up("marketplace", e.target.value)}>
+          <option value="">Select…</option>
+          {MARKETPLACES.map((m) => <option key={m} value={m}>{MP_LABELS[m]}</option>)}
+        </select>
       </div>
+      {connectedStores.length > 0 && (
+        <div>
+          <label className={LABEL}>
+            Source Store
+            {storeInherited && (
+              <span className="ml-2 text-xs font-normal text-emerald-600 dark:text-emerald-400">
+                · Inherited from Package
+              </span>
+            )}
+          </label>
+          <div className="flex gap-2">
+            <select
+              className={`${INPUT} flex-1`}
+              value={state.store_id}
+              onChange={(e) => { up("store_id", e.target.value); setStoreInherited(false); }}
+              disabled={storeInherited}
+            >
+              <option value="">— Select store (optional) —</option>
+              {connectedStores.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name} ({s.platform})
+                </option>
+              ))}
+            </select>
+            {storeInherited && (
+              <button
+                type="button"
+                onClick={() => { up("store_id", ""); setStoreInherited(false); }}
+                className="shrink-0 rounded-xl border border-slate-200 px-3 text-xs font-medium text-muted-foreground hover:bg-accent dark:border-slate-700"
+              >
+                Override
+              </button>
+            )}
+          </div>
+          {storeInherited && (
+            <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+              🔒 Auto-filled from package. Click Override to select a different store.
+            </p>
+          )}
+        </div>
+      )}
       <div>
         <label className={LABEL}>Item Name <span className="text-rose-500">*</span></label>
         <input
@@ -2047,15 +2520,32 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
           })}
         </div>
       </div>
-      {state.condition_keys.includes("expired") && (
-        <div className="rounded-2xl border border-orange-200 bg-orange-50 p-4 dark:border-orange-700/40 dark:bg-orange-950/30 space-y-3">
-          <p className="flex items-center gap-2 text-sm font-bold text-orange-700 dark:text-orange-400"><CalendarX2 className="h-4 w-4" />FIFO Violation Details</p>
-          <div className="grid grid-cols-2 gap-3">
-            <div><label className={LABEL}>Expiration Date</label><input type="date" className={INPUT} value={state.expiration_date} onChange={(e) => up("expiration_date", e.target.value)} /></div>
-            <div><label className={LABEL}>Batch / Lot #</label><input type="text" className={INPUT} placeholder="LOT-2024A…" value={state.batch_number} onChange={(e) => up("batch_number", e.target.value)} /></div>
+      <div className="rounded-2xl border border-orange-200 bg-orange-50 p-4 dark:border-orange-700/40 dark:bg-orange-950/30 space-y-3">
+        <div className="flex items-start justify-between gap-2">
+          <p className="flex items-center gap-2 text-sm font-bold text-orange-700 dark:text-orange-400">
+            <CalendarX2 className="h-4 w-4" />Expiry &amp; Batch
+          </p>
+          <span className="rounded-full border border-orange-300 bg-orange-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-orange-600 dark:border-orange-700/60 dark:bg-orange-950/50 dark:text-orange-400">
+            FEFO Tracking
+          </span>
+        </div>
+        <p className="text-xs text-orange-600 dark:text-orange-400">
+          Enter the expiry date for all perishable items to enable First-Expired, First-Out (FEFO) compliance. Required if the item has an expiry label.
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className={LABEL}>
+              Expiration Date
+              {state.condition_keys.includes("expired") && <span className="ml-1 text-rose-500">*</span>}
+            </label>
+            <input type="date" className={INPUT} value={state.expiration_date} onChange={(e) => up("expiration_date", e.target.value)} />
+          </div>
+          <div>
+            <label className={LABEL}>Batch / Lot #</label>
+            <input type="text" className={INPUT} placeholder="LOT-2024A…" value={state.batch_number} onChange={(e) => up("batch_number", e.target.value)} />
           </div>
         </div>
-      )}
+      </div>
 
       <div>
         <label className={LABEL}>Additional Comments / Discrepancy Notes <span className="text-xs font-normal text-slate-400">(optional)</span></label>
@@ -2077,22 +2567,115 @@ export function WizardStep2({ state, setState, conditions, photoCtx }: {
   photoCtx?: { hasPackageLink: boolean; orphanLpn: boolean };
 }) {
   const categories = getCategoriesForConditions(conditions, photoCtx);
-  if (!categories.length) return <div className="flex flex-col items-center gap-3 py-12 text-center"><CheckCircle2 className="h-12 w-12 text-emerald-500" /><p className="font-bold text-foreground">No Photos Required</p><p className="text-sm text-slate-400">Sellable items don&apos;t require evidence.</p></div>;
+
+  // ── Item Condition & Evidence: upload states ─────────────────────────────
+  const [itemPhotoUploading,   setItemPhotoUploading]   = useState(false);
+  const [expiryPhotoUploading, setExpiryPhotoUploading] = useState(false);
+  const itemPhotoRef   = useRef<HTMLInputElement>(null);
+  const expiryPhotoRef = useRef<HTMLInputElement>(null);
+
+  async function uploadEvidencePhoto(
+    file: File,
+    field: "photo_item_url" | "photo_expiry_url",
+    setUploading: (v: boolean) => void,
+  ) {
+    setUploading(true);
+    try {
+      const ext  = file.name.split(".").pop() ?? "jpg";
+      const path = `evidence/${field}/${Date.now()}.${ext}`;
+      const { error: upErr } = await supabaseBrowser.storage
+        .from("media")
+        .upload(path, file, { upsert: true });
+      if (upErr) throw new Error(upErr.message);
+      const { data: urlData } = supabaseBrowser.storage.from("media").getPublicUrl(path);
+      setState((p) => ({ ...p, [field]: urlData.publicUrl }));
+    } catch {
+      // silently ignore — operator can retry
+    } finally {
+      setUploading(false);
+    }
+  }
+
   return (
     <div className="space-y-5">
-      <p className="text-xs text-muted-foreground">Packing slip / manifest scans belong to <span className="font-semibold">Package</span> setup only — not here.</p>
-      {categories.map((cat) => (
-        <div key={cat.id} className={`rounded-2xl border p-4 ${cat.accentClass}`}>
-          <div className="mb-3 flex items-center gap-2">
-            <cat.icon className={`h-5 w-5 ${cat.iconColor}`} />
-            <div><p className="text-sm font-bold text-foreground">{cat.label}<span className={`ml-2 text-[10px] font-semibold uppercase tracking-wide ${cat.optional ? "text-slate-400" : "text-rose-500"}`}>{cat.optional ? "Optional" : "Required"}</span></p><p className="text-xs text-slate-400">{cat.hint}</p></div>
-          </div>
-          <SmartCameraUpload label={cat.label} hint={cat.hint} required={!cat.optional} icon={cat.icon} iconColor={cat.iconColor} accentClass={cat.accentClass}
-            files={state.photos[cat.id] ?? []}
-            onChange={(files) => setState((p) => ({ ...p, photos: { ...p.photos, [cat.id]: files } }))}
-          />
+      {/* ── Item Condition & Evidence ──────────────────────────────────────── */}
+      <div className="rounded-2xl border-2 border-sky-200 bg-sky-50 p-4 space-y-4 dark:border-sky-700/50 dark:bg-sky-950/20">
+        <div className="flex items-center gap-2">
+          <Camera className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+          <p className="text-sm font-bold text-sky-800 dark:text-sky-200">Item Condition &amp; Evidence</p>
+          <span className="ml-auto rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-sky-600 dark:bg-sky-900/40 dark:text-sky-300">Claim Photos</span>
         </div>
-      ))}
+
+        {/* Item photo */}
+        <div>
+          <p className="mb-1.5 text-xs font-semibold text-sky-700 dark:text-sky-300">
+            Item Photo <span className="font-normal text-slate-400">(optional)</span>
+          </p>
+          {state.photo_item_url ? (
+            <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+              <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+              <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Item photo saved ✓</span>
+              <button type="button" onClick={() => setState((p) => ({ ...p, photo_item_url: "" }))} className="text-xs text-slate-400 underline hover:text-slate-600">Remove</button>
+            </div>
+          ) : (
+            <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${itemPhotoUploading ? "border-sky-300 bg-sky-50 text-sky-500" : "border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:border-sky-700/60 dark:bg-sky-950/30 dark:text-sky-300"}`}>
+              {itemPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+              {itemPhotoUploading ? "Uploading…" : "📸 Upload Item Photo"}
+              <input ref={itemPhotoRef} type="file" accept="image/*" capture="environment" className="hidden" disabled={itemPhotoUploading}
+                onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadEvidencePhoto(f, "photo_item_url", setItemPhotoUploading); }} />
+            </label>
+          )}
+        </div>
+
+        {/* Expiry date photo */}
+        <div>
+          <p className="mb-1.5 text-xs font-semibold text-sky-700 dark:text-sky-300">
+            Expiry Date Photo
+            {state.expiration_date && <span className="ml-1.5 text-rose-500 font-bold">— Required (expiry set)</span>}
+            {!state.expiration_date && <span className="font-normal text-slate-400">(recommended if expiry label exists)</span>}
+          </p>
+          {state.photo_expiry_url ? (
+            <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+              <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+              <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Expiry photo saved ✓</span>
+              <button type="button" onClick={() => setState((p) => ({ ...p, photo_expiry_url: "" }))} className="text-xs text-slate-400 underline hover:text-slate-600">Remove</button>
+            </div>
+          ) : (
+            <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${expiryPhotoUploading ? "border-orange-300 bg-orange-50 text-orange-500" : state.expiration_date ? "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100 dark:border-rose-700/60 dark:bg-rose-950/30 dark:text-rose-300" : "border-orange-300 bg-orange-50 text-orange-700 hover:bg-orange-100 dark:border-orange-700/60 dark:bg-orange-950/30 dark:text-orange-300"}`}>
+              {expiryPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+              {expiryPhotoUploading ? "Uploading…" : "📸 Upload Expiry Date Photo"}
+              <input ref={expiryPhotoRef} type="file" accept="image/*" capture="environment" className="hidden" disabled={expiryPhotoUploading}
+                onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadEvidencePhoto(f, "photo_expiry_url", setExpiryPhotoUploading); }} />
+            </label>
+          )}
+        </div>
+      </div>
+
+      {/* ── Existing condition-based photo categories ─────────────────────── */}
+      {categories.length > 0 && (
+        <>
+          <p className="text-xs text-muted-foreground">Packing slip / manifest scans belong to <span className="font-semibold">Package</span> setup only — not here.</p>
+          {categories.map((cat) => (
+            <div key={cat.id} className={`rounded-2xl border p-4 ${cat.accentClass}`}>
+              <div className="mb-3 flex items-center gap-2">
+                <cat.icon className={`h-5 w-5 ${cat.iconColor}`} />
+                <div><p className="text-sm font-bold text-foreground">{cat.label}<span className={`ml-2 text-[10px] font-semibold uppercase tracking-wide ${cat.optional ? "text-slate-400" : "text-rose-500"}`}>{cat.optional ? "Optional" : "Required"}</span></p><p className="text-xs text-slate-400">{cat.hint}</p></div>
+              </div>
+              <SmartCameraUpload label={cat.label} hint={cat.hint} required={!cat.optional} icon={cat.icon} iconColor={cat.iconColor} accentClass={cat.accentClass}
+                files={state.photos[cat.id] ?? []}
+                onChange={(files) => setState((p) => ({ ...p, photos: { ...p.photos, [cat.id]: files } }))}
+              />
+            </div>
+          ))}
+        </>
+      )}
+      {categories.length === 0 && (
+        <div className="flex flex-col items-center gap-3 py-8 text-center">
+          <CheckCircle2 className="h-10 w-10 text-emerald-500" />
+          <p className="font-bold text-foreground">No Condition Photos Required</p>
+          <p className="text-sm text-slate-400">Use the evidence buttons above if you have a claim photo.</p>
+        </div>
+      )}
     </div>
   );
 }
@@ -2122,7 +2705,6 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
         <div className="grid grid-cols-2 gap-y-3 gap-x-6 text-sm">
           <div><p className="text-xs text-slate-400">Product ID</p><p className="font-mono font-bold">{state.product_identifier || "—"}</p></div>
           {state.lpn && <div><p className="text-xs text-slate-400">LPN (optional)</p><p className="font-mono font-bold">{state.lpn}</p></div>}
-          <div><p className="text-xs text-slate-400">RMA</p><p className="font-mono font-bold">{state.rma_number}</p></div>
           <div><p className="text-xs text-slate-400">Marketplace</p><p className="font-bold capitalize">{state.marketplace}</p></div>
           <div className="col-span-2"><p className="text-xs text-slate-400">Item</p><p className="font-bold">{state.item_name}</p></div>
         </div>
@@ -2193,7 +2775,6 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
   const packageExpectationMismatch = !!(pkgForWarn && !itemMatchesPackageExpectation(state.item_name, pkgForWarn));
 
   const step1Valid =
-    !!state.rma_number.trim() &&
     !!state.marketplace &&
     !!state.item_name.trim() &&
     !!state.product_identifier.trim() &&
@@ -2211,9 +2792,14 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
     const res = await insertReturn({
       lpn: state.lpn || undefined,
       product_identifier: state.product_identifier.trim(),
-      rma_number: state.rma_number, marketplace: state.marketplace as string, item_name: state.item_name, conditions,
-      notes: state.notes, photo_evidence: photoEvidence, expiration_date: state.expiration_date || undefined, batch_number: state.batch_number || undefined,
+      marketplace: state.marketplace as string, item_name: state.item_name, conditions,
+      notes: state.notes, photo_evidence: photoEvidence,
+      expiration_date: state.expiration_date || undefined,
+      batch_number: state.batch_number || undefined,
+      photo_item_url:   state.photo_item_url   || undefined,
+      photo_expiry_url: state.photo_expiry_url || undefined,
       package_id: pkgId,
+      store_id:   state.store_id || undefined,
       created_by: actor,
     });
     setSubmitting(false);
@@ -2227,7 +2813,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
   return (
     <div className="fixed inset-0 z-[300] flex items-end justify-center bg-black/50 backdrop-blur-sm sm:items-center sm:p-4">
       <div className={`relative flex h-full w-full max-w-2xl flex-col overflow-hidden rounded-t-3xl bg-white shadow-2xl dark:bg-slate-950 sm:h-auto sm:max-h-[92vh] sm:rounded-3xl sm:border sm:border-slate-200 sm:dark:border-slate-700 ${flash ? "animate-[grow_0.4s_ease]" : ""}`}>
-        <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-6 py-4 dark:border-slate-700">
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-200 px-4 py-3 sm:px-6 sm:py-4 dark:border-slate-700">
           <div className="flex items-center gap-4">
             <button onClick={onClose} className="rounded-full p-2 text-slate-400 hover:bg-accent hover:text-accent-foreground"><ArrowLeft className="h-5 w-5" /></button>
             <div>
@@ -2240,7 +2826,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
           </div>
           <StepIndicator step={step} total={3} />
         </div>
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6">
           {step === 1 && <WizardStep1 state={state} setState={setState} openPackages={openPackages} openPallets={openPallets} onCreatePackage={onCreatePackage} onCreatePallet={onCreatePallet} inherited={inheritedContext} aiLabelEnabled={aiLabelEnabled} onAdvance={step1Valid ? () => setStep(2) : undefined} />}
           {step === 2 && (
             <WizardStep2
@@ -2255,8 +2841,8 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
           )}
           {step === 3 && <WizardStep3 state={state} conditions={conditions} packages={openPackages} pallets={openPallets} inherited={inheritedContext} onNotesChange={(v) => setState((p) => ({ ...p, notes: v }))} packageExpectationMismatch={packageExpectationMismatch} />}
         </div>
-        {submitErr && <p className="shrink-0 px-6 pb-2 text-sm font-semibold text-rose-600 dark:text-rose-400">{submitErr}</p>}
-        <div className="flex shrink-0 items-center gap-3 border-t border-slate-200 px-6 py-4 dark:border-slate-700">
+        {submitErr && <p className="shrink-0 px-4 sm:px-6 pb-2 text-sm font-semibold text-rose-600 dark:text-rose-400">{submitErr}</p>}
+        <div className="flex shrink-0 items-center gap-3 border-t border-slate-200 px-4 py-3 sm:px-6 sm:py-4 dark:border-slate-700">
           {step > 1 && <button onClick={() => setStep((s) => s-1)} className={`${BTN_GHOST} h-14 px-4`}><ArrowLeft className="h-5 w-5" /></button>}
           {step < 3 ? <button onClick={() => setStep((s) => s+1)} disabled={step === 1 && !step1Valid} className={BTN_PRIMARY}>Next <ArrowRight className="h-5 w-5" /></button>
             : <button onClick={handleSubmit} disabled={submitting} className={BTN_PRIMARY}>{submitting ? <Loader2 className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-5 w-5" />}{submitting ? "Saving…" : "Submit to Claims"}</button>}
@@ -2274,22 +2860,69 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
 }) {
   const [pkgNum, setPkgNum] = useState(generatePackageNumber());
   const [tracking, setTracking] = useState(""); const [carrier, setCarrier] = useState(""); const [expected, setExpected] = useState(""); const [palletId, setPalletId] = useState("");
+  const [rmaNumber, setRmaNumber] = useState("");
   const [ocrFile, setOcrFile] = useState<File | null>(null); const [ocrLoad, setOcrLoad] = useState(false); const [ocrDone, setOcrDone] = useState(false);
   const [saving, setSaving] = useState(false); const [error, setError] = useState("");
-  const [photoUrl, setPhotoUrl] = useState<string | null>(null);
-  const [photoUploading, setPhotoUploading] = useState(false);
-  const photoRef = useRef<HTMLInputElement>(null);
+  const [photoClosedUrl, setPhotoClosedUrl] = useState<string | null>(null);
+  const [photoClosedUploading, setPhotoClosedUploading] = useState(false);
+  const [photoOpenedUrl, setPhotoOpenedUrl] = useState<string | null>(null);
+  const [photoOpenedUploading, setPhotoOpenedUploading] = useState(false);
+  const [photoReturnLabelUrl, setPhotoReturnLabelUrl] = useState<string | null>(null);
+  const [photoReturnLabelUploading, setPhotoReturnLabelUploading] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const palletOptions = openPallets.map((p) => ({ id: p.id, label: p.pallet_number, sublabel: `${p.item_count} items` }));
 
-  // ── Physical hardware scanner — fills tracking_number automatically ───────
-  const { scannedBarcode: pkgScannedBarcode, clearScan: clearPkgScan } = usePhysicalScanner();
+  // ── Auto-fill carrier from the pallet's existing packages ─────────────────
   useEffect(() => {
-    if (pkgScannedBarcode) {
-      setTracking(pkgScannedBarcode);
-      clearPkgScan();
+    if (!palletId) return;
+    supabaseBrowser
+      .from("packages")
+      .select("carrier_name")
+      .eq("pallet_id", palletId)
+      .not("carrier_name", "is", null)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (data?.carrier_name) setCarrier(data.carrier_name as string);
+      });
+  }, [palletId]);
+
+  // ── Store state (Package form) ─────────────────────────────────────────────
+  const [pkgStoreId,        setPkgStoreId]        = useState("");
+  const [pkgStoreInherited, setPkgStoreInherited] = useState(false);
+  const [pkgStoresList,     setPkgStoresList]     = useState<{ id: string; name: string; platform: string }[]>([]);
+  useEffect(() => {
+    supabaseBrowser
+      .from("stores")
+      .select("id, name, platform")
+      .eq("is_active", true)
+      .order("created_at", { ascending: false })
+      .then(({ data }) => { if (data) setPkgStoresList(data as { id: string; name: string; platform: string }[]); })
+      .catch(() => {});
+  }, []);
+
+  // ── Inherit store_id from pallet (Pallet → Package) ──────────────────────
+  useEffect(() => {
+    if (!palletId) { setPkgStoreInherited(false); return; }
+    const pallet = openPallets.find((p) => p.id === palletId);
+    if (pallet?.store_id) {
+      setPkgStoreId(pallet.store_id);
+      setPkgStoreInherited(true);
+    } else {
+      setPkgStoreInherited(false);
     }
-  }, [pkgScannedBarcode, clearPkgScan]);
+  }, [palletId, openPallets]);
+
+  // ── Physical hardware scanner — attached only to the tracking # input ───────
+  const { onKeyDown: trackingKeyDown } = usePhysicalScanner({
+    onScan: (code) => setTracking(code),
+  });
+
+  // ── Physical hardware scanner — attached only to the RMA # input ─────────
+  const { onKeyDown: rmaKeyDown } = usePhysicalScanner({
+    onScan: (code) => setRmaNumber(code),
+  });
 
   async function handleOcr(file: File) { setOcrFile(file); setOcrLoad(true); setOcrDone(false); const res = await mockPackageOcr(file); setOcrLoad(false); if (res.ok && res.data) { setExpected(String(res.data.expected_item_count)); setCarrier(res.data.carrier_name); setTracking(res.data.tracking_number); setOcrDone(true); } else setError(res.error ?? "OCR failed."); }
   async function handleManifestUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -2297,35 +2930,57 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
     if (f) handleOcr(f);
     e.target.value = "";
   }
-  async function handlePhotoCapture(e: React.ChangeEvent<HTMLInputElement>) {
+  async function handleClaimPhotoCapture(
+    e: React.ChangeEvent<HTMLInputElement>,
+    field: "closed" | "opened" | "return_label",
+  ) {
     const f = e.target.files?.[0];
     e.target.value = "";
     if (!f) return;
-    setPhotoUploading(true);
+    const setUploading = field === "closed" ? setPhotoClosedUploading
+                       : field === "opened" ? setPhotoOpenedUploading
+                       : setPhotoReturnLabelUploading;
+    const setUrl       = field === "closed" ? setPhotoClosedUrl
+                       : field === "opened" ? setPhotoOpenedUrl
+                       : setPhotoReturnLabelUrl;
+    setUploading(true);
     try {
-      const ext = f.name.split(".").pop() ?? "jpg";
-      const path = `packages/${Date.now()}.${ext}`;
-      const { error: upErr } = await supabaseBrowser.storage.from("media").upload(path, f, { upsert: true });
-      if (upErr) throw new Error(upErr.message);
-      const { data: urlData } = supabaseBrowser.storage.from("media").getPublicUrl(path);
-      setPhotoUrl(urlData.publicUrl);
+      const folder =
+        field === "closed"       ? "packages/claim_closed"       :
+        field === "opened"       ? "packages/claim_opened"       :
+                                   "packages/claim_return_label";
+      const publicUrl = await uploadToStorage(f, folder);
+      setUrl(publicUrl);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Photo upload failed.");
     } finally {
-      setPhotoUploading(false);
+      setUploading(false);
     }
   }
+
   async function handleCreate() {
     if (!pkgNum.trim()) return; setSaving(true); setError("");
-    const res = await createPackage({ package_number: pkgNum.trim(), tracking_number: tracking.trim() || undefined, carrier_name: carrier || undefined, expected_item_count: expected ? parseInt(expected, 10) : 0, pallet_id: palletId || undefined, created_by: actor, photo_url: photoUrl ?? undefined });
+    const res = await createPackage({
+      package_number: pkgNum.trim(),
+      tracking_number: tracking.trim() || undefined,
+      carrier_name: carrier || undefined,
+      rma_number: rmaNumber.trim() || undefined,
+      expected_item_count: expected ? parseInt(expected, 10) : 0,
+      pallet_id: palletId || undefined,
+      store_id: pkgStoreId || undefined,
+      created_by: actor,
+      photo_closed_url:        photoClosedUrl         ?? undefined,
+      photo_opened_url:        photoOpenedUrl         ?? undefined,
+      photo_return_label_url:  photoReturnLabelUrl    ?? undefined,
+    });
     setSaving(false);
     if (res.ok && res.data) onCreated(res.data); else setError(res.error ?? "Failed.");
   }
 
   return (
-    <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-md overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950">
-        <div className="flex items-center justify-between border-b border-slate-200 p-6 dark:border-slate-700">
+    <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/50 p-2 sm:p-4 backdrop-blur-sm">
+      <div className="w-[95vw] max-w-lg overflow-hidden rounded-2xl sm:rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950">
+        <div className="flex items-center justify-between border-b border-slate-200 p-4 sm:p-6 dark:border-slate-700">
           <div>
             <div className="flex items-center gap-2">
               <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Batch Flow</p>
@@ -2335,7 +2990,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
           </div>
           <button onClick={onClose} className="rounded-full p-2 text-slate-400 hover:bg-accent hover:text-accent-foreground"><X className="h-5 w-5" /></button>
         </div>
-        <div className="max-h-[65vh] overflow-y-auto p-6 space-y-5">
+        <div className="max-h-[78vh] sm:max-h-[70vh] overflow-y-auto p-4 sm:p-6 space-y-5">
           {aiPackingSlipEnabled && (
             <>
               <div className="flex items-center gap-2 mb-1">
@@ -2360,7 +3015,10 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
                   type="text" className={`${INPUT} pl-11`} placeholder="Scan or type…"
                   value={tracking} onChange={(e) => setTracking(e.target.value)}
                   autoFocus
-                  onKeyDown={(e) => { if (e.key === "Enter" && pkgNum.trim() && !saving) { e.preventDefault(); handleCreate(); } }}
+                  onKeyDown={(e) => {
+                    trackingKeyDown(e);
+                    if (!e.defaultPrevented && e.key === "Enter" && pkgNum.trim() && !saving) { e.preventDefault(); handleCreate(); }
+                  }}
                 />
               </div>
               <ContextualScanButton
@@ -2369,8 +3027,123 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
               />
             </div>
           </div>
+          <div>
+            <label className={LABEL}>RMA # <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <Tag className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text" className={`${INPUT} pl-11`} placeholder="Scan or type RMA…"
+                  value={rmaNumber} onChange={(e) => setRmaNumber(e.target.value)}
+                  onKeyDown={rmaKeyDown}
+                />
+              </div>
+              <ContextualScanButton
+                onDetected={(code) => setRmaNumber(code)}
+                modalTitle="Scan RMA Number"
+              />
+            </div>
+          </div>
           <div><label className={LABEL}>Expected Items</label><input type="number" min="0" className={INPUT} placeholder="0" value={expected} onChange={(e) => setExpected(e.target.value)} /></div>
           <ComboboxField label="Link to Pallet" hint="(optional)" icon={Boxes} options={palletOptions} value={palletId} onChange={setPalletId} onClear={() => setPalletId("")} placeholder="Search pallets…" />
+
+          {pkgStoresList.length > 0 && (
+            <div>
+              <label className={LABEL}>
+                Source Store
+                {pkgStoreInherited && (
+                  <span className="ml-2 text-xs font-normal text-emerald-600 dark:text-emerald-400">
+                    · Inherited from Pallet
+                  </span>
+                )}
+              </label>
+              <div className="flex gap-2">
+                <select
+                  className={`${INPUT} flex-1`}
+                  value={pkgStoreId}
+                  onChange={(e) => { setPkgStoreId(e.target.value); setPkgStoreInherited(false); }}
+                  disabled={pkgStoreInherited}
+                >
+                  <option value="">— Select store (optional) —</option>
+                  {pkgStoresList.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
+                  ))}
+                </select>
+                {pkgStoreInherited && (
+                  <button
+                    type="button"
+                    onClick={() => { setPkgStoreId(""); setPkgStoreInherited(false); }}
+                    className="shrink-0 rounded-xl border border-slate-200 px-3 text-xs font-medium text-muted-foreground hover:bg-accent dark:border-slate-700"
+                  >
+                    Override
+                  </button>
+                )}
+              </div>
+              {pkgStoreInherited && (
+                <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+                  🔒 Auto-filled from pallet. Click Override to select a different store.
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* ── Claim Evidence Photos ──────────────────────────────────────── */}
+          <div className="rounded-2xl border-2 border-rose-200 bg-rose-50 p-4 space-y-3 dark:border-rose-700/50 dark:bg-rose-950/20">
+            <div className="flex items-center gap-2">
+              <Camera className="h-4 w-4 text-rose-600 dark:text-rose-400" />
+              <p className="text-sm font-bold text-rose-800 dark:text-rose-200">Claim Evidence Photos</p>
+              <span className="ml-auto rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-rose-600 dark:bg-rose-900/40 dark:text-rose-300">Box Level</span>
+            </div>
+
+            {/* Closed box */}
+            {photoClosedUrl ? (
+              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Closed box photo saved ✓</span>
+                <button type="button" onClick={() => setPhotoClosedUrl(null)} className="text-xs text-slate-400 underline">Remove</button>
+              </div>
+            ) : (
+              <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${photoClosedUploading ? "border-rose-300 bg-rose-50/80 text-rose-500" : "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100 dark:border-rose-700/60 dark:bg-rose-950/30 dark:text-rose-300"}`}>
+                {photoClosedUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                {photoClosedUploading ? "Uploading…" : "📸 Upload Closed Box Photo"}
+                <input type="file" accept="image/*" capture="environment" className="hidden" disabled={photoClosedUploading}
+                  onChange={(e) => handleClaimPhotoCapture(e, "closed")} />
+              </label>
+            )}
+
+            {/* Opened box */}
+            {photoOpenedUrl ? (
+              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Opened box photo saved ✓</span>
+                <button type="button" onClick={() => setPhotoOpenedUrl(null)} className="text-xs text-slate-400 underline">Remove</button>
+              </div>
+            ) : (
+              <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${photoOpenedUploading ? "border-amber-300 bg-amber-50/80 text-amber-500" : "border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-300"}`}>
+                {photoOpenedUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                {photoOpenedUploading ? "Uploading…" : "📸 Upload Opened Box Photo"}
+                <input type="file" accept="image/*" capture="environment" className="hidden" disabled={photoOpenedUploading}
+                  onChange={(e) => handleClaimPhotoCapture(e, "opened")} />
+              </label>
+            )}
+
+            {/* Return shipping label */}
+            {photoReturnLabelUrl ? (
+              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Return label photo saved ✓</span>
+                <button type="button" onClick={() => setPhotoReturnLabelUrl(null)} className="text-xs text-slate-400 underline">Remove</button>
+              </div>
+            ) : (
+              <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${photoReturnLabelUploading ? "border-violet-300 bg-violet-50/80 text-violet-500" : "border-violet-300 bg-violet-50 text-violet-700 hover:bg-violet-100 dark:border-violet-700/60 dark:bg-violet-950/30 dark:text-violet-300"}`}>
+                {photoReturnLabelUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                {photoReturnLabelUploading ? "Uploading…" : "📸 Upload Return Label Photo"}
+                <input type="file" accept="image/*" capture="environment" className="hidden" disabled={photoReturnLabelUploading}
+                  onChange={(e) => handleClaimPhotoCapture(e, "return_label")} />
+              </label>
+            )}
+          </div>
+
           {error && <p className="rounded-xl bg-rose-50 px-4 py-2 text-sm text-rose-700 dark:bg-rose-950/40 dark:text-rose-400">{error}</p>}
         </div>
         <div className="border-t border-slate-200 p-4 dark:border-slate-700 flex flex-col gap-3">
@@ -2378,13 +3151,6 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
             📸 Scan Packing Slip / Manifest
             <input type="file" accept="image/*" capture="environment" className="hidden" onChange={handleManifestUpload} />
           </label>
-          {/* General box photo */}
-          <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-2xl border-2 border-dashed py-3 text-sm font-semibold transition ${photoUrl ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700/60 dark:bg-emerald-950/30 dark:text-emerald-300" : "border-amber-300 bg-amber-50 text-amber-700 hover:border-amber-400 hover:bg-amber-100 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-300"}`}>
-            {photoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-            {photoUploading ? "Uploading…" : photoUrl ? "📦 Box Photo Saved ✓" : "📸 Take Photo of Box"}
-            <input ref={photoRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handlePhotoCapture} disabled={photoUploading} />
-          </label>
-          {photoUrl && <p className="truncate text-center text-[10px] text-muted-foreground">{photoUrl}</p>}
           <button onClick={handleCreate} disabled={saving || !pkgNum.trim()} className={BTN_PRIMARY}>{saving ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}{saving ? "Creating…" : "Create Package"}</button>
         </div>
       </div>
@@ -2407,6 +3173,19 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
   const photoRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const bolRef = useRef<HTMLInputElement>(null);
+
+  // ── Store state (Pallet form — top of hierarchy) ──────────────────────────
+  const [palletStoreId,  setPalletStoreId]  = useState("");
+  const [palletStoresList, setPalletStoresList] = useState<{ id: string; name: string; platform: string }[]>([]);
+  useEffect(() => {
+    supabaseBrowser
+      .from("stores")
+      .select("id, name, platform")
+      .eq("is_active", true)
+      .order("created_at", { ascending: false })
+      .then(({ data }) => { if (data) setPalletStoresList(data as { id: string; name: string; platform: string }[]); })
+      .catch(() => {});
+  }, []);
 
   async function handleOcr(f: File) { setFile(f); setOcrLoad(true); const res = await mockPalletOcr(f); setOcrLoad(false); if (res.ok && res.data) { setOcrResult(res.data); setPalletNum(res.data.pallet_number); } else setError(res.error ?? "OCR failed."); }
   async function handlePhotoCapture(e: React.ChangeEvent<HTMLInputElement>) {
@@ -2431,16 +3210,16 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
     if (!palletNum.trim()) return; setSaving(true); setError("");
     const manifest_photo_url = file ? URL.createObjectURL(file) : undefined;
     const bol_photo_url = bolFile ? URL.createObjectURL(bolFile) : undefined;
-    const res = await createPallet({ pallet_number: palletNum.trim(), manifest_photo_url, bol_photo_url, photo_url: photoUrl ?? undefined, notes, created_by: actor });
+    const res = await createPallet({ pallet_number: palletNum.trim(), manifest_photo_url, bol_photo_url, photo_url: photoUrl ?? undefined, store_id: palletStoreId || undefined, notes, created_by: actor });
     setSaving(false);
     if (res.ok && res.data) onCreated(res.data); else setError(res.error ?? "Failed.");
   }
 
   return (
-    <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
-      <div className="w-full max-w-md overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950">
-        <div className="flex items-center justify-between border-b border-slate-200 p-6 dark:border-slate-700"><div><p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Pallet Flow</p><h2 className="mt-0.5 text-xl font-bold text-foreground">Create Pallet</h2></div><button onClick={onClose} className="rounded-full p-2 text-slate-400 hover:bg-accent hover:text-accent-foreground"><X className="h-5 w-5" /></button></div>
-        <div className="p-6 space-y-4">
+    <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/50 p-2 sm:p-4 backdrop-blur-sm">
+      <div className="w-[95vw] max-w-lg overflow-hidden rounded-2xl sm:rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950">
+        <div className="flex items-center justify-between border-b border-slate-200 p-4 sm:p-6 dark:border-slate-700"><div><p className="text-xs font-semibold uppercase tracking-widest text-slate-400">Pallet Flow</p><h2 className="mt-0.5 text-xl font-bold text-foreground">Create Pallet</h2></div><button onClick={onClose} className="rounded-full p-2 text-slate-400 hover:bg-accent hover:text-accent-foreground"><X className="h-5 w-5" /></button></div>
+        <div className="p-4 sm:p-6 space-y-4">
           {aiManifestEnabled && (
             <>
               <div className="flex items-center gap-2 mb-1">
@@ -2481,6 +3260,24 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
             )}
             <input ref={bolRef} type="file" className="hidden" accept="image/*,application/pdf" capture="environment" onChange={(e) => { const f = e.target.files?.[0]; if (f) setBolFile(f); e.target.value = ""; }} />
           </div>
+          {palletStoresList.length > 0 && (
+            <div>
+              <label className={LABEL}>Source Store</label>
+              <select
+                className={INPUT}
+                value={palletStoreId}
+                onChange={(e) => setPalletStoreId(e.target.value)}
+              >
+                <option value="">— Select store (optional) —</option>
+                {palletStoresList.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
+                ))}
+              </select>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Packages created inside this pallet will inherit this store automatically.
+              </p>
+            </div>
+          )}
           <div><label className={LABEL}>Notes (optional)</label><textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="w-full resize-none rounded-2xl border border-slate-200 bg-white p-4 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" /></div>
           {/* General pallet photo */}
           <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-2xl border-2 border-dashed py-3 text-sm font-semibold transition ${photoUrl ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700/60 dark:bg-emerald-950/30 dark:text-emerald-300" : "border-amber-300 bg-amber-50 text-amber-700 hover:border-amber-400 hover:bg-amber-100 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-300"}`}>
@@ -2530,7 +3327,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, onRowCli
       d = d.filter((r) => {
         const pkg = r.package_id ? pkgMap.get(r.package_id) : null;
         const blob = [
-          r.id, r.lpn, r.rma_number, r.item_name, r.marketplace,
+          r.id, r.lpn, r.item_name, r.marketplace,
           formatMarketplaceSource(r.marketplace),
           r.product_identifier ?? "", r.inherited_tracking_number ?? "",
           pkg?.tracking_number ?? "", pkg?.package_number ?? "",
@@ -2599,7 +3396,6 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, onRowCli
                 <th className="px-4 py-3 text-left"><SortButton field="product_identifier" label="Product ID" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="tracking_effective" label="Tracking" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="lpn" label="LPN" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
-                <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="rma_number" label="RMA" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="marketplace" label="Source" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="px-4 py-3 text-left"><SortButton field="item_name" label="Item" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left lg:table-cell"><SortButton field="item_conditions" label="Conditions" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
@@ -2625,7 +3421,6 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, onRowCli
                     <td className="px-4 py-3 font-mono text-xs font-semibold text-slate-700 dark:text-slate-300">{r.product_identifier ?? "—"}</td>
                     <td className="hidden px-4 py-3 font-mono text-[11px] text-muted-foreground md:table-cell">{track || "—"}</td>
                     <td className="hidden px-4 py-3 font-mono text-xs text-muted-foreground sm:table-cell">{r.lpn ?? "—"}</td>
-                    <td className="hidden px-4 py-3 font-mono text-xs text-muted-foreground sm:table-cell">{r.rma_number}</td>
                     <td className="hidden px-4 py-3 text-xs font-medium text-slate-600 dark:text-slate-300 sm:table-cell">{formatMarketplaceSource(r.marketplace)}</td>
                     <td className="min-w-0 max-w-none truncate px-4 py-3 text-slate-600 dark:text-slate-300">{r.item_name}</td>
                     <td className="hidden px-4 py-3 lg:table-cell"><div className="flex flex-wrap gap-1">{r.conditions.slice(0,2).map((c) => <ConditionBadge key={c} value={c} />)}</div></td>
@@ -2801,7 +3596,6 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                               <div className="overflow-hidden rounded-xl border border-violet-200 dark:border-violet-800/50">
                                 <table className="w-full text-xs">
                                   <thead><tr className="border-b border-violet-200 bg-violet-100/60 dark:border-violet-800/50 dark:bg-violet-950/40">
-                                    <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">RMA</th>
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Item</th>
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Source</th>
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Condition</th>
@@ -2811,7 +3605,6 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                                   <tbody className="divide-y divide-violet-100 dark:divide-violet-900/40">
                                     {pkgItems.map((r) => (
                                       <tr key={r.id} className="hover:bg-violet-50 dark:hover:bg-violet-950/20">
-                                        <td className="px-3 py-2 font-mono font-semibold text-slate-600 dark:text-slate-300">{r.rma_number}</td>
                                         <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{r.item_name}</td>
                                         <td className="px-3 py-2 text-slate-500">{formatMarketplaceSource(r.marketplace)}</td>
                                         <td className="px-3 py-2"><div className="flex flex-wrap gap-1">{r.conditions.slice(0,2).map((c) => <ConditionBadge key={c} value={c} />)}</div></td>
@@ -3035,7 +3828,6 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                                                     <div className="overflow-hidden rounded-lg border border-slate-200 dark:border-slate-600">
                                                       <table className="w-full text-[11px]">
                                                         <thead><tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-950/40">
-                                                          <th className="px-2 py-1.5 text-left font-bold uppercase tracking-wide text-slate-500">RMA</th>
                                                           <th className="px-2 py-1.5 text-left font-bold uppercase tracking-wide text-slate-500">Item</th>
                                                           <th className="px-2 py-1.5 text-left font-bold uppercase tracking-wide text-slate-500">Source</th>
                                                           <th className="px-2 py-1.5 text-left font-bold uppercase tracking-wide text-slate-500">Condition</th>
@@ -3045,7 +3837,6 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                                                         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                                                           {pkgItems.map((r) => (
                                                             <tr key={r.id} className="hover:bg-slate-50 dark:hover:bg-slate-950/30">
-                                                              <td className="px-2 py-1.5 font-mono font-semibold text-slate-600 dark:text-slate-300">{r.rma_number}</td>
                                                               <td className="px-2 py-1.5 text-slate-600 dark:text-slate-300">{r.item_name}</td>
                                                               <td className="px-2 py-1.5 text-slate-500">{formatMarketplaceSource(r.marketplace)}</td>
                                                               <td className="px-2 py-1.5"><div className="flex flex-wrap gap-1">{r.conditions.slice(0, 2).map((c) => <ConditionBadge key={c} value={c} />)}</div></td>

@@ -19,7 +19,7 @@ import {
   ChevronDown, ChevronRight,
   LayoutDashboard, Menu,
   PanelLeftClose, PanelLeftOpen,
-  RotateCcw, Settings, ShieldAlert, Store, X,
+  RotateCcw, Settings, ShieldAlert, X,
 } from "lucide-react";
 import { TopHeader } from "./TopHeader";
 import { LogoMark } from "./LogoMark";
@@ -47,26 +47,10 @@ const NAV: NavSection[] = [
     ],
   },
   {
-    id: "int",
-    label: "Integrations",
-    items: [
-      { label: "Marketplace Adapters", icon: Store, href: "/settings/adapters" },
-    ],
-  },
-  {
     id: "sys",
     label: "System",
     items: [
-      {
-        label: "Settings",
-        icon: Settings,
-        children: [
-          { label: "OpenAI & API keys", href: "/settings" },
-          { label: "Marketplace Adapters", href: "/settings/adapters" },
-          { label: "User Management",      href: "/settings/users",   disabled: true, badge: "Pro" },
-          { label: "Organization",         href: "/settings/org",     disabled: true, badge: "Pro" },
-        ],
-      },
+      { label: "Settings", icon: Settings, href: "/settings" },
     ],
   },
 ];

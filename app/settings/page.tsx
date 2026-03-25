@@ -3,9 +3,9 @@
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import {
-  ArrowLeft, CheckCircle2, ChevronDown, ChevronUp, Cpu, Globe, HardDrive,
-  KeyRound, Loader2, Plus, Printer, Save, ScanLine, ShieldAlert, Tag,
-  Trash2, Wifi, X, Zap,
+  ArrowLeft, BarChart3, CheckCircle2, ChevronUp, CreditCard, Cpu, Globe,
+  HardDrive, KeyRound, Loader2, Plus, Printer, Save, ScanLine, Settings,
+  ShieldAlert, Store, Tag, Trash2, UserCog, Users, Wifi, X, Zap,
 } from "lucide-react";
 import {
   clearAIUnifiedKeyFromStorage,
@@ -20,6 +20,8 @@ import {
   setAIRoleAssignmentsInStorage,
   setBarcodeModeInStorage,
   setLabelPrinterInStorage,
+  getDefaultStoreIdFromStorage,
+  setDefaultStoreIdInStorage,
   type AIConfig,
   type AIConfigStatus,
   type AIProvider,
@@ -29,18 +31,50 @@ import {
   type LabelPrinter,
 } from "../../lib/openai-settings";
 import { useUserRole } from "../../components/UserRoleContext";
+import { listMarketplaces, listStores, type StorePublicRow } from "./adapters/actions";
 
-// ─── constants ────────────────────────────────────────────────────────────────
+// ─── Types & Constants ────────────────────────────────────────────────────────
 
 type ToastState = { msg: string; ok: boolean } | null;
-type TabId = "ai" | "hardware";
+type TabId = "general" | "marketplaces" | "ai_quotas" | "hardware" | "billing" | "team";
+
+type StoreRecord = {
+  id: string;
+  provider: string;
+  nickname: string;
+  display_id?: string;
+  organization_id: string;
+  role_required: string;
+  created_at: string;
+};
+
+const PLATFORM_LABELS: Record<string, string> = {
+  amazon:  "Amazon",
+  walmart: "Walmart",
+  ebay:    "eBay",
+  target:  "Target",
+  shopify: "Shopify",
+  custom:  "Custom",
+};
+
+const PLANS = ["Free Tier", "Pro Tier", "Enterprise"] as const;
+type SaasPlan = typeof PLANS[number];
+
+const PLAN_LIMITS: Record<SaasPlan, { ai_calls: number; stores: number; items: number }> = {
+  "Free Tier":  { ai_calls: 500,      stores: 1,        items: 2_000   },
+  "Pro Tier":   { ai_calls: 5_000,    stores: 5,        items: 20_000  },
+  "Enterprise": { ai_calls: Infinity, stores: Infinity, items: Infinity },
+};
+
+const MOCK_AI_CALLS      = 450;
+const MOCK_SCANNED_ITEMS = 1_247;
 
 const SELECT_CLS =
   "h-12 w-full rounded-xl border border-border bg-background px-4 text-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20";
 const INPUT_CLS =
   "h-12 w-full rounded-xl border border-border bg-background px-4 text-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20";
-const LABEL_CLS  = "mb-1.5 block text-sm font-semibold";
-const HINT_CLS   = "mb-2 text-xs text-muted-foreground";
+const LABEL_CLS = "mb-1.5 block text-sm font-semibold";
+const HINT_CLS  = "mb-2 text-xs text-muted-foreground";
 
 const PROVIDER_LABELS: Record<AIProvider, string> = {
   openai: "OpenAI",
@@ -55,27 +89,110 @@ const STATUS_META: Record<AIConfigStatus, { label: string; cls: string }> = {
   error:    { label: "Error",     cls: "border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400" },
 };
 
+const NAV_ITEMS: { id: TabId; label: string; icon: React.ReactNode }[] = [
+  { id: "general",      label: "General & Workflow",     icon: <Settings   className="h-4 w-4" /> },
+  { id: "marketplaces", label: "Marketplaces & Stores",  icon: <Store      className="h-4 w-4" /> },
+  { id: "ai_quotas",    label: "AI & OCR Quotas",        icon: <Cpu        className="h-4 w-4" /> },
+  { id: "hardware",     label: "Hardware Scanners",      icon: <HardDrive  className="h-4 w-4" /> },
+  { id: "billing",      label: "Billing & Subscription", icon: <CreditCard className="h-4 w-4" /> },
+  { id: "team",         label: "Team & Roles",           icon: <Users      className="h-4 w-4" /> },
+];
+
 function newBlankConfig(): Omit<AIConfig, "id"> {
   return {
-    providerName: "",
-    provider:     "openai",
-    baseURL:      DEFAULT_BASE_URLS.openai,
-    apiKey:       "",
-    role:         "default",
-    status:       "untested",
+    providerName:     "",
+    provider:         "openai",
+    baseURL:          DEFAULT_BASE_URLS.openai,
+    apiKey:           "",
+    role:             "default",
+    status:           "untested",
     isGlobalOverride: false,
   };
 }
 
-// ─── Main page ────────────────────────────────────────────────────────────────
+// ─── UsageMeter sub-component ─────────────────────────────────────────────────
+
+function UsageMeter({
+  label, used, limit, color = "sky", hint,
+}: {
+  label: string;
+  used: number;
+  limit: number;
+  color?: "violet" | "sky" | "emerald";
+  hint?: string;
+}) {
+  const isUnlimited = limit === Infinity;
+  const pct = isUnlimited ? 100 : Math.min((used / limit) * 100, 100);
+  const isNearLimit = !isUnlimited && pct >= 80;
+  const isAtLimit   = !isUnlimited && pct >= 100;
+
+  const barCls = isAtLimit
+    ? "bg-rose-500"
+    : isNearLimit
+    ? "bg-amber-500"
+    : color === "violet" ? "bg-violet-500"
+    : color === "emerald" ? "bg-emerald-500"
+    : "bg-sky-500";
+
+  const trackCls =
+    color === "violet"  ? "bg-violet-100 dark:bg-violet-900/30"
+    : color === "emerald" ? "bg-emerald-100 dark:bg-emerald-900/30"
+    : "bg-sky-100 dark:bg-sky-900/30";
+
+  const countCls = isAtLimit
+    ? "text-rose-600 dark:text-rose-400"
+    : isNearLimit
+    ? "text-amber-600 dark:text-amber-400"
+    : color === "violet"  ? "text-violet-700 dark:text-violet-300"
+    : color === "emerald" ? "text-emerald-700 dark:text-emerald-300"
+    : "text-sky-700 dark:text-sky-300";
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <p className="text-sm font-semibold">{label}</p>
+          {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+        </div>
+        <span className={`shrink-0 text-sm font-bold tabular-nums ${countCls}`}>
+          {used.toLocaleString()}{isUnlimited ? " / ∞" : ` / ${limit.toLocaleString()}`}
+        </span>
+      </div>
+      <div className={`h-3 w-full overflow-hidden rounded-full ${trackCls}`}>
+        <div
+          className={`h-3 rounded-full transition-all duration-700 ${barCls} ${isUnlimited ? "opacity-30" : ""}`}
+          style={{ width: isUnlimited ? "100%" : `${pct}%` }}
+        />
+      </div>
+      {isAtLimit && !isUnlimited && (
+        <p className="text-xs font-medium text-rose-600 dark:text-rose-400">
+          Limit reached — upgrade your plan to continue.
+        </p>
+      )}
+      {isNearLimit && !isAtLimit && (
+        <p className="text-xs font-medium text-amber-600 dark:text-amber-400">
+          {Math.round(pct)}% of quota used — consider upgrading soon.
+        </p>
+      )}
+    </div>
+  );
+}
+
+// ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function SettingsPage() {
   const { role } = useUserRole();
 
-  const [activeTab, setActiveTab] = useState<TabId>("ai");
+  const [activeTab, setActiveTab] = useState<TabId>("general");
   const [mounted,   setMounted]   = useState(false);
 
-  // ── AI configs (multi-API) ─────────────────────────────────────────────────
+  // ── General Preferences ────────────────────────────────────────────────────
+  const [defaultStoreId,  setDefaultStoreId]  = useState<string>("");
+  const [storesList,      setStoresList]      = useState<StorePublicRow[]>([]);
+  const [storesListLoading, setStoresListLoading] = useState(false);
+  const [generalSaved,    setGeneralSaved]    = useState(false);
+
+  // ── AI configs ─────────────────────────────────────────────────────────────
   const [configs,    setConfigs]    = useState<AIConfig[]>([]);
   const [showForm,   setShowForm]   = useState(false);
   const [formData,   setFormData]   = useState<Omit<AIConfig, "id">>(newBlankConfig());
@@ -83,30 +200,86 @@ export default function SettingsPage() {
   const [savingForm, setSavingForm] = useState(false);
 
   // ── Role assignments ───────────────────────────────────────────────────────
-  const [assignments, setAssignments] = useState<AIRoleAssignments>({ defaultGeneral: null, defaultVision: null });
+  const [assignments, setAssignments] = useState<AIRoleAssignments>({
+    defaultGeneral: null,
+    defaultVision:  null,
+  });
 
   // ── Hardware ───────────────────────────────────────────────────────────────
   const [barcodeMode,  setBarcodeMode]  = useState<BarcodeMode>("physical");
   const [labelPrinter, setLabelPrinter] = useState<LabelPrinter>("system");
   const [hwSaved,      setHwSaved]      = useState(false);
 
+  // ── Stores ─────────────────────────────────────────────────────────────────
+  const [connections,   setConnections]   = useState<StoreRecord[]>([]);
+  const [storesLoading, setStoresLoading] = useState(false);
+
+  // ── Billing / SaaS plan ────────────────────────────────────────────────────
+  const [mockPlan, setMockPlan] = useState<SaasPlan>("Free Tier");
+
   const [toast, setToast] = useState<ToastState>(null);
 
-  // ── Load from storage ──────────────────────────────────────────────────────
+  // ── Hydrate from localStorage ──────────────────────────────────────────────
   useEffect(() => {
     setMounted(true);
+    setDefaultStoreId(getDefaultStoreIdFromStorage());
     setConfigs(getAIConfigsFromStorage());
     setAssignments(getAIRoleAssignmentsFromStorage());
     setBarcodeMode(getBarcodeModeFromStorage());
     setLabelPrinter(getLabelPrinterFromStorage());
+    const saved = localStorage.getItem("mock_saas_plan") as SaasPlan | null;
+    if (saved && (PLANS as readonly string[]).includes(saved)) setMockPlan(saved as SaasPlan);
   }, []);
+
+  // ── Load connected marketplace credentials ─────────────────────────────────
+  useEffect(() => {
+    if (!mounted) return;
+    let cancelled = false;
+    setStoresLoading(true);
+    listMarketplaces()
+      .then((res) => {
+        if (cancelled) return;
+        if (res.ok && res.data) setConnections(res.data as StoreRecord[]);
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setStoresLoading(false); });
+    return () => { cancelled = true; };
+  }, [mounted]);
+
+  // ── Load stores (stores table) for Default Store selector ─────────────────
+  useEffect(() => {
+    if (!mounted) return;
+    let cancelled = false;
+    setStoresListLoading(true);
+    listStores()
+      .then((res) => {
+        if (cancelled) return;
+        if (res.ok && res.data) setStoresList(res.data);
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setStoresListLoading(false); });
+    return () => { cancelled = true; };
+  }, [mounted]);
 
   function showToast(msg: string, ok: boolean) {
     setToast({ msg, ok });
     setTimeout(() => setToast(null), 4500);
   }
 
-  // ── Provider helpers ───────────────────────────────────────────────────────
+  // ── Paywall helpers ────────────────────────────────────────────────────────
+  const planLimits  = PLAN_LIMITS[mockPlan];
+  const canAddStore = planLimits.stores === Infinity || connections.length < planLimits.stores;
+
+  // ── General save ───────────────────────────────────────────────────────────
+  function handleSaveGeneral(e: React.FormEvent) {
+    e.preventDefault();
+    setDefaultStoreIdInStorage(defaultStoreId);
+    setGeneralSaved(true);
+    setTimeout(() => setGeneralSaved(false), 2500);
+    showToast("General preferences saved.", true);
+  }
+
+  // ── Provider change ────────────────────────────────────────────────────────
   function handleFormProviderChange(p: AIProvider) {
     setFormData((prev) => ({
       ...prev,
@@ -117,14 +290,15 @@ export default function SettingsPage() {
 
   // ── Test connection ────────────────────────────────────────────────────────
   async function runTest(cfg: Pick<AIConfig, "provider" | "baseURL" | "apiKey">, id: string | null) {
-    if (!cfg.apiKey.trim()) { showToast("Enter an API key first.", false); return; }
+    if (!cfg.apiKey.trim())  { showToast("Enter an API key first.", false); return; }
     if (!cfg.baseURL.trim()) { showToast("Enter a Base URL first.", false); return; }
     const resolvedId = id ?? "__form__";
     setTestingId(resolvedId);
 
-    // Mark existing config as "testing"
     if (id) {
-      const updated = configs.map((c) => c.id === id ? { ...c, status: "testing" as AIConfigStatus } : c);
+      const updated = configs.map((c) =>
+        c.id === id ? { ...c, status: "testing" as AIConfigStatus } : c,
+      );
       setConfigs(updated);
       setAIConfigsInStorage(updated);
     }
@@ -160,25 +334,25 @@ export default function SettingsPage() {
       setTestingId(null);
       if (id) {
         const newStatus: AIConfigStatus = ok ? "active" : "error";
-        const updated = configs.map((c) => c.id === id ? { ...c, status: newStatus } : c);
+        const updated = configs.map((c) =>
+          c.id === id ? { ...c, status: newStatus } : c,
+        );
         setConfigs(updated);
         setAIConfigsInStorage(updated);
       }
     }
   }
 
-  // ── Save new config ────────────────────────────────────────────────────────
+  // ── Save new AI config ─────────────────────────────────────────────────────
   function handleAddConfig(e: React.FormEvent) {
     e.preventDefault();
     if (!formData.apiKey.trim())  { showToast("API key is required.", false); return; }
     if (!formData.baseURL.trim()) { showToast("Base URL is required.", false); return; }
     setSavingForm(true);
 
-    // If this is flagged as global override, clear override on all others
-    let base = configs.map((c) =>
+    const base = configs.map((c) =>
       formData.isGlobalOverride ? { ...c, isGlobalOverride: false } : c,
     );
-
     const newCfg: AIConfig = {
       ...formData,
       id:           `cfg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -196,7 +370,6 @@ export default function SettingsPage() {
     showToast("API connection saved.", true);
   }
 
-  // ── Toggle global override on a saved config ───────────────────────────────
   function handleToggleGlobalOverride(id: string) {
     const target = configs.find((c) => c.id === id);
     if (!target) return;
@@ -210,31 +383,27 @@ export default function SettingsPage() {
     showToast(
       willBeGlobal
         ? `"${target.providerName}" is now the global provider for all tasks.`
-        : `Global override removed.`,
+        : "Global override removed.",
       true,
     );
   }
 
-  // ── Update role tag for an existing config ─────────────────────────────────
   function handleRoleChange(id: string, newRole: AIRole) {
-    const updated = configs.map((c) => c.id === id ? { ...c, role: newRole } : c);
+    const updated = configs.map((c) => (c.id === id ? { ...c, role: newRole } : c));
     setConfigs(updated);
     setAIConfigsInStorage(updated);
   }
 
-  // ── Save role assignments ──────────────────────────────────────────────────
   function handleSaveAssignments() {
     setAIRoleAssignmentsInStorage(assignments);
     showToast("Role assignments saved.", true);
   }
 
-  // ── Delete config — guarded by confirmation ───────────────────────────────
   function handleDeleteConfig(id: string) {
-    if (!window.confirm("Are you sure you want to remove this API configuration? This cannot be undone.")) return;
+    if (!window.confirm("Remove this API configuration? This cannot be undone.")) return;
     const updated = configs.filter((c) => c.id !== id);
     setConfigs(updated);
     setAIConfigsInStorage(updated);
-    // Clean up role assignments if they referenced this id
     const newAssign: AIRoleAssignments = {
       defaultGeneral: assignments.defaultGeneral === id ? null : assignments.defaultGeneral,
       defaultVision:  assignments.defaultVision  === id ? null : assignments.defaultVision,
@@ -244,9 +413,8 @@ export default function SettingsPage() {
     showToast("Configuration removed.", true);
   }
 
-  // ── Clear all (legacy + configs) — guarded ────────────────────────────────
   function handleClearAll() {
-    if (!window.confirm("Are you sure you want to delete ALL saved API configurations and keys? This cannot be undone.")) return;
+    if (!window.confirm("Delete ALL saved API configurations and keys? This cannot be undone.")) return;
     clearAIUnifiedKeyFromStorage();
     clearOpenAIApiKeyFromStorage();
     clearGeminiApiKeyFromStorage();
@@ -257,16 +425,15 @@ export default function SettingsPage() {
     showToast("All API configurations cleared.", true);
   }
 
-  // ── Save hardware settings ─────────────────────────────────────────────────
   function handleSaveHardware(e: React.FormEvent) {
     e.preventDefault();
     setBarcodeModeInStorage(barcodeMode);
     setLabelPrinterInStorage(labelPrinter);
     setHwSaved(true);
     setTimeout(() => setHwSaved(false), 2500);
+    showToast("Hardware settings saved.", true);
   }
 
-  // ── Access guard (hide entirely — do not show blocked page to operators) ──
   if (!mounted) {
     return (
       <div className="flex min-h-[60vh] items-center justify-center">
@@ -278,11 +445,11 @@ export default function SettingsPage() {
   if (role !== "admin") return null;
 
   const globalProvider = configs.find((c) => c.isGlobalOverride) ?? null;
-  const isOverridden = globalProvider !== null;
+  const isOverridden   = globalProvider !== null;
 
-  // ── Main UI ───────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div className="mx-auto max-w-2xl px-4 py-8">
+    <div className="w-full max-w-7xl mx-auto px-2 sm:px-4 py-8">
       <Link
         href="/"
         className="mb-6 inline-flex items-center gap-2 text-sm font-medium text-muted-foreground transition hover:text-foreground"
@@ -292,19 +459,19 @@ export default function SettingsPage() {
       </Link>
 
       {/* Page header */}
-      <div className="mb-6 flex items-center gap-3">
+      <div className="mb-8 flex items-center gap-3">
         <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-violet-100 dark:bg-violet-950/50">
           <KeyRound className="h-6 w-6 text-violet-600 dark:text-violet-400" />
         </div>
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Settings</h1>
           <p className="text-sm text-muted-foreground">
-            Configuration stored locally in this browser. Admin-only.
+            Workspace configuration · Admin-only
           </p>
         </div>
       </div>
 
-      {/* Toast */}
+      {/* Toast notification */}
       {toast && (
         <div
           className={[
@@ -321,535 +488,944 @@ export default function SettingsPage() {
         </div>
       )}
 
-      {/* ── Tab bar ──────────────────────────────────────────────────────────── */}
-      <div className="flex gap-1 rounded-2xl border border-border bg-muted/40 p-1">
-        {(["ai", "hardware"] as TabId[]).map((tab) => (
-          <button
-            key={tab}
-            type="button"
-            onClick={() => setActiveTab(tab)}
-            className={[
-              "flex flex-1 items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-all",
-              activeTab === tab
-                ? "bg-background text-foreground shadow-sm"
-                : "text-muted-foreground hover:text-foreground",
-            ].join(" ")}
-          >
-            {tab === "ai"
-              ? <Cpu       className="h-4 w-4" />
-              : <HardDrive className="h-4 w-4" />}
-            {tab === "ai" ? "AI & System" : "Hardware & Devices"}
-          </button>
-        ))}
-      </div>
+      {/* ── Enterprise layout: fixed sidebar + flex content ─────────────────── */}
+      <div className="flex flex-col md:flex-row w-full gap-6">
 
-      {/* ════════════════ AI & SYSTEM TAB ════════════════ */}
-      {activeTab === "ai" && (
-        <div className="mt-6 space-y-4">
-
-          {/* ── Global override banner ──────────────────────────────────── */}
-          {isOverridden && (
-            <div className="flex items-center gap-3 rounded-2xl border-2 border-violet-300 bg-violet-50 px-4 py-3 dark:border-violet-600/50 dark:bg-violet-950/30">
-              <Zap className="h-5 w-5 shrink-0 text-violet-600 dark:text-violet-400" />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-bold text-violet-700 dark:text-violet-300">
-                  Global Override Active
-                </p>
-                <p className="truncate text-xs text-violet-600 dark:text-violet-400">
-                  All tasks are routed through <strong>{globalProvider!.providerName}</strong>.
-                  Role assignments are disabled.
-                </p>
-              </div>
-            </div>
-          )}
-
-          {/* ── Saved connections list ──────────────────────────────────────── */}
-          <div className="rounded-2xl border border-border bg-card p-6 shadow-sm">
-            <div className="mb-4 flex items-center justify-between">
-              <div>
-                <h2 className="text-base font-bold">API Connections</h2>
-                <p className="text-xs text-muted-foreground">
-                  Add multiple providers — assign roles below, or use the global override.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowForm((v) => !v)}
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
-              >
-                {showForm ? <ChevronUp className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
-                {showForm ? "Cancel" : "Add Connection"}
-              </button>
-            </div>
-
-            {/* Empty state */}
-            {configs.length === 0 && !showForm && (
-              <div className="flex flex-col items-center gap-2 rounded-2xl border border-dashed border-border bg-muted/30 py-10 text-center">
-                <KeyRound className="h-8 w-8 text-muted-foreground/40" />
-                <p className="text-sm font-medium text-muted-foreground">No API connections saved yet.</p>
-                <p className="text-xs text-muted-foreground">Click <strong>Add Connection</strong> to get started.</p>
-              </div>
-            )}
-
-            {/* Config cards */}
-            {configs.length > 0 && (
-              <div className="space-y-3">
-                {configs.map((cfg) => {
-                  const isTesting    = testingId === cfg.id;
-                  const statusMeta   = STATUS_META[cfg.status ?? "untested"];
-                  const isGlobal     = !!cfg.isGlobalOverride;
-                  return (
-                    <div
-                      key={cfg.id}
-                      className={[
-                        "group rounded-xl border bg-background p-4 transition",
-                        isGlobal
-                          ? "border-violet-300 ring-1 ring-violet-200 dark:border-violet-600/60 dark:ring-violet-800/40"
-                          : "border-border hover:border-sky-300 dark:hover:border-sky-700",
-                      ].join(" ")}
-                    >
-                      {/* Top row: name + badges + actions */}
-                      <div className="flex flex-wrap items-start gap-2">
-                        {/* Provider name */}
-                        <p className="font-semibold text-sm text-foreground leading-tight min-w-0 flex-1">
-                          {cfg.providerName || PROVIDER_LABELS[cfg.provider]}
-                        </p>
-
-                        {/* Global override badge */}
-                        {isGlobal && (
-                          <span className="inline-flex items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-violet-700 dark:border-violet-700/50 dark:bg-violet-950/40 dark:text-violet-300">
-                            <Zap className="h-3 w-3" />Global
-                          </span>
-                        )}
-
-                        {/* Status badge */}
-                        <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold ${statusMeta.cls}`}>
-                          {isTesting ? "Testing…" : statusMeta.label}
-                        </span>
-
-                        {/* Provider type */}
-                        <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">
-                          {PROVIDER_LABELS[cfg.provider]}
-                        </span>
-                      </div>
-
-                      {/* URL + masked key */}
-                      <p className="mt-1.5 font-mono text-[11px] text-muted-foreground truncate">{cfg.baseURL}</p>
-                      <p className="mt-0.5 font-mono text-[11px] text-muted-foreground">
-                        {cfg.apiKey.length > 8
-                          ? `${cfg.apiKey.slice(0, 4)}${"•".repeat(Math.min(cfg.apiKey.length - 6, 20))}${cfg.apiKey.slice(-2)}`
-                          : "••••••••"}
-                      </p>
-
-                      {/* Bottom row: role tag + global toggle + actions */}
-                      <div className="mt-3 flex flex-wrap items-center gap-2">
-                        {/* Role tag dropdown */}
-                        <select
-                          value={cfg.role}
-                          onChange={(e) => handleRoleChange(cfg.id, e.target.value as AIRole)}
-                          className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-[11px] font-semibold text-slate-600 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
-                          aria-label="Role tag"
-                        >
-                          <option value="default">Tag: Default</option>
-                          <option value="ocr_vision">Tag: OCR / Vision</option>
-                        </select>
-
-                        {/* "Use for all tasks" toggle */}
-                        <label className="flex cursor-pointer items-center gap-1.5">
-                          <input
-                            type="checkbox"
-                            checked={isGlobal}
-                            onChange={() => handleToggleGlobalOverride(cfg.id)}
-                            className="h-3.5 w-3.5 rounded accent-violet-600"
-                          />
-                          <span className="text-[11px] font-medium text-muted-foreground">
-                            Use for all tasks
-                          </span>
-                        </label>
-
-                        <div className="flex-1" />
-
-                        {/* Test */}
-                        <button
-                          type="button"
-                          onClick={() => runTest(cfg, cfg.id)}
-                          disabled={isTesting}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1 text-xs font-medium text-muted-foreground transition hover:border-sky-300 hover:text-sky-600 disabled:opacity-50"
-                        >
-                          {isTesting
-                            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            : <Wifi    className="h-3.5 w-3.5" />}
-                          {isTesting ? "Testing…" : "Test"}
-                        </button>
-
-                        {/* Delete — guarded */}
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteConfig(cfg.id)}
-                          title="Remove this API configuration"
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-medium text-rose-600 transition hover:bg-rose-100 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                          Remove
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          {/* ── Add new connection form ────────────────────────────────────── */}
-          {showForm && (
-            <form
-              onSubmit={handleAddConfig}
-              className="space-y-5 rounded-2xl border border-sky-200 bg-sky-50/40 p-6 shadow-sm dark:border-sky-700/50 dark:bg-sky-950/20"
+        {/* LEFT SIDEBAR — vertical stack on all screen sizes, fixed w-64 on desktop */}
+        <nav className="w-full md:w-64 md:flex-shrink-0 md:border-r md:border-border md:pr-6 md:sticky md:top-6 md:self-start">
+          <div className="flex flex-col w-full gap-2">
+          {NAV_ITEMS.map(({ id, label, icon }) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setActiveTab(id)}
+              className={[
+                "flex items-center gap-3 rounded-xl px-4 py-3 text-sm font-semibold transition-all text-left w-full",
+                activeTab === id
+                  ? "bg-violet-100 text-violet-700 dark:bg-violet-950/50 dark:text-violet-300"
+                  : "bg-muted/50 text-muted-foreground hover:bg-accent hover:text-foreground dark:bg-muted/30",
+              ].join(" ")}
             >
-              <div className="flex items-center justify-between">
-                <h3 className="text-sm font-bold text-sky-800 dark:text-sky-200">New API Connection</h3>
-                <button
-                  type="button"
-                  onClick={() => { setShowForm(false); setFormData(newBlankConfig()); }}
-                  className="rounded-full p-1 text-muted-foreground hover:bg-accent"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
+              {icon}
+              <span>{label}</span>
+            </button>
+          ))}
 
-              {/* Friendly name */}
-              <div>
-                <label className={LABEL_CLS}>
-                  Connection Name
-                </label>
-                <p className={HINT_CLS}>A label to identify this connection (e.g. &quot;Gemini Flash — Chat&quot;).</p>
-                <input
-                  type="text"
-                  value={formData.providerName}
-                  onChange={(e) => setFormData((p) => ({ ...p, providerName: e.target.value }))}
-                  placeholder="e.g. GPT-4o Vision"
-                  className={INPUT_CLS}
-                />
-              </div>
+          {/* Plan badge in sidebar */}
+          <div className="hidden md:block mt-6 rounded-xl border border-border bg-muted/40 px-4 py-3">
+            <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Current Plan</p>
+            <p className={`mt-1 text-sm font-bold ${
+              mockPlan === "Free Tier"  ? "text-slate-600 dark:text-slate-300"
+              : mockPlan === "Pro Tier" ? "text-sky-600 dark:text-sky-400"
+              : "text-violet-600 dark:text-violet-400"
+            }`}>
+              {mockPlan === "Enterprise" && <Zap className="mr-1 inline h-3.5 w-3.5" />}
+              {mockPlan}
+            </p>
+          </div>
+          </div>
+        </nav>
 
-              {/* Provider */}
-              <div>
-                <label className={LABEL_CLS}>Provider Type</label>
-                <select
-                  value={formData.provider}
-                  onChange={(e) => handleFormProviderChange(e.target.value as AIProvider)}
-                  className={SELECT_CLS}
-                >
-                  <option value="openai">OpenAI  (GPT-4o, o3, o4-mini…)</option>
-                  <option value="gemini">Google Gemini</option>
-                  <option value="custom">Custom / Other  (Ollama, Groq, Azure OpenAI, LM Studio…)</option>
-                </select>
-              </div>
+        {/* RIGHT CONTENT AREA */}
+        <div className="flex-1 min-w-0 w-full overflow-hidden">
 
-              {/* Role tag */}
-              <div>
-                <label className={LABEL_CLS}>
-                  <Tag className="mr-1 inline h-3.5 w-3.5" />
-                  Role Tag
-                </label>
-                <p className={HINT_CLS}>Tag this connection — used by the Role Assignment section below.</p>
-                <select
-                  value={formData.role}
-                  onChange={(e) => setFormData((p) => ({ ...p, role: e.target.value as AIRole }))}
-                  className={SELECT_CLS}
-                >
-                  <option value="default">Default — general AI tasks</option>
-                  <option value="ocr_vision">OCR / Vision — image analysis &amp; packing-slip scanning</option>
-                </select>
-              </div>
-
-              {/* Base URL */}
-              <div>
-                <label className={LABEL_CLS}>Base URL</label>
-                <p className={HINT_CLS}>Auto-filled for known providers; edit freely for custom deployments.</p>
-                <input
-                  type="text"
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={formData.baseURL}
-                  onChange={(e) => setFormData((p) => ({ ...p, baseURL: e.target.value }))}
-                  placeholder="https://api.openai.com/v1"
-                  className={`${INPUT_CLS} font-mono`}
-                />
-                {formData.provider === "custom" && (
-                  <p className="mt-1.5 text-xs text-amber-600 dark:text-amber-400">
-                    Custom providers: ensure CORS allows requests from this origin, or proxy via your backend.
+          {/* ══════════════ GENERAL & WORKFLOW ══════════════ */}
+          {activeTab === "general" && (
+            <form onSubmit={handleSaveGeneral} className="space-y-6">
+              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-6">
+                <div>
+                  <h2 className="text-base font-bold">General Preferences</h2>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Operational defaults applied across the warehouse workflow.
                   </p>
-                )}
-              </div>
-
-              {/* API Key */}
-              <div>
-                <label className={LABEL_CLS}>API Key</label>
-                <p className={HINT_CLS}>
-                  Stored only in this browser&apos;s localStorage — never sent to our servers.
-                </p>
-                <div className="flex gap-2">
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    value={formData.apiKey}
-                    onChange={(e) => setFormData((p) => ({ ...p, apiKey: e.target.value }))}
-                    placeholder={
-                      formData.provider === "openai" ? "sk-…"
-                      : formData.provider === "gemini" ? "AIza…"
-                      : "Your API key…"
-                    }
-                    className={`${INPUT_CLS} min-w-0 flex-1 font-mono`}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => runTest(formData, null)}
-                    disabled={testingId === "__form__"}
-                    title="Test connection"
-                    className="inline-flex h-12 shrink-0 items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-4 text-sm font-semibold text-sky-700 transition hover:bg-sky-100 disabled:opacity-50 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
-                  >
-                    {testingId === "__form__"
-                      ? <Loader2 className="h-4 w-4 animate-spin" />
-                      : <Wifi    className="h-4 w-4" />}
-                    {testingId === "__form__" ? "Testing…" : "Test"}
-                  </button>
                 </div>
-                <p className="mt-1.5 text-xs text-muted-foreground">
-                  Test fires{" "}
-                  <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
-                    GET {"{baseURL}"}/models
-                  </code>.
-                </p>
-              </div>
 
-              {/* Use for all tasks */}
-              <div className="rounded-xl border border-violet-200 bg-violet-50/60 p-4 dark:border-violet-700/40 dark:bg-violet-950/20">
-                <label className="flex cursor-pointer items-start gap-3">
-                  <input
-                    type="checkbox"
-                    checked={!!formData.isGlobalOverride}
-                    onChange={(e) => setFormData((p) => ({ ...p, isGlobalOverride: e.target.checked }))}
-                    className="mt-0.5 h-4 w-4 rounded accent-violet-600"
-                  />
-                  <div>
-                    <p className="text-sm font-bold text-violet-800 dark:text-violet-200">
-                      Use this configuration for all roles
-                    </p>
-                    <p className="mt-0.5 text-xs text-violet-700 dark:text-violet-400">
-                      When checked, this API becomes the sole provider for every task (general chat AND
-                      OCR/Vision). Role assignment dropdowns will be disabled.
-                    </p>
+                <div>
+                  <div className="mb-2 flex items-center gap-2">
+                    <Tag className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+                    <label className="text-sm font-semibold">Default Store</label>
                   </div>
-                </label>
+                  <p className={HINT_CLS}>
+                    Fallback store when a scanned barcode can&apos;t be matched to a parent package.
+                    Amazon FNSKUs (starting with{" "}
+                    <code className="rounded bg-muted px-1 font-mono text-[11px]">X00</code> or{" "}
+                    <code className="rounded bg-muted px-1 font-mono text-[11px]">B00</code>) are
+                    auto-matched to your first active Amazon store.
+                  </p>
+                  {storesListLoading ? (
+                    <div className="flex items-center gap-2 py-3">
+                      <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                      <span className="text-xs text-muted-foreground">Loading stores…</span>
+                    </div>
+                  ) : storesList.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-border bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
+                      No stores found. Add a store in the{" "}
+                      <strong>Marketplaces &amp; Stores</strong> tab first.
+                    </div>
+                  ) : (
+                    <select
+                      value={defaultStoreId}
+                      onChange={(e) => setDefaultStoreId(e.target.value)}
+                      className={SELECT_CLS}
+                    >
+                      <option value="">— No default (unknown) —</option>
+                      {storesList.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name}{" "}
+                          ({PLATFORM_LABELS[s.platform] ?? s.platform}
+                          {!s.is_active ? " · inactive" : ""})
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {defaultStoreId && (
+                    <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                      Standalone scans will fall back to{" "}
+                      <strong>
+                        {storesList.find((s) => s.id === defaultStoreId)?.name ?? defaultStoreId}
+                      </strong>{" "}
+                      when no package or prefix is detected.
+                    </p>
+                  )}
+                </div>
               </div>
 
-              <div className="flex gap-2 pt-1">
+              <div className="flex flex-wrap gap-2">
                 <button
                   type="submit"
-                  disabled={savingForm}
-                  className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:opacity-50"
+                  className="inline-flex min-w-[180px] flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white transition hover:bg-sky-700"
                 >
                   <Save className="h-4 w-4" />
-                  Save Connection
+                  Save General Preferences
                 </button>
               </div>
+              {generalSaved && (
+                <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">Saved.</p>
+              )}
             </form>
           )}
 
-          {/* ── Role Assignment section ────────────────────────────────────── */}
-          {configs.length > 0 && (
-            <div
-              className={[
-                "rounded-2xl border bg-card p-6 shadow-sm transition",
-                isOverridden
-                  ? "border-border opacity-60 pointer-events-none select-none"
-                  : "border-border",
-              ].join(" ")}
-            >
-              <div className="mb-4">
-                <div className="flex items-center gap-2">
-                  <Globe className="h-4 w-4 text-sky-600 dark:text-sky-400" />
-                  <h2 className="text-base font-bold">Role Assignment</h2>
-                  {isOverridden && (
-                    <span className="ml-1 inline-flex items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-[10px] font-bold text-violet-700 dark:border-violet-700/50 dark:bg-violet-950/40 dark:text-violet-300">
-                      <Zap className="h-3 w-3" />Overridden by Global Provider
-                    </span>
+          {/* ══════════════ MARKETPLACES & STORES ══════════════ */}
+          {activeTab === "marketplaces" && (
+            <div className="space-y-6">
+              {/* Connected stores card with paywall */}
+              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-5">
+                <div className="flex items-start justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-100 dark:bg-sky-950/50">
+                      <Store className="h-5 w-5 text-sky-600 dark:text-sky-400" />
+                    </div>
+                    <div>
+                      <h2 className="text-base font-bold">Connected Stores</h2>
+                      <p className="text-xs text-muted-foreground">
+                        {connections.length}
+                        {planLimits.stores === Infinity ? "" : ` / ${planLimits.stores}`} store
+                        {connections.length !== 1 ? "s" : ""} on{" "}
+                        <span className="font-semibold">{mockPlan}</span>
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Add Store — paywall gated */}
+                  {canAddStore ? (
+                    <Link
+                      href="/settings/adapters"
+                      className="inline-flex shrink-0 items-center gap-2 rounded-xl bg-sky-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-sky-700"
+                    >
+                      <Plus className="h-4 w-4" />
+                      Add Store
+                    </Link>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled
+                      title="Upgrade your plan to connect more stores"
+                      className="inline-flex shrink-0 cursor-not-allowed items-center gap-2 rounded-xl bg-amber-400 px-4 py-2.5 text-sm font-bold text-amber-950 opacity-95"
+                    >
+                      👑 Upgrade to Add Stores
+                    </button>
                   )}
                 </div>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Choose which saved API handles each task type. Example: fast model for chat, vision model for packing slips.
-                </p>
+
+                {/* Paywall banner when at limit */}
+                {!canAddStore && (
+                  <div className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 dark:border-amber-700/40 dark:bg-amber-950/20">
+                    <Zap className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                    <p className="text-xs font-medium text-amber-800 dark:text-amber-300">
+                      You&apos;ve reached the <strong>{mockPlan}</strong> limit of{" "}
+                      {planLimits.stores} store{planLimits.stores !== 1 ? "s" : ""}. Upgrade to Pro
+                      or Enterprise to connect additional channels.
+                    </p>
+                  </div>
+                )}
+
+                {/* Stores list */}
+                {storesLoading ? (
+                  <div className="flex items-center gap-2 py-4">
+                    <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                    <p className="text-sm text-muted-foreground">Loading stores…</p>
+                  </div>
+                ) : connections.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-border bg-muted/20 py-10 text-center">
+                    <Store className="mx-auto mb-2 h-8 w-8 text-muted-foreground/40" />
+                    <p className="text-sm font-medium text-muted-foreground">No stores connected yet.</p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Add your first marketplace to start syncing returns.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {connections.map((c) => (
+                      <div
+                        key={c.id}
+                        className="flex items-center gap-4 rounded-xl border border-border bg-background px-4 py-3"
+                      >
+                        <div className="h-2.5 w-2.5 shrink-0 rounded-full bg-emerald-400" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold truncate">{c.nickname}</p>
+                          {c.display_id && (
+                            <p className="text-xs text-muted-foreground font-mono">{c.display_id}</p>
+                          )}
+                        </div>
+                        <span className="shrink-0 rounded-full bg-muted px-2.5 py-0.5 text-xs font-semibold text-muted-foreground capitalize">
+                          {c.provider.replace("_api", "").replace("_sp_api", "")}
+                        </span>
+                        <span className="shrink-0 inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/40 dark:text-emerald-300">
+                          Active
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="border-t border-border pt-4">
+                  <Link
+                    href="/settings/adapters"
+                    className="text-sm font-semibold text-sky-600 transition hover:text-sky-700 dark:text-sky-400"
+                  >
+                    Manage credentials, test connections &amp; sync claims →
+                  </Link>
+                </div>
               </div>
 
-              <div className="grid gap-5 sm:grid-cols-2">
-                {/* Default General */}
-                <div>
-                  <label className={LABEL_CLS}>Default General API</label>
-                  <p className={HINT_CLS}>Used for general chat, decision-making, and summaries.</p>
-                  <select
-                    value={assignments.defaultGeneral ?? ""}
-                    onChange={(e) => setAssignments((p) => ({ ...p, defaultGeneral: e.target.value || null }))}
-                    disabled={isOverridden}
-                    className={SELECT_CLS}
-                  >
-                    <option value="">— Not assigned —</option>
-                    {configs.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.providerName || PROVIDER_LABELS[c.provider]}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                {/* Default OCR/Vision */}
-                <div>
-                  <label className={LABEL_CLS}>Default OCR / Vision API</label>
-                  <p className={HINT_CLS}>Used for packing-slip photos and image analysis.</p>
-                  <select
-                    value={assignments.defaultVision ?? ""}
-                    onChange={(e) => setAssignments((p) => ({ ...p, defaultVision: e.target.value || null }))}
-                    disabled={isOverridden}
-                    className={SELECT_CLS}
-                  >
-                    <option value="">— Not assigned —</option>
-                    {configs.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.providerName || PROVIDER_LABELS[c.provider]}
-                      </option>
-                    ))}
-                  </select>
+              {/* Available channels overview */}
+              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-4">
+                <h3 className="text-sm font-bold">Available Channels</h3>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {[
+                    { name: "Amazon SP-API",   desc: "FBA/FBM returns, A-to-Z claims automation",     active: true  },
+                    { name: "Walmart DSV",      desc: "Supplier returns portal, RMA workflows",         active: true  },
+                    { name: "eBay",             desc: "Money Back Guarantee automation",                active: false, soon: true },
+                    { name: "Target / Circle",  desc: "Freight claim &amp; supplier integration",      active: false, soon: true },
+                  ].map((m) => (
+                    <div
+                      key={m.name}
+                      className="flex items-start gap-3 rounded-xl border border-border bg-background p-4"
+                    >
+                      <div
+                        className={`mt-0.5 h-2.5 w-2.5 shrink-0 rounded-full ${
+                          m.soon ? "bg-slate-300 dark:bg-slate-600" : "bg-emerald-400"
+                        }`}
+                      />
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <p className="text-sm font-semibold">{m.name}</p>
+                          {m.soon && (
+                            <span className="rounded-full bg-muted px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-muted-foreground">
+                              Soon
+                            </span>
+                          )}
+                        </div>
+                        <p
+                          className="mt-0.5 text-xs text-muted-foreground"
+                          dangerouslySetInnerHTML={{ __html: m.desc }}
+                        />
+                      </div>
+                    </div>
+                  ))}
                 </div>
               </div>
+            </div>
+          )}
 
-              {!isOverridden && (
-                <div className="mt-5">
+          {/* ══════════════ AI & OCR QUOTAS ══════════════ */}
+          {activeTab === "ai_quotas" && (
+            <div className="space-y-4">
+
+              {isOverridden && (
+                <div className="flex items-center gap-3 rounded-2xl border-2 border-violet-300 bg-violet-50 px-4 py-3 dark:border-violet-600/50 dark:bg-violet-950/30">
+                  <Zap className="h-5 w-5 shrink-0 text-violet-600 dark:text-violet-400" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-bold text-violet-700 dark:text-violet-300">
+                      Global Override Active
+                    </p>
+                    <p className="truncate text-xs text-violet-600 dark:text-violet-400">
+                      All tasks routed through <strong>{globalProvider!.providerName}</strong>.
+                      Role assignments disabled.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm">
+                <div className="mb-4 flex items-center justify-between">
+                  <div>
+                    <h2 className="text-base font-bold">API Connections</h2>
+                    <p className="text-xs text-muted-foreground">
+                      Add multiple providers — assign roles below or use global override.
+                    </p>
+                  </div>
                   <button
                     type="button"
-                    onClick={handleSaveAssignments}
-                    className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-sky-700"
+                    onClick={() => setShowForm((v) => !v)}
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
                   >
-                    <Save className="h-4 w-4" />
-                    Save Role Assignments
+                    {showForm ? <ChevronUp className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+                    {showForm ? "Cancel" : "Add Connection"}
+                  </button>
+                </div>
+
+                {configs.length === 0 && !showForm && (
+                  <div className="flex flex-col items-center gap-2 rounded-2xl border border-dashed border-border bg-muted/30 py-10 text-center">
+                    <KeyRound className="h-8 w-8 text-muted-foreground/40" />
+                    <p className="text-sm font-medium text-muted-foreground">No API connections saved yet.</p>
+                    <p className="text-xs text-muted-foreground">
+                      Click <strong>Add Connection</strong> to get started.
+                    </p>
+                  </div>
+                )}
+
+                {configs.length > 0 && (
+                  <div className="space-y-3">
+                    {configs.map((cfg) => {
+                      const isTesting  = testingId === cfg.id;
+                      const statusMeta = STATUS_META[cfg.status ?? "untested"];
+                      const isGlobal   = !!cfg.isGlobalOverride;
+                      return (
+                        <div
+                          key={cfg.id}
+                          className={[
+                            "group rounded-xl border bg-background p-4 transition",
+                            isGlobal
+                              ? "border-violet-300 ring-1 ring-violet-200 dark:border-violet-600/60 dark:ring-violet-800/40"
+                              : "border-border hover:border-sky-300 dark:hover:border-sky-700",
+                          ].join(" ")}
+                        >
+                          <div className="flex flex-wrap items-start gap-2">
+                            <p className="font-semibold text-sm text-foreground leading-tight min-w-0 flex-1">
+                              {cfg.providerName || PROVIDER_LABELS[cfg.provider]}
+                            </p>
+                            {isGlobal && (
+                              <span className="inline-flex items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-violet-700 dark:border-violet-700/50 dark:bg-violet-950/40 dark:text-violet-300">
+                                <Zap className="h-3 w-3" />Global
+                              </span>
+                            )}
+                            <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold ${statusMeta.cls}`}>
+                              {isTesting ? "Testing…" : statusMeta.label}
+                            </span>
+                            <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                              {PROVIDER_LABELS[cfg.provider]}
+                            </span>
+                          </div>
+                          <p className="mt-1.5 font-mono text-[11px] text-muted-foreground truncate">
+                            {cfg.baseURL}
+                          </p>
+                          <p className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+                            {cfg.apiKey.length > 8
+                              ? `${cfg.apiKey.slice(0, 4)}${"•".repeat(Math.min(cfg.apiKey.length - 6, 20))}${cfg.apiKey.slice(-2)}`
+                              : "••••••••"}
+                          </p>
+                          <div className="mt-3 flex flex-wrap items-center gap-2">
+                            <select
+                              value={cfg.role}
+                              onChange={(e) => handleRoleChange(cfg.id, e.target.value as AIRole)}
+                              className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-[11px] font-semibold text-slate-600 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+                              aria-label="Role tag"
+                            >
+                              <option value="default">Tag: Default</option>
+                              <option value="ocr_vision">Tag: OCR / Vision</option>
+                            </select>
+                            <label className="flex cursor-pointer items-center gap-1.5">
+                              <input
+                                type="checkbox"
+                                checked={isGlobal}
+                                onChange={() => handleToggleGlobalOverride(cfg.id)}
+                                className="h-3.5 w-3.5 rounded accent-violet-600"
+                              />
+                              <span className="text-[11px] font-medium text-muted-foreground">
+                                Use for all tasks
+                              </span>
+                            </label>
+                            <div className="flex-1" />
+                            <button
+                              type="button"
+                              onClick={() => runTest(cfg, cfg.id)}
+                              disabled={isTesting}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2.5 py-1 text-xs font-medium text-muted-foreground transition hover:border-sky-300 hover:text-sky-600 disabled:opacity-50"
+                            >
+                              {isTesting
+                                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                : <Wifi    className="h-3.5 w-3.5" />}
+                              {isTesting ? "Testing…" : "Test"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteConfig(cfg.id)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-xs font-medium text-rose-600 transition hover:bg-rose-100 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                              Remove
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Add connection form */}
+              {showForm && (
+                <form
+                  onSubmit={handleAddConfig}
+                  className="space-y-5 rounded-2xl border border-sky-200 bg-sky-50/40 p-6 shadow-sm dark:border-sky-700/50 dark:bg-sky-950/20"
+                >
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-bold text-sky-800 dark:text-sky-200">New API Connection</h3>
+                    <button
+                      type="button"
+                      onClick={() => { setShowForm(false); setFormData(newBlankConfig()); }}
+                      className="rounded-full p-1 text-muted-foreground hover:bg-accent"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+
+                  <div>
+                    <label className={LABEL_CLS}>Connection Name</label>
+                    <p className={HINT_CLS}>A label to identify this connection (e.g. &quot;Gemini Flash — Chat&quot;).</p>
+                    <input
+                      type="text"
+                      value={formData.providerName}
+                      onChange={(e) => setFormData((p) => ({ ...p, providerName: e.target.value }))}
+                      placeholder="e.g. GPT-4o Vision"
+                      className={INPUT_CLS}
+                    />
+                  </div>
+
+                  <div>
+                    <label className={LABEL_CLS}>Provider Type</label>
+                    <select
+                      value={formData.provider}
+                      onChange={(e) => handleFormProviderChange(e.target.value as AIProvider)}
+                      className={SELECT_CLS}
+                    >
+                      <option value="openai">OpenAI  (GPT-4o, o3, o4-mini…)</option>
+                      <option value="gemini">Google Gemini</option>
+                      <option value="custom">Custom / Other  (Ollama, Groq, Azure OpenAI…)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className={LABEL_CLS}>
+                      <Tag className="mr-1 inline h-3.5 w-3.5" />
+                      Role Tag
+                    </label>
+                    <p className={HINT_CLS}>Tag this connection for the Role Assignment section below.</p>
+                    <select
+                      value={formData.role}
+                      onChange={(e) => setFormData((p) => ({ ...p, role: e.target.value as AIRole }))}
+                      className={SELECT_CLS}
+                    >
+                      <option value="default">Default — general AI tasks</option>
+                      <option value="ocr_vision">OCR / Vision — image analysis &amp; packing-slip scanning</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className={LABEL_CLS}>Base URL</label>
+                    <p className={HINT_CLS}>Auto-filled for known providers; edit freely for custom deployments.</p>
+                    <input
+                      type="text"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={formData.baseURL}
+                      onChange={(e) => setFormData((p) => ({ ...p, baseURL: e.target.value }))}
+                      placeholder="https://api.openai.com/v1"
+                      className={`${INPUT_CLS} font-mono`}
+                    />
+                    {formData.provider === "custom" && (
+                      <p className="mt-1.5 text-xs text-amber-600 dark:text-amber-400">
+                        Custom providers: ensure CORS allows requests from this origin, or proxy via your backend.
+                      </p>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className={LABEL_CLS}>API Key</label>
+                    <p className={HINT_CLS}>Stored only in this browser&apos;s localStorage — never sent to our servers.</p>
+                    <div className="flex gap-2">
+                      <input
+                        type="password"
+                        autoComplete="off"
+                        value={formData.apiKey}
+                        onChange={(e) => setFormData((p) => ({ ...p, apiKey: e.target.value }))}
+                        placeholder={
+                          formData.provider === "openai" ? "sk-…"
+                          : formData.provider === "gemini" ? "AIza…"
+                          : "Your API key…"
+                        }
+                        className={`${INPUT_CLS} min-w-0 flex-1 font-mono`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => runTest(formData, null)}
+                        disabled={testingId === "__form__"}
+                        className="inline-flex h-12 shrink-0 items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-4 text-sm font-semibold text-sky-700 transition hover:bg-sky-100 disabled:opacity-50 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
+                      >
+                        {testingId === "__form__"
+                          ? <Loader2 className="h-4 w-4 animate-spin" />
+                          : <Wifi    className="h-4 w-4" />}
+                        {testingId === "__form__" ? "Testing…" : "Test"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-violet-200 bg-violet-50/60 p-4 dark:border-violet-700/40 dark:bg-violet-950/20">
+                    <label className="flex cursor-pointer items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={!!formData.isGlobalOverride}
+                        onChange={(e) => setFormData((p) => ({ ...p, isGlobalOverride: e.target.checked }))}
+                        className="mt-0.5 h-4 w-4 rounded accent-violet-600"
+                      />
+                      <div>
+                        <p className="text-sm font-bold text-violet-800 dark:text-violet-200">
+                          Use this configuration for all roles
+                        </p>
+                        <p className="mt-0.5 text-xs text-violet-700 dark:text-violet-400">
+                          When checked, this API becomes the sole provider for every task.
+                        </p>
+                      </div>
+                    </label>
+                  </div>
+
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      type="submit"
+                      disabled={savingForm}
+                      className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:opacity-50"
+                    >
+                      <Save className="h-4 w-4" />
+                      Save Connection
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              {/* Role Assignment */}
+              {configs.length > 0 && (
+                <div
+                  className={[
+                    "rounded-2xl border bg-card p-6 shadow-sm transition",
+                    isOverridden ? "border-border opacity-60 pointer-events-none select-none" : "border-border",
+                  ].join(" ")}
+                >
+                  <div className="mb-4">
+                    <div className="flex items-center gap-2">
+                      <Globe className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+                      <h2 className="text-base font-bold">Role Assignment</h2>
+                      {isOverridden && (
+                        <span className="ml-1 inline-flex items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-[10px] font-bold text-violet-700 dark:border-violet-700/50 dark:bg-violet-950/40 dark:text-violet-300">
+                          <Zap className="h-3 w-3" />Overridden by Global Provider
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Choose which saved API handles each task type.
+                    </p>
+                  </div>
+
+                  <div className="grid gap-5 sm:grid-cols-2">
+                    <div>
+                      <label className={LABEL_CLS}>Default General API</label>
+                      <p className={HINT_CLS}>Used for general chat, decision-making, and summaries.</p>
+                      <select
+                        value={assignments.defaultGeneral ?? ""}
+                        onChange={(e) =>
+                          setAssignments((p) => ({ ...p, defaultGeneral: e.target.value || null }))
+                        }
+                        disabled={isOverridden}
+                        className={SELECT_CLS}
+                      >
+                        <option value="">— Not assigned —</option>
+                        {configs.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.providerName || PROVIDER_LABELS[c.provider]}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className={LABEL_CLS}>Default OCR / Vision API</label>
+                      <p className={HINT_CLS}>Used for packing-slip photos and image analysis.</p>
+                      <select
+                        value={assignments.defaultVision ?? ""}
+                        onChange={(e) =>
+                          setAssignments((p) => ({ ...p, defaultVision: e.target.value || null }))
+                        }
+                        disabled={isOverridden}
+                        className={SELECT_CLS}
+                      >
+                        <option value="">— Not assigned —</option>
+                        {configs.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.providerName || PROVIDER_LABELS[c.provider]}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  {!isOverridden && (
+                    <div className="mt-5">
+                      <button
+                        type="button"
+                        onClick={handleSaveAssignments}
+                        className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-sky-700"
+                      >
+                        <Save className="h-4 w-4" />
+                        Save Role Assignments
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {configs.length > 0 && (
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleClearAll}
+                    className="inline-flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm font-semibold text-rose-600 transition hover:bg-rose-100 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    Clear All Configurations
                   </button>
                 </div>
               )}
             </div>
           )}
 
-          {/* ── Clear all (destructive, guarded) ──────────────────────────── */}
-          {configs.length > 0 && (
-            <div className="flex justify-end">
-              <button
-                type="button"
-                onClick={handleClearAll}
-                className="inline-flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm font-semibold text-rose-600 transition hover:bg-rose-100 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
-              >
-                <Trash2 className="h-4 w-4" />
-                Clear All Configurations
-              </button>
+          {/* ══════════════ HARDWARE SCANNERS ══════════════ */}
+          {activeTab === "hardware" && (
+            <form onSubmit={handleSaveHardware} className="space-y-6">
+              <div className="space-y-6 rounded-2xl border border-border bg-card p-6 shadow-sm">
+
+                <div>
+                  <div className="mb-2 flex items-center gap-2">
+                    <ScanLine className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+                    <label className="text-sm font-semibold">Barcode Input Mode</label>
+                  </div>
+                  <p className={HINT_CLS}>
+                    Physical / keyboard-wedge scanners (e.g. Netum C750) emulate a keyboard. Select
+                    &quot;Web / Camera&quot; only if you use a browser-based QR camera scanner.
+                  </p>
+                  <select
+                    value={barcodeMode}
+                    onChange={(e) => setBarcodeMode(e.target.value as BarcodeMode)}
+                    className={SELECT_CLS}
+                  >
+                    <option value="physical">Physical Scanner  (Keyboard Emulation — Netum, Honeywell, Zebra…)</option>
+                    <option value="camera">Web / Camera Scanner</option>
+                  </select>
+                  {barcodeMode === "physical" && (
+                    <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                      Keyboard-wedge mode — &quot;Scan&quot; buttons show a ready indicator; no camera window.
+                    </p>
+                  )}
+                  {barcodeMode === "camera" && (
+                    <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-sky-600 dark:text-sky-400">
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                      Camera mode — &quot;Scan&quot; buttons open a live QR/barcode camera modal.
+                    </p>
+                  )}
+                </div>
+
+                <div>
+                  <div className="mb-2 flex items-center gap-2">
+                    <Printer className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+                    <label className="text-sm font-semibold">Default Label Printer</label>
+                  </div>
+                  <p className={HINT_CLS}>Select the default printer for shipping and return labels.</p>
+                  <select
+                    value={labelPrinter}
+                    onChange={(e) => setLabelPrinter(e.target.value as LabelPrinter)}
+                    className={SELECT_CLS}
+                  >
+                    <option value="system">System Default</option>
+                    <option value="zebra_zd410">Zebra ZD410</option>
+                    <option value="zebra_zd620">Zebra ZD620</option>
+                    <option value="brother_ql">Brother QL Series</option>
+                  </select>
+                </div>
+
+                <div className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 dark:border-sky-700/50 dark:bg-sky-950/40">
+                  <p className="text-xs font-semibold text-sky-700 dark:text-sky-300">
+                    Physical Scanner Hook  (usePhysicalScanner)
+                  </p>
+                  <p className="mt-1 text-xs text-sky-600 dark:text-sky-400">
+                    Per-input{" "}
+                    <code className="rounded bg-sky-100 px-1 dark:bg-sky-900">keydown</code>{" "}
+                    listeners measure inter-keystroke timing. Wired into the{" "}
+                    <strong>Item</strong>, <strong>Package</strong>, and <strong>RMA</strong> inputs.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="submit"
+                  className="inline-flex min-w-[180px] flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white transition hover:bg-sky-700"
+                >
+                  <Save className="h-4 w-4" />
+                  Save Hardware Settings
+                </button>
+              </div>
+              {hwSaved && (
+                <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">Saved.</p>
+              )}
+            </form>
+          )}
+
+          {/* ══════════════ BILLING & SUBSCRIPTION ══════════════ */}
+          {activeTab === "billing" && (
+            <div className="space-y-6">
+
+              {/* Plan card + switcher */}
+              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-5">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h2 className="text-base font-bold">Billing &amp; Subscription</h2>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Monitor usage quotas and manage your workspace plan.
+                    </p>
+                  </div>
+                  <span
+                    className={[
+                      "shrink-0 inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm font-bold",
+                      mockPlan === "Free Tier"
+                        ? "border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+                        : mockPlan === "Pro Tier"
+                        ? "border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
+                        : "border-violet-200 bg-violet-50 text-violet-700 dark:border-violet-700/50 dark:bg-violet-950/40 dark:text-violet-300",
+                    ].join(" ")}
+                  >
+                    {mockPlan === "Enterprise" && <Zap className="h-3.5 w-3.5" />}
+                    {mockPlan}
+                  </span>
+                </div>
+
+                <div>
+                  <label className={LABEL_CLS}>Test Plan (Local Mock)</label>
+                  <p className={HINT_CLS}>
+                    Switch plans to preview paywalls and feature gating. Saved in this browser only.
+                  </p>
+                  <select
+                    value={mockPlan}
+                    onChange={(e) => {
+                      const plan = e.target.value as SaasPlan;
+                      setMockPlan(plan);
+                      localStorage.setItem("mock_saas_plan", plan);
+                      showToast(`Plan switched to ${plan}. Paywalls updated.`, true);
+                    }}
+                    className={SELECT_CLS}
+                  >
+                    {PLANS.map((p) => (
+                      <option key={p} value={p}>{p}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Plan comparison quick-view */}
+                <div className="grid gap-3 sm:grid-cols-3">
+                  {(["Free Tier", "Pro Tier", "Enterprise"] as SaasPlan[]).map((p) => (
+                    <div
+                      key={p}
+                      className={[
+                        "rounded-xl border p-3 transition",
+                        mockPlan === p
+                          ? "border-violet-300 bg-violet-50 dark:border-violet-600/50 dark:bg-violet-950/30"
+                          : "border-border bg-background",
+                      ].join(" ")}
+                    >
+                      <p className={`text-xs font-bold ${mockPlan === p ? "text-violet-700 dark:text-violet-300" : "text-foreground"}`}>
+                        {p}
+                      </p>
+                      <p className="mt-1 text-[11px] text-muted-foreground">
+                        {PLAN_LIMITS[p].ai_calls === Infinity ? "∞" : PLAN_LIMITS[p].ai_calls.toLocaleString()} AI calls ·{" "}
+                        {PLAN_LIMITS[p].stores === Infinity ? "∞" : PLAN_LIMITS[p].stores} store{PLAN_LIMITS[p].stores !== 1 ? "s" : ""}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Usage meters */}
+              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-6">
+                <div className="flex items-center gap-2">
+                  <BarChart3 className="h-5 w-5 text-violet-600 dark:text-violet-400" />
+                  <h3 className="text-base font-bold">Usage This Month</h3>
+                </div>
+
+                <UsageMeter
+                  label="AI Invoices Scanned"
+                  used={MOCK_AI_CALLS}
+                  limit={planLimits.ai_calls}
+                  color="violet"
+                  hint="Packing slip OCR + product label scans via AI vision"
+                />
+
+                <UsageMeter
+                  label="Connected Stores"
+                  used={connections.length}
+                  limit={planLimits.stores}
+                  color="sky"
+                  hint="Active marketplace channel integrations"
+                />
+
+                <UsageMeter
+                  label="Items Processed"
+                  used={MOCK_SCANNED_ITEMS}
+                  limit={planLimits.items}
+                  color="emerald"
+                  hint="Total return items scanned and logged this billing period"
+                />
+              </div>
+
+              {/* Upgrade CTA */}
+              {mockPlan !== "Enterprise" && (
+                <div className="rounded-2xl border-2 border-violet-200 bg-violet-50/60 p-6 dark:border-violet-700/40 dark:bg-violet-950/20 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Zap className="h-5 w-5 text-violet-600 dark:text-violet-400" />
+                    <h3 className="text-base font-bold text-violet-800 dark:text-violet-200">
+                      {mockPlan === "Free Tier" ? "Upgrade to Pro" : "Upgrade to Enterprise"}
+                    </h3>
+                  </div>
+                  <p className="text-sm text-violet-700 dark:text-violet-400">
+                    {mockPlan === "Free Tier"
+                      ? "Get 5 stores, 5,000 AI calls/month, priority support, and advanced analytics."
+                      : "Unlimited stores, unlimited AI calls, dedicated account manager, custom SLAs, and SSO."}
+                  </p>
+                  <div className="flex flex-wrap gap-3">
+                    <button
+                      type="button"
+                      onClick={() => showToast("Contact sales@example.com to upgrade your plan.", true)}
+                      className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-violet-700"
+                    >
+                      <Zap className="h-4 w-4" />
+                      Upgrade Plan
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => showToast("Sales team will reach out within 24 hours.", true)}
+                      className="inline-flex items-center gap-2 rounded-xl border border-violet-300 bg-white px-5 py-2.5 text-sm font-semibold text-violet-700 transition hover:bg-violet-50 dark:border-violet-600/50 dark:bg-transparent dark:text-violet-300"
+                    >
+                      Talk to Sales
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {mockPlan === "Enterprise" && (
+                <div className="flex items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 px-5 py-4 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                  <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                  <div>
+                    <p className="text-sm font-bold text-emerald-800 dark:text-emerald-200">
+                      You&apos;re on Enterprise — unlimited everything.
+                    </p>
+                    <p className="text-xs text-emerald-700 dark:text-emerald-400">
+                      No quotas, dedicated infrastructure, and a named account manager.
+                    </p>
+                  </div>
+                </div>
+              )}
             </div>
           )}
+
+          {/* ══════════════ TEAM & ROLES ══════════════ */}
+          {activeTab === "team" && (
+            <div className="space-y-6">
+              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-5">
+                <div>
+                  <h2 className="text-base font-bold">Team &amp; Roles</h2>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Control which role has access to admin and warehouse features.
+                    Role is stored locally in this browser session.
+                  </p>
+                </div>
+
+                <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 flex items-center gap-3">
+                  <UserCog className="h-5 w-5 text-violet-600 dark:text-violet-400 shrink-0" />
+                  <div>
+                    <p className="text-sm font-semibold">Current Session Role</p>
+                    <p className="text-xs text-muted-foreground capitalize">{role}</p>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  {(
+                    [
+                      { r: "admin",     label: "Admin",    desc: "Full access — settings, all actions, user management." },
+                      { r: "warehouse", label: "Warehouse", desc: "Scan, pack, and process returns. No settings access." },
+                      { r: "viewer",    label: "Viewer",    desc: "Read-only dashboard access. No mutations allowed." },
+                    ] as { r: string; label: string; desc: string }[]
+                  ).map(({ r, label, desc }) => (
+                    <div
+                      key={r}
+                      className={[
+                        "flex items-start gap-3 rounded-xl border p-4 transition",
+                        role === r
+                          ? "border-violet-300 bg-violet-50 dark:border-violet-600/50 dark:bg-violet-950/30"
+                          : "border-border bg-background",
+                      ].join(" ")}
+                    >
+                      <div
+                        className={`mt-0.5 h-2.5 w-2.5 shrink-0 rounded-full ${
+                          role === r ? "bg-violet-500" : "bg-slate-300 dark:bg-slate-600"
+                        }`}
+                      />
+                      <div>
+                        <p className="text-sm font-semibold">{label}</p>
+                        <p className="text-xs text-muted-foreground">{desc}</p>
+                      </div>
+                      {role === r && (
+                        <span className="ml-auto inline-flex items-center gap-1 rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-bold text-violet-700 dark:bg-violet-900/40 dark:text-violet-300">
+                          Active
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                <div className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 dark:border-sky-700/50 dark:bg-sky-950/40">
+                  <p className="text-xs font-semibold text-sky-700 dark:text-sky-300">Role Switching (Dev / Demo)</p>
+                  <p className="mt-1 text-xs text-sky-600 dark:text-sky-400">
+                    In production, roles are enforced server-side via Supabase RLS policies.
+                    Use the role switcher in the top header to change roles for testing.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
         </div>
-      )}
-
-      {/* ════════════════ HARDWARE & DEVICES TAB ════════════════ */}
-      {activeTab === "hardware" && (
-        <form onSubmit={handleSaveHardware} className="mt-6 space-y-6">
-          <div className="space-y-6 rounded-2xl border border-border bg-card p-6 shadow-sm">
-
-            {/* Barcode Input Mode */}
-            <div>
-              <div className="mb-2 flex items-center gap-2">
-                <ScanLine className="h-4 w-4 text-sky-600 dark:text-sky-400" />
-                <label className="text-sm font-semibold">Barcode Input Mode</label>
-              </div>
-              <p className={HINT_CLS}>
-                Physical / keyboard-wedge scanners (e.g. Netum C750) emulate a keyboard — they type
-                characters very fast and press Enter. <strong>No camera window opens.</strong>{" "}
-                The app detects rapid keystrokes and fills the focused input automatically.
-                Select &quot;Web / Camera&quot; only if you use a browser-based QR camera scanner.
-              </p>
-              <select
-                value={barcodeMode}
-                onChange={(e) => setBarcodeMode(e.target.value as BarcodeMode)}
-                className={SELECT_CLS}
-              >
-                <option value="physical">Physical Scanner  (Keyboard Emulation — Netum, Honeywell, Zebra…)</option>
-                <option value="camera">Web / Camera Scanner</option>
-              </select>
-              {barcodeMode === "physical" && (
-                <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                  Keyboard-wedge mode — &quot;Scan&quot; buttons show a ready indicator; no camera window.
-                  Rapid keystrokes (&lt;30 ms apart ending in Enter) are captured globally.
-                </p>
-              )}
-              {barcodeMode === "camera" && (
-                <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-sky-600 dark:text-sky-400">
-                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                  Camera mode — &quot;Scan&quot; buttons open a live QR/barcode camera modal.
-                </p>
-              )}
-            </div>
-
-            {/* Default Label Printer */}
-            <div>
-              <div className="mb-2 flex items-center gap-2">
-                <Printer className="h-4 w-4 text-sky-600 dark:text-sky-400" />
-                <label className="text-sm font-semibold">Default Label Printer</label>
-              </div>
-              <p className={HINT_CLS}>Select the default printer for shipping and return labels.</p>
-              <select
-                value={labelPrinter}
-                onChange={(e) => setLabelPrinter(e.target.value as LabelPrinter)}
-                className={SELECT_CLS}
-              >
-                <option value="system">System Default</option>
-                <option value="zebra_zd410">Zebra ZD410</option>
-                <option value="zebra_zd620">Zebra ZD620</option>
-                <option value="brother_ql">Brother QL Series</option>
-              </select>
-            </div>
-
-            {/* Info card */}
-            <div className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 dark:border-sky-700/50 dark:bg-sky-950/40">
-              <p className="text-xs font-semibold text-sky-700 dark:text-sky-300">
-                Physical Scanner Hook  (usePhysicalScanner)
-              </p>
-              <p className="mt-1 text-xs text-sky-600 dark:text-sky-400">
-                A global <code className="rounded bg-sky-100 px-1 dark:bg-sky-900">keydown</code> listener
-                measures inter-keystroke timing. When characters arrive in &lt;30 ms bursts followed by
-                Enter, the string is captured as a barcode and broadcast to listening inputs — even
-                when no input is focused. Wired into the <strong>Item</strong> and <strong>Package</strong> forms.
-              </p>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap gap-2">
-            <button
-              type="submit"
-              className="inline-flex min-w-[160px] flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white transition hover:bg-sky-700"
-            >
-              <Save className="h-4 w-4" />
-              Save Hardware Settings
-            </button>
-          </div>
-
-          {hwSaved && (
-            <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">Saved.</p>
-          )}
-        </form>
-      )}
-
-      <p className="mt-6 text-center text-xs text-muted-foreground">
-        <Link
-          href="/settings/adapters"
-          className="font-medium text-sky-600 underline hover:text-sky-700 dark:text-sky-400"
-        >
-          Marketplace adapters
-        </Link>
-      </p>
+        {/* end right content */}
+      </div>
+      {/* end layout */}
     </div>
   );
 }

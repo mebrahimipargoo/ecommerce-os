@@ -7,14 +7,16 @@ export const GEMINI_API_KEY_STORAGE_KEY  = "ecommerce_os_gemini_api_key";
 export const AI_PROVIDER_STORAGE_KEY     = "ecommerce_os_ai_provider";
 export const AI_BASE_URL_STORAGE_KEY     = "ecommerce_os_ai_base_url";
 export const AI_UNIFIED_KEY_STORAGE_KEY  = "ecommerce_os_ai_key";
-export const BARCODE_MODE_STORAGE_KEY    = "ecommerce_os_barcode_mode";
-export const LABEL_PRINTER_STORAGE_KEY   = "ecommerce_os_label_printer";
+export const BARCODE_MODE_STORAGE_KEY          = "ecommerce_os_barcode_mode";
+export const LABEL_PRINTER_STORAGE_KEY         = "ecommerce_os_label_printer";
+export const DEFAULT_PRODUCT_SOURCE_STORAGE_KEY = "ecommerce_os_default_product_source";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-export type AIProvider   = "openai" | "gemini" | "custom";
-export type BarcodeMode  = "physical" | "camera";
-export type LabelPrinter = "system" | "zebra_zd410" | "zebra_zd620" | "brother_ql";
+export type AIProvider           = "openai" | "gemini" | "custom";
+export type BarcodeMode          = "physical" | "camera";
+export type LabelPrinter         = "system" | "zebra_zd410" | "zebra_zd620" | "brother_ql";
+export type DefaultProductSource = "amazon" | "walmart" | "target" | "unknown";
 
 export const DEFAULT_BASE_URLS: Record<AIProvider, string> = {
   openai: "https://api.openai.com/v1",
@@ -114,6 +116,17 @@ export function setLabelPrinterInStorage(printer: LabelPrinter): void {
   localStorage.setItem(LABEL_PRINTER_STORAGE_KEY, printer);
 }
 
+// ── General: Default product source ──────────────────────────────────────────
+
+export function getDefaultProductSourceFromStorage(): DefaultProductSource {
+  if (typeof window === "undefined") return "unknown";
+  return (localStorage.getItem(DEFAULT_PRODUCT_SOURCE_STORAGE_KEY) as DefaultProductSource) || "unknown";
+}
+
+export function setDefaultProductSourceInStorage(source: DefaultProductSource): void {
+  localStorage.setItem(DEFAULT_PRODUCT_SOURCE_STORAGE_KEY, source);
+}
+
 // ── Multi-API configurations ──────────────────────────────────────────────────
 
 export const AI_CONFIGS_STORAGE_KEY        = "ecommerce_os_ai_configs";
@@ -177,6 +190,25 @@ export function getAIRoleAssignmentsFromStorage(): AIRoleAssignments {
 
 export function setAIRoleAssignmentsInStorage(assignments: AIRoleAssignments): void {
   localStorage.setItem(AI_ROLE_ASSIGNMENTS_STORAGE_KEY, JSON.stringify(assignments));
+}
+
+// ── Default Store ID ──────────────────────────────────────────────────────────
+// Saves the UUID of the user's chosen fallback store from the stores table.
+// Used when no parent package is selected and barcode prefix doesn't match.
+
+export const DEFAULT_STORE_ID_STORAGE_KEY = "ecommerce_os_default_store_id";
+
+export function getDefaultStoreIdFromStorage(): string {
+  if (typeof window === "undefined") return "";
+  return localStorage.getItem(DEFAULT_STORE_ID_STORAGE_KEY) ?? "";
+}
+
+export function setDefaultStoreIdInStorage(id: string): void {
+  if (!id) {
+    localStorage.removeItem(DEFAULT_STORE_ID_STORAGE_KEY);
+  } else {
+    localStorage.setItem(DEFAULT_STORE_ID_STORAGE_KEY, id);
+  }
 }
 
 /** Returns the config that should be used for a given role, respecting the global override. */
