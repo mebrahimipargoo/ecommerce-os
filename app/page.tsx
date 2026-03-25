@@ -1,45 +1,28 @@
-"use client";
-import React, { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import {
-  LayoutDashboard,
-  RotateCcw,
-  ShieldAlert,
-  Settings,
-  Bell,
   Search,
-  ChevronDown,
-  Store,
-  Building2,
+  TrendingUp,
+  Clock,
+  AlertTriangle,
+  FileText,
 } from "lucide-react";
+import { supabaseServer } from "../lib/supabase-server";
+import { getReturnsAnalyticsData } from "./returns/actions";
+import { DashboardAnalytics } from "../components/DashboardAnalytics";
 
-import { supabase } from "../src/lib/supabase";
-
-type ClaimStatus = "pending" | "recovered" | "suspicious";
+const DEFAULT_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001";
 
 type ClaimRow = {
   id: string;
-  amount: number | string;
-  status: ClaimStatus;
+  amount: number;
+  status: "pending" | "recovered" | "suspicious";
+  claim_type: string | null;
+  marketplace_provider: string | null;
   created_at: string;
-};
-
-type ClaimsSummary = {
-  totalRecoverable: number;
-  pendingSlas: number;
-  suspiciousReturns: number;
-};
-
-const initialSummary: ClaimsSummary = {
-  totalRecoverable: 0,
-  pendingSlas: 0,
-  suspiciousReturns: 0,
+  amazon_order_id: string | null;
 };
 
 function formatCurrency(value: number): string {
-  if (!Number.isFinite(value)) {
-    return "$0";
-  }
-
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
@@ -47,269 +30,124 @@ function formatCurrency(value: number): string {
   }).format(value);
 }
 
-function toNumber(value: number | string): number {
-  if (typeof value === "number") {
-    return value;
-  }
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
+function formatDate(iso: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(iso));
 }
 
-async function fetchClaimsSummary(): Promise<ClaimsSummary> {
-  const { data, error } = await supabase
-    .from("claims")
-    .select("id, amount, status, created_at");
-  console.log("Fetched data:", data);
-
-  if (error) {
-    throw new Error(error.message);
-  }
-
-  const rows = (data ?? []) as ClaimRow[];
-
-  let totalRecoverable = 0;
-  let pendingSlas = 0;
-  let suspiciousReturns = 0;
-
-  for (const row of rows) {
-    if (row.status === "recovered") {
-      totalRecoverable += toNumber(row.amount);
-    } else if (row.status === "pending") {
-      pendingSlas += 1;
-    } else if (row.status === "suspicious") {
-      suspiciousReturns += 1;
-    }
-  }
-
-  return { totalRecoverable, pendingSlas, suspiciousReturns };
+function providerLabel(raw: string | null): string {
+  if (!raw) return "—";
+  const map: Record<string, string> = {
+    amazon_sp_api: "Amazon",
+    walmart_api: "Walmart",
+    ebay_api: "eBay",
+  };
+  return map[raw] ?? raw;
 }
 
-const sidebarItems = [
-  {
-    label: "Dashboard",
-    icon: LayoutDashboard,
-    active: true,
-  },
-  {
-    label: "Returns Intelligence",
-    icon: RotateCcw,
-    active: false,
-  },
-  {
-    label: "Claim Engine",
-    icon: ShieldAlert,
-    active: false,
-  },
-];
-const adapterItems = [
-  {
-    label: "Amazon",
-    icon: Store,
-  },
-  {
-    label: "Walmart",
-    icon: Store,
-  },
-  {
-    label: "Costco",
-    icon: Building2,
-  },
-];
-const footerItems = [
-  {
-    label: "Settings",
-    icon: Settings,
-  },
-];
-export default function Page() {
-  const [summary, setSummary] = useState<ClaimsSummary>(initialSummary);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+const STATUS_STYLES: Record<string, string> = {
+  pending:
+    "border-amber-700/60 bg-amber-950/50 text-amber-300",
+  recovered:
+    "border-emerald-700/60 bg-emerald-950/50 text-emerald-300",
+  suspicious:
+    "border-rose-700/60 bg-rose-950/50 text-rose-300",
+};
 
-  useEffect(() => {
-    let cancelled = false;
 
-    async function run() {
-      try {
-        setIsLoading(true);
-        setErrorMessage(null);
-        const result = await fetchClaimsSummary();
-        if (!cancelled) {
-          setSummary(result);
-        }
-      } catch (error) {
-        if (cancelled) {
-          return;
-        }
-        const message =
-          error instanceof Error ? error.message : "Failed to load claims.";
-        setErrorMessage(message);
-        setSummary(initialSummary);
-      } finally {
-        if (!cancelled) {
-          setIsLoading(false);
-        }
-      }
-    }
+export default async function Page() {
+  let claims: ClaimRow[] = [];
+  let fetchError: string | null = null;
+  const analyticsRes = await getReturnsAnalyticsData();
+  const analyticsData = analyticsRes.ok ? analyticsRes.data ?? null : null;
 
-    void run();
+  try {
+    const { data, error } = await supabaseServer
+      .from("claims")
+      .select(
+        "id, amount, status, claim_type, marketplace_provider, created_at, amazon_order_id"
+      )
+      .eq("organization_id", DEFAULT_ORGANIZATION_ID)
+      .order("created_at", { ascending: false })
+      .limit(50);
 
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    if (error) throw new Error(error.message);
+    claims = (data ?? []) as ClaimRow[];
+  } catch (err) {
+    fetchError = err instanceof Error ? err.message : "Failed to load claims.";
+  }
 
-  const kpis = useMemo(
-    () => [
-      {
-        label: "Total Recoverable",
-        value: isLoading
-          ? "Syncing..."
-          : formatCurrency(summary.totalRecoverable),
-        change: isLoading ? "Loading" : "Live from claims",
-        trend: "Sum of recovered claim amounts",
-        accentClass:
-          "from-sky-500/10 via-sky-500/5 to-sky-500/0 border-sky-500/30",
-        pillClass: "bg-sky-500/10 text-sky-500 border-sky-500/30",
-      },
-      {
-        label: "Pending SLAs",
-        value: isLoading ? "—" : String(summary.pendingSlas),
-        change: isLoading ? "Loading" : "Open pending claims",
-        trend: "Claims currently in pending status",
-        accentClass:
-          "from-amber-500/10 via-amber-500/5 to-amber-500/0 border-amber-500/30",
-        pillClass: "bg-amber-500/10 text-amber-500 border-amber-500/30",
-      },
-      {
-        label: "Suspicious Returns",
-        value: isLoading ? "—" : String(summary.suspiciousReturns),
-        change: isLoading ? "Loading" : "Flagged for review",
-        trend: "Claims marked as suspicious",
-        accentClass:
-          "from-rose-500/10 via-rose-500/5 to-rose-500/0 border-rose-500/30",
-        pillClass: "bg-rose-500/10 text-rose-500 border-rose-500/30",
-      },
-    ],
-    [isLoading, summary.pendingSlas, summary.suspiciousReturns, summary.totalRecoverable]
-  );
+  // --- Real KPI calculations ---
+  const totalRecovered = claims
+    .filter((c) => c.status === "recovered")
+    .reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
+
+  const pendingCount = claims.filter((c) => c.status === "pending").length;
+  const suspiciousCount = claims.filter((c) => c.status === "suspicious").length;
+  const totalCount = claims.length;
+
+  const recentClaims = claims.slice(0, 10);
+
+  const kpis = [
+    {
+      label: "Total Recovered",
+      value: formatCurrency(totalRecovered),
+      change: "Recovered claims",
+      trend: "Sum of recovered claim amounts",
+      icon: TrendingUp,
+      accentClass: "from-sky-500/10 via-sky-500/5 to-sky-500/0 border-sky-500/30",
+      pillClass: "bg-sky-500/10 text-sky-400 border-sky-500/30",
+    },
+    {
+      label: "Pending Claims",
+      value: String(pendingCount),
+      change: "Awaiting action",
+      trend: "Claims currently in pending status",
+      icon: Clock,
+      accentClass: "from-amber-500/10 via-amber-500/5 to-amber-500/0 border-amber-500/30",
+      pillClass: "bg-amber-500/10 text-amber-400 border-amber-500/30",
+    },
+    {
+      label: "Suspicious Returns",
+      value: String(suspiciousCount),
+      change: "Flagged for review",
+      trend: "Claims marked as suspicious",
+      icon: AlertTriangle,
+      accentClass: "from-rose-500/10 via-rose-500/5 to-rose-500/0 border-rose-500/30",
+      pillClass: "bg-rose-500/10 text-rose-400 border-rose-500/30",
+    },
+  ];
 
   return (
-    <div className="flex min-h-screen bg-slate-950 text-slate-50">
-      {/* Sidebar */}
-      <aside className="flex w-64 flex-col border-r border-slate-800 bg-slate-950/70 backdrop-blur-xl">
-        <div className="flex h-16 items-center gap-2 border-b border-slate-800 px-4">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-sky-500/10 ring-1 ring-sky-500/40">
-            <span className="text-lg font-semibold text-sky-400">OS</span>
-          </div>
-          <div className="flex flex-col">
-            <span className="text-sm font-semibold tracking-tight text-slate-50">
-              E‑commerce OS
-            </span>
-            <span className="text-xs text-slate-400">
-              B2B Returns & Recovery
-            </span>
-          </div>
-        </div>
-        <nav className="flex-1 space-y-6 px-3 py-4">
-          <div className="space-y-1">
-            <p className="px-2 text-xs font-medium uppercase tracking-wide text-slate-500">
-              Core
-            </p>
-            {sidebarItems.map((item) => (
-              <button
-                key={item.label}
-                className={[
-                  "group flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm font-medium transition",
-                  item.active
-                    ? "bg-slate-900 text-slate-50 ring-1 ring-slate-700 shadow-[0_0_0_1px_rgba(15,23,42,0.9)]"
-                    : "text-slate-400 hover:bg-slate-900/60 hover:text-slate-100 hover:ring-1 hover:ring-slate-800",
-                ].join(" ")}
-              >
-                <item.icon className="h-4 w-4 text-slate-400 group-hover:text-slate-100" />
-                <span>{item.label}</span>
-              </button>
-            ))}
-          </div>
-          <div className="space-y-1">
-            <p className="px-2 text-xs font-medium uppercase tracking-wide text-slate-500">
-              Adapters
-            </p>
-            {adapterItems.map((item) => (
-              <button
-                key={item.label}
-                className="group flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm font-medium text-slate-400 transition hover:bg-slate-900/60 hover:text-slate-100 hover:ring-1 hover:ring-slate-800"
-              >
-                <item.icon className="h-4 w-4 text-slate-500 group-hover:text-slate-100" />
-                <span>{item.label}</span>
-              </button>
-            ))}
-          </div>
-        </nav>
-        <div className="border-t border-slate-800 px-3 py-3">
-          {footerItems.map((item) => (
-            <button
-              key={item.label}
-              className="group flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm font-medium text-slate-400 transition hover:bg-slate-900/80 hover:text-slate-100 hover:ring-1 hover:ring-slate-800"
-            >
-              <item.icon className="h-4 w-4 text-slate-500 group-hover:text-slate-100" />
-              <span>{item.label}</span>
-            </button>
-          ))}
-        </div>
-      </aside>
-      {/* Main Column */}
-      <div className="flex min-w-0 flex-1 flex-col">
+    <>
         {/* Header */}
-        <header className="flex h-16 items-center justify-between border-b border-slate-800 bg-slate-950/70 px-6 backdrop-blur-xl">
+        <header className="flex h-16 flex-col gap-2 border-b border-slate-200 bg-white/80 px-4 backdrop-blur-xl dark:border-slate-800 dark:bg-slate-950/70 sm:flex-row sm:items-center sm:justify-between sm:gap-4 md:px-6">
           <div className="flex flex-col">
-            <h1 className="text-sm font-semibold tracking-tight text-slate-50">
-              Dashboard
-            </h1>
-            <p className="text-xs text-slate-400">
-              Unified control center for returns, claims, and adapters.
-            </p>
+            <h1 className="text-base font-semibold tracking-tight text-slate-900 dark:text-slate-50 sm:text-sm">Dashboard</h1>
+            <p className="text-xs text-muted-foreground">Unified control center for returns, claims, and adapters.</p>
           </div>
-          <div className="flex items-center gap-4">
-            {/* Global Search */}
-            <div className="relative hidden w-80 items-center md:flex">
-              <Search className="pointer-events-none absolute left-3 h-4 w-4 text-slate-500" />
+          <div className="flex flex-wrap items-center gap-2 sm:gap-4">
+            <div className="relative hidden w-72 items-center md:flex">
+              <Search className="pointer-events-none absolute left-3 h-4 w-4 text-muted-foreground" />
               <input
                 type="search"
-                placeholder="Search orders, RMAs, claims, SKUs..."
-                className="h-9 w-full rounded-lg border border-slate-800 bg-slate-950/70 pl-9 pr-3 text-xs text-slate-100 placeholder:text-slate-500 shadow-sm outline-none ring-0 transition focus:border-sky-500/60 focus:ring-1 focus:ring-sky-500/60"
+                placeholder="Search orders, RMAs, claims…"
+                className="h-9 w-full rounded-lg border border-border bg-muted pl-9 pr-3 text-xs text-foreground placeholder:text-muted-foreground shadow-sm outline-none ring-0 transition focus:border-primary focus:ring-1 focus:ring-ring"
               />
-              <span className="pointer-events-none absolute right-2 hidden items-center gap-1 rounded border border-slate-800 bg-slate-900/60 px-1.5 py-0.5 text-[10px] font-medium text-slate-400 md:inline-flex">
-                ⌘K
-              </span>
             </div>
-            {/* Notification Bell */}
-            <button className="relative flex h-9 w-9 items-center justify-center rounded-full border border-slate-800 bg-slate-950/70 text-slate-300 shadow-sm transition hover:border-sky-500/60 hover:text-sky-400">
-              <Bell className="h-4 w-4" />
-              <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-rose-500 ring-2 ring-slate-950" />
-            </button>
-            {/* User Avatar */}
-            <button className="flex items-center gap-2 rounded-full border border-slate-800 bg-slate-950/70 px-2 py-1.5 text-xs text-slate-200 shadow-sm transition hover:border-sky-500/60">
-              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-gradient-to-tr from-sky-500 to-blue-500 text-[11px] font-semibold text-white">
-                J
-              </div>
-              <div className="hidden flex-col items-start leading-tight sm:flex">
-                <span className="text-xs font-medium text-slate-50">
-                  Jennifer Lee
-                </span>
-                <span className="text-[10px] text-slate-400">
-                  Operations Director
-                </span>
-              </div>
-              <ChevronDown className="hidden h-3 w-3 text-slate-500 sm:block" />
-            </button>
           </div>
         </header>
+
         {/* Main Content */}
-        <main className="flex-1 overflow-y-auto bg-gradient-to-br from-slate-950 via-slate-950 to-slate-900">
-          <div className="mx-auto flex max-w-6xl flex-col gap-6 px-4 py-6 lg:px-8">
+        <main className="flex-1 overflow-y-auto overflow-x-hidden bg-slate-50 dark:bg-gradient-to-br dark:from-slate-950 dark:via-slate-950 dark:to-slate-900">
+          <div className="mx-auto flex w-full max-w-[100vw] flex-col gap-6 px-4 py-6 sm:px-4 lg:px-8">
+
             {/* KPI Cards */}
-            <section className="grid gap-4 md:grid-cols-3">
+            <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 sm:gap-6 lg:grid-cols-3">
               {kpis.map((kpi) => (
                 <div
                   key={kpi.label}
@@ -318,151 +156,178 @@ export default function Page() {
                   <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-slate-100/2 via-slate-100/0 to-slate-100/0" />
                   <div className="relative flex items-start justify-between gap-3">
                     <div className="space-y-2">
-                      <p className="text-xs font-medium uppercase tracking-wide text-slate-400">
-                        {kpi.label}
-                      </p>
-                      <div className="flex items-baseline gap-1">
-                        <span
-                          className={`text-2xl font-semibold tracking-tight ${
-                            isLoading ? "text-slate-500" : "text-slate-50"
-                          }`}
-                        >
-                          {kpi.value}
-                        </span>
-                      </div>
+                      <p className="text-xs font-medium uppercase tracking-wide text-slate-400">{kpi.label}</p>
+                      <p className="text-2xl font-semibold tracking-tight text-slate-50">{kpi.value}</p>
                     </div>
-                    <span
-                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[10px] font-medium ${kpi.pillClass}`}
-                    >
+                    <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[10px] font-medium ${kpi.pillClass}`}>
                       <span className="h-1.5 w-1.5 rounded-full bg-current" />
                       {kpi.change}
                     </span>
                   </div>
-                  <p className="relative mt-3 text-[11px] text-slate-400">
-                    {kpi.trend}
-                  </p>
-                  {isLoading && (
-                    <div className="mt-3 h-1.5 w-20 rounded-full bg-slate-800/80">
-                      <div className="h-1.5 w-1/2 animate-pulse rounded-full bg-slate-600/80" />
-                    </div>
-                  )}
+                  <p className="relative mt-3 text-[11px] text-slate-400">{kpi.trend}</p>
                 </div>
               ))}
             </section>
 
-            {errorMessage && (
+            <DashboardAnalytics data={analyticsData} />
+
+            {/* Fetch error banner */}
+            {fetchError && (
               <div className="rounded-2xl border border-rose-700/60 bg-rose-950/40 px-4 py-3 text-xs text-rose-100">
-                <span className="font-semibold">Data warning:</span>{" "}
-                {errorMessage}
+                <span className="font-semibold">Data warning:</span> {fetchError}
               </div>
             )}
+
             {/* Secondary Content */}
-            <section className="grid gap-4 lg:grid-cols-3">
-              {/* Left: Activity Snapshot */}
-              <div className="col-span-2 overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/70 shadow-sm">
-                <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+            <section className="flex flex-col gap-4 lg:grid lg:grid-cols-3">
+              {/* Left: Returns Pipeline */}
+              <div className="min-h-[300px] w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950/70 lg:col-span-2">
+                <div className="flex flex-col gap-2 border-b border-slate-200 px-4 py-3 dark:border-slate-800 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <p className="text-xs font-semibold tracking-tight text-slate-50">
-                      Returns Pipeline
-                    </p>
-                    <p className="text-[11px] text-slate-400">
-                      Live view across marketplaces and carriers.
-                    </p>
+                    <p className="text-xs font-semibold tracking-tight text-slate-900 dark:text-slate-50">Returns Pipeline</p>
+                    <p className="text-[11px] text-muted-foreground">Live view across marketplaces and carriers.</p>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <button className="rounded-full bg-slate-900 px-2.5 py-1.5 text-[11px] font-medium text-slate-200 ring-1 ring-slate-700">
-                      Last 30 days
-                    </button>
-                    <button className="rounded-full bg-transparent px-2.5 py-1.5 text-[11px] font-medium text-slate-400 ring-1 ring-slate-800 hover:text-slate-100">
-                      Custom
-                    </button>
-                  </div>
+                  <span className="w-fit rounded-full bg-slate-100 px-2.5 py-1.5 text-[11px] font-medium text-slate-600 ring-1 ring-slate-200 dark:bg-slate-900 dark:text-slate-200 dark:ring-slate-700">
+                    All time
+                  </span>
                 </div>
-                <div className="grid gap-4 px-4 py-4 md:grid-cols-3">
+                <div className="grid w-full min-w-0 grid-cols-1 gap-4 px-4 py-4 sm:grid-cols-2 md:grid-cols-4">
                   <div className="space-y-1">
-                    <p className="text-xs text-slate-400">Open RMAs</p>
-                    <p className="text-lg font-semibold text-slate-50">196</p>
-                    <p className="text-[11px] text-emerald-400">
-                      72% within SLA
-                    </p>
+                    <p className="text-xs text-muted-foreground">Total Claims</p>
+                    <p className="text-lg font-semibold text-slate-900 dark:text-slate-50">{totalCount}</p>
+                    <p className="text-[11px] text-muted-foreground">All statuses</p>
                   </div>
                   <div className="space-y-1">
-                    <p className="text-xs text-slate-400">Claims In Flight</p>
-                    <p className="text-lg font-semibold text-slate-50">84</p>
-                    <p className="text-[11px] text-sky-400">
-                      54% with carrier evidence
-                    </p>
+                    <p className="text-xs text-muted-foreground">Pending</p>
+                    <p className="text-lg font-semibold text-amber-600 dark:text-amber-400">{pendingCount}</p>
+                    <p className="text-[11px] text-amber-600/70 dark:text-amber-500/70">Awaiting action</p>
                   </div>
                   <div className="space-y-1">
-                    <p className="text-xs text-slate-400">High Risk</p>
-                    <p className="text-lg font-semibold text-slate-50">23</p>
-                    <p className="text-[11px] text-rose-400">
-                      Pattern anomalies detected
+                    <p className="text-xs text-muted-foreground">Recovered</p>
+                    <p className="text-lg font-semibold text-emerald-600 dark:text-emerald-400">
+                      {claims.filter((c) => c.status === "recovered").length}
                     </p>
+                    <p className="text-[11px] text-emerald-600/70 dark:text-emerald-500/70">{formatCurrency(totalRecovered)} total</p>
+                  </div>
+                  <div className="space-y-1">
+                    <p className="text-xs text-muted-foreground">Suspicious</p>
+                    <p className="text-lg font-semibold text-rose-600 dark:text-rose-400">{suspiciousCount}</p>
+                    <p className="text-[11px] text-rose-600/70 dark:text-rose-500/70">Pattern anomalies</p>
                   </div>
                 </div>
               </div>
+
               {/* Right: SLA Overview */}
-              <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-950/70 shadow-sm">
-                <div className="border-b border-slate-800 px-4 py-3">
-                  <p className="text-xs font-semibold tracking-tight text-slate-50">
-                    SLA Overview
-                  </p>
-                  <p className="text-[11px] text-slate-400">
-                    Where your attention is required today.
-                  </p>
+              <div className="min-h-[300px] w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
+                <div className="border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                  <p className="text-xs font-semibold tracking-tight text-slate-900 dark:text-slate-50">SLA Overview</p>
+                  <p className="text-[11px] text-muted-foreground">Where your attention is required today.</p>
                 </div>
                 <div className="space-y-3 px-4 py-4">
-                  <div className="flex items-center justify-between rounded-lg bg-slate-900/80 px-3 py-2">
+                  <div className="flex items-center justify-between rounded-lg bg-slate-100 px-3 py-2 dark:bg-slate-900/80">
                     <div>
-                      <p className="text-xs font-medium text-slate-50">
-                        Marketplace responses
-                      </p>
-                      <p className="text-[11px] text-slate-400">
-                        18 tickets require response in the next 4 hours.
+                      <p className="text-xs font-medium text-slate-900 dark:text-slate-50">Marketplace responses</p>
+                      <p className="text-[11px] text-muted-foreground">
+                        {pendingCount} ticket{pendingCount !== 1 ? "s" : ""} require response.
                       </p>
                     </div>
-                    <span className="text-xs font-semibold text-amber-400">
-                      4h
-                    </span>
+                    <span className="shrink-0 text-xs font-semibold text-amber-600 dark:text-amber-400">4h</span>
                   </div>
-                  <div className="flex items-center justify-between rounded-lg bg-slate-900/60 px-3 py-2">
+                  <div className="flex flex-col gap-2 rounded-lg bg-slate-100/70 px-3 py-2 dark:bg-slate-900/60 sm:flex-row sm:items-center sm:justify-between">
                     <div>
-                      <p className="text-xs font-medium text-slate-50">
-                        Carrier evidence
-                      </p>
-                      <p className="text-[11px] text-slate-400">
-                        9 shipments awaiting proof-of-delivery uploads.
-                      </p>
+                      <p className="text-xs font-medium text-slate-900 dark:text-slate-50">Carrier evidence</p>
+                      <p className="text-[11px] text-muted-foreground">9 shipments awaiting proof-of-delivery uploads.</p>
                     </div>
-                    <span className="text-xs font-semibold text-sky-400">
-                      Today
-                    </span>
+                    <span className="shrink-0 text-xs font-semibold text-sky-600 dark:text-sky-400">Today</span>
                   </div>
-                  <div className="flex items-center justify-between rounded-lg bg-slate-900/60 px-3 py-2">
+                  <div className="flex flex-col gap-2 rounded-lg bg-slate-100/70 px-3 py-2 dark:bg-slate-900/60 sm:flex-row sm:items-center sm:justify-between">
                     <div>
-                      <p className="text-xs font-medium text-slate-50">
-                        Policy breaches
-                      </p>
-                      <p className="text-[11px] text-slate-400">
-                        3 high-value returns outside policy guidelines.
+                      <p className="text-xs font-medium text-slate-900 dark:text-slate-50">Suspicious returns</p>
+                      <p className="text-[11px] text-muted-foreground">
+                        {suspiciousCount} high-value return{suspiciousCount !== 1 ? "s" : ""} flagged for review.
                       </p>
                     </div>
-                    <span className="text-xs font-semibold text-rose-400">
-                      Review
-                    </span>
+                    <span className="shrink-0 text-xs font-semibold text-rose-600 dark:text-rose-400">Review</span>
                   </div>
                 </div>
               </div>
             </section>
-            {/* Bottom Placeholder Section for Future Widgets */}
-            <section className="rounded-2xl border border-dashed border-slate-800/80 bg-slate-950/50 px-4 py-4 text-xs text-slate-500">
-              This area can host charts, cohort analysis, adapter health, or
-              custom widgets tailored to your B2B stack.
+
+            {/* Recent Claims Table */}
+            <section className="w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                <div>
+                  <p className="text-xs font-semibold tracking-tight text-slate-900 dark:text-slate-50">Recent Claims</p>
+                  <p className="text-[11px] text-muted-foreground">Latest {recentClaims.length} claims synced from connected marketplaces.</p>
+                </div>
+                <FileText className="h-4 w-4 text-muted-foreground" />
+              </div>
+
+              {recentClaims.length === 0 ? (
+                <div className="flex flex-col items-center justify-center gap-3 px-6 py-12 text-center">
+                  <div className="flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
+                    <FileText className="h-5 w-5 text-muted-foreground" />
+                  </div>
+                  <p className="text-sm font-medium text-slate-700 dark:text-slate-300">No claims yet</p>
+                  <p className="max-w-xs text-xs text-slate-500">
+                    Connect a marketplace adapter and click &ldquo;Sync Claims&rdquo; to pull in your first claims.
+                  </p>
+                  <Link
+                    href="/settings/adapters"
+                    className="mt-1 inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-100 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-slate-600 dark:hover:text-white"
+                  >
+                    Go to Adapters
+                  </Link>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[600px] text-sm">
+                    <thead>
+                      <tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-900/40">
+                        <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Provider</th>
+                        <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Claim Type</th>
+                        <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Order / Ref</th>
+                        <th className="px-4 py-2.5 text-right text-[11px] font-medium uppercase tracking-wide text-slate-500">Amount</th>
+                        <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Status</th>
+                        <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Date</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
+                      {recentClaims.map((claim) => (
+                        <tr key={claim.id} className="transition hover:bg-accent hover:text-accent-foreground/40">
+                          <td className="px-4 py-3 text-xs font-medium text-slate-700 dark:text-slate-200">
+                            {providerLabel(claim.marketplace_provider)}
+                          </td>
+                          <td className="px-4 py-3 text-xs text-slate-600 dark:text-slate-300">
+                            {claim.claim_type ?? "—"}
+                          </td>
+                          <td className="px-4 py-3 text-xs font-mono text-muted-foreground">
+                            {claim.amazon_order_id ?? "—"}
+                          </td>
+                          <td className="px-4 py-3 text-right text-xs font-semibold text-slate-900 dark:text-slate-50">
+                            {formatCurrency(Number(claim.amount) || 0)}
+                          </td>
+                          <td className="px-4 py-3">
+                            <span
+                              className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${STATUS_STYLES[claim.status] ?? STATUS_STYLES.pending}`}
+                            >
+                              <span className="h-1.5 w-1.5 rounded-full bg-current" />
+                              {claim.status.charAt(0).toUpperCase() + claim.status.slice(1)}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-xs text-muted-foreground">
+                            {formatDate(claim.created_at)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </section>
+
           </div>
         </main>
-      </div>
-    </div>
+    </>
   );
 }

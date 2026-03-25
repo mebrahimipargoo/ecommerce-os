@@ -1,26 +1,216 @@
 @import "tailwindcss";
 
+/*
+ * ── Dark-mode variant ──────────────────────────────────────────────────────────
+ * By default Tailwind v4 dark: uses @media (prefers-color-scheme: dark).
+ * next-themes adds a .dark class to <html>; we override the variant so that
+ * ALL dark: utilities respond to the .dark class instead of the media query.
+ * THIS IS THE CRITICAL FIX that makes the theme toggle button work.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * ── Design tokens ─────────────────────────────────────────────────────────────
+ * Defined as plain CSS custom properties; .dark overrides them.
+ * Tailwind @theme inline maps them to utility classes
+ * (bg-background, text-foreground, bg-card, border-border, etc.)
+ */
+
+/* Light mode */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Core surfaces */
+  --background:             #ffffff;
+  --foreground:             #0f172a;   /* slate-900 */
+
+  /* Card / panel */
+  --card:                   #ffffff;
+  --card-foreground:        #0f172a;
+
+  /* Popover / dropdown */
+  --popover:                #ffffff;
+  --popover-foreground:     #0f172a;
+
+  /* Brand primary — sky-500 */
+  --primary:                #0ea5e9;
+  --primary-foreground:     #ffffff;
+
+  /* Secondary surfaces */
+  --secondary:              #f1f5f9;   /* slate-100 */
+  --secondary-foreground:   #0f172a;
+
+  /* Muted (inputs, subtle backgrounds) */
+  --muted:                  #f1f5f9;   /* slate-100 */
+  --muted-foreground:       #64748b;   /* slate-500 */
+
+  /* Hover / selected accent */
+  --accent:                 #f1f5f9;   /* slate-100 */
+  --accent-foreground:      #0f172a;
+
+  /* Destructive — red */
+  --destructive:            #ef4444;
+  --destructive-foreground: #ffffff;
+
+  /* Structural */
+  --border:                 #e2e8f0;   /* slate-200 */
+  --input:                  #e2e8f0;
+  --ring:                   #0ea5e9;
+
+  /* Sidebar tokens (slightly different from page bg for depth) */
+  --sidebar:                #ffffff;
+  --sidebar-foreground:     #0f172a;
+  --sidebar-border:         #e2e8f0;
+  --sidebar-accent:         #f1f5f9;
+  --sidebar-accent-foreground: #0f172a;
+
+  /* Radius */
+  --radius:                 0.75rem;
 }
 
+/* Dark mode — applied when <html class="dark"> (set by next-themes) */
+.dark {
+  --background:             #020617;   /* slate-950 */
+  --foreground:             #f1f5f9;   /* slate-100 */
+
+  --card:                   #0f172a;   /* slate-900 */
+  --card-foreground:        #f1f5f9;
+
+  --popover:                #0f172a;
+  --popover-foreground:     #f1f5f9;
+
+  --primary:                #38bdf8;   /* sky-400 (brighter for dark bg) */
+  --primary-foreground:     #0f172a;
+
+  --secondary:              #1e293b;   /* slate-800 */
+  --secondary-foreground:   #f1f5f9;
+
+  --muted:                  #1e293b;   /* slate-800 */
+  --muted-foreground:       #94a3b8;   /* slate-400 */
+
+  --accent:                 #1e293b;
+  --accent-foreground:      #f1f5f9;
+
+  --destructive:            #dc2626;
+  --destructive-foreground: #fef2f2;
+
+  --border:                 #1e293b;   /* slate-800 */
+  --input:                  #1e293b;
+  --ring:                   #38bdf8;
+
+  --sidebar:                #0a0f1e;   /* slightly darker than page bg */
+  --sidebar-foreground:     #f1f5f9;
+  --sidebar-border:         #1e293b;
+  --sidebar-accent:         #1e293b;
+  --sidebar-accent-foreground: #f1f5f9;
+}
+
+/*
+ * ── Tailwind v4 theme extension ────────────────────────────────────────────────
+ * Registers CSS-var-backed colors as Tailwind utility classes so you can write
+ * bg-background, text-foreground, bg-card, border-border, hover:bg-accent, etc.
+ */
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  /* Typography */
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+
+  /* Semantic colors → CSS custom properties */
+  --color-background:              var(--background);
+  --color-foreground:              var(--foreground);
+  --color-card:                    var(--card);
+  --color-card-foreground:         var(--card-foreground);
+  --color-popover:                 var(--popover);
+  --color-popover-foreground:      var(--popover-foreground);
+  --color-primary:                 var(--primary);
+  --color-primary-foreground:      var(--primary-foreground);
+  --color-secondary:               var(--secondary);
+  --color-secondary-foreground:    var(--secondary-foreground);
+  --color-muted:                   var(--muted);
+  --color-muted-foreground:        var(--muted-foreground);
+  --color-accent:                  var(--accent);
+  --color-accent-foreground:       var(--accent-foreground);
+  --color-destructive:             var(--destructive);
+  --color-destructive-foreground:  var(--destructive-foreground);
+  --color-border:                  var(--border);
+  --color-input:                   var(--input);
+  --color-ring:                    var(--ring);
+  --color-sidebar:                 var(--sidebar);
+  --color-sidebar-foreground:      var(--sidebar-foreground);
+  --color-sidebar-border:          var(--sidebar-border);
+  --color-sidebar-accent:          var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+
+  /* Border radius scale */
+  --radius-sm:  calc(var(--radius) - 4px);
+  --radius-md:  calc(var(--radius) - 2px);
+  --radius-lg:  var(--radius);
+  --radius-xl:  calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+/*
+ * ── Base reset ─────────────────────────────────────────────────────────────────
+ */
+@layer base {
+  *,
+  ::after,
+  ::before {
+    border-color: var(--border);
+    box-sizing: border-box;
   }
+
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Smooth scrollbar in dark mode */
+  :root { color-scheme: light; }
+  .dark  { color-scheme: dark;  }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* ── Drawer / slide animations ────────────────────────────────────────────────── */
+
+@keyframes drawer-slide-up {
+  from { transform: translateY(100%); }
+  to   { transform: translateY(0);    }
+}
+.animate-drawer-slide-up {
+  animation: drawer-slide-up 0.35s cubic-bezier(0.32, 0.72, 0, 1) forwards;
+}
+
+@keyframes drawer-slide-in-left {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(0);     }
+}
+.animate-drawer-slide-in-left {
+  animation: drawer-slide-in-left 0.3s cubic-bezier(0.32, 0.72, 0, 1) forwards;
+}
+
+@keyframes drawer-slide-in-right {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0);    }
+}
+.animate-drawer-slide-in-right {
+  animation: drawer-slide-in-right 0.3s cubic-bezier(0.32, 0.72, 0, 1) forwards;
+}
+
+@keyframes scan {
+  0%   { top: 3rem;                opacity: 1; }
+  48%  { top: calc(100% - 3rem);  opacity: 1; }
+  50%  { opacity: 0; }
+  52%  { top: 3rem;                opacity: 0; }
+  54%  { opacity: 1; }
+  100% { top: 3rem;                opacity: 1; }
+}
+
+@keyframes grow {
+  from { width: 0%;   }
+  to   { width: 100%; }
 }
