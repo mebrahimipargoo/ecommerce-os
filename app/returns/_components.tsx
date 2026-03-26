@@ -7,14 +7,14 @@ import Link from "next/link";
 import {
   AlertTriangle, ArrowLeft, ArrowRight, Barcode, Boxes, Calendar, CalendarX2,
   Camera, CheckCircle2, CheckSquare, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardCheck,
-  Clock, Eye, FileImage, FileText, Loader2, Minus, MoreHorizontal, Package2,
+  Clock, Copy, Eye, FileImage, FileText, Loader2, Minus, MoreHorizontal, Package2,
   PackageCheck, PackageX, Pencil, Plus, QrCode, Save, ScanLine, Search,
-  ShieldAlert, ShieldCheck, Sparkles, Tag, Trash2, Truck, User, X, XCircle, ZoomIn,
+  ShieldAlert, ShieldCheck, Sparkles, Tag, Trash2, Truck, User, X, XCircle, Zap, ZoomIn,
 } from "lucide-react";
-import type { OrgSettings } from "./actions";
 import { SmartCameraUpload } from "../../components/ui/SmartCameraUpload";
 import { BarcodeScannerModal } from "../../components/ui/BarcodeScannerModal";
 import {
+  type OrgSettings,
   type ReturnRecord, type ReturnUpdatePayload,
   type PalletRecord, type PalletStatus,
   type PackageRecord, type PackageStatus,
@@ -29,6 +29,11 @@ import { parseBarcodeSource } from "../../lib/utils/barcode-parser";
 import { supabase as supabaseBrowser } from "../../src/lib/supabase";
 import { uploadToStorage } from "../../lib/supabase/storage";
 import { fetchProductFromAmazon } from "../../lib/api/amazon-mock";
+import { operatorDisplayLabel } from "../../lib/operator-display";
+import { listStores } from "../settings/adapters/actions";
+
+/** Seeded MVP org — use in client `stores` queries so RLS returns rows for local dev. */
+export const MVP_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001";
 
 // ─── Contextual Scan Button ────────────────────────────────────────────────────
 //
@@ -418,6 +423,12 @@ export type WizardState = {
   /** ASIN / UPC / FNSKU — required product identity at item level. */
   product_identifier: string;
   marketplace: Marketplace | ""; item_name: string;
+  /** Amazon Standard Identification Number */
+  asin: string;
+  /** Fulfillment Network SKU */
+  fnsku: string;
+  /** Seller SKU — Amazon warehouse / Seller Central (MSKU) */
+  sku: string;
   /** Multi-select condition keys — see {@link CONDITION_CHIP_DEFS}. */
   condition_keys: string[];
   expiration_date: string; batch_number: string;
@@ -427,12 +438,13 @@ export type WizardState = {
   /** Claim evidence photo URLs — uploaded to Supabase Storage during Step 2. */
   photo_item_url: string;
   photo_expiry_url: string;
-  /** Connected store UUID — links this item to a specific marketplace store account. */
+  /** Connected store UUID — links this item to a specific store account. */
   store_id: string;
 };
 
 export const EMPTY_WIZARD: WizardState = {
   lpn: "", product_identifier: "", marketplace: "", item_name: "",
+  asin: "", fnsku: "", sku: "",
   condition_keys: [],
   expiration_date: "", batch_number: "", package_link_id: "",
   notes: "", photos: {},
@@ -542,6 +554,123 @@ function formatMarketplaceSource(marketplace: string): string {
   return marketplace?.trim() || "—";
 }
 
+/** Map connected store `platform` string to `returns.marketplace` enum. */
+export function platformToMarketplace(platform: string): Marketplace {
+  const p = platform.toLowerCase();
+  if (p.includes("walmart")) return "walmart";
+  if (p.includes("ebay")) return "ebay";
+  return "amazon";
+}
+
+/** Opens the marketplace catalog search with the given product code (prefills site search). */
+export function marketplaceSearchUrl(platformOrMarketplace: string | null | undefined, query: string): string | null {
+  const q = query.trim();
+  if (!q) return null;
+  const raw = (platformOrMarketplace ?? "").toLowerCase();
+  let channel: Marketplace = "amazon";
+  if (raw.includes("walmart")) channel = "walmart";
+  else if (raw.includes("ebay")) channel = "ebay";
+  else if ((MARKETPLACES as readonly string[]).includes(raw)) channel = raw as Marketplace;
+  else if (raw.includes("amazon")) channel = "amazon";
+
+  if (channel === "walmart") return `https://www.walmart.com/search?q=${encodeURIComponent(q)}`;
+  if (channel === "ebay") return `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}`;
+  return `https://www.amazon.com/s?k=${encodeURIComponent(q)}`;
+}
+
+/** Amazon search results for a product code (ASIN / FNSKU / SKU) — paste-friendly in the site search box. */
+export function amazonProductSearchUrl(query: string): string | null {
+  const q = query.trim();
+  if (!q) return null;
+  return `https://www.amazon.com/s?k=${encodeURIComponent(q)}`;
+}
+
+// ─── FEFO Expiry Status ────────────────────────────────────────────────────────
+//  criticalDays / warningDays are dynamic — fetched from workspace_settings JSONB.
+//  Defaults: critical ≤ 30d (🔴), warning ≤ 90d (🟡), OK > 90d (🟢).
+
+function getExpiryStatus(
+  dateStr:      string | null | undefined,
+  criticalDays: number = 30,
+  warningDays:  number = 90,
+): {
+  label: string; daysLabel: string; cls: string; dotCls: string;
+} | null {
+  if (!dateStr) return null;
+  const now = new Date(); now.setHours(0, 0, 0, 0);
+  const exp = new Date(dateStr); exp.setHours(0, 0, 0, 0);
+  const diffDays = Math.floor((exp.getTime() - now.getTime()) / 86400000);
+  if (diffDays < 0)              return { label: "Expired",  daysLabel: `${Math.abs(diffDays)}d ago`, cls: "border-red-200 bg-red-50 text-red-700 dark:border-red-700/60 dark:bg-red-950/50 dark:text-red-300",       dotCls: "bg-red-500"     };
+  if (diffDays <= criticalDays)  return { label: "🔴 Critical", daysLabel: `${diffDays}d left`,       cls: "border-red-200 bg-red-50 text-red-700 dark:border-red-700/60 dark:bg-red-950/50 dark:text-red-300",       dotCls: "bg-red-500"     };
+  if (diffDays <= warningDays)   return { label: "🟡 Warning",  daysLabel: `${diffDays}d left`,       cls: "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-700/60 dark:bg-amber-950/50 dark:text-amber-300", dotCls: "bg-amber-400" };
+  return                                { label: "🟢 OK",       daysLabel: `${diffDays}d left`,       cls: "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-700/60 dark:bg-emerald-950/50 dark:text-emerald-300", dotCls: "bg-emerald-500" };
+}
+
+// ─── Platform Badge ────────────────────────────────────────────────────────────
+
+function PlatformBadge({ platform }: { platform?: string | null }) {
+  const p = platform?.toLowerCase() ?? "";
+  const cfg: Record<string, { label: string; cls: string }> = {
+    amazon:  { label: "AMZ",  cls: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" },
+    walmart: { label: "WMT",  cls: "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300" },
+    ebay:    { label: "eBay", cls: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300" },
+    target:  { label: "TGT",  cls: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300" },
+  };
+  const c = cfg[p] ?? { label: p.toUpperCase().slice(0, 3) || "?", cls: "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300" };
+  return <span className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide ${c.cls}`}>{c.label}</span>;
+}
+
+// ─── Evidence Photo Thumbnail ──────────────────────────────────────────────────
+
+function PhotoThumb({ url, alt = "Evidence photo" }: { url: string; alt?: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); setOpen(true); }}
+        className="group relative inline-block h-8 w-8 overflow-hidden rounded-lg border border-slate-200 shadow-sm hover:ring-2 hover:ring-sky-400 dark:border-slate-700"
+        title="View evidence photo"
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={url} alt={alt} className="h-full w-full object-cover transition group-hover:scale-110" />
+        <span className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition group-hover:bg-black/20 group-hover:opacity-100">
+          <ZoomIn className="h-3.5 w-3.5 text-white" />
+        </span>
+      </button>
+
+      {/* Full-size lightbox */}
+      {open && (
+        <div
+          className="fixed inset-0 z-[500] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          onClick={() => setOpen(false)}
+        >
+          <div className="relative max-h-[90vh] max-w-[90vw]" onClick={(e) => e.stopPropagation()}>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={url} alt={alt} className="max-h-[85vh] max-w-[88vw] rounded-2xl object-contain shadow-2xl" />
+            <button
+              type="button"
+              onClick={() => setOpen(false)}
+              className="absolute -right-3 -top-3 flex h-8 w-8 items-center justify-center rounded-full bg-white shadow-lg hover:bg-slate-100 dark:bg-slate-800 dark:hover:bg-slate-700"
+            >
+              <X className="h-4 w-4 text-slate-700 dark:text-slate-300" />
+            </button>
+            <a
+              href={url}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => e.stopPropagation()}
+              className="absolute -bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-full bg-white px-4 py-1.5 text-xs font-semibold text-slate-700 shadow-lg hover:bg-slate-50 dark:bg-slate-800 dark:text-slate-300"
+            >
+              <Eye className="h-3.5 w-3.5" /> Open full size
+            </a>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 function compareSortKeys(a: string | number, b: string | number, asc: boolean): number {
   if (typeof a === "number" && typeof b === "number") return asc ? a - b : b - a;
   const sa = String(a);
@@ -563,7 +692,8 @@ function sortKeyItem(
     case "inherited_tracking_number":
     case "tracking_effective": return trackEff.toLowerCase();
     case "lpn": return (r.lpn ?? "").toLowerCase();
-    case "marketplace": return r.marketplace.toLowerCase();
+    case "marketplace":
+    case "store_name": return (r.stores?.name ?? r.marketplace ?? "").toLowerCase();
     case "item_name": return r.item_name.toLowerCase();
     case "item_conditions": return [...r.conditions].sort().join(",");
     case "status": return r.status.toLowerCase();
@@ -572,7 +702,8 @@ function sortKeyItem(
       const pltPart = linkedPlt?.pallet_number ?? "";
       return `${linkedPkg.package_number}\0${pltPart}`.toLowerCase();
     }
-    case "created_by": return (r.created_by ?? "").toLowerCase();
+    case "expiration_date": return r.expiration_date ? r.expiration_date : "\uffff";
+    case "created_by": return (r.created_by ?? r.created_by_id ?? "").toLowerCase();
     case "created_at": return new Date(r.created_at).getTime();
     default:
       return String((r as unknown as Record<string, unknown>)[field] ?? "").toLowerCase();
@@ -589,7 +720,8 @@ function sortKeyPackage(p: PackageRecord, field: string): string | number {
     case "expected_item_count": return p.expected_item_count;
     case "pkg_items_sort": return p.actual_item_count * 1_000_000 + p.expected_item_count;
     case "status": return p.status.toLowerCase();
-    case "created_by": return (p.created_by ?? "").toLowerCase();
+    case "store_name": return (p.stores?.name ?? "").toLowerCase();
+    case "created_by": return (p.created_by ?? p.created_by_id ?? "").toLowerCase();
     case "created_at": return new Date(p.created_at).getTime();
     default: return String((p as unknown as Record<string, unknown>)[field] ?? "").toLowerCase();
   }
@@ -603,7 +735,8 @@ function sortKeyPallet(p: PalletSortRow, field: string): string | number {
     case "rollup_pkgs": return p._rollupPkgs;
     case "rollup_items": return p._rollupItems;
     case "status": return p.status.toLowerCase();
-    case "created_by": return (p.created_by ?? "").toLowerCase();
+    case "store_name": return (p.stores?.name ?? "").toLowerCase();
+    case "created_by": return (p.created_by ?? p.created_by_id ?? "").toLowerCase();
     case "created_at": return new Date(p.created_at).getTime();
     default: return String((p as unknown as Record<string, unknown>)[field] ?? "").toLowerCase();
   }
@@ -1076,13 +1209,14 @@ function PackagesSubTable({ palletId, packages, onPackageClick }: {
 
 // ─── Item Drawer Content ───────────────────────────────────────────────────────
 
-export function ItemDrawerContent({ record, role, actor, packages, pallets, onUpdated, onDeleted, startInEditMode = false, sessionPhotos }: {
+export function ItemDrawerContent({ record, role, actor, packages, pallets, onUpdated, onDeleted, startInEditMode = false, sessionPhotos, onToast }: {
   record: ReturnRecord; role: UserRole; actor: string;
   packages: PackageRecord[]; pallets: PalletRecord[];
   onUpdated: (r: ReturnRecord) => void; onDeleted: (id: string) => void;
   startInEditMode?: boolean;
   /** File objects captured in the current browser session — enables live gallery. */
   sessionPhotos?: Record<string, File[]>;
+  onToast?: (msg: string, kind?: ToastKind) => void;
 }) {
   const [editing,    setEditing]    = useState(startInEditMode);
   const [saving,     setSaving]     = useState(false);
@@ -1091,6 +1225,11 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   const [err,        setErr]        = useState("");
   const [editLpn,    setEditLpn]    = useState(record.lpn ?? "");
   const [editProductId, setEditProductId] = useState(record.product_identifier ?? "");
+  const [editAsin,   setEditAsin]   = useState(record.asin ?? "");
+  const [editFnsku,  setEditFnsku]  = useState(record.fnsku ?? "");
+  const [editSku, setEditSku] = useState(record.sku ?? "");
+  const [editStoreId, setEditStoreId] = useState(record.store_id ?? "");
+  const [itemStoresList, setItemStoresList] = useState<{ id: string; name: string; platform: string }[]>([]);
   const [editItem,   setEditItem]   = useState(record.item_name);
   const [editNotes,  setEditNotes]  = useState(record.notes ?? "");
   const [editStatus, setEditStatus] = useState(record.status);
@@ -1113,8 +1252,26 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   const [expiryPhotoUploading, setExpiryPhotoUploading] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const res = await listStores();
+      if (cancelled || !res.ok || !res.data) return;
+      setItemStoresList(
+        res.data
+          .filter((s) => s.is_active !== false)
+          .map((s) => ({ id: s.id, name: s.name, platform: s.platform })),
+      );
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
     setEditLpn(record.lpn ?? "");
     setEditProductId(record.product_identifier ?? "");
+    setEditAsin(record.asin ?? "");
+    setEditFnsku(record.fnsku ?? "");
+    setEditSku(record.sku ?? "");
+    setEditStoreId(record.store_id ?? "");
     setEditItem(record.item_name);
     setEditNotes(record.notes ?? "");
     setEditStatus(record.status);
@@ -1124,7 +1281,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     setEditPhotoExpiryUrl(record.photo_expiry_url ?? "");
     setEditCatalogStatus("idle");
     setEditCatalogPreview(null);
-  }, [record.id, record.lpn, record.product_identifier, record.item_name, record.notes, record.status, record.photo_evidence, record.expiration_date, record.photo_item_url, record.photo_expiry_url]);
+  }, [record.id, record.lpn, record.product_identifier, record.asin, record.fnsku, record.sku, record.store_id, record.item_name, record.notes, record.status, record.photo_evidence, record.expiration_date, record.photo_item_url, record.photo_expiry_url]);
 
   async function handleItemEvidencePhoto(
     e: React.ChangeEvent<HTMLInputElement>,
@@ -1201,7 +1358,23 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
 
   const linkedPkg    = packages.find((p) => p.id === record.package_id);
   const linkedPallet = pallets.find((p) => p.id === record.pallet_id);
+  const showClaimLinkage =
+    record.status === "ready_for_claim" || record.status === "pending_evidence";
+  const editStorePlatform =
+    itemStoresList.find((s) => s.id === editStoreId)?.platform ?? record.stores?.platform ?? null;
   const photoTotal   = record.photo_evidence ? Object.values(record.photo_evidence).reduce((a, b) => a + b, 0) : 0;
+  const drawerEditIdBtn =
+    "inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800";
+
+  async function copyEditCode(v: string, label: string) {
+    if (!v.trim()) return;
+    try {
+      await navigator.clipboard.writeText(v.trim());
+      onToast?.(`Copied ${label}`, "success");
+    } catch {
+      onToast?.("Copy failed", "error");
+    }
+  }
 
   async function handleSave() {
     setSaving(true); setErr("");
@@ -1214,6 +1387,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     Object.entries(newPhotoCount).forEach(([cat, n]) => {
       mergedPhotoEvidence[cat] = (mergedPhotoEvidence[cat] ?? 0) + n;
     });
+    const pickedStore = itemStoresList.find((s) => s.id === editStoreId);
     const res = await updateReturn(record.id, {
       lpn: editLpn || undefined,
       item_name: editItem,
@@ -1222,6 +1396,12 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
       photo_evidence:   Object.keys(mergedPhotoEvidence).length ? mergedPhotoEvidence : undefined,
       photo_item_url:   editPhotoItemUrl   || undefined,
       photo_expiry_url: editPhotoExpiryUrl || undefined,
+      asin: editAsin.trim() || null,
+      fnsku: editFnsku.trim() || null,
+      sku: editSku.trim() || null,
+      product_identifier: editProductId.trim() || null,
+      store_id: editStoreId.trim() || null,
+      marketplace: pickedStore ? platformToMarketplace(pickedStore.platform) : record.marketplace,
     }, actor);
     setSaving(false);
     if (res.ok && res.data) { onUpdated(res.data); setEditing(false); setEditNewPhotos({}); }
@@ -1239,7 +1419,9 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     <div className="p-4 sm:p-6 space-y-5">
       <div className="flex flex-wrap gap-2">
         <StatusBadge status={record.status} />
-        <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-semibold capitalize text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">{record.marketplace}</span>
+        <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+          {record.stores?.name ? `${record.stores.name} (${record.stores.platform})` : formatMarketplaceSource(record.marketplace)}
+        </span>
         {linkedPkg    && <span className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 py-0.5 text-xs font-semibold text-sky-700 dark:border-sky-700/60 dark:bg-sky-950/50 dark:text-sky-300"><Tag className="h-3 w-3" />{linkedPkg.package_number}</span>}
         {linkedPallet && <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"><Boxes className="h-3 w-3" />{linkedPallet.pallet_number}</span>}
       </div>
@@ -1247,7 +1429,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
       {editing ? (
         <div className="space-y-4">
           <div>
-            <label className={LABEL}>Product barcode (ASIN / UPC)</label>
+            <label className={LABEL}>Product barcode (UPC / scan)</label>
             <input
               className={`${INPUT} transition-all ${editCatalogStatus === "unknown" ? "border-yellow-400 ring-2 ring-yellow-300 focus:border-yellow-400 focus:ring-yellow-300" : ""}`}
               value={editProductId}
@@ -1276,6 +1458,83 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                 ⚠️ Unknown Item — Not found locally or on Amazon.
               </div>
             )}
+          </div>
+          <div className="space-y-3">
+            <div>
+              <label className={LABEL}>
+                ASIN <span className="text-xs font-normal text-slate-400">(optional — Amazon catalog ID)</span>
+              </label>
+              <div className="flex gap-2">
+                <input type="text" className={INPUT} placeholder="e.g. B08N5WRWNW" value={editAsin} onChange={(e) => setEditAsin(e.target.value)} />
+                <button type="button" title="Copy ASIN" className={drawerEditIdBtn} onClick={() => void copyEditCode(editAsin, "ASIN")} disabled={!editAsin.trim()}><Copy className="h-4 w-4" /></button>
+                <button
+                  type="button"
+                  title="Search marketplace"
+                  className={drawerEditIdBtn}
+                  disabled={!marketplaceSearchUrl(editStorePlatform, editAsin)}
+                  onClick={() => {
+                    const u = marketplaceSearchUrl(editStorePlatform, editAsin);
+                    if (u) window.open(u, "_blank", "noopener,noreferrer");
+                  }}
+                >
+                  <Search className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            <div>
+              <label className={LABEL}>
+                FNSKU <span className="text-xs font-normal text-slate-400">(optional — your FBA label on Amazon)</span>
+              </label>
+              <div className="flex gap-2">
+                <input type="text" className={INPUT} placeholder="e.g. X001ABC123" value={editFnsku} onChange={(e) => setEditFnsku(e.target.value)} />
+                <button type="button" title="Copy FNSKU" className={drawerEditIdBtn} onClick={() => void copyEditCode(editFnsku, "FNSKU")} disabled={!editFnsku.trim()}><Copy className="h-4 w-4" /></button>
+                <button
+                  type="button"
+                  title="Search marketplace"
+                  className={drawerEditIdBtn}
+                  disabled={!marketplaceSearchUrl(editStorePlatform, editFnsku)}
+                  onClick={() => {
+                    const u = marketplaceSearchUrl(editStorePlatform, editFnsku);
+                    if (u) window.open(u, "_blank", "noopener,noreferrer");
+                  }}
+                >
+                  <Search className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            <div>
+              <label className={LABEL}>
+                SKU <span className="text-xs font-normal text-slate-400">(optional — Seller / warehouse SKU, MSKU)</span>
+              </label>
+              <div className="flex gap-2">
+                <input type="text" className={INPUT} placeholder="Seller Central SKU…" value={editSku} onChange={(e) => setEditSku(e.target.value)} />
+                <button type="button" title="Copy SKU" className={drawerEditIdBtn} onClick={() => void copyEditCode(editSku, "SKU")} disabled={!editSku.trim()}><Copy className="h-4 w-4" /></button>
+                <button
+                  type="button"
+                  title="Search marketplace"
+                  className={drawerEditIdBtn}
+                  disabled={!marketplaceSearchUrl(editStorePlatform, editSku)}
+                  onClick={() => {
+                    const u = marketplaceSearchUrl(editStorePlatform, editSku);
+                    if (u) window.open(u, "_blank", "noopener,noreferrer");
+                  }}
+                >
+                  <Search className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            <div>
+              <label className={LABEL}>Sales Channel</label>
+              <select className={INPUT} value={editStoreId} onChange={(e) => setEditStoreId(e.target.value)}>
+                <option value="">— Select Sales Channel —</option>
+                {itemStoresList.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
+                ))}
+              </select>
+              {itemStoresList.length === 0 && (
+                <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">No active stores found. Add a store in Settings → Stores.</p>
+              )}
+            </div>
           </div>
           {!record.package_id && (
             <div><label className={LABEL}>LPN <span className="text-xs font-normal text-slate-400">(optional)</span></label><input className={INPUT} value={editLpn} onChange={(e) => setEditLpn(e.target.value)} placeholder="Orphan label scan…" /></div>
@@ -1410,7 +1669,22 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
 
           {err && <p className="rounded-xl bg-rose-50 px-4 py-2 text-sm text-rose-700 dark:bg-rose-950/40 dark:text-rose-400">{err}</p>}
           <div className="flex gap-3">
-            <button onClick={() => { setEditing(false); setEditLpn(record.lpn ?? ""); setEditProductId(record.product_identifier ?? ""); setEditPhotoEvidence(record.photo_evidence ?? {}); setEditNewPhotos({}); }} className={`${BTN_GHOST} flex-1 h-12`}><XCircle className="h-4 w-4" />Cancel</button>
+            <button
+              onClick={() => {
+                setEditing(false);
+                setEditLpn(record.lpn ?? "");
+                setEditProductId(record.product_identifier ?? "");
+                setEditAsin(record.asin ?? "");
+                setEditFnsku(record.fnsku ?? "");
+                setEditSku(record.sku ?? "");
+                setEditStoreId(record.store_id ?? "");
+                setEditPhotoEvidence(record.photo_evidence ?? {});
+                setEditNewPhotos({});
+              }}
+              className={`${BTN_GHOST} flex-1 h-12`}
+            >
+              <XCircle className="h-4 w-4" />Cancel
+            </button>
             <button onClick={handleSave} disabled={saving} className="flex h-12 flex-1 items-center justify-center gap-2 rounded-2xl bg-sky-500 font-semibold text-white hover:bg-sky-600 disabled:opacity-50">
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}Save
             </button>
@@ -1419,9 +1693,72 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
       ) : (
         <>
           <div className="grid grid-cols-2 gap-4 text-sm">
-            <div className="col-span-2"><p className="text-xs text-slate-400">Product ID</p><p className="font-mono font-bold text-foreground">{record.product_identifier ?? "—"}</p></div>
+            <div className="col-span-2">
+              <p className="text-xs text-slate-400">Item Name</p>
+              <p className="font-semibold text-foreground">{record.item_name || "Unknown Item"}</p>
+            </div>
+            {showClaimLinkage ? (
+              <div className="col-span-2 rounded-2xl border border-violet-200 bg-violet-50/90 p-4 dark:border-violet-800/50 dark:bg-violet-950/30">
+                <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-violet-700 dark:text-violet-300">Claim filing context</p>
+                <p className="mb-3 text-[10px] leading-relaxed text-violet-600/90 dark:text-violet-400/90">
+                  Pallet and package hierarchy with copyable product codes for your claim.
+                </p>
+                <div className="mb-4 grid gap-2 sm:grid-cols-2">
+                  <div className="flex min-w-0 items-center gap-2 rounded-xl border border-violet-200 bg-white/80 px-3 py-2 dark:border-violet-800/60 dark:bg-slate-900/50">
+                    <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide text-violet-600 dark:text-violet-400">Pallet #</span>
+                    <span className="min-w-0 flex-1 truncate font-mono text-sm font-semibold text-foreground">{linkedPallet?.pallet_number ?? "—"}</span>
+                    {linkedPallet?.pallet_number ? (
+                      <button type="button" title="Copy Pallet #" className={drawerEditIdBtn} onClick={() => void copyEditCode(linkedPallet.pallet_number, "Pallet #")}><Copy className="h-4 w-4" /></button>
+                    ) : null}
+                  </div>
+                  <div className="flex min-w-0 items-center gap-2 rounded-xl border border-violet-200 bg-white/80 px-3 py-2 dark:border-violet-800/60 dark:bg-slate-900/50">
+                    <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide text-violet-600 dark:text-violet-400">Package #</span>
+                    <span className="min-w-0 flex-1 truncate font-mono text-sm font-semibold text-foreground">{linkedPkg?.package_number ?? "—"}</span>
+                    {linkedPkg?.package_number ? (
+                      <button type="button" title="Copy Package #" className={drawerEditIdBtn} onClick={() => void copyEditCode(linkedPkg.package_number, "Package #")}><Copy className="h-4 w-4" /></button>
+                    ) : null}
+                  </div>
+                </div>
+                <p className="mb-2 text-[10px] font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">Product title &amp; identifiers</p>
+                <ItemIdentifiersCell
+                  itemName={record.item_name}
+                  asin={record.asin}
+                  fnsku={record.fnsku}
+                  sku={record.sku}
+                  storePlatform={record.stores?.platform}
+                  onToast={onToast}
+                  alwaysShowCodeRows
+                />
+                {record.product_identifier ? (
+                  <p className="mt-3 font-mono text-[11px] text-slate-500 dark:text-slate-400" title="Barcode / UPC scan">
+                    UPC / scan: <span className="text-foreground/90">{record.product_identifier}</span>
+                  </p>
+                ) : null}
+              </div>
+            ) : (
+              <div className="col-span-2 rounded-2xl border border-slate-200 bg-slate-50/90 p-4 dark:border-slate-700 dark:bg-slate-900/50">
+                <p className="mb-2 text-[11px] font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">Product codes</p>
+                <p className="mb-3 text-[10px] leading-relaxed text-slate-500 dark:text-slate-500">
+                  ASIN = Amazon catalog ID · FNSKU = your FBA label on Amazon · SKU = Seller / warehouse SKU (MSKU)
+                </p>
+                <ItemIdentifiersCell
+                  showItemHeading={false}
+                  alwaysShowCodeRows
+                  itemName=""
+                  asin={record.asin}
+                  fnsku={record.fnsku}
+                  sku={record.sku}
+                  storePlatform={record.stores?.platform}
+                  onToast={onToast}
+                />
+                {record.product_identifier ? (
+                  <p className="mt-3 font-mono text-[11px] text-slate-500 dark:text-slate-400" title="Barcode / UPC scan">
+                    UPC / scan: <span className="text-foreground/90">{record.product_identifier}</span>
+                  </p>
+                ) : null}
+              </div>
+            )}
             {record.lpn && <div><p className="text-xs text-slate-400">LPN</p><p className="font-mono font-bold text-foreground">{record.lpn}</p></div>}
-            <div className="col-span-2"><p className="text-xs text-slate-400">Item</p><p className="font-semibold text-foreground">{record.item_name}</p></div>
             {record.expiration_date && (
               <div className="col-span-2 rounded-xl border border-orange-200 bg-orange-50 px-3 py-2 dark:border-orange-700/40 dark:bg-orange-950/30">
                 <p className="text-[10px] font-bold uppercase tracking-wide text-orange-500 mb-0.5">Expiry (FEFO)</p>
@@ -1489,7 +1826,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
           )}
           {record.notes && <p className="rounded-xl bg-slate-50 p-3 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300">{record.notes}</p>}
           <div className="rounded-2xl border border-slate-100 bg-slate-50/50 p-4 dark:border-slate-800 dark:bg-slate-900/50 grid grid-cols-2 gap-3 text-xs">
-            <div><p className="text-slate-400">By</p><p className="font-semibold capitalize text-slate-700 dark:text-slate-300">{record.created_by}</p></div>
+            <div><p className="text-slate-400">By</p><p className="font-semibold capitalize text-slate-700 dark:text-slate-300">{operatorDisplayLabel(record)}</p></div>
             <div><p className="text-slate-400">Date</p><p className="font-semibold text-slate-700 dark:text-slate-300">{fmt(record.created_at)}</p></div>
           </div>
           <div className="flex gap-3">
@@ -1901,7 +2238,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
               <p className="font-mono font-bold text-foreground">{pkg.rma_number}</p>
             </div>
           )}
-          <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{pkg.created_by}</p></div>
+          <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{operatorDisplayLabel(pkg)}</p></div>
           <div><p className="text-xs text-slate-400">Created</p><p className="font-semibold text-foreground">{fmt(pkg.created_at)}</p></div>
           {(pkg.photo_closed_url || pkg.photo_opened_url || pkg.photo_return_label_url) && (
             <div className="col-span-2 flex flex-wrap gap-1.5 pt-1">
@@ -2148,7 +2485,7 @@ export function PalletDrawerContent({ pallet, role, actor, packages, onClose, on
       <PalletStatusBadge status={plt.status} />
       <div className="grid grid-cols-2 gap-3 text-sm">
         <div><p className="text-xs text-slate-400">Total Items</p><p className="text-3xl font-extrabold text-foreground">{plt.item_count}</p></div>
-        <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{plt.created_by}</p></div>
+        <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{operatorDisplayLabel(plt)}</p></div>
         <div><p className="text-xs text-slate-400">Created</p><p className="font-semibold">{fmt(plt.created_at)}</p></div>
         <div><p className="text-xs text-slate-400">Updated</p><p className="font-semibold">{fmt(plt.updated_at)}</p></div>
       </div>
@@ -2234,37 +2571,59 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   >([]);
   const [storeInherited, setStoreInherited] = useState(false);
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      try {
-        const { data } = await supabaseBrowser
-          .from("stores")
-          .select("id, name, platform")
-          .eq("is_active", true)
-          .order("created_at", { ascending: false });
-        if (data) setConnectedStores(data as { id: string; name: string; platform: string }[]);
-      } catch {
-        // ignore fetch errors
-      }
+      const res = await listStores();
+      if (cancelled || !res.ok || !res.data) return;
+      setConnectedStores(
+        res.data
+          .filter((s) => s.is_active !== false)
+          .map((s) => ({ id: s.id, name: s.name, platform: s.platform })),
+      );
     })();
+    return () => { cancelled = true; };
   }, []);
 
   // ── Auto-fill store_id from linked package (Package → Item inheritance) ───
   useEffect(() => {
     const pkgId = state.package_link_id || inherited?.packageId;
-    if (!pkgId) { setStoreInherited(false); return; }
-    const pkg = openPackages.find((p) => p.id === pkgId);
-    if (pkg?.store_id) {
-      up("store_id", pkg.store_id);
-      setStoreInherited(true);
-    } else {
+    if (!pkgId) {
       setStoreInherited(false);
+      return;
     }
+    let cancelled = false;
+    (async () => {
+      const local = openPackages.find((p) => p.id === pkgId);
+      if (local?.store_id) {
+        if (!cancelled) {
+          up("store_id", local.store_id);
+          setStoreInherited(true);
+        }
+        return;
+      }
+      const { data } = await supabaseBrowser
+        .from("packages")
+        .select("store_id")
+        .eq("id", pkgId)
+        .eq("organization_id", MVP_ORGANIZATION_ID)
+        .maybeSingle();
+      if (cancelled) return;
+      if (data?.store_id) {
+        up("store_id", data.store_id as string);
+        setStoreInherited(true);
+      } else {
+        setStoreInherited(false);
+      }
+    })();
+    return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.package_link_id, inherited?.packageId]);
+  }, [state.package_link_id, inherited?.packageId, openPackages]);
 
   // ── Catalog lookup state ──────────────────────────────────────────────────
   const [catalogStatus, setCatalogStatus] = useState<"idle" | "loading" | "local" | "amazon" | "unknown">("idle");
   const [catalogPreview, setCatalogPreview] = useState<{ name: string; price?: number; image_url?: string } | null>(null);
+  // ── SP-API mock auto-fill state ───────────────────────────────────────────
+  const [spApiStatus, setSpApiStatus] = useState<"idle" | "loading" | "done">("idle");
 
   async function handleBarcodeLookup(barcode: string) {
     if (!barcode.trim()) { setCatalogStatus("idle"); return; }
@@ -2328,6 +2687,24 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
     setCatalogStatus("unknown");
   }
 
+  // ── SP-API Phase B mock: auto-fill ASIN / FNSKU / Item Name ──────────────
+  async function handleSpApiLookup() {
+    if (!state.product_identifier.trim()) return;
+    setSpApiStatus("loading");
+    await new Promise((r) => setTimeout(r, 1500));
+    const clean = state.product_identifier.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const mockAsin  = `B0${clean.slice(0, 6).padEnd(6, "0")}`;
+    const mockFnsku = `X00${clean.slice(0, 5).padEnd(5, "0")}`;
+    setState((p) => ({
+      ...p,
+      asin:      mockAsin,
+      fnsku:     mockFnsku,
+      item_name: p.item_name.trim() || `Amazon Return Product (${state.product_identifier.trim()})`,
+    }));
+    setSpApiStatus("done");
+    setTimeout(() => setSpApiStatus("idle"), 3500);
+  }
+
   // ── Physical hardware scanner — attached directly to the barcode input only ─
   const { onKeyDown: barcodeKeyDown } = usePhysicalScanner({
     onScan: (code) => { up("product_identifier", code); void handleBarcodeLookup(code); },
@@ -2349,6 +2726,21 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
       setOcrBanner({ ok: false, msg: res.error ?? "Scan failed. Enter manually." });
     }
   }
+
+  const wizardIdIconBtn =
+    "inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800";
+
+  async function copyWizardCode(v: string) {
+    const t = v.trim();
+    if (!t) return;
+    try {
+      await navigator.clipboard.writeText(t);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const wizardStorePlatform = connectedStores.find((s) => s.id === state.store_id)?.platform;
 
   return (
     <div className="space-y-5">
@@ -2415,9 +2807,36 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
             onDetected={(code) => { up("product_identifier", code); void handleBarcodeLookup(code); }}
             modalTitle="Scan Product Barcode"
           />
+          {/* SP-API auto-fill trigger */}
+          <button
+            type="button"
+            onClick={() => void handleSpApiLookup()}
+            disabled={!state.product_identifier.trim() || spApiStatus === "loading"}
+            title="Auto-fill ASIN, FNSKU & Item Name from SP-API (mock)"
+            aria-label="Fetch product details from SP-API"
+            className="inline-flex h-12 items-center gap-1.5 rounded-xl border border-amber-300 bg-amber-50 px-3 text-xs font-semibold text-amber-700 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-300 dark:hover:bg-amber-950/50"
+          >
+            {spApiStatus === "loading"
+              ? <Loader2 className="h-4 w-4 animate-spin shrink-0" />
+              : <Zap className="h-4 w-4 shrink-0" />}
+            <span className="hidden sm:inline">{spApiStatus === "loading" ? "Fetching…" : "SP-API"}</span>
+          </button>
         </div>
+        {/* SP-API fetch feedback */}
+        {spApiStatus === "loading" && (
+          <div className="mt-1.5 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-700 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-300">
+            <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
+            Fetching product details from SP-API…
+          </div>
+        )}
+        {spApiStatus === "done" && (
+          <div className="mt-1.5 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-700 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-300">
+            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+            SP-API — ASIN, FNSKU &amp; Item Name auto-filled (mock data)
+          </div>
+        )}
         {/* Catalog lookup feedback */}
-        {catalogStatus === "loading" && (
+        {catalogStatus === "loading" && spApiStatus === "idle" && (
           <div className="mt-1.5 flex items-center gap-2 text-xs text-slate-400">
             <Loader2 className="h-3.5 w-3.5 animate-spin" />Looking up barcode…
           </div>
@@ -2452,53 +2871,38 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
         </p>
       )}
       <div>
-        <label className={LABEL}>Marketplace <span className="text-rose-500">*</span></label>
-        <select className={INPUT} value={state.marketplace} onChange={(e) => up("marketplace", e.target.value)}>
-          <option value="">Select…</option>
-          {MARKETPLACES.map((m) => <option key={m} value={m}>{MP_LABELS[m]}</option>)}
-        </select>
-      </div>
-      {connectedStores.length > 0 && (
-        <div>
-          <label className={LABEL}>
-            Source Store
-            {storeInherited && (
-              <span className="ml-2 text-xs font-normal text-emerald-600 dark:text-emerald-400">
-                · Inherited from Package
-              </span>
-            )}
-          </label>
-          <div className="flex gap-2">
-            <select
-              className={`${INPUT} flex-1`}
-              value={state.store_id}
-              onChange={(e) => { up("store_id", e.target.value); setStoreInherited(false); }}
-              disabled={storeInherited}
-            >
-              <option value="">— Select store (optional) —</option>
-              {connectedStores.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name} ({s.platform})
-                </option>
-              ))}
-            </select>
-            {storeInherited && (
-              <button
-                type="button"
-                onClick={() => { up("store_id", ""); setStoreInherited(false); }}
-                className="shrink-0 rounded-xl border border-slate-200 px-3 text-xs font-medium text-muted-foreground hover:bg-accent dark:border-slate-700"
-              >
-                Override
-              </button>
-            )}
-          </div>
+        <label className={LABEL}>
+          Sales Channel <span className="text-rose-500">*</span>
           {storeInherited && (
-            <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
-              🔒 Auto-filled from package. Click Override to select a different store.
-            </p>
+            <span className="ml-2 text-xs font-normal text-emerald-600 dark:text-emerald-400">
+              · Inherited from Package
+            </span>
           )}
-        </div>
-      )}
+        </label>
+        <select
+          className={INPUT}
+          value={state.store_id}
+          onChange={(e) => { up("store_id", e.target.value); setStoreInherited(false); }}
+          disabled={storeInherited}
+        >
+          <option value="">— Select Sales Channel —</option>
+          {connectedStores.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name} ({s.platform})
+            </option>
+          ))}
+        </select>
+        {storeInherited && (
+          <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+            🔒 Locked — Sales Channel is inherited from the linked package.
+          </p>
+        )}
+        {connectedStores.length === 0 && (
+          <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+            No active stores found. Add a store in Settings → Stores.
+          </p>
+        )}
+      </div>
       <div>
         <label className={LABEL}>Item Name <span className="text-rose-500">*</span></label>
         <input
@@ -2506,6 +2910,77 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
           value={state.item_name} onChange={(e) => up("item_name", e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter" && onAdvance) { e.preventDefault(); onAdvance(); } }}
         />
+      </div>
+      <div className="space-y-4">
+        <p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
+          ASIN = catalog ID · FNSKU = your FBA label · SKU = Seller / warehouse (MSKU). Each is copyable; search uses the Sales Channel store (Amazon / Walmart).
+        </p>
+        <div>
+          <label className={LABEL}>ASIN <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+          <div className="flex gap-2">
+            <input
+              type="text" className={INPUT} placeholder="e.g. B08N5WRWNW"
+              value={state.asin} onChange={(e) => up("asin", e.target.value)}
+            />
+            <button type="button" title="Copy ASIN" className={wizardIdIconBtn} onClick={() => void copyWizardCode(state.asin)} disabled={!state.asin.trim()}><Copy className="h-4 w-4" /></button>
+            <button
+              type="button"
+              title="Search marketplace"
+              className={wizardIdIconBtn}
+              disabled={!marketplaceSearchUrl(wizardStorePlatform, state.asin)}
+              onClick={() => {
+                const url = marketplaceSearchUrl(wizardStorePlatform, state.asin);
+                if (url) window.open(url, "_blank", "noopener,noreferrer");
+              }}
+            >
+              <Search className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+        <div>
+          <label className={LABEL}>FNSKU <span className="text-xs font-normal text-slate-400">(optional — your label on Amazon)</span></label>
+          <div className="flex gap-2">
+            <input
+              type="text" className={INPUT} placeholder="e.g. X001ABC123"
+              value={state.fnsku} onChange={(e) => up("fnsku", e.target.value)}
+            />
+            <button type="button" title="Copy FNSKU" className={wizardIdIconBtn} onClick={() => void copyWizardCode(state.fnsku)} disabled={!state.fnsku.trim()}><Copy className="h-4 w-4" /></button>
+            <button
+              type="button"
+              title="Search marketplace"
+              className={wizardIdIconBtn}
+              disabled={!marketplaceSearchUrl(wizardStorePlatform, state.fnsku)}
+              onClick={() => {
+                const url = marketplaceSearchUrl(wizardStorePlatform, state.fnsku);
+                if (url) window.open(url, "_blank", "noopener,noreferrer");
+              }}
+            >
+              <Search className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+        <div>
+          <label className={LABEL}>SKU <span className="text-xs font-normal text-slate-400">(optional — warehouse / Seller Central)</span></label>
+          <div className="flex gap-2">
+            <input
+              type="text" className={INPUT} placeholder="Seller SKU…"
+              value={state.sku} onChange={(e) => up("sku", e.target.value)}
+            />
+            <button type="button" title="Copy SKU" className={wizardIdIconBtn} onClick={() => void copyWizardCode(state.sku)} disabled={!state.sku.trim()}><Copy className="h-4 w-4" /></button>
+            <button
+              type="button"
+              title="Search marketplace"
+              className={wizardIdIconBtn}
+              disabled={!marketplaceSearchUrl(wizardStorePlatform, state.sku)}
+              onClick={() => {
+                const url = marketplaceSearchUrl(wizardStorePlatform, state.sku);
+                if (url) window.open(url, "_blank", "noopener,noreferrer");
+              }}
+            >
+              <Search className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
       </div>
       <div>
         <label className={LABEL}>What is wrong with this item? <span className="text-rose-500">*</span></label>
@@ -2715,7 +3190,16 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
         <div className="grid grid-cols-2 gap-y-3 gap-x-6 text-sm">
           <div><p className="text-xs text-slate-400">Product ID</p><p className="font-mono font-bold">{state.product_identifier || "—"}</p></div>
           {state.lpn && <div><p className="text-xs text-slate-400">LPN (optional)</p><p className="font-mono font-bold">{state.lpn}</p></div>}
-          <div><p className="text-xs text-slate-400">Marketplace</p><p className="font-bold capitalize">{state.marketplace}</p></div>
+          <div>
+            <p className="text-xs text-slate-400">Sales Channel</p>
+            <p className="font-bold">
+              {linkedPkg?.stores?.name
+                ? linkedPkg.stores.name
+                : state.store_id
+                  ? <span className="text-emerald-600 dark:text-emerald-400">Store Assigned ✓</span>
+                  : <span className="text-amber-600 dark:text-amber-400">Not assigned</span>}
+            </p>
+          </div>
           <div className="col-span-2"><p className="text-xs text-slate-400">Item</p><p className="font-bold">{state.item_name}</p></div>
         </div>
         <div><p className="text-xs text-slate-400 mb-1.5">Conditions</p><div className="flex flex-wrap gap-1.5">{conditions.map((c) => <ConditionBadge key={c} value={c} />)}</div></div>
@@ -2803,6 +3287,9 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
       lpn: state.lpn || undefined,
       product_identifier: state.product_identifier.trim(),
       marketplace: state.marketplace as string, item_name: state.item_name, conditions,
+      asin: state.asin.trim() || undefined,
+      fnsku: state.fnsku.trim() || undefined,
+      sku: state.sku.trim() || undefined,
       notes: state.notes, photo_evidence: photoEvidence,
       expiration_date: state.expiration_date || undefined,
       batch_number: state.batch_number || undefined,
@@ -2903,30 +3390,50 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
   const [pkgStoreInherited, setPkgStoreInherited] = useState(false);
   const [pkgStoresList,     setPkgStoresList]     = useState<{ id: string; name: string; platform: string }[]>([]);
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      try {
-        const { data } = await supabaseBrowser
-          .from("stores")
-          .select("id, name, platform")
-          .eq("is_active", true)
-          .order("created_at", { ascending: false });
-        if (data) setPkgStoresList(data as { id: string; name: string; platform: string }[]);
-      } catch {
-        // ignore fetch errors
-      }
+      const res = await listStores();
+      if (cancelled || !res.ok || !res.data) return;
+      setPkgStoresList(
+        res.data
+          .filter((s) => s.is_active !== false)
+          .map((s) => ({ id: s.id, name: s.name, platform: s.platform })),
+      );
     })();
+    return () => { cancelled = true; };
   }, []);
 
-  // ── Inherit store_id from pallet (Pallet → Package) ──────────────────────
+  // ── Inherit store_id from pallet (Pallet → Package) — local list or DB fetch ─
   useEffect(() => {
-    if (!palletId) { setPkgStoreInherited(false); return; }
-    const pallet = openPallets.find((p) => p.id === palletId);
-    if (pallet?.store_id) {
-      setPkgStoreId(pallet.store_id);
-      setPkgStoreInherited(true);
-    } else {
+    if (!palletId) {
       setPkgStoreInherited(false);
+      return;
     }
+    let cancelled = false;
+    (async () => {
+      const local = openPallets.find((p) => p.id === palletId);
+      if (local?.store_id) {
+        if (!cancelled) {
+          setPkgStoreId(local.store_id);
+          setPkgStoreInherited(true);
+        }
+        return;
+      }
+      const { data } = await supabaseBrowser
+        .from("pallets")
+        .select("store_id")
+        .eq("id", palletId)
+        .eq("organization_id", MVP_ORGANIZATION_ID)
+        .maybeSingle();
+      if (cancelled) return;
+      if (data?.store_id) {
+        setPkgStoreId(data.store_id as string);
+        setPkgStoreInherited(true);
+      } else {
+        setPkgStoreInherited(false);
+      }
+    })();
+    return () => { cancelled = true; };
   }, [palletId, openPallets]);
 
   // ── Physical hardware scanner — attached only to the tracking # input ───────
@@ -3062,45 +3569,37 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
           <div><label className={LABEL}>Expected Items</label><input type="number" min="0" className={INPUT} placeholder="0" value={expected} onChange={(e) => setExpected(e.target.value)} /></div>
           <ComboboxField label="Link to Pallet" hint="(optional)" icon={Boxes} options={palletOptions} value={palletId} onChange={setPalletId} onClear={() => setPalletId("")} placeholder="Search pallets…" />
 
-          {pkgStoresList.length > 0 && (
-            <div>
-              <label className={LABEL}>
-                Source Store
-                {pkgStoreInherited && (
-                  <span className="ml-2 text-xs font-normal text-emerald-600 dark:text-emerald-400">
-                    · Inherited from Pallet
-                  </span>
-                )}
-              </label>
-              <div className="flex gap-2">
-                <select
-                  className={`${INPUT} flex-1`}
-                  value={pkgStoreId}
-                  onChange={(e) => { setPkgStoreId(e.target.value); setPkgStoreInherited(false); }}
-                  disabled={pkgStoreInherited}
-                >
-                  <option value="">— Select store (optional) —</option>
-                  {pkgStoresList.map((s) => (
-                    <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
-                  ))}
-                </select>
-                {pkgStoreInherited && (
-                  <button
-                    type="button"
-                    onClick={() => { setPkgStoreId(""); setPkgStoreInherited(false); }}
-                    className="shrink-0 rounded-xl border border-slate-200 px-3 text-xs font-medium text-muted-foreground hover:bg-accent dark:border-slate-700"
-                  >
-                    Override
-                  </button>
-                )}
-              </div>
+          <div>
+            <label className={LABEL}>
+              Sales Channel <span className="text-rose-500">*</span>
               {pkgStoreInherited && (
-                <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
-                  🔒 Auto-filled from pallet. Click Override to select a different store.
-                </p>
+                <span className="ml-2 text-xs font-normal text-emerald-600 dark:text-emerald-400">
+                  · Inherited from Pallet
+                </span>
               )}
-            </div>
-          )}
+            </label>
+            <select
+              className={INPUT}
+              value={pkgStoreId}
+              onChange={(e) => { setPkgStoreId(e.target.value); setPkgStoreInherited(false); }}
+              disabled={pkgStoreInherited}
+            >
+              <option value="">— Select Sales Channel —</option>
+              {pkgStoresList.map((s) => (
+                <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
+              ))}
+            </select>
+            {pkgStoreInherited && (
+              <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+                🔒 Locked — Sales Channel is inherited from the selected pallet.
+              </p>
+            )}
+            {pkgStoresList.length === 0 && (
+              <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+                No active stores found. Add a store in Settings → Stores.
+              </p>
+            )}
+          </div>
 
           {/* ── Claim Evidence Photos ──────────────────────────────────────── */}
           <div className="rounded-2xl border-2 border-rose-200 bg-rose-50 p-4 space-y-3 dark:border-rose-700/50 dark:bg-rose-950/20">
@@ -3193,18 +3692,17 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
   const [palletStoreId,  setPalletStoreId]  = useState("");
   const [palletStoresList, setPalletStoresList] = useState<{ id: string; name: string; platform: string }[]>([]);
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      try {
-        const { data } = await supabaseBrowser
-          .from("stores")
-          .select("id, name, platform")
-          .eq("is_active", true)
-          .order("created_at", { ascending: false });
-        if (data) setPalletStoresList(data as { id: string; name: string; platform: string }[]);
-      } catch {
-        // ignore fetch errors
-      }
+      const res = await listStores();
+      if (cancelled || !res.ok || !res.data) return;
+      setPalletStoresList(
+        res.data
+          .filter((s) => s.is_active !== false)
+          .map((s) => ({ id: s.id, name: s.name, platform: s.platform })),
+      );
     })();
+    return () => { cancelled = true; };
   }, []);
 
   async function handleOcr(f: File) { setFile(f); setOcrLoad(true); const res = await mockPalletOcr(f); setOcrLoad(false); if (res.ok && res.data) { setOcrResult(res.data); setPalletNum(res.data.pallet_number); } else setError(res.error ?? "OCR failed."); }
@@ -3280,24 +3778,28 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
             )}
             <input ref={bolRef} type="file" className="hidden" accept="image/*,application/pdf" capture="environment" onChange={(e) => { const f = e.target.files?.[0]; if (f) setBolFile(f); e.target.value = ""; }} />
           </div>
-          {palletStoresList.length > 0 && (
-            <div>
-              <label className={LABEL}>Source Store</label>
-              <select
-                className={INPUT}
-                value={palletStoreId}
-                onChange={(e) => setPalletStoreId(e.target.value)}
-              >
-                <option value="">— Select store (optional) —</option>
-                {palletStoresList.map((s) => (
-                  <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
-                ))}
-              </select>
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                Packages created inside this pallet will inherit this store automatically.
+          <div>
+            <label className={LABEL}>Sales Channel <span className="text-rose-500">*</span></label>
+            <select
+              className={INPUT}
+              value={palletStoreId}
+              onChange={(e) => setPalletStoreId(e.target.value)}
+            >
+              <option value="">— Select Sales Channel —</option>
+              {palletStoresList.map((s) => (
+                <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
+              ))}
+            </select>
+            {palletStoresList.length === 0 ? (
+              <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+                No active stores found. Add a store in Settings → Stores.
               </p>
-            </div>
-          )}
+            ) : (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Packages created inside this pallet will inherit this Sales Channel automatically.
+              </p>
+            )}
+          </div>
           <div><label className={LABEL}>Notes (optional)</label><textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="w-full resize-none rounded-2xl border border-slate-200 bg-white p-4 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" /></div>
           {/* General pallet photo */}
           <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-2xl border-2 border-dashed py-3 text-sm font-semibold transition ${photoUrl ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700/60 dark:bg-emerald-950/30 dark:text-emerald-300" : "border-amber-300 bg-amber-50 text-amber-700 hover:border-amber-400 hover:bg-amber-100 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-300"}`}>
@@ -3314,18 +3816,127 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
   );
 }
 
+// ─── Item / Identifiers cell (stacked + copy + Amazon search) ─────────────────
+
+export function ItemIdentifiersCell({
+  itemName,
+  asin,
+  fnsku,
+  sku,
+  storePlatform,
+  compact,
+  onToast,
+  showItemHeading = true,
+  /** When true, show placeholder rows even if all codes empty (detail drawer). */
+  alwaysShowCodeRows = false,
+}: {
+  itemName: string | null | undefined;
+  asin: string | null | undefined;
+  fnsku: string | null | undefined;
+  /** Stock Keeping Unit (Seller / warehouse MSKU) */
+  sku?: string | null | undefined;
+  /** Connected store `platform` (e.g. amazon, walmart) — drives marketplace search URL. */
+  storePlatform?: string | null | undefined;
+  /** Smaller typography for nested package / pallet sub-tables */
+  compact?: boolean;
+  onToast?: (msg: string, kind?: ToastKind) => void;
+  /** When false, only code rows (e.g. item drawer under a separate title) */
+  showItemHeading?: boolean;
+  alwaysShowCodeRows?: boolean;
+}) {
+  const a = (asin ?? "").trim();
+  const f = (fnsku ?? "").trim();
+  const s = (sku ?? "").trim();
+  const textCls = compact ? "text-[11px] text-muted-foreground" : "text-xs text-muted-foreground";
+  const iconBtn =
+    "inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-border bg-background text-muted-foreground/90 transition hover:bg-accent hover:text-foreground";
+  async function copyVal(v: string, label: string) {
+    if (!v) return;
+    try {
+      await navigator.clipboard.writeText(v);
+      onToast?.(`Copied ${label}`, "success");
+    } catch {
+      onToast?.("Copy failed", "error");
+    }
+  }
+  function openMarketplaceSearch(q: string) {
+    const url = marketplaceSearchUrl(storePlatform, q);
+    if (!url) return;
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+  const showRows = alwaysShowCodeRows || !!a || !!f || !!s;
+
+  return (
+    <div className="min-w-0">
+      {showItemHeading ? (
+        <p className={`font-bold text-slate-800 dark:text-slate-100 leading-tight truncate ${compact ? "text-xs max-w-[160px]" : "text-sm max-w-[200px]"}`}>
+          {itemName || "Unknown Item"}
+        </p>
+      ) : null}
+      {showRows ? (
+        <div className={`${showItemHeading ? "mt-1" : ""} flex flex-col gap-1 font-mono leading-snug ${textCls}`}>
+          <div
+            className="flex min-w-0 items-center gap-1"
+            title="ASIN — Amazon Standard Identification Number (catalog product ID)"
+          >
+            <span className="w-14 shrink-0 font-semibold text-slate-500 dark:text-slate-400">ASIN</span>
+            <span className="min-w-0 flex-1 truncate text-foreground/90">{a || "—"}</span>
+            {a ? (
+              <>
+                <button type="button" title="Copy ASIN" className={iconBtn} onClick={(e) => { e.stopPropagation(); void copyVal(a, "ASIN"); }}><Copy className="h-3 w-3" /></button>
+                <button type="button" title="Search marketplace" className={iconBtn} onClick={(e) => { e.stopPropagation(); openMarketplaceSearch(a); }}><Search className="h-3 w-3" /></button>
+              </>
+            ) : null}
+          </div>
+          <div
+            className="flex min-w-0 items-center gap-1"
+            title="FNSKU — Fulfillment Network SKU: your FBA label / identifier for this listing on Amazon"
+          >
+            <span className="w-14 shrink-0 font-semibold text-slate-500 dark:text-slate-400">FNSKU</span>
+            <span className="min-w-0 flex-1 truncate text-foreground/90">{f || "—"}</span>
+            {f ? (
+              <>
+                <button type="button" title="Copy FNSKU" className={iconBtn} onClick={(e) => { e.stopPropagation(); void copyVal(f, "FNSKU"); }}><Copy className="h-3 w-3" /></button>
+                <button type="button" title="Search marketplace" className={iconBtn} onClick={(e) => { e.stopPropagation(); openMarketplaceSearch(f); }}><Search className="h-3 w-3" /></button>
+              </>
+            ) : null}
+          </div>
+          <div
+            className="flex min-w-0 items-center gap-1"
+            title="SKU — Seller SKU (MSKU): warehouse / Seller Central product code (not the same as FNSKU)"
+          >
+            <span className="w-14 shrink-0 font-semibold text-slate-500 dark:text-slate-400">SKU</span>
+            <span className="min-w-0 flex-1 truncate text-foreground/90">{s || "—"}</span>
+            {s ? (
+              <>
+                <button type="button" title="Copy SKU" className={iconBtn} onClick={(e) => { e.stopPropagation(); void copyVal(s, "SKU"); }}><Copy className="h-3 w-3" /></button>
+                <button type="button" title="Search marketplace" className={iconBtn} onClick={(e) => { e.stopPropagation(); openMarketplaceSearch(s); }}><Search className="h-3 w-3" /></button>
+              </>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 // ─── Items Data Table ──────────────────────────────────────────────────────────
 
-export function ItemsDataTable({ items, packages, pallets, role, actor, onRowClick, onRowEdit, onBulkDeleted, onBulkMoved, onNewItem, externalSearch = "" }: {
+export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSettings, onRowClick, onRowEdit, onBulkDeleted, onBulkMoved, onNewItem, externalSearch = "", onToast }: {
   items: ReturnRecord[]; packages: PackageRecord[]; pallets: PalletRecord[];
   role: UserRole; actor: string;
+  fefoSettings?: { fefo_critical_days: number; fefo_warning_days: number };
   onRowClick: (r: ReturnRecord) => void; onRowEdit: (r: ReturnRecord) => void;
   onBulkDeleted: (ids: string[]) => void;
   onBulkMoved: (updated: ReturnRecord[]) => void;
   onNewItem: () => void;
   /** Merged with local search — set from TopHeader global search on Returns. */
   externalSearch?: string;
+  /** Copy-to-clipboard feedback (page-level toast). */
+  onToast?: (msg: string, kind?: ToastKind) => void;
 }) {
+  const fefo_critical = fefoSettings?.fefo_critical_days ?? 30;
+  const fefo_warning  = fefoSettings?.fefo_warning_days  ?? 90;
   const [search, setSearch] = useState(""); const [statusF, setStatusF] = useState(""); const [marketF, setMarketF] = useState("");
   const [dateFrom, setDateFrom] = useState(""); const [dateTo, setDateTo] = useState("");
   const [sortField, setSortField] = useState("created_at"); const [sortAsc, setSortAsc] = useState(false);
@@ -3350,6 +3961,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, onRowCli
           r.id, r.lpn, r.item_name, r.marketplace,
           formatMarketplaceSource(r.marketplace),
           r.product_identifier ?? "", r.inherited_tracking_number ?? "",
+          r.asin ?? "", r.fnsku ?? "", r.sku ?? "",
           pkg?.tracking_number ?? "", pkg?.package_number ?? "",
         ].join(" ").toLowerCase();
         return blob.includes(q);
@@ -3392,7 +4004,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, onRowCli
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative min-w-[180px] flex-1"><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><input placeholder="Filter: ID, ASIN, tracking, RMA…" value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }} className={`${INPUT_SM_DARK} pl-9`} /></div>
         <select value={statusF} onChange={(e) => { setStatusF(e.target.value); setPage(1); }} className={`${INPUT_SM_DARK} w-auto`}><option value="">All Statuses</option>{Object.entries(STATUS_CFG).map(([k,v]) => <option key={k} value={k}>{v.label}</option>)}</select>
-        <select value={marketF} onChange={(e) => { setMarketF(e.target.value); setPage(1); }} className={`${INPUT_SM_DARK} w-auto`} title="Filter by source / marketplace"><option value="">All sources</option>{MARKETPLACES.map((m) => <option key={m} value={m}>{MP_LABELS[m]}</option>)}</select>
+        <select value={marketF} onChange={(e) => { setMarketF(e.target.value); setPage(1); }} className={`${INPUT_SM_DARK} w-auto`} title="Filter by sales channel / store"><option value="">All Stores</option>{MARKETPLACES.map((m) => <option key={m} value={m}>{MP_LABELS[m]}</option>)}</select>
         <div className="flex items-center gap-1.5">
           <Calendar className="h-4 w-4 shrink-0 text-slate-400" />
           <input type="date" value={dateFrom} onChange={(e) => { setDateFrom(e.target.value); setPage(1); }} className={`${INPUT_SM_DARK} w-36`} title="From date" />
@@ -3403,9 +4015,9 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, onRowCli
         <button onClick={onNewItem} className="ml-auto flex h-10 items-center gap-2 rounded-xl bg-sky-500 px-4 text-sm font-semibold text-white hover:bg-sky-600"><Plus className="h-4 w-4" />Scan Item</button>
       </div>
 
-      <div className="w-full overflow-hidden rounded-2xl border border-border">
-        <div className="w-full min-w-0 overflow-x-auto">
-          <table className="w-full min-w-[1040px] text-sm">
+      <div className="w-full overflow-x-auto rounded-2xl border border-border">
+        <div className="w-full min-w-0">
+          <table className="w-full min-w-[1400px] text-sm">
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900">
                 <th className={TH_CHK} onClick={(e) => e.stopPropagation()}>
@@ -3413,13 +4025,16 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, onRowCli
                     <input type="checkbox" checked={allSelected} onChange={(e) => setSelectedIds(e.target.checked ? new Set(filtered.map((r) => r.id)) : new Set())} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                   </div>
                 </th>
-                <th className="px-4 py-3 text-left"><SortButton field="product_identifier" label="Product ID" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
+                <th className="px-4 py-3 text-left"><SortButton field="item_name" label="Item / Identifiers" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="tracking_effective" label="Tracking" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="lpn" label="LPN" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
-                <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="marketplace" label="Source" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
-                <th className="px-4 py-3 text-left"><SortButton field="item_name" label="Item" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
+                <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="store_name" label="Sales Channel" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left lg:table-cell"><SortButton field="item_conditions" label="Conditions" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="px-4 py-3 text-left"><SortButton field="status" label="Status" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
+                {/* ── NEW: Expiry Date column ── */}
+                <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="expiration_date" label="Expiry" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
+                {/* ── NEW: Evidence Photo column ── */}
+                <th className="hidden px-4 py-3 text-left md:table-cell text-xs font-semibold text-slate-500 uppercase tracking-wide">Photo</th>
                 <th className="hidden px-4 py-3 text-left lg:table-cell"><SortButton field="hierarchy_key" label="Hierarchy" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left xl:table-cell"><SortButton field="created_by" label="Operator" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left lg:table-cell"><SortButton field="created_at" label="Date" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
@@ -3431,6 +4046,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, onRowCli
                 const linkedPkg = r.package_id ? pkgMap.get(r.package_id) : null;
                 const linkedPlt = r.pallet_id  ? pltMap.get(r.pallet_id)  : null;
                 const track = r.inherited_tracking_number ?? linkedPkg?.tracking_number ?? "";
+                const expiryStatus = getExpiryStatus(r.expiration_date, fefo_critical, fefo_warning);
                 return (
                   <tr key={r.id} onClick={() => onRowClick(r)} className="cursor-pointer transition hover:bg-sky-50/50 dark:hover:bg-sky-950/20">
                     <td className={TD_CHK} onClick={(e) => e.stopPropagation()}>
@@ -3438,13 +4054,49 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, onRowCli
                         <input type="checkbox" checked={selectedIds.has(r.id)} onChange={(e) => { const s = new Set(selectedIds); e.target.checked ? s.add(r.id) : s.delete(r.id); setSelectedIds(s); }} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                       </div>
                     </td>
-                    <td className="px-4 py-3 font-mono text-xs font-semibold text-slate-700 dark:text-slate-300">{r.product_identifier ?? "—"}</td>
+                    <td className="px-4 py-3 min-w-[180px]">
+                      <ItemIdentifiersCell
+                        itemName={r.item_name}
+                        asin={r.asin}
+                        fnsku={r.fnsku}
+                        sku={r.sku}
+                        storePlatform={r.stores?.platform}
+                        onToast={onToast}
+                      />
+                    </td>
                     <td className="hidden px-4 py-3 font-mono text-[11px] text-muted-foreground md:table-cell">{track || "—"}</td>
                     <td className="hidden px-4 py-3 font-mono text-xs text-muted-foreground sm:table-cell">{r.lpn ?? "—"}</td>
-                    <td className="hidden px-4 py-3 text-xs font-medium text-slate-600 dark:text-slate-300 sm:table-cell">{formatMarketplaceSource(r.marketplace)}</td>
-                    <td className="min-w-0 max-w-none truncate px-4 py-3 text-slate-600 dark:text-slate-300">{r.item_name}</td>
+                    <td className="hidden px-4 py-3 sm:table-cell">
+                      {r.stores ? (
+                        <span className="max-w-[140px] truncate text-xs font-medium text-slate-700 dark:text-slate-300" title={r.stores.name}>{r.stores.name}</span>
+                      ) : (
+                        <span className="text-xs font-medium text-slate-500 dark:text-slate-400">{formatMarketplaceSource(r.marketplace)}</span>
+                      )}
+                    </td>
                     <td className="hidden px-4 py-3 lg:table-cell"><div className="flex flex-wrap gap-1">{r.conditions.slice(0,2).map((c) => <ConditionBadge key={c} value={c} />)}</div></td>
                     <td className="px-4 py-3"><StatusBadge status={r.status} /></td>
+                    {/* ── Expiry Date cell (FEFO) ── */}
+                    <td className="hidden px-4 py-3 md:table-cell">
+                      {expiryStatus ? (
+                        <div className="flex flex-col gap-0.5">
+                          <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${expiryStatus.cls}`}>
+                            <span className={`h-1.5 w-1.5 rounded-full ${expiryStatus.dotCls}`} />
+                            {expiryStatus.label}
+                          </span>
+                          <span className="pl-0.5 text-[10px] text-slate-400">{expiryStatus.daysLabel}</span>
+                        </div>
+                      ) : (
+                        <span className="text-xs text-slate-400">—</span>
+                      )}
+                    </td>
+                    {/* ── Evidence Photo cell ── */}
+                    <td className="hidden px-4 py-3 md:table-cell" onClick={(e) => e.stopPropagation()}>
+                      {r.photo_item_url ? (
+                        <PhotoThumb url={r.photo_item_url} alt={`Evidence: ${r.item_name}`} />
+                      ) : (
+                        <span className="text-xs text-slate-400">—</span>
+                      )}
+                    </td>
                     <td className="hidden px-4 py-3 lg:table-cell">
                       {linkedPkg
                         ? <span className="inline-flex items-center gap-1 rounded-full bg-sky-100 px-2 py-0.5 font-mono text-[10px] font-bold text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">📦 {linkedPkg.package_number}{linkedPlt ? ` › ${linkedPlt.pallet_number}` : ""}</span>
@@ -3485,7 +4137,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, onRowCli
 
 // ─── Packages Data Table ───────────────────────────────────────────────────────
 
-export function PackagesDataTable({ packages, returns: allReturns = [], pallets = [], role, actor, onRowClick, onRowEdit, onBulkDeleted, onBulkPackagesUpdated, onNewPackage, externalSearch = "" }: {
+export function PackagesDataTable({ packages, returns: allReturns = [], pallets = [], role, actor, onRowClick, onRowEdit, onBulkDeleted, onBulkPackagesUpdated, onNewPackage, externalSearch = "", onToast }: {
   packages: PackageRecord[]; returns?: ReturnRecord[]; pallets?: PalletRecord[];
   role: UserRole; actor: string;
   onRowClick: (p: PackageRecord) => void; onRowEdit: (p: PackageRecord) => void;
@@ -3494,6 +4146,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
   onBulkPackagesUpdated?: (updated: PackageRecord[]) => void;
   onNewPackage: () => void;
   externalSearch?: string;
+  onToast?: (msg: string, kind?: ToastKind) => void;
 }) {
   const [search, setSearch] = useState(""); const [statusF, setStatusF] = useState(""); const [carrierF, setCarrierF] = useState("");
   const [dateFrom, setDateFrom] = useState(""); const [dateTo, setDateTo] = useState("");
@@ -3568,6 +4221,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                   </div>
                 </th>
                 <th className="px-4 py-3 text-left"><SortButton field="package_number" label="Package #" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
+                <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="store_name" label="Sales Channel" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="carrier_tracking" label="Carrier / Tracking" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="px-4 py-3 text-left"><SortButton field="pkg_items_sort" label="Items" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="px-4 py-3 text-left"><SortButton field="status" label="Status" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
@@ -3595,10 +4249,17 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                         </div>
                       </td>
                       <td className="px-4 py-3 font-mono text-xs font-bold text-foreground">{p.package_number}</td>
+                      <td className="hidden px-4 py-3 md:table-cell">
+                        {p.stores ? (
+                          <span className="max-w-[140px] truncate text-xs font-medium text-slate-700 dark:text-slate-300" title={p.stores.name}>{p.stores.name}</span>
+                        ) : (
+                          <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-400 dark:border-slate-700 dark:bg-slate-900">Mixed / Unassigned</span>
+                        )}
+                      </td>
                       <td className="hidden px-4 py-3 sm:table-cell"><div className="flex flex-col gap-0.5">{p.carrier_name && <span className="flex items-center gap-1 text-xs text-slate-600 dark:text-slate-300"><Truck className="h-3 w-3" />{p.carrier_name}</span>}{p.tracking_number && <span className="font-mono text-[10px] text-slate-400">{p.tracking_number}</span>}</div></td>
                       <td className="px-4 py-3"><div className="flex items-center gap-2"><span className="text-sm font-bold text-slate-700 dark:text-slate-300">{p.actual_item_count}/{p.expected_item_count > 0 ? p.expected_item_count : "?"}</span>{pct !== null && <div className="hidden h-1.5 w-12 overflow-hidden rounded-full bg-muted sm:block"><div className={`h-full rounded-full ${pct >= 100 ? "bg-emerald-500" : "bg-sky-500"}`} style={{ width: `${pct}%` }} /></div>}</div></td>
                       <td className="px-4 py-3"><PkgStatusBadge status={p.status} /></td>
-                      <td className="hidden px-4 py-3 text-xs capitalize text-slate-400 md:table-cell">{p.created_by ?? "—"}</td>
+                      <td className="hidden px-4 py-3 text-xs capitalize text-slate-400 md:table-cell">{operatorDisplayLabel(p)}</td>
                       <td className="hidden px-4 py-3 text-xs text-slate-400 md:table-cell">{fmt(p.created_at)}</td>
                       <td className="px-3 py-3">
                         <RowActionMenu
@@ -3609,7 +4270,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                     </tr>
                     {isExpanded && (
                       <tr className="bg-violet-50/40 dark:bg-violet-950/10">
-                        <td colSpan={9} className="px-6 py-3">
+                        <td colSpan={10} className="px-6 py-3">
                           {pkgItems.length === 0
                             ? <p className="py-2 text-center text-xs text-slate-400">No items scanned for this package yet.</p>
                             : (
@@ -3617,7 +4278,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                                 <table className="w-full text-xs">
                                   <thead><tr className="border-b border-violet-200 bg-violet-100/60 dark:border-violet-800/50 dark:bg-violet-950/40">
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Item</th>
-                                    <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Source</th>
+                                    <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Sales Channel</th>
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Condition</th>
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Status</th>
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Operator</th>
@@ -3625,11 +4286,27 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                                   <tbody className="divide-y divide-violet-100 dark:divide-violet-900/40">
                                     {pkgItems.map((r) => (
                                       <tr key={r.id} className="hover:bg-violet-50 dark:hover:bg-violet-950/20">
-                                        <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{r.item_name}</td>
-                                        <td className="px-3 py-2 text-slate-500">{formatMarketplaceSource(r.marketplace)}</td>
+                                        <td className="px-3 py-2">
+                                          <ItemIdentifiersCell
+                                            compact
+                                            itemName={r.item_name}
+                                            asin={r.asin}
+                                            fnsku={r.fnsku}
+                                            sku={r.sku}
+                                            storePlatform={r.stores?.platform}
+                                            onToast={onToast}
+                                          />
+                                        </td>
+                                        <td className="px-3 py-2">
+                                          {r.stores ? (
+                                            <span className="max-w-[100px] truncate text-[11px] font-medium text-slate-600 dark:text-slate-300" title={r.stores.name}>{r.stores.name}</span>
+                                          ) : (
+                                            <span className="text-[11px] text-slate-500">{formatMarketplaceSource(r.marketplace)}</span>
+                                          )}
+                                        </td>
                                         <td className="px-3 py-2"><div className="flex flex-wrap gap-1">{r.conditions.slice(0,2).map((c) => <ConditionBadge key={c} value={c} />)}</div></td>
                                         <td className="px-3 py-2"><StatusBadge status={r.status} /></td>
-                                        <td className="px-3 py-2 capitalize text-slate-400">{r.created_by ?? "—"}</td>
+                                        <td className="px-3 py-2 capitalize text-slate-400">{operatorDisplayLabel(r)}</td>
                                       </tr>
                                     ))}
                                   </tbody>
@@ -3669,11 +4346,12 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
 
 // ─── Pallets Data Table ────────────────────────────────────────────────────────
 
-export function PalletsDataTable({ pallets, packages: allPackages = [], returns: allReturns = [], role, actor, onRowClick, onRowEdit, onBulkDeleted, onNewPallet, externalSearch = "" }: {
+export function PalletsDataTable({ pallets, packages: allPackages = [], returns: allReturns = [], role, actor, onRowClick, onRowEdit, onBulkDeleted, onNewPallet, externalSearch = "", onToast }: {
   pallets: PalletRecord[]; packages?: PackageRecord[]; returns?: ReturnRecord[]; role: UserRole; actor: string;
   onRowClick: (p: PalletRecord) => void; onRowEdit: (p: PalletRecord) => void;
   onBulkDeleted: (ids: string[]) => void; onNewPallet: () => void;
   externalSearch?: string;
+  onToast?: (msg: string, kind?: ToastKind) => void;
 }) {
   const [search, setSearch] = useState(""); const [statusF, setStatusF] = useState("");
   const [dateFrom, setDateFrom] = useState(""); const [dateTo, setDateTo] = useState("");
@@ -3754,6 +4432,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                   </div>
                 </th>
                 <th className="px-4 py-3 text-left"><SortButton field="pallet_number" label="Pallet #" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
+                <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="store_name" label="Sales Channel" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="px-4 py-3 text-left">
                   <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
                     <SortButton field="rollup_pkgs" label="Pkgs" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} />
@@ -3785,9 +4464,16 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                         </div>
                       </td>
                       <td className="px-4 py-3 font-mono text-xs font-bold text-foreground">{p.pallet_number}</td>
+                      <td className="hidden px-4 py-3 md:table-cell">
+                        {p.stores ? (
+                          <span className="max-w-[140px] truncate text-xs font-medium text-slate-700 dark:text-slate-300" title={p.stores.name}>{p.stores.name}</span>
+                        ) : (
+                          <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-400 dark:border-slate-700 dark:bg-slate-900">Mixed / Unassigned</span>
+                        )}
+                      </td>
                       <td className="px-4 py-3"><span className="font-bold text-slate-700 dark:text-slate-300">{p._rollupPkgs}</span><span className="mx-1 text-slate-300 dark:text-slate-600">pkgs</span><span className="font-bold text-slate-500">{p._rollupItems}</span><span className="ml-1 text-slate-300 dark:text-slate-600">items</span></td>
                       <td className="px-4 py-3"><PalletStatusBadge status={p.status} /></td>
-                      <td className="hidden px-4 py-3 text-xs capitalize text-slate-400 md:table-cell">{p.created_by}</td>
+                      <td className="hidden px-4 py-3 text-xs capitalize text-slate-400 md:table-cell">{operatorDisplayLabel(p)}</td>
                       <td className="hidden px-4 py-3 text-xs text-slate-400 lg:table-cell">{fmt(p.created_at)}</td>
                       <td className="px-3 py-3">
                         <RowActionMenu
@@ -3798,7 +4484,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                     </tr>
                     {isExpanded && (
                       <tr className="bg-slate-50/70 dark:bg-slate-900/50">
-                        <td colSpan={8} className="px-6 py-3">
+                        <td colSpan={9} className="px-6 py-3">
                           {pltPackages.length === 0
                             ? <p className="py-2 text-center text-xs text-slate-400">No packages linked to this pallet yet.</p>
                             : (
@@ -3837,7 +4523,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                                               </div>
                                             </td>
                                             <td className="px-3 py-2"><PkgStatusBadge status={pk.status} /></td>
-                                            <td className="px-3 py-2 capitalize text-slate-400">{pk.created_by ?? "—"}</td>
+                                            <td className="px-3 py-2 capitalize text-slate-400">{operatorDisplayLabel(pk)}</td>
                                           </tr>
                                           {nestedOpen && (
                                             <tr className="bg-slate-100/60 dark:bg-slate-900/40">
@@ -3849,7 +4535,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                                                       <table className="w-full text-[11px]">
                                                         <thead><tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-950/40">
                                                           <th className="px-2 py-1.5 text-left font-bold uppercase tracking-wide text-slate-500">Item</th>
-                                                          <th className="px-2 py-1.5 text-left font-bold uppercase tracking-wide text-slate-500">Source</th>
+                                                          <th className="px-2 py-1.5 text-left font-bold uppercase tracking-wide text-slate-500">Store</th>
                                                           <th className="px-2 py-1.5 text-left font-bold uppercase tracking-wide text-slate-500">Condition</th>
                                                           <th className="px-2 py-1.5 text-left font-bold uppercase tracking-wide text-slate-500">Status</th>
                                                           <th className="px-2 py-1.5 text-left font-bold uppercase tracking-wide text-slate-500">Operator</th>
@@ -3857,11 +4543,27 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                                                         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                                                           {pkgItems.map((r) => (
                                                             <tr key={r.id} className="hover:bg-slate-50 dark:hover:bg-slate-950/30">
-                                                              <td className="px-2 py-1.5 text-slate-600 dark:text-slate-300">{r.item_name}</td>
-                                                              <td className="px-2 py-1.5 text-slate-500">{formatMarketplaceSource(r.marketplace)}</td>
+                                                              <td className="px-2 py-1.5">
+                                                                <ItemIdentifiersCell
+                                                                  compact
+                                                                  itemName={r.item_name}
+                                                                  asin={r.asin}
+                                                                  fnsku={r.fnsku}
+                                                                  sku={r.sku}
+                                                                  storePlatform={r.stores?.platform}
+                                                                  onToast={onToast}
+                                                                />
+                                                              </td>
+                                                              <td className="px-2 py-1.5">
+                                                                {r.stores ? (
+                                                                  <span className="max-w-[90px] truncate text-[10px] font-medium text-slate-600 dark:text-slate-300" title={r.stores.name}>{r.stores.name}</span>
+                                                                ) : (
+                                                                  <span className="text-[10px] text-slate-500">{formatMarketplaceSource(r.marketplace)}</span>
+                                                                )}
+                                                              </td>
                                                               <td className="px-2 py-1.5"><div className="flex flex-wrap gap-1">{r.conditions.slice(0, 2).map((c) => <ConditionBadge key={c} value={c} />)}</div></td>
                                                               <td className="px-2 py-1.5"><StatusBadge status={r.status} /></td>
-                                                              <td className="px-2 py-1.5 capitalize text-slate-400">{r.created_by ?? "—"}</td>
+                                                              <td className="px-2 py-1.5 capitalize text-slate-400">{operatorDisplayLabel(r)}</td>
                                                             </tr>
                                                           ))}
                                                         </tbody>

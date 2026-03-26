@@ -1,9 +1,24 @@
 "use server";
 
 import { supabaseServer } from "../../lib/supabase-server";
+import { isUuidString } from "../../lib/uuid";
 
 const DEFAULT_ORG   = "00000000-0000-0000-0000-000000000001";
+/** Legacy default label for audit logs (TEXT only — never write to UUID columns). */
 const DEFAULT_ACTOR = "operator";
+
+/**
+ * Seeded MVP operator when the UI passes a display name (e.g. "Maysam") instead of
+ * `auth.users.id`. Keeps `created_by_id` / `updated_by_id` valid UUIDs.
+ */
+const MVP_ACTOR_USER_ID = "00000000-0000-0000-0000-0000000000fe";
+
+/** Maps UI `actor` (name or UUID) to a UUID for `created_by_id` / `updated_by_id`. */
+function resolveActorUserId(actor?: string | null): string {
+  const raw = (actor ?? DEFAULT_ACTOR).trim();
+  if (isUuidString(raw)) return raw;
+  return MVP_ACTOR_USER_ID;
+}
 
 // ─── Organisation Settings ────────────────────────────────────────────────────
 
@@ -115,12 +130,17 @@ export type PalletRecord = {
   bol_photo_url?: string | null; // post-migration field
   photo_url?: string | null; // box/pallet general photo — added in 20260324_media_photo_urls.sql
   status: PalletStatus; notes: string | null; item_count: number;
-  created_by: string;
+  /** Legacy text label (older rows); prefer `created_by_id` for new schema. */
+  created_by?: string | null;
+  created_by_id?: string | null;
   /** Last actor who updated this row — HR / performance analytics */
   updated_by?: string | null;
+  updated_by_id?: string | null;
   created_at: string; updated_at: string;
   /** UUID of the connected store — added in 20260325_pallets_store_id.sql */
   store_id?: string | null;
+  /** Joined store row — present when fetched with stores(name,platform) select */
+  stores?: { name: string; platform: string } | null;
   /** Live counts from `listPallets` relation embeds (optional). */
   child_packages_count?: number;
   child_returns_count?: number;
@@ -164,9 +184,13 @@ export type PackageRecord = {
   photo_return_label_url?: string | null;
   /** UUID of the connected store — added in 20260325_saas_stores_usage.sql */
   store_id?: string | null;
-  created_by: string;
+  /** Joined store row — present when fetched with stores(name,platform) select */
+  stores?: { name: string; platform: string } | null;
+  created_by?: string | null;
+  created_by_id?: string | null;
   /** Last actor who updated this row — HR / performance analytics */
   updated_by?: string | null;
+  updated_by_id?: string | null;
   created_at: string; updated_at: string;
 };
 
@@ -194,6 +218,12 @@ export type ReturnInsertPayload = {
   /** ASIN / UPC / FNSKU — primary product identifier at item level. */
   product_identifier?: string;
   marketplace: string; item_name: string;
+  /** Amazon Standard Identification Number */
+  asin?: string;
+  /** Fulfillment Network SKU (FBA label / network ID) */
+  fnsku?: string;
+  /** Stock Keeping Unit (Seller / warehouse MSKU) — column `sku` in DB V16.4+ */
+  sku?: string;
   conditions: string[];
   notes?: string; photo_evidence?: Record<string, number>;
   expiration_date?: string; batch_number?: string;
@@ -217,6 +247,12 @@ export type ReturnRecord = {
   inherited_tracking_number?: string | null;
   inherited_carrier?: string | null;
   marketplace: string; item_name: string;
+  /** Amazon Standard Identification Number — added in 20260326_returns_asin_fnsku_name.sql */
+  asin?: string | null;
+  /** Fulfillment Network SKU — added in 20260326_returns_asin_fnsku_name.sql */
+  fnsku?: string | null;
+  /** Stock Keeping Unit — unified with DB column `sku` (replaces legacy seller_sku). */
+  sku?: string | null;
   conditions: string[]; status: string;
   notes: string | null; photo_evidence: Record<string, number> | null;
   expiration_date: string | null; batch_number: string | null;
@@ -225,13 +261,17 @@ export type ReturnRecord = {
   photo_expiry_url?: string | null;
   /** UUID of the connected store — added in 20260325_saas_stores_usage.sql */
   store_id?: string | null;
+  /** Joined store row — present when fetched with stores(name,platform) select */
+  stores?: { name: string; platform: string } | null;
   pallet_id: string | null; package_id: string | null;
   // Post-migration fields — null/undefined until 20250324_returns_order_customer_ids.sql is applied
   order_id?: string | null;
   customer_id?: string | null;
-  created_by: string;
+  created_by?: string | null;
+  created_by_id?: string | null;
   /** Last actor who touched this row — HR / performance analytics */
   updated_by?: string | null;
+  updated_by_id?: string | null;
   created_at: string; updated_at: string;
 };
 
@@ -241,6 +281,7 @@ export type ReturnUpdatePayload = Partial<Pick<
   | "conditions" | "expiration_date" | "batch_number"
   | "package_id" | "pallet_id"
   | "photo_evidence" | "photo_item_url" | "photo_expiry_url"
+  | "asin" | "fnsku" | "sku" | "product_identifier" | "store_id" | "marketplace"
 >>;
 
 // ─── Audit Log Types ──────────────────────────────────────────────────────────
@@ -261,14 +302,16 @@ export type AuditLogRecord = {
 //       → migration: 20250325_returns_product_inherited_tracking.sql
 //   • order_id / customer_id
 //       → migration: 20250324_returns_order_customer_ids.sql
+//   • asin / fnsku (included in RETURN_SELECT)
+//       → migration: 20260326_returns_asin_fnsku_name.sql  (run this before deploying)
 // NOTE: store_id in PALLET_SELECT requires migration 20260325_pallets_store_id.sql to be applied first.
-const PALLET_SELECT = "id,organization_id,pallet_number,manifest_photo_url,store_id,status,notes,item_count,created_by,updated_by,created_at,updated_at";
-const PKG_SELECT    = "id,organization_id,package_number,tracking_number,carrier_name,rma_number,expected_item_count,actual_item_count,pallet_id,store_id,status,discrepancy_note,manifest_url,photo_closed_url,photo_opened_url,photo_return_label_url,created_by,updated_by,created_at,updated_at";
-const RETURN_SELECT = "id,organization_id,lpn,marketplace,item_name,conditions,status,notes,photo_evidence,expiration_date,batch_number,photo_item_url,photo_expiry_url,store_id,pallet_id,package_id,created_by,updated_by,created_at,updated_at";
+const PALLET_SELECT = "id,organization_id,pallet_number,manifest_photo_url,store_id,status,notes,item_count,created_by,created_by_id,updated_by,updated_by_id,created_at,updated_at";
+const PKG_SELECT    = "id,organization_id,package_number,tracking_number,carrier_name,rma_number,expected_item_count,actual_item_count,pallet_id,store_id,status,discrepancy_note,manifest_url,photo_closed_url,photo_opened_url,photo_return_label_url,created_by,created_by_id,updated_by,updated_by_id,created_at,updated_at";
+const RETURN_SELECT = "id,organization_id,lpn,marketplace,item_name,asin,fnsku,sku,conditions,status,notes,photo_evidence,expiration_date,batch_number,photo_item_url,photo_expiry_url,store_id,stores(name,platform),pallet_id,package_id,created_by,created_by_id,updated_by,updated_by_id,created_at,updated_at";
 
-/** Supabase relation embeds: live child counts (avoids stale actual_item_count / item_count). */
-const PKG_LIST_SELECT = `${PKG_SELECT},returns(count)`;
-const PALLET_LIST_SELECT = `${PALLET_SELECT},packages(count),returns(count)`;
+/** Supabase relation embeds: live child counts + joined store name/platform. */
+const PKG_LIST_SELECT = `${PKG_SELECT},stores(name,platform),returns(count)`;
+const PALLET_LIST_SELECT = `${PALLET_SELECT},stores(name,platform),packages(count),returns(count)`;
 
 function normalizePackageRow(row: Record<string, unknown>): PackageRecord {
   const ret = row.returns as { count: number }[] | undefined;
@@ -309,7 +352,7 @@ export async function createPallet(
       manifest_photo_url: payload.manifest_photo_url ?? null,
       notes: payload.notes?.trim() || null,
       status: "open",
-      created_by: actor,
+      created_by_id: resolveActorUserId(payload.created_by),
     };
     // bol_photo_url / photo_url / store_id only inserted if migration has been applied
     if (payload.bol_photo_url) insertRow.bol_photo_url = payload.bol_photo_url;
@@ -331,6 +374,7 @@ export async function listPallets(organizationId?: string): Promise<{ ok: boolea
   try {
     const { data, error } = await supabaseServer.from("pallets").select(PALLET_LIST_SELECT)
       .eq("organization_id", organizationId ?? DEFAULT_ORG)
+      .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(200);
     if (error) {
       console.error("[listPallets] Supabase error:", error.message, "| code:", error.code);
@@ -349,6 +393,7 @@ export async function listOpenPallets(organizationId?: string): Promise<{ ok: bo
   try {
     const { data, error } = await supabaseServer.from("pallets").select(PALLET_LIST_SELECT)
       .eq("organization_id", organizationId ?? DEFAULT_ORG).eq("status", "open")
+      .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(50);
     if (error) throw new Error(error.message);
     const rows = (data ?? []) as Record<string, unknown>[];
@@ -363,7 +408,7 @@ export async function updatePalletStatus(
 ): Promise<{ ok: boolean; error?: string }> {
   try {
     const { error } = await supabaseServer.from("pallets")
-      .update({ status, updated_by: actor ?? DEFAULT_ACTOR }).eq("id", palletId);
+      .update({ status, updated_by_id: resolveActorUserId(actor) }).eq("id", palletId);
     if (error) throw new Error(error.message);
     void logPalletAudit({ organizationId: DEFAULT_ORG, palletId, action: "status_changed", field: "status", newValue: status, actor: actor ?? DEFAULT_ACTOR });
     return { ok: true };
@@ -407,11 +452,11 @@ export async function createPackage(
         ...(payload.photo_opened_url        ? { photo_opened_url:        payload.photo_opened_url        } : {}),
         ...(payload.photo_return_label_url  ? { photo_return_label_url:  payload.photo_return_label_url  } : {}),
         status:              "open",
-        created_by:          actor,
+        created_by_id:       resolveActorUserId(payload.created_by),
       })
       .select(PKG_LIST_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
-    void logPackageAudit({ organizationId: orgId, packageId: (data as PackageRecord).id, action: "created", actor });
+    void logPackageAudit({ organizationId: orgId, packageId: (data as { id: string }).id, action: "created", actor });
     return { ok: true, data: normalizePackageRow(data as Record<string, unknown>) };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Failed to create package." };
@@ -428,7 +473,12 @@ export async function updatePackage(
   actor?: string,
 ): Promise<{ ok: boolean; data?: PackageRecord; error?: string }> {
   try {
-    const payload = omitUndefined({ ...updates, updated_by: actor ?? DEFAULT_ACTOR } as Record<string, unknown>);
+    const payload = omitUndefined({
+      ...updates,
+      updated_by_id: resolveActorUserId(actor),
+    } as Record<string, unknown>);
+    delete payload.updated_by;
+    delete payload.created_by;
     const { data, error } = await supabaseServer.from("packages")
       .update(payload)
       .eq("id", packageId).select(PKG_LIST_SELECT).single();
@@ -452,6 +502,7 @@ export async function listPackages(organizationId?: string): Promise<{ ok: boole
   try {
     const { data, error } = await supabaseServer.from("packages").select(PKG_LIST_SELECT)
       .eq("organization_id", organizationId ?? DEFAULT_ORG)
+      .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(200);
     if (error) {
       console.error("[listPackages] Supabase error:", error.message, "| code:", error.code);
@@ -470,6 +521,7 @@ export async function listOpenPackages(organizationId?: string): Promise<{ ok: b
   try {
     const { data, error } = await supabaseServer.from("packages").select(PKG_LIST_SELECT)
       .eq("organization_id", organizationId ?? DEFAULT_ORG).eq("status", "open")
+      .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(50);
     if (error) throw new Error(error.message);
     const rows = (data ?? []) as Record<string, unknown>[];
@@ -482,9 +534,9 @@ export async function listOpenPackages(organizationId?: string): Promise<{ ok: b
 export async function listReturnsByPackage(packageId: string): Promise<{ ok: boolean; data: ReturnRecord[]; error?: string }> {
   try {
     const { data, error } = await supabaseServer.from("returns").select(RETURN_SELECT)
-      .eq("package_id", packageId).order("created_at", { ascending: false });
+      .eq("package_id", packageId).is("deleted_at", null).order("created_at", { ascending: false });
     if (error) throw new Error(error.message);
-    return { ok: true, data: (data ?? []) as ReturnRecord[] };
+    return { ok: true, data: (data ?? []) as unknown as ReturnRecord[] };
   } catch (err) {
     return { ok: false, data: [], error: err instanceof Error ? err.message : "Failed to load package items." };
   }
@@ -503,7 +555,7 @@ export async function closePackage(
     const hasDiscrepancy = (pkg.expected_item_count > 0 && pkg.expected_item_count !== pkg.actual_item_count) || !!opts?.discrepancyNote;
     const newStatus: PackageStatus = hasDiscrepancy ? "suspicious" : "closed";
     const { error } = await supabaseServer.from("packages")
-      .update({ status: newStatus, discrepancy_note: opts?.discrepancyNote ?? null, updated_by: actor })
+      .update({ status: newStatus, discrepancy_note: opts?.discrepancyNote ?? null, updated_by_id: resolveActorUserId(actor) })
       .eq("id", packageId);
     if (error) throw new Error(error.message);
     void logPackageAudit({ organizationId: pkg.organization_id ?? DEFAULT_ORG, packageId, action: "status_changed", field: "status", newValue: newStatus, actor });
@@ -531,7 +583,6 @@ export async function insertReturn(
 ): Promise<{ ok: boolean; data?: ReturnRecord; error?: string }> {
   try {
     const orgId  = payload.organization_id ?? DEFAULT_ORG;
-    const actor  = payload.created_by      ?? DEFAULT_ACTOR;
     const status = deriveStatus(payload.conditions, payload.photo_evidence ?? null);
 
     // Inherit pallet_id from package when not explicitly provided
@@ -555,15 +606,18 @@ export async function insertReturn(
       pallet_id:       effectivePalletId,
       package_id:      payload.package_id ?? null,
       status,
-      created_by:      actor,
+      created_by_id:   resolveActorUserId(payload.created_by),
     };
-    // Post-migration columns — only written once their migration is applied
+    // Post-migration columns — only written once their migrations are applied
     // NOTE: product_identifier is intentionally excluded here because the column does not yet
     // exist in the DB schema (migration 20250325_returns_product_inherited_tracking.sql is pending).
     // Trying to INSERT it causes a PostgREST 400 / schema cache error.
     // Re-enable after running the migration:
     //   if (payload.product_identifier) insertRow.product_identifier = payload.product_identifier.trim();
     if (payload.store_id)         insertRow.store_id         = payload.store_id;
+    if (payload.asin)             insertRow.asin             = payload.asin.trim();
+    if (payload.fnsku)            insertRow.fnsku            = payload.fnsku.trim();
+    if (payload.sku)              insertRow.sku              = payload.sku.trim();
     if (payload.order_id)        insertRow.order_id        = payload.order_id.trim();
     if (payload.customer_id)    insertRow.customer_id    = payload.customer_id.trim();
     if (payload.photo_item_url)   insertRow.photo_item_url   = payload.photo_item_url;
@@ -573,8 +627,16 @@ export async function insertReturn(
       .insert(insertRow).select(RETURN_SELECT).single();
 
     if (error) throw new Error(parseDuplicateError(error.message));
-    const rec = data as ReturnRecord;
-    void logReturnAudit({ organizationId: orgId, returnId: rec.id, palletId: rec.pallet_id ?? undefined, packageId: rec.package_id ?? undefined, action: "created", newValue: JSON.stringify({ conditions: payload.conditions, status }), actor });
+    const rec = data as unknown as ReturnRecord;
+    void logReturnAudit({
+      organizationId: orgId,
+      returnId: rec.id,
+      palletId: rec.pallet_id ?? undefined,
+      packageId: rec.package_id ?? undefined,
+      action: "created",
+      newValue: JSON.stringify({ conditions: payload.conditions, status }),
+      actor: payload.created_by ?? DEFAULT_ACTOR,
+    });
     return { ok: true, data: rec };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Failed to save return." };
@@ -587,11 +649,12 @@ export async function updateReturn(
   actor?: string,
 ): Promise<{ ok: boolean; data?: ReturnRecord; error?: string }> {
   try {
-    const patch: Record<string, unknown> = { ...updates, updated_by: actor ?? DEFAULT_ACTOR };
+    const patch: Record<string, unknown> = { ...updates, updated_by_id: resolveActorUserId(actor) };
+    delete patch.updated_by;
+    delete patch.created_by;
     // Remove post-migration columns from patch — they may not be in the DB yet
     delete patch.inherited_tracking_number;
     delete patch.inherited_carrier;
-    delete patch.product_identifier;
     delete patch.order_id;
     delete patch.customer_id;
     // Inherit pallet_id from package when package_id is set to a real package
@@ -611,7 +674,7 @@ export async function updateReturn(
       .eq("id", returnId).select(RETURN_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
     void logReturnAudit({ organizationId: DEFAULT_ORG, returnId, action: "updated", actor: actor ?? DEFAULT_ACTOR });
-    return { ok: true, data: data as ReturnRecord };
+    return { ok: true, data: data as unknown as ReturnRecord };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Failed to update return." };
   }
@@ -628,16 +691,36 @@ export async function deleteReturn(returnId: string, actor?: string): Promise<{ 
   }
 }
 
+/** Returns in the claim workflow (evidence gathering or ready to file). */
+export async function listClaimPipelineReturns(
+  organizationId?: string,
+): Promise<{ ok: boolean; data: ReturnRecord[]; error?: string }> {
+  try {
+    const { data, error } = await supabaseServer.from("returns")
+      .select(RETURN_SELECT)
+      .eq("organization_id", organizationId ?? DEFAULT_ORG)
+      .in("status", ["ready_for_claim", "pending_evidence"])
+      .is("deleted_at", null)
+      .order("created_at", { ascending: false })
+      .limit(200);
+    if (error) throw new Error(error.message);
+    return { ok: true, data: (data ?? []) as unknown as ReturnRecord[] };
+  } catch (err) {
+    return { ok: false, data: [], error: err instanceof Error ? err.message : "Failed to load claim pipeline items." };
+  }
+}
+
 export async function listReturns(organizationId?: string): Promise<{ ok: boolean; data: ReturnRecord[]; error?: string }> {
   try {
     const { data, error } = await supabaseServer.from("returns").select(RETURN_SELECT)
       .eq("organization_id", organizationId ?? DEFAULT_ORG)
+      .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(200);
     if (error) {
       console.error("[listReturns] Supabase error:", error.message, "| code:", error.code, "| details:", error.details);
       throw new Error(error.message);
     }
-    return { ok: true, data: (data ?? []) as ReturnRecord[] };
+    return { ok: true, data: (data ?? []) as unknown as ReturnRecord[] };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Failed to load returns.";
     console.error("[listReturns] Caught error:", msg);
@@ -648,9 +731,9 @@ export async function listReturns(organizationId?: string): Promise<{ ok: boolea
 export async function listReturnsByPallet(palletId: string): Promise<{ ok: boolean; data: ReturnRecord[]; error?: string }> {
   try {
     const { data, error } = await supabaseServer.from("returns").select(RETURN_SELECT)
-      .eq("pallet_id", palletId).order("created_at", { ascending: false });
+      .eq("pallet_id", palletId).is("deleted_at", null).order("created_at", { ascending: false });
     if (error) throw new Error(error.message);
-    return { ok: true, data: (data ?? []) as ReturnRecord[] };
+    return { ok: true, data: (data ?? []) as unknown as ReturnRecord[] };
   } catch (err) {
     return { ok: false, data: [], error: err instanceof Error ? err.message : "Failed to load pallet items." };
   }
@@ -665,6 +748,50 @@ export async function listAuditLog(organizationId?: string, limit = 50): Promise
     return { ok: true, data: (data ?? []) as AuditLogRecord[] };
   } catch (err) {
     return { ok: false, data: [], error: err instanceof Error ? err.message : "Failed to load audit log." };
+  }
+}
+
+// ─── Dashboard high-level snapshot (UTC “today”) ───────────────────────────────
+
+export type DashboardSnapshot = {
+  returnsToday: number;
+  palletCount: number;
+  packageCount: number;
+};
+
+export async function getDashboardSnapshot(
+  organizationId?: string,
+): Promise<{ ok: boolean; data?: DashboardSnapshot; error?: string }> {
+  const org = organizationId ?? DEFAULT_ORG;
+  const startUtc = new Date();
+  startUtc.setUTCHours(0, 0, 0, 0);
+  const iso = startUtc.toISOString();
+  try {
+    const [
+      { count: returnsToday, error: e1 },
+      { count: palletCount, error: e2 },
+      { count: packageCount, error: e3 },
+    ] = await Promise.all([
+      supabaseServer.from("returns").select("id", { count: "exact", head: true }).eq("organization_id", org).gte("created_at", iso).is("deleted_at", null),
+      supabaseServer.from("pallets").select("id", { count: "exact", head: true }).eq("organization_id", org).is("deleted_at", null),
+      supabaseServer.from("packages").select("id", { count: "exact", head: true }).eq("organization_id", org).is("deleted_at", null),
+    ]);
+    if (e1) throw new Error(e1.message);
+    if (e2) throw new Error(e2.message);
+    if (e3) throw new Error(e3.message);
+    return {
+      ok: true,
+      data: {
+        returnsToday: returnsToday ?? 0,
+        palletCount: palletCount ?? 0,
+        packageCount: packageCount ?? 0,
+      },
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Failed to load dashboard snapshot.",
+    };
   }
 }
 

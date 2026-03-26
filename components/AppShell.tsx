@@ -25,6 +25,7 @@ import { TopHeader } from "./TopHeader";
 import { LogoMark } from "./LogoMark";
 import { GlobalSearchProvider } from "./GlobalSearchContext";
 import { UserRoleProvider, useUserRole } from "./UserRoleContext";
+import { getCoreSettings } from "../app/settings/workspace-settings-actions";
 
 // ─── Nav Definition ────────────────────────────────────────────────────────────
 
@@ -43,7 +44,7 @@ const NAV: NavSection[] = [
     items: [
       { label: "Dashboard",          icon: LayoutDashboard, href: "/" },
       { label: "Returns Processing", icon: RotateCcw,       href: "/returns" },
-      { label: "Claim Engine",       icon: ShieldAlert,     href: "#", disabled: true, badge: "Soon" },
+      { label: "Claim Engine",       icon: ShieldAlert,     href: "/claim-engine" },
     ],
   },
   {
@@ -71,11 +72,23 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [mounted,    setMounted]    = useState(false);
   const [expanded,   setExpanded]   = useState<Record<string, boolean>>({});
+  const [brandName,  setBrandName]  = useState<string>("");
+  const [brandLogo,  setBrandLogo]  = useState<string>("");
   const pathname = usePathname();
 
   useEffect(() => {
     setMounted(true);
     if (localStorage.getItem("sidebar_collapsed") === "true") setCollapsed(true);
+    async function loadBranding() {
+      try {
+        const cfg = await getCoreSettings();
+        setBrandName(cfg.company_name ?? "");
+        setBrandLogo(cfg.company_logo_url ?? "");
+      } catch {
+        // silently fall back to defaults
+      }
+    }
+    loadBranding();
   }, []);
 
   const toggleCollapsed = useCallback(() => {
@@ -257,9 +270,21 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       >
         <div className="flex h-14 shrink-0 items-center justify-between border-b border-sidebar-border px-4">
           <div className="flex items-center gap-2.5">
-            <LogoMark />
+            {brandLogo ? (
+              /* eslint-disable-next-line @next/next/no-img-element */
+              <img
+                src={brandLogo}
+                alt="Brand logo"
+                className="h-8 w-8 shrink-0 rounded-xl object-contain"
+                onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
+              />
+            ) : (
+              <LogoMark />
+            )}
             <div>
-              <p className="text-sm font-bold text-sidebar-foreground">E-commerce OS</p>
+              <p className="text-sm font-bold text-sidebar-foreground">
+                {brandName || "E-commerce OS"}
+              </p>
               <p className="text-[10px] text-muted-foreground">Returns ERP</p>
             </div>
           </div>
@@ -299,10 +324,22 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             "flex h-14 shrink-0 items-center border-b border-sidebar-border px-4",
             collapsed ? "justify-center" : "gap-2.5",
           ].join(" ")}>
-            <LogoMark />
+            {brandLogo ? (
+              /* eslint-disable-next-line @next/next/no-img-element */
+              <img
+                src={brandLogo}
+                alt="Brand logo"
+                className="h-8 w-8 shrink-0 rounded-xl object-contain"
+                onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
+              />
+            ) : (
+              <LogoMark />
+            )}
             {!collapsed && (
               <div className="min-w-0">
-                <p className="truncate text-sm font-bold text-sidebar-foreground">E-commerce OS</p>
+                <p className="truncate text-sm font-bold text-sidebar-foreground">
+                  {brandName || "E-commerce OS"}
+                </p>
                 <p className="text-[10px] text-muted-foreground">Returns ERP</p>
               </div>
             )}

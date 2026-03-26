@@ -9,6 +9,11 @@ import {
   type OrgSettings,
   listReturns, listPackages, listPallets, getOrgSettings,
 } from "./actions";
+import { getFefoSettings } from "../settings/workspace-settings-actions";
+import {
+  DEFAULT_FEFO,
+  type InventoryModuleConfig,
+} from "../settings/workspace-settings-types";
 import {
   DEFAULT_ORG_SETTINGS,
   type DrawerContent, type WizardInheritedContext,
@@ -32,6 +37,7 @@ export default function ReturnsPage() {
   const [loading,      setLoading]      = useState(true);
   const [fetchErrors,  setFetchErrors]  = useState<string[]>([]);
   const [orgSettings,  setOrgSettings]  = useState<OrgSettings>(DEFAULT_ORG_SETTINGS);
+  const [fefoSettings, setFefoSettings] = useState<InventoryModuleConfig>(DEFAULT_FEFO);
   /** In-session File objects keyed by returnId — enables live photo gallery in the drawer. */
   const [sessionPhotos, setSessionPhotos] = useState<Map<string, Record<string, File[]>>>(new Map());
 
@@ -64,8 +70,8 @@ export default function ReturnsPage() {
     async function load() {
       setLoading(true);
       setFetchErrors([]);
-      const [r, p, pl, settings] = await Promise.all([
-        listReturns(), listPackages(), listPallets(), getOrgSettings(),
+      const [r, p, pl, settings, fefo] = await Promise.all([
+        listReturns(), listPackages(), listPallets(), getOrgSettings(), getFefoSettings(),
       ]);
       const errs: string[] = [];
       if (r.ok)  setReturns(r.data   ?? []);
@@ -76,6 +82,7 @@ export default function ReturnsPage() {
       else       errs.push(`Pallets: ${pl.error ?? "unknown error"}`);
       if (errs.length) setFetchErrors(errs);
       setOrgSettings(settings);
+      setFefoSettings(fefo);
       setLoading(false);
     }
     load();
@@ -216,7 +223,9 @@ export default function ReturnsPage() {
                 pallets={pallets}
                 role={role}
                 actor={actor}
+                fefoSettings={fefoSettings}
                 externalSearch={globalSearchQuery}
+                onToast={showToast}
                 onRowClick={(r) => openDrawer({ type: "item", record: r })}
                 onRowEdit={(r)  => openDrawer({ type: "item", record: r })}
                 onBulkDeleted={bulkRemoveReturns}
@@ -233,6 +242,7 @@ export default function ReturnsPage() {
                 role={role}
                 actor={actor}
                 externalSearch={globalSearchQuery}
+                onToast={showToast}
                 onRowClick={(p) => openDrawer({ type: "package", record: p })}
                 onRowEdit={(p)  => openDrawer({ type: "package", record: p })}
                 onBulkDeleted={bulkRemovePackages}
@@ -249,6 +259,7 @@ export default function ReturnsPage() {
                 role={role}
                 actor={actor}
                 externalSearch={globalSearchQuery}
+                onToast={showToast}
                 onRowClick={(p) => openDrawer({ type: "pallet", record: p })}
                 onRowEdit={(p)  => openDrawer({ type: "pallet", record: p })}
                 onBulkDeleted={bulkRemovePallets}
@@ -275,6 +286,7 @@ export default function ReturnsPage() {
             packages={packages}
             pallets={pallets}
             sessionPhotos={sessionPhotos.get(activeDrawer.record.id)}
+            onToast={showToast}
             onUpdated={(r) => { updateReturn_(r); openDrawer({ type: "item", record: r }); }}
             onDeleted={(id) => { removeReturn(id); closeDrawer(); showToast("Return deleted.", "warning"); }}
           />

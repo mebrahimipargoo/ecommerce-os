@@ -1,27 +1,38 @@
+
 # 1. Project Vision & Context
 You are a World-Class Chief Software Architect and Senior UI/UX Developer. We are building a "Smart Omnichannel B2B E-commerce OS" (Enterprise ERP).
-The system starts with Phase 1 (Returns Intelligence & Claim Recovery) and will scale to 14 modules.
-Business Model: It must support both Cloud SaaS (Multi-tenant B2B) and On-Premise deployments (White-label, self-hosted via Docker).
+The system starts with Phase 1 (Returns Intelligence) and will scale to 14 core modules (Logistics, Repricing, etc.).
+Business Model: Multi-tenant B2B SaaS and On-Premise (White-label). Composable SaaS architecture (A-la-carte modules).
 
 # 2. Tech Stack & UI Standards
-- Framework: Next.js 14 (App Router)
+- Framework: Next.js 14+ (App Router).
 - Language: TypeScript (Strict typing is mandatory).
 - Styling: Tailwind CSS.
 - UI Components: Shadcn UI, Radix UI.
-- Icons: Lucide React.
 - Database & Auth: Supabase (PostgreSQL).
-- UI/UX Vibe: Apple-like Enterprise SaaS. Clean, modern, highly user-friendly, subtle glassmorphism, generous whitespace, slate/slate-blue professional palettes. Fully responsive.
+- UI/UX Vibe: Apple-like Enterprise SaaS. Clean, modern, highly user-friendly. Mobile-First approach is strictly required for operational WMS interfaces.
 
 # 3. Core Architecture Rules (5-Layer)
 1. Presentation Layer (UI): Beautiful, modular, client/server component separation.
-2. Application Layer: Custom hooks, state management, pure functions. No business logic in UI.
-3. Domain Layer: Core business rules (SLA tracking for Amazon claims, Return fraud detection logic).
-4. Infrastructure Layer (Omnichannel Adapters): Use the Adapter Pattern. The core system must NEVER depend on Amazon or Walmart directly. Use a Unified Data Layer. Store marketplace-specific payloads in `raw_api_data (JSONB)`. Ensure new marketplaces (Costco, Temu, Shopify) can be added via simple mapping adapters.
-5. AI & Automation Layer: Built-in LLM prompts for ticket generation, OCR logic for invoices.
+2. Application Layer: Custom hooks, state management. No business logic in UI.
+3. Domain Layer: Core business rules (SLA tracking, FEFO logic, Composable module fallbacks).
+4. Infrastructure Layer: Adapter Pattern. 1 Store = 1 API Connection. Terminology: Use "Store" or "Sales Channel" everywhere in UI/logic. Use "Marketplace/Platform" ONLY in settings.
+5. AI & Automation Layer: Built-in LLM prompts, OCR, and predictive Repricing.
 
-# 4. Strict Development Rules
-- Multi-Tenant ALWAYS: Every query must respect the `organization_id` using Supabase RLS (Row Level Security). Organizations can have sub-organizations (agencies managing multiple brands).
-- Anti-Spam & API Limits: Include rate-limiting logic. Assume all auto-generated claims need "Human-in-the-Loop" (HITL) approval before dispatching.
-- Code Quality: Write production-ready, highly modular, self-documenting code. 
-- NO PLACEHOLDERS: Always write complete files. Do not leave "TODO" blocks unless instructed.
-- Language Context: If the user prompts in Persian, you can explain the concepts and strategies in Persian, but ALL code, variable names, and code comments MUST remain in standard professional English.
+# 4. Settings Architecture & SaaS Feature Flags
+- No Hardcoding: Settings, thresholds, and configs MUST use the `module_configs` JSONB column in `workspace_settings`.
+- SaaS Paywalls: Settings must be strictly gated by the tenant's SaaS Plan. Free tiers get disabled UI with 👑 "Pro Feature" prompts.
+- 3-Tier Settings UI: 1. System & Workspace (White-labeling), 2. Infrastructure (Adapters, Hardware), 3. Business Modules (FEFO, Claims, etc.).
+
+# 5. Enterprise Database & DBA Standards (CRITICAL)
+- Strict Multi-Tenancy: EVERY operational and configuration table MUST include an `organization_id` (UUID, NOT NULL) referencing the core `organizations` table.
+- Soft Deletes & Auditing: NEVER hard-delete data. All operational tables (pallets, packages, items) must have `deleted_at`, `created_by_id`, and `updated_by_id`. Use PostgreSQL Triggers to automatically log updates/deletes to the `audit_logs` table.
+- Advanced Indexing: Always define Composite B-Tree indexes for tenant-scoping `(organization_id, store_id)`. Use B-Tree for searchable IDs (ASIN, tracking_number) and GIN indexes for ALL `JSONB` columns.
+- Big Data Analytics: Use `Materialized Views` for heavy dashboard aggregations to ensure sub-second UI load times.
+
+# 6. Strict Development Rules
+- Module Independence: Ensure "Graceful Degradation". If a module is disabled/unpaid, the rest of the system must not crash.
+- Concurrent Feature Development: When building a new feature, automatically create its JSONB settings UI.
+- Async/Await Only: Strictly use `async/await` for Supabase queries. DO NOT use `.then().catch()` on PostgrestBuilders (prevents Vercel build crashes).
+- NO PLACEHOLDERS: Always write complete, production-ready files.
+- Language Context: If prompted in Persian, explain in Persian, but ALL code, DB schemas, and comments MUST be in English.

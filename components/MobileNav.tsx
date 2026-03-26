@@ -20,7 +20,7 @@ const navLinks = [
     items: [
       { label: "Dashboard", icon: LayoutDashboard, href: "/" },
       { label: "Returns Processing", icon: RotateCcw, href: "/returns" },
-      { label: "Claim Engine", icon: ShieldAlert, href: "#" },
+      { label: "Claim Engine", icon: ShieldAlert, href: "/claim-engine" },
     ],
   },
   {

@@ -3,10 +3,22 @@
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import {
-  ArrowLeft, BadgeCheck, BarChart3, CheckCircle2, ChevronUp, CreditCard, Cpu, Globe,
-  HardDrive, KeyRound, Loader2, Pencil, Plus, Printer, RefreshCw, Save, ScanLine,
-  Settings, ShieldAlert, Store, Tag, Trash2, TriangleAlert, UserCog, Users, Wifi, X, Zap,
+  ArrowLeft, BadgeCheck, BarChart3, Building2, CheckCircle2, ChevronUp, CreditCard, Cpu, Crown,
+  Globe, HardDrive, ImageIcon, KeyRound, Loader2, Package, PackageX, Pencil, Plus, Printer,
+  RefreshCw, RotateCcw, Save, ScanLine, Settings, ShieldAlert, ShieldCheck, Store, Tag, Trash2,
+  TriangleAlert, UserCog, Users, Wifi, X, Zap,
 } from "lucide-react";
+import {
+  getCoreSettings,
+  getFefoSettings,
+  saveInventoryFefoSettings,
+  saveCoreSettings,
+} from "./workspace-settings-actions";
+import {
+  DEFAULT_FEFO,
+  type CoreSettings,
+  type InventoryModuleConfig,
+} from "./workspace-settings-types";
 import {
   clearAIUnifiedKeyFromStorage,
   clearGeminiApiKeyFromStorage,
@@ -40,7 +52,20 @@ import {
 // ─── Types & Constants ────────────────────────────────────────────────────────
 
 type ToastState = { msg: string; ok: boolean } | null;
-type TabId = "general" | "marketplaces" | "ai_quotas" | "hardware" | "billing" | "team";
+type TabId =
+  // ── System & Workspace ──────────────────────────────────────────────────────
+  | "general"
+  | "team"
+  | "billing"
+  // ── Infrastructure ──────────────────────────────────────────────────────────
+  | "marketplaces"
+  | "ai_quotas"
+  | "hardware"
+  // ── Business Modules ────────────────────────────────────────────────────────
+  | "returns_processing"
+  | "inventory_fefo"
+  | "claim_engine"
+  | "reports_analytics";
 
 type StoreRecord = {
   id: string;
@@ -135,13 +160,39 @@ const STATUS_META: Record<AIConfigStatus, { label: string; cls: string }> = {
   error:    { label: "Error",     cls: "border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400" },
 };
 
-const NAV_ITEMS: { id: TabId; label: string; icon: React.ReactNode }[] = [
-  { id: "general",      label: "General & Workflow",     icon: <Settings   className="h-4 w-4" /> },
-  { id: "marketplaces", label: "Marketplaces & Stores",  icon: <Store      className="h-4 w-4" /> },
-  { id: "ai_quotas",    label: "AI & OCR Quotas",        icon: <Cpu        className="h-4 w-4" /> },
-  { id: "hardware",     label: "Hardware Scanners",      icon: <HardDrive  className="h-4 w-4" /> },
-  { id: "billing",      label: "Billing & Subscription", icon: <CreditCard className="h-4 w-4" /> },
-  { id: "team",         label: "Team & Roles",           icon: <Users      className="h-4 w-4" /> },
+// ─── Grouped sidebar navigation ───────────────────────────────────────────────
+
+type NavGroup = {
+  label: string;
+  items: { id: TabId; label: string; icon: React.ReactNode; proOnly?: boolean }[];
+};
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    label: "SYSTEM & WORKSPACE",
+    items: [
+      { id: "general",  label: "General & White-label", icon: <Building2  className="h-4 w-4" /> },
+      { id: "team",     label: "Team & Roles",          icon: <Users      className="h-4 w-4" /> },
+      { id: "billing",  label: "Billing & Subscription", icon: <CreditCard className="h-4 w-4" /> },
+    ],
+  },
+  {
+    label: "INFRASTRUCTURE",
+    items: [
+      { id: "marketplaces", label: "Marketplaces & Stores", icon: <Store     className="h-4 w-4" /> },
+      { id: "ai_quotas",    label: "AI & OCR Engine",       icon: <Cpu       className="h-4 w-4" /> },
+      { id: "hardware",     label: "Hardware Scanners",     icon: <HardDrive className="h-4 w-4" /> },
+    ],
+  },
+  {
+    label: "BUSINESS MODULES",
+    items: [
+      { id: "returns_processing", label: "Returns Processing",  icon: <RotateCcw   className="h-4 w-4" />, proOnly: true },
+      { id: "inventory_fefo",     label: "Inventory & FEFO",    icon: <Package     className="h-4 w-4" />, proOnly: true },
+      { id: "claim_engine",       label: "Claim Engine",        icon: <ShieldCheck className="h-4 w-4" />, proOnly: true },
+      { id: "reports_analytics",  label: "Reports & Analytics", icon: <BarChart3   className="h-4 w-4" />, proOnly: true },
+    ],
+  },
 ];
 
 function newBlankConfig(): Omit<AIConfig, "id"> {
@@ -238,6 +289,13 @@ export default function SettingsPage() {
   const [storesListLoading, setStoresListLoading] = useState(false);
   const [generalSaved,    setGeneralSaved]    = useState(false);
 
+  // ── White-label / Tenant Customization (core_settings JSONB) ───────────────
+  const [companyName,         setCompanyName]         = useState<string>("");
+  const [companyLogoUrl,      setCompanyLogoUrl]      = useState<string>("");
+  const [logoUploading,       setLogoUploading]       = useState(false);
+  const [coreSettingsLoading, setCoreSettingsLoading] = useState(false);
+  const [coreSettingsSaving,  setCoreSettingsSaving]  = useState(false);
+
   // ── AI configs ─────────────────────────────────────────────────────────────
   const [configs,    setConfigs]    = useState<AIConfig[]>([]);
   const [showForm,   setShowForm]   = useState(false);
@@ -274,6 +332,12 @@ export default function SettingsPage() {
   // ── Billing / SaaS plan ────────────────────────────────────────────────────
   const [mockPlan, setMockPlan] = useState<SaasPlan>("Free Tier");
 
+  // ── Inventory / FEFO module settings ──────────────────────────────────────
+  const [fefoSettings,   setFefoSettings]   = useState<InventoryModuleConfig>(DEFAULT_FEFO);
+  const [fefoLoading,    setFefoLoading]    = useState(false);
+  const [fefoSaving,     setFefoSaving]     = useState(false);
+  const [fefoLocalEdit,  setFefoLocalEdit]  = useState<InventoryModuleConfig>(DEFAULT_FEFO);
+
   const [toast, setToast] = useState<ToastState>(null);
 
   // ── Hydrate from localStorage ──────────────────────────────────────────────
@@ -287,6 +351,38 @@ export default function SettingsPage() {
     const saved = localStorage.getItem("mock_saas_plan") as SaasPlan | null;
     if (saved && (PLANS as readonly string[]).includes(saved)) setMockPlan(saved as SaasPlan);
   }, []);
+
+  // ── Load core_settings (white-label) from DB ──────────────────────────────
+  useEffect(() => {
+    if (!mounted) return;
+    async function loadCoreSettings() {
+      setCoreSettingsLoading(true);
+      try {
+        const cfg = await getCoreSettings();
+        setCompanyName(cfg.company_name ?? "");
+        setCompanyLogoUrl(cfg.company_logo_url ?? "");
+      } finally {
+        setCoreSettingsLoading(false);
+      }
+    }
+    loadCoreSettings();
+  }, [mounted]);
+
+  // ── Load FEFO settings from DB ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!mounted) return;
+    async function loadFefoSettings() {
+      setFefoLoading(true);
+      try {
+        const cfg = await getFefoSettings();
+        setFefoSettings(cfg);
+        setFefoLocalEdit(cfg);
+      } finally {
+        setFefoLoading(false);
+      }
+    }
+    loadFefoSettings();
+  }, [mounted]);
 
   // ── Load connected marketplace credentials ─────────────────────────────────
   useEffect(() => {
@@ -334,6 +430,51 @@ export default function SettingsPage() {
     setGeneralSaved(true);
     setTimeout(() => setGeneralSaved(false), 2500);
     showToast("General preferences saved.", true);
+  }
+
+  // ── Logo file upload → Supabase Storage → saves URL ──────────────────────
+  async function handleLogoFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setLogoUploading(true);
+    try {
+      const { supabase: sb } = await import("../../src/lib/supabase");
+      const ext = file.name.split(".").pop() ?? "png";
+      const path = `logos/${Date.now()}.${ext}`;
+      const { error: upErr } = await sb.storage
+        .from("workspace_logos")
+        .upload(path, file, { upsert: true, contentType: file.type });
+      if (upErr) throw new Error(upErr.message);
+      const { data: urlData } = sb.storage.from("workspace_logos").getPublicUrl(path);
+      setCompanyLogoUrl(urlData.publicUrl);
+      const res = await saveCoreSettings({
+        company_name:     companyName.trim(),
+        company_logo_url: urlData.publicUrl,
+      });
+      if (!res.ok) throw new Error(res.error ?? "Failed to save logo URL.");
+      showToast("Logo uploaded and saved.", true);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Logo upload failed.", false);
+    } finally {
+      setLogoUploading(false);
+    }
+  }
+
+  // ── White-label / Tenant save ──────────────────────────────────────────────
+  async function handleSaveWhitelabel(e: React.FormEvent) {
+    e.preventDefault();
+    setCoreSettingsSaving(true);
+    const res = await saveCoreSettings({
+      company_name:     companyName.trim(),
+      company_logo_url: companyLogoUrl.trim(),
+    });
+    setCoreSettingsSaving(false);
+    if (!res.ok) {
+      showToast(res.error ?? "Failed to save white-label settings.", false);
+      return;
+    }
+    showToast("White-label settings saved.", true);
   }
 
   // ── Provider change ────────────────────────────────────────────────────────
@@ -480,6 +621,22 @@ export default function SettingsPage() {
     setConfigs([]);
     setAssignments({ defaultGeneral: null, defaultVision: null });
     showToast("All API configurations cleared.", true);
+  }
+
+  async function handleSaveFefo(e: React.FormEvent) {
+    e.preventDefault();
+    if (mockPlan === "Free Tier") { showToast("Upgrade to Pro to customise FEFO rules.", false); return; }
+    const critical = Number(fefoLocalEdit.fefo_critical_days);
+    const warning  = Number(fefoLocalEdit.fefo_warning_days);
+    if (isNaN(critical) || critical < 1)  { showToast("Critical days must be ≥ 1.", false); return; }
+    if (isNaN(warning)  || warning  < 1)  { showToast("Warning days must be ≥ 1.", false); return; }
+    if (critical >= warning) { showToast("Critical days must be less than Warning days.", false); return; }
+    setFefoSaving(true);
+    const res = await saveInventoryFefoSettings({ fefo_critical_days: critical, fefo_warning_days: warning });
+    setFefoSaving(false);
+    if (!res.ok) { showToast(res.error ?? "Failed to save FEFO settings.", false); return; }
+    setFefoSettings({ fefo_critical_days: critical, fefo_warning_days: warning });
+    showToast("Inventory / FEFO settings saved.", true);
   }
 
   function handleSaveHardware(e: React.FormEvent) {
@@ -671,119 +828,231 @@ export default function SettingsPage() {
       {/* ── Enterprise layout: fixed sidebar + flex content ─────────────────── */}
       <div className="flex flex-col md:flex-row w-full gap-6">
 
-        {/* LEFT SIDEBAR — vertical stack on all screen sizes, fixed w-64 on desktop */}
+        {/* LEFT SIDEBAR — 3-tier: System & Workspace / Infrastructure / Business Modules */}
         <nav className="w-full md:w-64 md:flex-shrink-0 md:border-r md:border-border md:pr-6 md:sticky md:top-6 md:self-start">
-          <div className="flex flex-col w-full gap-2">
-          {NAV_ITEMS.map(({ id, label, icon }) => (
-            <button
-              key={id}
-              type="button"
-              onClick={() => setActiveTab(id)}
-              className={[
-                "flex items-center gap-3 rounded-xl px-4 py-3 text-sm font-semibold transition-all text-left w-full",
-                activeTab === id
-                  ? "bg-violet-100 text-violet-700 dark:bg-violet-950/50 dark:text-violet-300"
-                  : "bg-muted/50 text-muted-foreground hover:bg-accent hover:text-foreground dark:bg-muted/30",
-              ].join(" ")}
-            >
-              {icon}
-              <span>{label}</span>
-            </button>
-          ))}
+          <div className="flex flex-col w-full gap-1">
 
-          {/* Plan badge in sidebar */}
-          <div className="hidden md:block mt-6 rounded-xl border border-border bg-muted/40 px-4 py-3">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Current Plan</p>
-            <p className={`mt-1 text-sm font-bold ${
-              mockPlan === "Free Tier"  ? "text-slate-600 dark:text-slate-300"
-              : mockPlan === "Pro Tier" ? "text-sky-600 dark:text-sky-400"
-              : "text-violet-600 dark:text-violet-400"
-            }`}>
-              {mockPlan === "Enterprise" && <Zap className="mr-1 inline h-3.5 w-3.5" />}
-              {mockPlan}
-            </p>
-          </div>
+            {NAV_GROUPS.map((group) => (
+              <div key={group.label} className="mb-2">
+                {/* Section header */}
+                <p className="mb-1.5 px-2 text-[10px] font-bold uppercase tracking-widest text-muted-foreground/60">
+                  {group.label}
+                </p>
+
+                {group.items.map(({ id, label, icon, proOnly }) => {
+                  const isLocked = proOnly && mockPlan === "Free Tier";
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => setActiveTab(id)}
+                      className={[
+                        "flex w-full items-center gap-3 rounded-xl px-4 py-2.5 text-sm font-semibold transition-all text-left",
+                        activeTab === id
+                          ? "bg-violet-100 text-violet-700 dark:bg-violet-950/50 dark:text-violet-300"
+                          : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                        isLocked ? "opacity-70" : "",
+                      ].join(" ")}
+                    >
+                      {icon}
+                      <span className="flex-1">{label}</span>
+                      {isLocked && (
+                        <Crown className="h-3 w-3 shrink-0 text-amber-500" />
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            ))}
+
+            {/* Plan badge in sidebar */}
+            <div className="hidden md:block mt-4 rounded-xl border border-border bg-muted/40 px-4 py-3">
+              <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Current Plan</p>
+              <p className={`mt-1 text-sm font-bold ${
+                mockPlan === "Free Tier"  ? "text-slate-600 dark:text-slate-300"
+                : mockPlan === "Pro Tier" ? "text-sky-600 dark:text-sky-400"
+                : "text-violet-600 dark:text-violet-400"
+              }`}>
+                {mockPlan === "Enterprise" && <Zap className="mr-1 inline h-3.5 w-3.5" />}
+                {mockPlan}
+              </p>
+            </div>
           </div>
         </nav>
 
         {/* RIGHT CONTENT AREA */}
         <div className="flex-1 min-w-0 w-full overflow-hidden">
 
-          {/* ══════════════ GENERAL & WORKFLOW ══════════════ */}
+          {/* ══════════════ GENERAL & WHITE-LABEL ══════════════ */}
           {activeTab === "general" && (
-            <form onSubmit={handleSaveGeneral} className="space-y-6">
-              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-6">
-                <div>
-                  <h2 className="text-base font-bold">General Preferences</h2>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    Operational defaults applied across the warehouse workflow.
-                  </p>
-                </div>
+            <div className="space-y-6">
 
-                <div>
-                  <div className="mb-2 flex items-center gap-2">
-                    <Tag className="h-4 w-4 text-sky-600 dark:text-sky-400" />
-                    <label className="text-sm font-semibold">Default Store</label>
-                  </div>
-                  <p className={HINT_CLS}>
-                    Fallback store when a scanned barcode can&apos;t be matched to a parent package.
-                    Amazon FNSKUs (starting with{" "}
-                    <code className="rounded bg-muted px-1 font-mono text-[11px]">X00</code> or{" "}
-                    <code className="rounded bg-muted px-1 font-mono text-[11px]">B00</code>) are
-                    auto-matched to your first active Amazon store.
-                  </p>
-                  {storesListLoading ? (
-                    <div className="flex items-center gap-2 py-3">
-                      <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-                      <span className="text-xs text-muted-foreground">Loading stores…</span>
+              {/* ── Tenant Customization / White-label ───────────────────── */}
+              <form onSubmit={handleSaveWhitelabel} className="space-y-5">
+                <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-6">
+                  <div className="flex items-start gap-3">
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-violet-100 dark:bg-violet-950/50">
+                      <Building2 className="h-5 w-5 text-violet-600 dark:text-violet-400" />
                     </div>
-                  ) : storesList.length === 0 ? (
-                    <div className="rounded-xl border border-dashed border-border bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
-                      No stores found. Add a store in the{" "}
-                      <strong>Marketplaces &amp; Stores</strong> tab first.
+                    <div>
+                      <h2 className="text-base font-bold">Tenant Customization</h2>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        White-label branding fields. Used for{" "}
+                        <span className="font-semibold">report generation</span> and{" "}
+                        <span className="font-semibold">custom dashboard branding</span>.
+                        Stored in <code className="rounded bg-muted px-1 font-mono text-[11px]">core_settings</code>.
+                      </p>
+                    </div>
+                  </div>
+
+                  {coreSettingsLoading ? (
+                    <div className="flex items-center gap-2 py-2">
+                      <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                      <span className="text-xs text-muted-foreground">Loading branding settings…</span>
                     </div>
                   ) : (
-                    <select
-                      value={defaultStoreId}
-                      onChange={(e) => setDefaultStoreId(e.target.value)}
-                      className={SELECT_CLS}
-                    >
-                      <option value="">— No default (unknown) —</option>
-                      {storesList.map((s) => (
-                        <option key={s.id} value={s.id}>
-                          {s.name}{" "}
-                          ({PLATFORM_LABELS[s.platform] ?? s.platform}
-                          {!s.is_active ? " · inactive" : ""})
-                        </option>
-                      ))}
-                    </select>
+                    <div className="grid gap-5 sm:grid-cols-2">
+                      <div>
+                        <div className="mb-1.5 flex items-center gap-2">
+                          <Building2 className="h-3.5 w-3.5 text-muted-foreground" />
+                          <label className={LABEL_CLS}>Company Name</label>
+                        </div>
+                        <p className={HINT_CLS}>
+                          Displayed on generated reports, packing slips, and email footers.
+                        </p>
+                        <input
+                          type="text"
+                          value={companyName}
+                          onChange={(e) => setCompanyName(e.target.value)}
+                          placeholder="e.g. Acme Fulfillment Co."
+                          className={INPUT_CLS}
+                        />
+                      </div>
+
+                      <div>
+                        <div className="mb-1.5 flex items-center gap-2">
+                          <ImageIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                          <label className={LABEL_CLS}>Company Logo</label>
+                        </div>
+                        <p className={HINT_CLS}>
+                          Upload your logo (PNG/SVG/WEBP recommended, min 200 px wide). Displayed on the sidebar and reports.
+                        </p>
+                        <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${logoUploading ? "border-violet-300 bg-violet-50/80 text-violet-500 dark:bg-violet-950/20" : companyLogoUrl ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700/60 dark:bg-emerald-950/20 dark:text-emerald-300" : "border-violet-300 bg-violet-50 text-violet-700 hover:border-violet-400 hover:bg-violet-100 dark:border-violet-700/60 dark:bg-violet-950/30 dark:text-violet-300"}`}>
+                          {logoUploading
+                            ? <><Loader2 className="h-4 w-4 animate-spin" />Uploading…</>
+                            : companyLogoUrl
+                              ? <><ImageIcon className="h-4 w-4" />Logo saved — click to replace</>
+                              : <><ImageIcon className="h-4 w-4" />Upload Logo File</>}
+                          <input type="file" accept="image/*" className="hidden" disabled={logoUploading} onChange={handleLogoFileUpload} />
+                        </label>
+                      </div>
+                    </div>
                   )}
-                  {defaultStoreId && (
-                    <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                      Standalone scans will fall back to{" "}
-                      <strong>
-                        {storesList.find((s) => s.id === defaultStoreId)?.name ?? defaultStoreId}
-                      </strong>{" "}
-                      when no package or prefix is detected.
-                    </p>
+
+                  {companyLogoUrl && (
+                    <div className="flex items-center gap-3 rounded-xl border border-border bg-muted/30 px-4 py-3">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={companyLogoUrl}
+                        alt="Company logo preview"
+                        className="h-10 max-w-[120px] rounded object-contain"
+                        onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
+                      />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-xs font-semibold">Logo Preview</p>
+                        <p className="text-[11px] text-muted-foreground truncate">Displayed on sidebar &amp; reports.</p>
+                      </div>
+                      <button type="button" onClick={() => setCompanyLogoUrl("")} className="shrink-0 text-xs text-rose-500 underline hover:text-rose-700">Remove</button>
+                    </div>
                   )}
                 </div>
-              </div>
 
-              <div className="flex flex-wrap gap-2">
                 <button
                   type="submit"
-                  className="inline-flex min-w-[180px] flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white transition hover:bg-sky-700"
+                  disabled={coreSettingsSaving || coreSettingsLoading}
+                  className="inline-flex min-w-[220px] items-center justify-center gap-2 rounded-xl bg-violet-600 py-3 text-sm font-semibold text-white transition hover:bg-violet-700 disabled:opacity-50"
                 >
-                  <Save className="h-4 w-4" />
-                  Save General Preferences
+                  {coreSettingsSaving
+                    ? <><Loader2 className="h-4 w-4 animate-spin" />Saving…</>
+                    : <><Save    className="h-4 w-4" />Save White-label Settings</>}
                 </button>
-              </div>
-              {generalSaved && (
-                <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">Saved.</p>
-              )}
-            </form>
+              </form>
+
+              {/* ── General / Operational Preferences ───────────────────── */}
+              <form onSubmit={handleSaveGeneral} className="space-y-5">
+                <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-6">
+                  <div>
+                    <h2 className="text-base font-bold">Operational Preferences</h2>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Operational defaults applied across the warehouse workflow.
+                    </p>
+                  </div>
+
+                  <div>
+                    <div className="mb-2 flex items-center gap-2">
+                      <Tag className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+                      <label className="text-sm font-semibold">Default Store</label>
+                    </div>
+                    <p className={HINT_CLS}>
+                      Fallback store when a scanned barcode can&apos;t be matched to a parent package.
+                      Amazon FNSKUs (starting with{" "}
+                      <code className="rounded bg-muted px-1 font-mono text-[11px]">X00</code> or{" "}
+                      <code className="rounded bg-muted px-1 font-mono text-[11px]">B00</code>) are
+                      auto-matched to your first active Amazon store.
+                    </p>
+                    {storesListLoading ? (
+                      <div className="flex items-center gap-2 py-3">
+                        <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                        <span className="text-xs text-muted-foreground">Loading stores…</span>
+                      </div>
+                    ) : storesList.length === 0 ? (
+                      <div className="rounded-xl border border-dashed border-border bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
+                        No stores found. Add a store in the{" "}
+                        <strong>Marketplaces &amp; Stores</strong> tab first.
+                      </div>
+                    ) : (
+                      <select
+                        value={defaultStoreId}
+                        onChange={(e) => setDefaultStoreId(e.target.value)}
+                        className={SELECT_CLS}
+                      >
+                        <option value="">— No default (unknown) —</option>
+                        {storesList.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.name}{" "}
+                            ({PLATFORM_LABELS[s.platform] ?? s.platform}
+                            {!s.is_active ? " · inactive" : ""})
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    {defaultStoreId && (
+                      <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                        <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                        Standalone scans will fall back to{" "}
+                        <strong>
+                          {storesList.find((s) => s.id === defaultStoreId)?.name ?? defaultStoreId}
+                        </strong>{" "}
+                        when no package or prefix is detected.
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="submit"
+                    className="inline-flex min-w-[180px] flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white transition hover:bg-sky-700"
+                  >
+                    <Save className="h-4 w-4" />
+                    Save General Preferences
+                  </button>
+                </div>
+                {generalSaved && (
+                  <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">Saved.</p>
+                )}
+              </form>
+            </div>
           )}
 
           {/* ══════════════ MARKETPLACES & STORES ══════════════ */}
@@ -1493,6 +1762,238 @@ export default function SettingsPage() {
             </form>
           )}
 
+          {/* ══════════════ INVENTORY & FEFO ══════════════ */}
+          {activeTab === "inventory_fefo" && (
+            <div className="space-y-6">
+
+              {/* Module header */}
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-orange-100 dark:bg-orange-950/50">
+                  <Package className="h-5 w-5 text-orange-600 dark:text-orange-400" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold">Inventory &amp; FEFO Settings</h2>
+                  <p className="text-xs text-muted-foreground">
+                    Configure First-Expired, First-Out expiry threshold rules for your warehouse.
+                  </p>
+                </div>
+              </div>
+
+              {/* Paywall banner for Free Tier */}
+              {mockPlan === "Free Tier" && (
+                <div className="relative overflow-hidden rounded-2xl border-2 border-amber-300 bg-amber-50 px-6 py-5 dark:border-amber-600/50 dark:bg-amber-950/20">
+                  <div className="flex items-start gap-4">
+                    <Crown className="mt-0.5 h-6 w-6 shrink-0 text-amber-500" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-bold text-amber-900 dark:text-amber-200">
+                        Pro Feature — Upgrade to Customise FEFO Rules
+                      </p>
+                      <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+                        Free Tier uses standard 30-day critical / 90-day warning thresholds.
+                        Upgrade to <strong>Pro</strong> or <strong>Enterprise</strong> to set custom expiry thresholds
+                        per your product categories.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab("billing")}
+                        className="mt-3 inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-bold text-white transition hover:bg-amber-600"
+                      >
+                        <Zap className="h-3.5 w-3.5" />
+                        Upgrade Plan
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* FEFO Config card */}
+              <form onSubmit={handleSaveFefo}>
+                <div className={[
+                  "relative rounded-2xl border border-border bg-card p-6 shadow-sm space-y-6 transition-all",
+                  mockPlan === "Free Tier" ? "opacity-50 pointer-events-none select-none" : "",
+                ].join(" ")}>
+
+                  {fefoLoading ? (
+                    <div className="flex items-center gap-2 py-4">
+                      <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                      <span className="text-sm text-muted-foreground">Loading FEFO settings…</span>
+                    </div>
+                  ) : (
+                    <>
+                      <div>
+                        <h3 className="text-sm font-bold">Expiry Threshold Rules</h3>
+                        <p className="text-xs text-muted-foreground mt-0.5">
+                          These values control the colour-coding on the Expiry Date column in the Items table.
+                          Settings are stored in the <code className="rounded bg-muted px-1 font-mono text-[11px]">workspace_settings</code> database table.
+                        </p>
+                      </div>
+
+                      {/* Current thresholds visualization */}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="inline-flex items-center gap-1.5 rounded-full border border-red-200 bg-red-50 px-3 py-1 text-xs font-bold text-red-700 dark:border-red-700/60 dark:bg-red-950/40 dark:text-red-300">
+                          <span className="h-2 w-2 rounded-full bg-red-500" />
+                          🔴 Critical ≤ {fefoSettings.fefo_critical_days}d
+                        </span>
+                        <span className="text-xs text-muted-foreground">→</span>
+                        <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-bold text-amber-700 dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-300">
+                          <span className="h-2 w-2 rounded-full bg-amber-400" />
+                          🟡 Warning ≤ {fefoSettings.fefo_warning_days}d
+                        </span>
+                        <span className="text-xs text-muted-foreground">→</span>
+                        <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700 dark:border-emerald-700/60 dark:bg-emerald-950/40 dark:text-emerald-300">
+                          <span className="h-2 w-2 rounded-full bg-emerald-500" />
+                          🟢 OK &gt; {fefoSettings.fefo_warning_days}d
+                        </span>
+                      </div>
+
+                      <div className="grid gap-5 sm:grid-cols-2">
+
+                        {/* Critical days */}
+                        <div className="flex flex-col">
+                          <div className="flex-1">
+                            <label className={LABEL_CLS}>
+                              🔴 Critical Expiry (Days)
+                            </label>
+                            <p className={`${HINT_CLS} min-h-[2.5rem]`}>
+                              Items expiring within this many days are flagged <strong>Critical</strong> (red).
+                            </p>
+                          </div>
+                          <input
+                            type="number"
+                            min={1}
+                            max={fefoLocalEdit.fefo_warning_days - 1}
+                            value={fefoLocalEdit.fefo_critical_days}
+                            onChange={(e) =>
+                              setFefoLocalEdit((p) => ({ ...p, fefo_critical_days: Number(e.target.value) }))
+                            }
+                            className={INPUT_CLS}
+                          />
+                        </div>
+
+                        {/* Warning days */}
+                        <div className="flex flex-col">
+                          <div className="flex-1">
+                            <label className={LABEL_CLS}>
+                              🟡 Warning Expiry (Days)
+                            </label>
+                            <p className={`${HINT_CLS} min-h-[2.5rem]`}>
+                              Items expiring within this many days (but above Critical) are flagged <strong>Warning</strong> (amber).
+                            </p>
+                          </div>
+                          <input
+                            type="number"
+                            min={fefoLocalEdit.fefo_critical_days + 1}
+                            value={fefoLocalEdit.fefo_warning_days}
+                            onChange={(e) =>
+                              setFefoLocalEdit((p) => ({ ...p, fefo_warning_days: Number(e.target.value) }))
+                            }
+                            className={INPUT_CLS}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-orange-200 bg-orange-50/60 px-4 py-3 dark:border-orange-700/40 dark:bg-orange-950/20">
+                        <p className="text-xs font-semibold text-orange-800 dark:text-orange-200">FEFO Compliance</p>
+                        <p className="mt-1 text-xs text-orange-700 dark:text-orange-400">
+                          First-Expired, First-Out rules ensure perishable inventory is dispatched before
+                          expiry. These thresholds are applied dynamically to the Items table in real time.
+                          Changes take effect immediately on all users.
+                        </p>
+                      </div>
+
+                      <div className="flex gap-3">
+                        <button
+                          type="submit"
+                          disabled={fefoSaving}
+                          className="inline-flex items-center gap-2 rounded-xl bg-orange-600 px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-orange-700 disabled:opacity-50"
+                        >
+                          {fefoSaving ? (
+                            <><Loader2 className="h-4 w-4 animate-spin" />Saving…</>
+                          ) : (
+                            <><Save className="h-4 w-4" />Save FEFO Rules</>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setFefoLocalEdit(fefoSettings)}
+                          className="inline-flex items-center gap-2 rounded-xl border border-border bg-muted/50 px-4 py-2.5 text-sm font-semibold text-muted-foreground transition hover:bg-accent"
+                        >
+                          Reset
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </form>
+
+              {/* Info card — JSONB architecture note */}
+              <div className="rounded-2xl border border-violet-200 bg-violet-50/60 px-5 py-4 dark:border-violet-700/40 dark:bg-violet-950/20 space-y-1">
+                <p className="flex items-center gap-2 text-sm font-bold text-violet-800 dark:text-violet-200">
+                  <Zap className="h-4 w-4" />
+                  Scalable JSONB Architecture
+                </p>
+                <p className="text-xs text-violet-700 dark:text-violet-400">
+                  All module settings are stored in a single <code className="rounded bg-violet-100 px-1 font-mono text-[11px] dark:bg-violet-900/30">module_configs JSONB</code> column.
+                  Adding new module settings (Claims, Shipping, etc.) never requires a schema migration — just
+                  add new keys to the JSON object.
+                </p>
+              </div>
+
+            </div>
+          )}
+
+          {/* ══════════════ CLAIM ENGINE (Placeholder) ══════════════ */}
+          {activeTab === "claim_engine" && (
+            <div className="space-y-6">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-rose-100 dark:bg-rose-950/50">
+                  <ShieldCheck className="h-5 w-5 text-rose-600 dark:text-rose-400" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold">Claim Engine Settings</h2>
+                  <p className="text-xs text-muted-foreground">Configure automated claim rules and escalation logic.</p>
+                </div>
+              </div>
+
+              {mockPlan === "Free Tier" && (
+                <div className="rounded-2xl border-2 border-amber-300 bg-amber-50 px-6 py-5 dark:border-amber-600/50 dark:bg-amber-950/20">
+                  <div className="flex items-start gap-4">
+                    <Crown className="mt-0.5 h-6 w-6 shrink-0 text-amber-500" />
+                    <div>
+                      <p className="text-sm font-bold text-amber-900 dark:text-amber-200">
+                        Pro Feature — Upgrade to Unlock Claim Automation
+                      </p>
+                      <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+                        The Claim Engine module is available on Pro and Enterprise plans.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab("billing")}
+                        className="mt-3 inline-flex items-center gap-2 rounded-xl bg-amber-500 px-4 py-2 text-sm font-bold text-white transition hover:bg-amber-600"
+                      >
+                        <Zap className="h-3.5 w-3.5" />
+                        Upgrade Plan
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className={[
+                "rounded-2xl border border-border bg-card p-6 shadow-sm space-y-4 transition-all",
+                mockPlan === "Free Tier" ? "opacity-50 pointer-events-none select-none" : "",
+              ].join(" ")}>
+                <div className="rounded-xl border border-dashed border-border bg-muted/20 py-12 text-center">
+                  <ShieldCheck className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
+                  <p className="text-sm font-semibold text-muted-foreground">Claim Engine Configuration</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Auto-escalation rules, evidence scoring, and marketplace dispute settings coming soon.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* ══════════════ BILLING & SUBSCRIPTION ══════════════ */}
           {activeTab === "billing" && (
             <div className="space-y-6">
@@ -1645,6 +2146,122 @@ export default function SettingsPage() {
                   </div>
                 </div>
               )}
+            </div>
+          )}
+
+          {/* ══════════════ RETURNS PROCESSING (placeholder) ══════════════ */}
+          {activeTab === "returns_processing" && (
+            <div className="space-y-6">
+              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-4">
+                <div className="flex items-start gap-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-rose-100 dark:bg-rose-950/50">
+                    <RotateCcw className="h-5 w-5 text-rose-600 dark:text-rose-400" />
+                  </div>
+                  <div>
+                    <h2 className="text-base font-bold">Returns Processing</h2>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Granular configuration for the Returns Intelligence module — SLA rules,
+                      disposition workflows, fraud detection thresholds, and auto-routing logic.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 dark:border-amber-700/40 dark:bg-amber-950/20">
+                  <Zap className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                  <div>
+                    <p className="text-sm font-semibold text-amber-800 dark:text-amber-200">
+                      Module Settings — Coming in Phase 1
+                    </p>
+                    <p className="mt-0.5 text-xs text-amber-700 dark:text-amber-400">
+                      Settings for SLA day limits per carrier, return reason code mappings,
+                      condition grading rules, and HITL approval thresholds will be
+                      configured here and persisted to{" "}
+                      <code className="rounded bg-amber-100 px-1 font-mono text-[11px] dark:bg-amber-900/40">
+                        module_configs-&gt;returns
+                      </code>.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {[
+                    { label: "SLA Day Limits",          desc: "Per-carrier return SLA thresholds (Amazon, Walmart, eBay).",  icon: <RotateCcw className="h-4 w-4 text-rose-500" /> },
+                    { label: "Disposition Rules",        desc: "Auto-route by condition: Restock, Liquidate, Destroy.",       icon: <PackageX  className="h-4 w-4 text-orange-500" /> },
+                    { label: "Fraud Detection",          desc: "Configurable anomaly score thresholds for claim reviews.",    icon: <ShieldAlert className="h-4 w-4 text-amber-500" /> },
+                    { label: "HITL Approval Workflow",   desc: "Define which actions require human-in-the-loop sign-off.",   icon: <UserCog   className="h-4 w-4 text-sky-500" /> },
+                  ].map((item) => (
+                    <div
+                      key={item.label}
+                      className="flex items-start gap-3 rounded-xl border border-dashed border-border bg-muted/20 p-4 opacity-60"
+                    >
+                      {item.icon}
+                      <div>
+                        <p className="text-sm font-semibold">{item.label}</p>
+                        <p className="mt-0.5 text-xs text-muted-foreground">{item.desc}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ══════════════ REPORTS & ANALYTICS (placeholder) ══════════════ */}
+          {activeTab === "reports_analytics" && (
+            <div className="space-y-6">
+              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-4">
+                <div className="flex items-start gap-3">
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-sky-100 dark:bg-sky-950/50">
+                    <BarChart3 className="h-5 w-5 text-sky-600 dark:text-sky-400" />
+                  </div>
+                  <div>
+                    <h2 className="text-base font-bold">Reports &amp; Analytics</h2>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Configure custom table column preferences, default date ranges,
+                      export formats, and scheduled report delivery. All preferences
+                      are stored in{" "}
+                      <code className="rounded bg-muted px-1 font-mono text-[11px]">module_configs-&gt;reports</code>.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-3 rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 dark:border-sky-700/40 dark:bg-sky-950/20">
+                  <BarChart3 className="mt-0.5 h-4 w-4 shrink-0 text-sky-600 dark:text-sky-400" />
+                  <div>
+                    <p className="text-sm font-semibold text-sky-800 dark:text-sky-200">
+                      Column Config Storage — Ready
+                    </p>
+                    <p className="mt-0.5 text-xs text-sky-700 dark:text-sky-400">
+                      The{" "}
+                      <code className="rounded bg-sky-100 px-1 font-mono text-[11px] dark:bg-sky-900/40">
+                        module_configs-&gt;reports
+                      </code>{" "}
+                      JSONB key has been seeded and is ready to store your custom table
+                      column layouts once the Reports module is built.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {[
+                    { label: "Table Column Preferences", desc: "Show/hide and reorder columns per report view.",             icon: <BarChart3  className="h-4 w-4 text-sky-500" /> },
+                    { label: "Default Date Range",       desc: "Pre-select rolling windows (7d, 30d, 90d, custom).",        icon: <RefreshCw  className="h-4 w-4 text-slate-500" /> },
+                    { label: "Export Formats",           desc: "Choose default export: CSV, XLSX, or PDF.",                 icon: <Package    className="h-4 w-4 text-emerald-500" /> },
+                    { label: "Scheduled Delivery",       desc: "Email report digests on a defined cron schedule.",          icon: <Zap        className="h-4 w-4 text-violet-500" /> },
+                  ].map((item) => (
+                    <div
+                      key={item.label}
+                      className="flex items-start gap-3 rounded-xl border border-dashed border-border bg-muted/20 p-4 opacity-60"
+                    >
+                      {item.icon}
+                      <div>
+                        <p className="text-sm font-semibold">{item.label}</p>
+                        <p className="mt-0.5 text-xs text-muted-foreground">{item.desc}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
 
