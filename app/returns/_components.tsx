@@ -1173,11 +1173,13 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
       setEditItem(amazon.name);
       setEditCatalogPreview({ name: amazon.name, price: amazon.price, image_url: amazon.image_url });
       setEditCatalogStatus("amazon");
-      await supabaseBrowser
-        .from("products")
-        .insert({ barcode: barcode.trim(), name: amazon.name, price: amazon.price, image_url: amazon.image_url, source: "Amazon" })
-        .then(() => {})
-        .catch(() => {});
+      try {
+        await supabaseBrowser
+          .from("products")
+          .insert({ barcode: barcode.trim(), name: amazon.name, price: amazon.price, image_url: amazon.image_url, source: "Amazon" });
+      } catch {
+        // ignore duplicate/insert errors
+      }
       return;
     }
 
