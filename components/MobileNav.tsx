@@ -24,9 +24,9 @@ const navLinks = [
     ],
   },
   {
-    section: "Adapters",
+    section: "Integrations",
     items: [
-      { label: "Marketplace Adapters", icon: Store, href: "/settings/adapters" },
+      { label: "Connected Stores", icon: Store, href: "/settings" },
     ],
   },
 ];
@@ -115,7 +115,7 @@ export function MobileNav() {
         {role === "admin" && (
           <div className="shrink-0 border-t border-slate-800 px-3 py-3">
             <Link
-              href="/settings/adapters"
+              href="/settings"
               onClick={closeMenu}
               className="flex min-h-[44px] w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm font-medium text-slate-400 transition hover:bg-slate-900/80 hover:text-slate-100"
             >

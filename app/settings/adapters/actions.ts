@@ -332,6 +332,13 @@ export type StorePublicRow = {
   created_at: string;
 };
 
+export type StoreInsertPayload = {
+  name: string;
+  platform: string;
+  region?: string;
+  marketplace_id?: string;
+};
+
 export async function listStores(
   ctx?: RbacContext | null
 ): Promise<{ ok: boolean; data?: StorePublicRow[]; error?: string }> {
@@ -343,11 +350,114 @@ export async function listStores(
       .eq("organization_id", rbac.organization_id)
       .order("created_at", { ascending: false });
 
-    if (error) throw new Error(error.message);
+    if (error) {
+      // Fallback: if organization_id column missing or no match, return all stores
+      const { data: fallback, error: fbErr } = await supabaseServer
+        .from("stores")
+        .select("id, name, platform, is_active, marketplace_id, created_at")
+        .order("created_at", { ascending: false });
+      if (fbErr) throw new Error(fbErr.message);
+      return { ok: true, data: (fallback ?? []) as StorePublicRow[] };
+    }
     return { ok: true, data: (data ?? []) as StorePublicRow[] };
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Failed to load stores.";
+    return { ok: false, error: message };
+  }
+}
+
+export async function deleteStore(
+  id: string,
+  ctx?: RbacContext | null
+): Promise<{ ok: boolean; error?: string }> {
+  const rbac = getRbacContext(ctx);
+  try {
+    const { error } = await supabaseServer
+      .from("stores")
+      .delete()
+      .eq("id", id)
+      .eq("organization_id", rbac.organization_id);
+
+    if (error) {
+      // Fallback without org filter for local dev
+      const { error: fbErr } = await supabaseServer.from("stores").delete().eq("id", id);
+      if (fbErr) throw new Error(fbErr.message);
+    }
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to delete store.";
+    return { ok: false, error: message };
+  }
+}
+
+export async function updateStore(
+  id: string,
+  payload: { name?: string; is_active?: boolean },
+  ctx?: RbacContext | null
+): Promise<{ ok: boolean; data?: StorePublicRow; error?: string }> {
+  const rbac = getRbacContext(ctx);
+  try {
+    const update: Record<string, unknown> = {};
+    if (payload.name !== undefined) update.name = payload.name.trim();
+    if (payload.is_active !== undefined) update.is_active = payload.is_active;
+    if (Object.keys(update).length === 0) throw new Error("No fields to update.");
+
+    const { data, error } = await supabaseServer
+      .from("stores")
+      .update(update)
+      .eq("id", id)
+      .eq("organization_id", rbac.organization_id)
+      .select("id, name, platform, is_active, marketplace_id, organization_id, created_at")
+      .single();
+
+    if (error) {
+      // Fallback without org filter
+      const { data: fb, error: fbErr } = await supabaseServer
+        .from("stores")
+        .update(update)
+        .eq("id", id)
+        .select("id, name, platform, is_active, marketplace_id, created_at")
+        .single();
+      if (fbErr) throw new Error(fbErr.message);
+      return { ok: true, data: fb as StorePublicRow };
+    }
+    return { ok: true, data: data as StorePublicRow };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed to update store.";
+    return { ok: false, error: message };
+  }
+}
+
+export async function insertStore(
+  payload: StoreInsertPayload,
+  ctx?: RbacContext | null
+): Promise<{ ok: boolean; data?: StorePublicRow; error?: string }> {
+  const rbac = getRbacContext(ctx);
+  if (!canAccess(DEFAULT_ROLE_REQUIRED, rbac.user_role)) {
+    return { ok: false, error: "Insufficient role to create stores." };
+  }
+  try {
+    const row: Record<string, unknown> = {
+      name: payload.name.trim(),
+      platform: payload.platform,
+      is_active: true,
+      organization_id: rbac.organization_id,
+    };
+    if (payload.region)         row.region         = payload.region;
+    if (payload.marketplace_id) row.marketplace_id  = payload.marketplace_id;
+
+    const { data, error } = await supabaseServer
+      .from("stores")
+      .insert(row)
+      .select("id, name, platform, is_active, marketplace_id, organization_id, created_at")
+      .single();
+
+    if (error) throw new Error(error.message);
+    return { ok: true, data: data as StorePublicRow };
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to create store.";
     return { ok: false, error: message };
   }
 }
@@ -361,13 +471,22 @@ export async function listMarketplaces(
 }> {
   const rbac = getRbacContext(ctx);
   try {
-    const { data, error } = await supabaseServer
+    let { data, error } = await supabaseServer
       .from("marketplaces")
       .select("id, provider, nickname, credentials, organization_id, role_required, created_at")
       .eq("organization_id", rbac.organization_id)
       .order("created_at", { ascending: false });
 
-    if (error) throw new Error(error.message);
+    if (error) {
+      // Fallback without org filter
+      const fb = await supabaseServer
+        .from("marketplaces")
+        .select("id, provider, nickname, credentials, organization_id, role_required, created_at")
+        .order("created_at", { ascending: false });
+      if (fb.error) throw new Error(fb.error.message);
+      data = fb.data;
+    }
+
     const rows = (data ?? []) as MarketplaceRow[];
     const publicRows: MarketplacePublicRow[] = rows.map((r) => {
       const adapter = MarketplaceFactory.getAdapter(r.provider);

@@ -24,7 +24,7 @@ const NAV_SECTIONS = [
   {
     section: "Integrations",
     items: [
-      { label: "Marketplace Adapters", icon: Store, href: "/settings/adapters" },
+      { label: "Connected Stores", icon: Store, href: "/settings" },
     ],
   },
 ];
@@ -98,10 +98,10 @@ export function DesktopSidebar() {
       {role === "admin" && (
         <div className="shrink-0 border-t border-slate-200 px-3 py-3 dark:border-slate-800">
           <Link
-            href="/settings/adapters"
+            href="/settings"
             className={[
               "flex min-h-[40px] w-full items-center gap-2.5 rounded-xl px-3 py-2 text-sm font-medium transition",
-              pathname === "/settings/adapters"
+              pathname === "/settings"
                 ? "bg-sky-50 text-sky-700 dark:bg-sky-950/60 dark:text-sky-300"
                 : "text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-900 dark:hover:text-slate-200",
             ].join(" ")}

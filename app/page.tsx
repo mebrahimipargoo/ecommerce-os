@@ -273,10 +273,10 @@ export default async function Page() {
                     Connect a marketplace adapter and click &ldquo;Sync Claims&rdquo; to pull in your first claims.
                   </p>
                   <Link
-                    href="/settings/adapters"
+                    href="/settings"
                     className="mt-1 inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-100 px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-slate-600 dark:hover:text-white"
                   >
-                    Go to Adapters
+                    Connect a Store
                   </Link>
                 </div>
               ) : (

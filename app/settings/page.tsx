@@ -3,9 +3,9 @@
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import {
-  ArrowLeft, BarChart3, CheckCircle2, ChevronUp, CreditCard, Cpu, Globe,
-  HardDrive, KeyRound, Loader2, Plus, Printer, Save, ScanLine, Settings,
-  ShieldAlert, Store, Tag, Trash2, UserCog, Users, Wifi, X, Zap,
+  ArrowLeft, BadgeCheck, BarChart3, CheckCircle2, ChevronUp, CreditCard, Cpu, Globe,
+  HardDrive, KeyRound, Loader2, Pencil, Plus, Printer, RefreshCw, Save, ScanLine,
+  Settings, ShieldAlert, Store, Tag, Trash2, TriangleAlert, UserCog, Users, Wifi, X, Zap,
 } from "lucide-react";
 import {
   clearAIUnifiedKeyFromStorage,
@@ -31,7 +31,11 @@ import {
   type LabelPrinter,
 } from "../../lib/openai-settings";
 import { useUserRole } from "../../components/UserRoleContext";
-import { listMarketplaces, listStores, type StorePublicRow } from "./adapters/actions";
+import {
+  listMarketplaces, listStores, insertStore, insertMarketplace,
+  updateMarketplace, testConnection, deleteStore, updateStore,
+  type StorePublicRow,
+} from "./adapters/actions";
 
 // ─── Types & Constants ────────────────────────────────────────────────────────
 
@@ -55,6 +59,48 @@ const PLATFORM_LABELS: Record<string, string> = {
   target:  "Target",
   shopify: "Shopify",
   custom:  "Custom",
+};
+
+// ─── Marketplace credential field definitions ─────────────────────────────────
+
+type CredField = {
+  key: string; label: string; type: "text" | "password";
+  placeholder: string; credKey: string;
+};
+
+const PLATFORM_CRED_FIELDS: Record<string, CredField[]> = {
+  amazon: [
+    { key: "sellerId",        label: "Seller ID",         type: "text",     placeholder: "e.g. A1BCDEFGHIJKL",             credKey: "seller_id"         },
+    { key: "lwaClientId",     label: "Client ID",         type: "text",     placeholder: "amzn1.application-oa2-client…",  credKey: "lwa_client_id"     },
+    { key: "lwaClientSecret", label: "Client Secret",     type: "password", placeholder: "Paste client secret",            credKey: "lwa_client_secret" },
+    { key: "refreshToken",    label: "Refresh Token",     type: "password", placeholder: "Atzr|…",                         credKey: "refresh_token"     },
+  ],
+  walmart: [
+    { key: "clientId",     label: "Client ID",     type: "text",     placeholder: "Walmart API Client ID", credKey: "client_id"    },
+    { key: "clientSecret", label: "Client Secret", type: "password", placeholder: "Paste client secret",   credKey: "client_secret" },
+  ],
+  ebay: [
+    { key: "appId",  label: "App ID",  type: "text", placeholder: "eBay App ID",  credKey: "app_id"  },
+    { key: "certId", label: "Cert ID", type: "text", placeholder: "eBay Cert ID", credKey: "cert_id" },
+    { key: "devId",  label: "Dev ID",  type: "text", placeholder: "eBay Dev ID",  credKey: "dev_id"  },
+  ],
+  shopify: [
+    { key: "shopDomain",  label: "Shop Domain",   type: "text",     placeholder: "your-store.myshopify.com", credKey: "shop_domain"  },
+    { key: "accessToken", label: "Access Token",  type: "password", placeholder: "shpat_…",                  credKey: "access_token" },
+  ],
+  custom: [
+    { key: "apiUrl", label: "API URL", type: "text",     placeholder: "https://api.example.com", credKey: "api_url" },
+    { key: "apiKey", label: "API Key", type: "password", placeholder: "Your API key",            credKey: "api_key" },
+  ],
+};
+
+const PLATFORM_TO_PROVIDER: Record<string, string | null> = {
+  amazon:  "amazon_sp_api",
+  walmart: "walmart_api",
+  ebay:    "ebay_api",
+  target:  null,
+  shopify: null,
+  custom:  null,
 };
 
 const PLANS = ["Free Tier", "Pro Tier", "Enterprise"] as const;
@@ -214,6 +260,17 @@ export default function SettingsPage() {
   const [connections,   setConnections]   = useState<StoreRecord[]>([]);
   const [storesLoading, setStoresLoading] = useState(false);
 
+  // ── Add Store Modal ────────────────────────────────────────────────────────
+  const [showAddStoreModal,   setShowAddStoreModal]   = useState(false);
+  const [editingStoreId,      setEditingStoreId]      = useState<string | null>(null);
+  const [newStoreName,        setNewStoreName]        = useState("");
+  const [newStorePlatform,    setNewStorePlatform]    = useState("amazon");
+  const [newStoreRegion,      setNewStoreRegion]      = useState("US");
+  const [newStoreCredentials, setNewStoreCredentials] = useState<Record<string, string>>({});
+  const [addStoreSaving,      setAddStoreSaving]      = useState(false);
+  const [storeTestStatus, setStoreTestStatus] = useState<Record<string, "idle" | "testing" | "ok" | "error">>({});
+  const [deletingStoreId, setDeletingStoreId] = useState<string | null>(null);
+
   // ── Billing / SaaS plan ────────────────────────────────────────────────────
   const [mockPlan, setMockPlan] = useState<SaasPlan>("Free Tier");
 
@@ -268,7 +325,7 @@ export default function SettingsPage() {
 
   // ── Paywall helpers ────────────────────────────────────────────────────────
   const planLimits  = PLAN_LIMITS[mockPlan];
-  const canAddStore = planLimits.stores === Infinity || connections.length < planLimits.stores;
+  const canAddStore = planLimits.stores === Infinity || storesList.length < planLimits.stores;
 
   // ── General save ───────────────────────────────────────────────────────────
   function handleSaveGeneral(e: React.FormEvent) {
@@ -432,6 +489,129 @@ export default function SettingsPage() {
     setHwSaved(true);
     setTimeout(() => setHwSaved(false), 2500);
     showToast("Hardware settings saved.", true);
+  }
+
+  function openAddStoreModal() {
+    setEditingStoreId(null);
+    setNewStoreName(""); setNewStorePlatform("amazon"); setNewStoreRegion("US");
+    setNewStoreCredentials({});
+    setShowAddStoreModal(true);
+  }
+
+  function openEditStoreModal(store: StorePublicRow) {
+    setEditingStoreId(store.id);
+    setNewStoreName(store.name);
+    setNewStorePlatform(store.platform);
+    setNewStoreRegion("US");
+    setNewStoreCredentials({});
+    setShowAddStoreModal(true);
+  }
+
+  async function handleAddStore(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newStoreName.trim()) { showToast("Store name is required.", false); return; }
+    setAddStoreSaving(true);
+
+    if (editingStoreId) {
+      // ── Edit mode ────────────────────────────────────────────────────────────
+      const res = await updateStore(editingStoreId, { name: newStoreName });
+      if (!res.ok) { setAddStoreSaving(false); showToast(res.error ?? "Failed to update store.", false); return; }
+
+      // Update credentials if any were filled in
+      const credFields = PLATFORM_CRED_FIELDS[newStorePlatform] ?? [];
+      const creds: Record<string, string> = {};
+      for (const f of credFields) {
+        const v = newStoreCredentials[f.key]?.trim();
+        if (v) creds[f.credKey] = v;
+      }
+      if (Object.keys(creds).length > 0) {
+        const existingStore = storesList.find((s) => s.id === editingStoreId);
+        if (existingStore?.marketplace_id) {
+          await updateMarketplace(existingStore.marketplace_id, { credentials: creds });
+        } else {
+          const provider = PLATFORM_TO_PROVIDER[newStorePlatform];
+          if (provider) {
+            const mpRes = await insertMarketplace({
+              provider: provider as Parameters<typeof insertMarketplace>[0]["provider"],
+              nickname: newStoreName,
+              credentials: creds,
+            });
+            if (mpRes.ok && mpRes.data) {
+              // link the marketplace to the store if possible (best-effort)
+            }
+          }
+        }
+      }
+
+      const refreshed = await listStores();
+      if (refreshed.ok && refreshed.data) setStoresList(refreshed.data);
+      setAddStoreSaving(false);
+      setShowAddStoreModal(false);
+      setEditingStoreId(null);
+      showToast(`Store "${newStoreName}" updated.`, true);
+    } else {
+      // ── Add mode ─────────────────────────────────────────────────────────────
+      const provider = PLATFORM_TO_PROVIDER[newStorePlatform];
+      const credFields = PLATFORM_CRED_FIELDS[newStorePlatform] ?? [];
+      const credentials: Record<string, string> = {};
+      for (const f of credFields) {
+        const v = newStoreCredentials[f.key]?.trim();
+        if (v) credentials[f.credKey] = v;
+      }
+
+      let marketplace_id: string | undefined;
+      if (provider && Object.keys(credentials).length > 0) {
+        const mpRes = await insertMarketplace({
+          provider: provider as Parameters<typeof insertMarketplace>[0]["provider"],
+          nickname: newStoreName,
+          credentials,
+        });
+        if (!mpRes.ok) {
+          setAddStoreSaving(false);
+          showToast(mpRes.error ?? "Failed to save API credentials.", false);
+          return;
+        }
+        marketplace_id = mpRes.data?.id;
+      }
+
+      const res = await insertStore({
+        name: newStoreName, platform: newStorePlatform,
+        region: newStoreRegion, marketplace_id,
+      });
+      setAddStoreSaving(false);
+      if (!res.ok) { showToast(res.error ?? "Failed to create store.", false); return; }
+
+      const refreshed = await listStores();
+      if (refreshed.ok && refreshed.data) setStoresList(refreshed.data);
+      setNewStoreName(""); setNewStorePlatform("amazon"); setNewStoreRegion("US");
+      setNewStoreCredentials({});
+      setShowAddStoreModal(false);
+      showToast(`Store "${res.data?.name}" created successfully.`, true);
+    }
+  }
+
+  async function handleDeleteStore(store: StorePublicRow) {
+    if (!window.confirm(`Delete "${store.name}"? This cannot be undone.`)) return;
+    setDeletingStoreId(store.id);
+    const res = await deleteStore(store.id);
+    setDeletingStoreId(null);
+    if (!res.ok) { showToast(res.error ?? "Failed to delete store.", false); return; }
+    setStoresList((prev) => prev.filter((s) => s.id !== store.id));
+    showToast(`Store "${store.name}" deleted.`, true);
+  }
+
+  async function handleTestStoreConnection(store: StorePublicRow) {
+    if (!store.marketplace_id) {
+      showToast("No API credentials linked. Edit the store to add credentials first.", false);
+      return;
+    }
+    setStoreTestStatus((prev) => ({ ...prev, [store.id]: "testing" }));
+    const res = await testConnection(store.marketplace_id);
+    setStoreTestStatus((prev) => ({ ...prev, [store.id]: res.ok ? "ok" : "error" }));
+    showToast(
+      res.ok ? "Connection verified successfully ✓" : (res.error ?? "Connection test failed."),
+      res.ok,
+    );
   }
 
   if (!mounted) {
@@ -609,9 +789,10 @@ export default function SettingsPage() {
           {/* ══════════════ MARKETPLACES & STORES ══════════════ */}
           {activeTab === "marketplaces" && (
             <div className="space-y-6">
-              {/* Connected stores card with paywall */}
+
+              {/* ── Connected Stores card ─────────────────────────────────── */}
               <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-5">
-                <div className="flex items-start justify-between gap-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-100 dark:bg-sky-950/50">
                       <Store className="h-5 w-5 text-sky-600 dark:text-sky-400" />
@@ -619,23 +800,24 @@ export default function SettingsPage() {
                     <div>
                       <h2 className="text-base font-bold">Connected Stores</h2>
                       <p className="text-xs text-muted-foreground">
-                        {connections.length}
+                        {storesList.length}
                         {planLimits.stores === Infinity ? "" : ` / ${planLimits.stores}`} store
-                        {connections.length !== 1 ? "s" : ""} on{" "}
+                        {storesList.length !== 1 ? "s" : ""} on{" "}
                         <span className="font-semibold">{mockPlan}</span>
                       </p>
                     </div>
                   </div>
 
-                  {/* Add Store — paywall gated */}
+                  {/* Add New Store — paywall gated */}
                   {canAddStore ? (
-                    <Link
-                      href="/settings/adapters"
-                      className="inline-flex shrink-0 items-center gap-2 rounded-xl bg-sky-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-sky-700"
+                    <button
+                      type="button"
+                      onClick={openAddStoreModal}
+                      className="inline-flex shrink-0 items-center gap-2 rounded-xl bg-sky-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-700 active:scale-[0.98]"
                     >
                       <Plus className="h-4 w-4" />
-                      Add Store
-                    </Link>
+                      Add New Store
+                    </button>
                   ) : (
                     <button
                       type="button"
@@ -648,7 +830,7 @@ export default function SettingsPage() {
                   )}
                 </div>
 
-                {/* Paywall banner when at limit */}
+                {/* Paywall banner */}
                 {!canAddStore && (
                   <div className="flex items-start gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 dark:border-amber-700/40 dark:bg-amber-950/20">
                     <Zap className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
@@ -660,74 +842,187 @@ export default function SettingsPage() {
                   </div>
                 )}
 
-                {/* Stores list */}
-                {storesLoading ? (
+                {/* Stores list — card grid */}
+                {storesListLoading ? (
                   <div className="flex items-center gap-2 py-4">
                     <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
                     <p className="text-sm text-muted-foreground">Loading stores…</p>
                   </div>
-                ) : connections.length === 0 ? (
+                ) : storesList.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-border bg-muted/20 py-10 text-center">
-                    <Store className="mx-auto mb-2 h-8 w-8 text-muted-foreground/40" />
-                    <p className="text-sm font-medium text-muted-foreground">No stores connected yet.</p>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      Add your first marketplace to start syncing returns.
+                    <Store className="mx-auto mb-3 h-9 w-9 text-muted-foreground/30" />
+                    <p className="text-sm font-semibold text-muted-foreground">No stores yet.</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Click <strong>Add New Store</strong> above to connect your first channel.
                     </p>
                   </div>
                 ) : (
-                  <div className="space-y-2">
-                    {connections.map((c) => (
-                      <div
-                        key={c.id}
-                        className="flex items-center gap-4 rounded-xl border border-border bg-background px-4 py-3"
-                      >
-                        <div className="h-2.5 w-2.5 shrink-0 rounded-full bg-emerald-400" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-semibold truncate">{c.nickname}</p>
-                          {c.display_id && (
-                            <p className="text-xs text-muted-foreground font-mono">{c.display_id}</p>
-                          )}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    {storesList.map((s) => {
+                      const testSt     = storeTestStatus[s.id] ?? "idle";
+                      const isDeleting = deletingStoreId === s.id;
+                      const isTesting  = testSt === "testing";
+                      const isDefault  = s.id === defaultStoreId;
+
+                      // Derive display status: prefer test result over DB active flag
+                      const statusInvalid = testSt === "error";
+                      const statusActive  = testSt === "ok" || (s.is_active && testSt === "idle");
+
+                      // Per-platform accent colors
+                      const platformColor: Record<string, string> = {
+                        amazon:  "bg-amber-50 border-amber-200 text-amber-700 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-300",
+                        walmart: "bg-sky-50 border-sky-200 text-sky-700 dark:border-sky-700/50 dark:bg-sky-950/30 dark:text-sky-300",
+                        ebay:    "bg-red-50 border-red-200 text-red-700 dark:border-red-700/50 dark:bg-red-950/30 dark:text-red-300",
+                        shopify: "bg-emerald-50 border-emerald-200 text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-300",
+                        target:  "bg-rose-50 border-rose-200 text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-300",
+                        custom:  "bg-slate-50 border-slate-200 text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300",
+                      };
+                      const platCls = platformColor[s.platform] ?? platformColor.custom;
+
+                      return (
+                        <div
+                          key={s.id}
+                          className={[
+                            "relative flex flex-col gap-3 rounded-xl border p-4 transition",
+                            isDefault
+                              ? "border-violet-300 ring-1 ring-violet-200 bg-violet-50/30 dark:border-violet-600/60 dark:ring-violet-800/30 dark:bg-violet-950/10"
+                              : "border-border bg-background hover:border-sky-200 hover:shadow-sm",
+                          ].join(" ")}
+                        >
+                          {/* Top row: name + badges */}
+                          <div className="flex items-start justify-between gap-2 min-w-0">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <div className={`h-2.5 w-2.5 shrink-0 rounded-full ${statusInvalid ? "bg-rose-400" : statusActive ? "bg-emerald-400" : "bg-slate-300 dark:bg-slate-600"}`} />
+                              <p className="text-sm font-bold truncate">{s.name}</p>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1.5">
+                              {isDefault && (
+                                <span className="inline-flex items-center gap-1 rounded-full border border-violet-300 bg-violet-100 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-violet-700 dark:border-violet-700/50 dark:bg-violet-950/40 dark:text-violet-300">
+                                  ★ Default
+                                </span>
+                              )}
+                              {s.marketplace_id && (
+                                <span className="inline-flex items-center rounded-full border border-violet-200 bg-violet-50 px-1.5 py-0.5 text-[9px] font-bold text-violet-600 dark:border-violet-700/50 dark:bg-violet-950/40 dark:text-violet-300">
+                                  API
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Platform + Status row */}
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className={`inline-flex rounded-full border px-2.5 py-0.5 text-[11px] font-bold capitalize ${platCls}`}>
+                              {PLATFORM_LABELS[s.platform] ?? s.platform}
+                            </span>
+                            <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${
+                              statusInvalid
+                                ? "border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
+                                : statusActive
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/40 dark:text-emerald-300"
+                                : "border-slate-200 bg-slate-50 text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400"
+                            }`}>
+                              {statusInvalid ? (
+                                <><TriangleAlert className="h-2.5 w-2.5" />Invalid</>
+                              ) : statusActive ? (
+                                <><BadgeCheck className="h-2.5 w-2.5" />Active</>
+                              ) : (
+                                "Inactive"
+                              )}
+                            </span>
+                          </div>
+
+                          {/* Store ID */}
+                          <p className="font-mono text-[10px] text-muted-foreground">
+                            ID: {s.id.slice(0, 8)}…
+                          </p>
+
+                          {/* Action buttons */}
+                          <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-border">
+                            {/* Test Connection */}
+                            <button
+                              type="button"
+                              onClick={() => void handleTestStoreConnection(s)}
+                              disabled={isTesting || !s.marketplace_id}
+                              title={!s.marketplace_id ? "No API credentials linked — edit to add credentials" : undefined}
+                              className={[
+                                "inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] font-semibold transition disabled:opacity-40 disabled:cursor-not-allowed",
+                                testSt === "ok"
+                                  ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/40 dark:text-emerald-300"
+                                  : testSt === "error"
+                                  ? "border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
+                                  : "border-border bg-background text-muted-foreground hover:border-sky-300 hover:text-sky-600",
+                              ].join(" ")}
+                            >
+                              {isTesting ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : testSt === "ok" ? (
+                                <BadgeCheck className="h-3 w-3" />
+                              ) : testSt === "error" ? (
+                                <TriangleAlert className="h-3 w-3" />
+                              ) : (
+                                <RefreshCw className="h-3 w-3" />
+                              )}
+                              {isTesting ? "Testing…" : testSt === "ok" ? "Verified" : testSt === "error" ? "Failed" : "Test Connection"}
+                            </button>
+
+                            {/* Edit */}
+                            <button
+                              type="button"
+                              onClick={() => openEditStoreModal(s)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground transition hover:border-sky-300 hover:text-sky-600"
+                            >
+                              <Pencil className="h-3 w-3" />
+                              Edit
+                            </button>
+
+                            {/* Delete */}
+                            <button
+                              type="button"
+                              onClick={() => void handleDeleteStore(s)}
+                              disabled={isDeleting}
+                              className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-100 disabled:opacity-50 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
+                            >
+                              {isDeleting
+                                ? <Loader2 className="h-3 w-3 animate-spin" />
+                                : <Trash2  className="h-3 w-3" />}
+                              {isDeleting ? "Deleting…" : "Delete"}
+                            </button>
+                          </div>
                         </div>
-                        <span className="shrink-0 rounded-full bg-muted px-2.5 py-0.5 text-xs font-semibold text-muted-foreground capitalize">
-                          {c.provider.replace("_api", "").replace("_sp_api", "")}
-                        </span>
-                        <span className="shrink-0 inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-bold text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/40 dark:text-emerald-300">
-                          Active
-                        </span>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
-
-                <div className="border-t border-border pt-4">
-                  <Link
-                    href="/settings/adapters"
-                    className="text-sm font-semibold text-sky-600 transition hover:text-sky-700 dark:text-sky-400"
-                  >
-                    Manage credentials, test connections &amp; sync claims →
-                  </Link>
-                </div>
               </div>
 
-              {/* Available channels overview */}
+              {/* ── Hierarchy info banner ────────────────────────────────── */}
+              <div className="rounded-2xl border border-violet-200 bg-violet-50/60 px-5 py-4 dark:border-violet-700/40 dark:bg-violet-950/20 space-y-1">
+                <p className="flex items-center gap-2 text-sm font-bold text-violet-800 dark:text-violet-200">
+                  <Zap className="h-4 w-4" />
+                  Store Inheritance — Pallet → Package → Item
+                </p>
+                <p className="text-xs text-violet-700 dark:text-violet-400">
+                  When you assign a store to a <strong>Pallet</strong>, all Packages created inside it
+                  automatically inherit that store. Items then inherit from their parent Package.
+                  Standalone items fall back to your <strong>Default Store</strong> set in General settings.
+                </p>
+              </div>
+
+              {/* ── Available channels overview ──────────────────────────── */}
               <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-4">
-                <h3 className="text-sm font-bold">Available Channels</h3>
+                <h3 className="text-sm font-bold">Supported Channels</h3>
                 <div className="grid gap-3 sm:grid-cols-2">
                   {[
-                    { name: "Amazon SP-API",   desc: "FBA/FBM returns, A-to-Z claims automation",     active: true  },
-                    { name: "Walmart DSV",      desc: "Supplier returns portal, RMA workflows",         active: true  },
-                    { name: "eBay",             desc: "Money Back Guarantee automation",                active: false, soon: true },
-                    { name: "Target / Circle",  desc: "Freight claim &amp; supplier integration",      active: false, soon: true },
+                    { name: "Amazon SP-API",  desc: "FBA/FBM returns, A-to-Z claims automation",    active: true  },
+                    { name: "Walmart DSV",     desc: "Supplier returns portal, RMA workflows",        active: true  },
+                    { name: "eBay",            desc: "Money Back Guarantee automation",               active: false, soon: true },
+                    { name: "Target / Circle", desc: "Freight claim &amp; supplier integration",      active: false, soon: true },
                   ].map((m) => (
                     <div
                       key={m.name}
                       className="flex items-start gap-3 rounded-xl border border-border bg-background p-4"
                     >
-                      <div
-                        className={`mt-0.5 h-2.5 w-2.5 shrink-0 rounded-full ${
-                          m.soon ? "bg-slate-300 dark:bg-slate-600" : "bg-emerald-400"
-                        }`}
-                      />
+                      <div className={`mt-0.5 h-2.5 w-2.5 shrink-0 rounded-full ${m.soon ? "bg-slate-300 dark:bg-slate-600" : "bg-emerald-400"}`} />
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
                           <p className="text-sm font-semibold">{m.name}</p>
@@ -737,10 +1032,7 @@ export default function SettingsPage() {
                             </span>
                           )}
                         </div>
-                        <p
-                          className="mt-0.5 text-xs text-muted-foreground"
-                          dangerouslySetInnerHTML={{ __html: m.desc }}
-                        />
+                        <p className="mt-0.5 text-xs text-muted-foreground" dangerouslySetInnerHTML={{ __html: m.desc }} />
                       </div>
                     </div>
                   ))}
@@ -1291,7 +1583,7 @@ export default function SettingsPage() {
 
                 <UsageMeter
                   label="Connected Stores"
-                  used={connections.length}
+                  used={storesList.length}
                   limit={planLimits.stores}
                   color="sky"
                   hint="Active marketplace channel integrations"
@@ -1426,6 +1718,196 @@ export default function SettingsPage() {
         {/* end right content */}
       </div>
       {/* end layout */}
+
+      {/* ── Add / Edit Store Modal ───────────────────────────────────────────── */}
+      {showAddStoreModal && (
+        <div
+          className="fixed inset-0 z-[400] flex items-end justify-center sm:items-center bg-black/60 backdrop-blur-sm p-0 sm:p-4"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShowAddStoreModal(false);
+              setEditingStoreId(null);
+            }
+          }}
+        >
+          <div className="w-full sm:w-[95vw] sm:max-w-lg overflow-y-auto max-h-[92dvh] sm:max-h-[88vh] rounded-t-3xl sm:rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950 animate-in slide-in-from-bottom-4 duration-200">
+
+            {/* Modal header */}
+            <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200 bg-white px-5 py-4 dark:border-slate-700 dark:bg-slate-950">
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Marketplaces &amp; Stores</p>
+                <h2 className="mt-0.5 text-lg font-bold text-foreground">
+                  {editingStoreId ? "Edit Store" : "Add New Store"}
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => { setShowAddStoreModal(false); setEditingStoreId(null); }}
+                className="rounded-full p-2 text-slate-400 hover:bg-accent hover:text-accent-foreground transition"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {/* Modal form */}
+            <form onSubmit={handleAddStore} className="p-5 space-y-5">
+
+              {/* ── Basic Info ───────────────────────────────────────────── */}
+              <div className="space-y-4">
+                <div>
+                  <label className={LABEL_CLS}>
+                    Store Name <span className="text-rose-500">*</span>
+                  </label>
+                  <p className={HINT_CLS}>A friendly label (e.g. &quot;My US Amazon Store&quot;).</p>
+                  <input
+                    type="text"
+                    autoFocus
+                    required
+                    value={newStoreName}
+                    onChange={(e) => setNewStoreName(e.target.value)}
+                    placeholder="My Amazon Store…"
+                    className={INPUT_CLS}
+                  />
+                </div>
+
+                <div>
+                  <label className={LABEL_CLS}>
+                    Platform <span className="text-rose-500">*</span>
+                  </label>
+                  <select
+                    required
+                    value={newStorePlatform}
+                    disabled={!!editingStoreId}
+                    onChange={(e) => {
+                      setNewStorePlatform(e.target.value);
+                      setNewStoreRegion("US");
+                      setNewStoreCredentials({});
+                    }}
+                    className={`${SELECT_CLS} ${editingStoreId ? "opacity-60 cursor-not-allowed" : ""}`}
+                  >
+                    <option value="amazon">Amazon</option>
+                    <option value="walmart">Walmart</option>
+                    <option value="ebay">eBay</option>
+                    <option value="target">Target</option>
+                    <option value="shopify">Shopify</option>
+                    <option value="custom">Custom / Other</option>
+                  </select>
+                  {editingStoreId && (
+                    <p className="mt-1 text-[11px] text-muted-foreground">Platform cannot be changed after creation.</p>
+                  )}
+                </div>
+
+                {!editingStoreId && (
+                  <div>
+                    <label className={LABEL_CLS}>Marketplace Region</label>
+                    <p className={HINT_CLS}>The geographic marketplace where this store operates.</p>
+                    <select
+                      value={newStoreRegion}
+                      onChange={(e) => setNewStoreRegion(e.target.value)}
+                      className={SELECT_CLS}
+                    >
+                      {newStorePlatform === "amazon" ? (
+                        <>
+                          <option value="US">United States (US)</option>
+                          <option value="CA">Canada (CA)</option>
+                          <option value="MX">Mexico (MX)</option>
+                          <option value="UK">United Kingdom (UK)</option>
+                          <option value="DE">Germany (DE)</option>
+                          <option value="FR">France (FR)</option>
+                          <option value="IT">Italy (IT)</option>
+                          <option value="ES">Spain (ES)</option>
+                          <option value="NL">Netherlands (NL)</option>
+                          <option value="SE">Sweden (SE)</option>
+                          <option value="PL">Poland (PL)</option>
+                          <option value="TR">Turkey (TR)</option>
+                          <option value="JP">Japan (JP)</option>
+                          <option value="AU">Australia (AU)</option>
+                          <option value="IN">India (IN)</option>
+                          <option value="AE">UAE (AE)</option>
+                          <option value="BR">Brazil (BR)</option>
+                          <option value="SG">Singapore (SG)</option>
+                        </>
+                      ) : newStorePlatform === "walmart" ? (
+                        <>
+                          <option value="US">United States (US)</option>
+                          <option value="CA">Canada (CA)</option>
+                        </>
+                      ) : (
+                        <>
+                          <option value="US">United States</option>
+                          <option value="CA">Canada</option>
+                          <option value="UK">United Kingdom</option>
+                          <option value="AU">Australia</option>
+                          <option value="EU">Europe</option>
+                          <option value="GLOBAL">Global</option>
+                        </>
+                      )}
+                    </select>
+                  </div>
+                )}
+              </div>
+
+              {/* ── API Credentials ──────────────────────────────────────── */}
+              {(PLATFORM_CRED_FIELDS[newStorePlatform] ?? []).length > 0 && (
+                <div className="rounded-xl border border-sky-200 bg-sky-50/50 p-4 space-y-4 dark:border-sky-700/50 dark:bg-sky-950/20">
+                  <div className="flex items-center gap-2">
+                    <KeyRound className="h-4 w-4 text-sky-600 dark:text-sky-400 shrink-0" />
+                    <div>
+                      <p className="text-sm font-bold text-sky-800 dark:text-sky-200">API Credentials</p>
+                      <p className="text-[11px] text-sky-600 dark:text-sky-400">
+                        {editingStoreId
+                          ? "Leave fields blank to keep existing credentials."
+                          : "Optional — add now or edit later. Stored server-side via Supabase."}
+                      </p>
+                    </div>
+                  </div>
+
+                  {(PLATFORM_CRED_FIELDS[newStorePlatform] ?? []).map((f) => (
+                    <div key={f.key}>
+                      <label className={LABEL_CLS}>{f.label}</label>
+                      <input
+                        type={f.type}
+                        autoComplete="off"
+                        value={newStoreCredentials[f.key] ?? ""}
+                        onChange={(e) =>
+                          setNewStoreCredentials((prev) => ({ ...prev, [f.key]: e.target.value }))
+                        }
+                        placeholder={f.placeholder}
+                        className={`${INPUT_CLS} font-mono`}
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Actions */}
+              <div className="flex gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={() => { setShowAddStoreModal(false); setEditingStoreId(null); }}
+                  className="flex-1 rounded-xl border border-border bg-muted/50 py-3 text-sm font-semibold text-muted-foreground transition hover:bg-accent"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={addStoreSaving || !newStoreName.trim()}
+                  className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-700 disabled:opacity-50"
+                >
+                  {addStoreSaving ? (
+                    <><Loader2 className="h-4 w-4 animate-spin" />Saving…</>
+                  ) : editingStoreId ? (
+                    <><Save className="h-4 w-4" />Save Changes</>
+                  ) : (
+                    <><Plus className="h-4 w-4" />Create Store</>
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
