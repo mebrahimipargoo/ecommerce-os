@@ -2233,13 +2233,18 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   >([]);
   const [storeInherited, setStoreInherited] = useState(false);
   useEffect(() => {
-    supabaseBrowser
-      .from("stores")
-      .select("id, name, platform")
-      .eq("is_active", true)
-      .order("created_at", { ascending: false })
-      .then(({ data }) => { if (data) setConnectedStores(data as { id: string; name: string; platform: string }[]); })
-      .catch(() => {});
+    (async () => {
+      try {
+        const { data } = await supabaseBrowser
+          .from("stores")
+          .select("id, name, platform")
+          .eq("is_active", true)
+          .order("created_at", { ascending: false });
+        if (data) setConnectedStores(data as { id: string; name: string; platform: string }[]);
+      } catch {
+        // ignore fetch errors
+      }
+    })();
   }, []);
 
   // ── Auto-fill store_id from linked package (Package → Item inheritance) ───
@@ -2309,11 +2314,13 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
       setCatalogPreview({ name: amazon.name, price: amazon.price, image_url: amazon.image_url });
       setCatalogStatus("amazon");
       // Cache the result locally so the next scan is instant
-      await supabaseBrowser
-        .from("products")
-        .insert({ barcode: barcode.trim(), name: amazon.name, price: amazon.price, image_url: amazon.image_url, source: "Amazon" })
-        .then(() => {})
-        .catch(() => {});
+      try {
+        await supabaseBrowser
+          .from("products")
+          .insert({ barcode: barcode.trim(), name: amazon.name, price: amazon.price, image_url: amazon.image_url, source: "Amazon" });
+      } catch {
+        // ignore cache errors
+      }
       return;
     }
 
@@ -2895,13 +2902,18 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
   const [pkgStoreInherited, setPkgStoreInherited] = useState(false);
   const [pkgStoresList,     setPkgStoresList]     = useState<{ id: string; name: string; platform: string }[]>([]);
   useEffect(() => {
-    supabaseBrowser
-      .from("stores")
-      .select("id, name, platform")
-      .eq("is_active", true)
-      .order("created_at", { ascending: false })
-      .then(({ data }) => { if (data) setPkgStoresList(data as { id: string; name: string; platform: string }[]); })
-      .catch(() => {});
+    (async () => {
+      try {
+        const { data } = await supabaseBrowser
+          .from("stores")
+          .select("id, name, platform")
+          .eq("is_active", true)
+          .order("created_at", { ascending: false });
+        if (data) setPkgStoresList(data as { id: string; name: string; platform: string }[]);
+      } catch {
+        // ignore fetch errors
+      }
+    })();
   }, []);
 
   // ── Inherit store_id from pallet (Pallet → Package) ──────────────────────
@@ -3180,13 +3192,18 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
   const [palletStoreId,  setPalletStoreId]  = useState("");
   const [palletStoresList, setPalletStoresList] = useState<{ id: string; name: string; platform: string }[]>([]);
   useEffect(() => {
-    supabaseBrowser
-      .from("stores")
-      .select("id, name, platform")
-      .eq("is_active", true)
-      .order("created_at", { ascending: false })
-      .then(({ data }) => { if (data) setPalletStoresList(data as { id: string; name: string; platform: string }[]); })
-      .catch(() => {});
+    (async () => {
+      try {
+        const { data } = await supabaseBrowser
+          .from("stores")
+          .select("id, name, platform")
+          .eq("is_active", true)
+          .order("created_at", { ascending: false });
+        if (data) setPalletStoresList(data as { id: string; name: string; platform: string }[]);
+      } catch {
+        // ignore fetch errors
+      }
+    })();
   }, []);
 
   async function handleOcr(f: File) { setFile(f); setOcrLoad(true); const res = await mockPalletOcr(f); setOcrLoad(false); if (res.ok && res.data) { setOcrResult(res.data); setPalletNum(res.data.pallet_number); } else setError(res.error ?? "OCR failed."); }
