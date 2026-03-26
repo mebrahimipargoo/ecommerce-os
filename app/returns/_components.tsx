@@ -2225,6 +2225,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   const [ocrBanner, setOcrBanner] = useState<{ ok: boolean; msg: string } | null>(null);
   const ocrFileRef = useRef<HTMLInputElement>(null);
   // Scanner keyboard-nav refs
+  const rmaRef     = useRef<HTMLInputElement>(null);
   const itemNameRef = useRef<HTMLInputElement>(null);
 
   // ── Connected stores for the Store ID dropdown (fetched from stores table) ─
@@ -2442,7 +2443,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
       {!hasPackageLink && (
         <div>
           <label className={LABEL}>Return label / LPN <span className="ml-1 text-xs font-normal text-slate-400">(optional — orphaned items)</span></label>
-          <div className="relative"><Barcode className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" /><input type="text" className={`${INPUT} pl-11`} placeholder="Only if not assigned to a package…" value={state.lpn} onChange={(e) => up("lpn", e.target.value)} /></div>
+          <div className="relative"><Barcode className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" /><input ref={rmaRef} type="text" className={`${INPUT} pl-11`} placeholder="Only if not assigned to a package…" value={state.lpn} onChange={(e) => up("lpn", e.target.value)} /></div>
         </div>
       )}
       {hasPackageLink && (
