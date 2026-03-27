@@ -9,13 +9,17 @@ import {
   TriangleAlert, UserCog, Users, Wifi, X, Zap,
 } from "lucide-react";
 import {
+  getClaimAgentConfig,
   getCoreSettings,
   getFefoSettings,
+  saveClaimAgentConfig,
   saveInventoryFefoSettings,
   saveCoreSettings,
 } from "./workspace-settings-actions";
 import {
+  DEFAULT_CLAIM_AGENT_CONFIG,
   DEFAULT_FEFO,
+  type ClaimAgentConfig,
   type CoreSettings,
   type InventoryModuleConfig,
 } from "./workspace-settings-types";
@@ -338,6 +342,11 @@ export default function SettingsPage() {
   const [fefoSaving,     setFefoSaving]     = useState(false);
   const [fefoLocalEdit,  setFefoLocalEdit]  = useState<InventoryModuleConfig>(DEFAULT_FEFO);
 
+  const [claimAgentLocal, setClaimAgentLocal] = useState<ClaimAgentConfig>(DEFAULT_CLAIM_AGENT_CONFIG);
+  const [claimAgentSaved, setClaimAgentSaved] = useState<ClaimAgentConfig>(DEFAULT_CLAIM_AGENT_CONFIG);
+  const [claimAgentLoading, setClaimAgentLoading] = useState(false);
+  const [claimAgentSaving, setClaimAgentSaving] = useState(false);
+
   const [toast, setToast] = useState<ToastState>(null);
 
   // ── Hydrate from localStorage ──────────────────────────────────────────────
@@ -382,6 +391,22 @@ export default function SettingsPage() {
       }
     }
     loadFefoSettings();
+  }, [mounted]);
+
+  // ── Claim Engine / Agent Control (module_configs.claim_agent_config) ───────
+  useEffect(() => {
+    if (!mounted) return;
+    async function loadClaimAgent() {
+      setClaimAgentLoading(true);
+      try {
+        const cfg = await getClaimAgentConfig();
+        setClaimAgentSaved(cfg);
+        setClaimAgentLocal(cfg);
+      } finally {
+        setClaimAgentLoading(false);
+      }
+    }
+    loadClaimAgent();
   }, [mounted]);
 
   // ── Load connected marketplace credentials ─────────────────────────────────
@@ -637,6 +662,42 @@ export default function SettingsPage() {
     if (!res.ok) { showToast(res.error ?? "Failed to save FEFO settings.", false); return; }
     setFefoSettings({ fefo_critical_days: critical, fefo_warning_days: warning });
     showToast("Inventory / FEFO settings saved.", true);
+  }
+
+  async function handleSaveClaimAgent(e: React.FormEvent) {
+    e.preventDefault();
+    if (mockPlan === "Free Tier") {
+      showToast("Upgrade to Pro to configure Claim Engine agent controls.", false);
+      return;
+    }
+    const maxUsd = Number(claimAgentLocal.max_auto_submit_amount_usd);
+    if (isNaN(maxUsd) || maxUsd < 0) {
+      showToast("Maximum auto-submit amount must be zero or positive.", false);
+      return;
+    }
+    setClaimAgentSaving(true);
+    const res = await saveClaimAgentConfig({
+      auto_generate_pdf_reports: claimAgentLocal.auto_generate_pdf_reports ?? true,
+      allow_agent_direct_submit: claimAgentLocal.allow_agent_direct_submit ?? false,
+      max_auto_submit_amount_usd: maxUsd,
+      autonomous_claim_submission_0_50_usd: claimAgentLocal.autonomous_claim_submission_0_50_usd ?? false,
+      require_manual_approval_bulk_submission: claimAgentLocal.require_manual_approval_bulk_submission ?? true,
+      default_marketplace_adapter_store_id:
+        claimAgentLocal.default_marketplace_adapter_store_id?.trim() || null,
+    });
+    setClaimAgentSaving(false);
+    if (!res.ok) {
+      showToast(res.error ?? "Failed to save agent settings.", false);
+      return;
+    }
+    const merged: ClaimAgentConfig = {
+      ...DEFAULT_CLAIM_AGENT_CONFIG,
+      ...claimAgentLocal,
+      max_auto_submit_amount_usd: maxUsd,
+    };
+    setClaimAgentSaved(merged);
+    setClaimAgentLocal(merged);
+    showToast("Claim agent settings saved.", true);
   }
 
   function handleSaveHardware(e: React.FormEvent) {
@@ -1979,18 +2040,210 @@ export default function SettingsPage() {
                 </div>
               )}
 
-              <div className={[
-                "rounded-2xl border border-border bg-card p-6 shadow-sm space-y-4 transition-all",
-                mockPlan === "Free Tier" ? "opacity-50 pointer-events-none select-none" : "",
-              ].join(" ")}>
-                <div className="rounded-xl border border-dashed border-border bg-muted/20 py-12 text-center">
-                  <ShieldCheck className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-                  <p className="text-sm font-semibold text-muted-foreground">Claim Engine Configuration</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    Auto-escalation rules, evidence scoring, and marketplace dispute settings coming soon.
-                  </p>
+              <form
+                onSubmit={handleSaveClaimAgent}
+                className={[
+                  "rounded-2xl border border-border bg-card p-6 shadow-sm space-y-6 transition-all",
+                  mockPlan === "Free Tier" ? "opacity-50 pointer-events-none select-none" : "",
+                ].join(" ")}
+              >
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="flex items-start gap-3">
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-100 dark:bg-violet-950/50">
+                      <Cpu className="h-5 w-5 text-violet-600 dark:text-violet-400" />
+                    </div>
+                    <div>
+                      <h3 className="text-sm font-bold text-foreground">Agent Control</h3>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        White-label automation: PDF generation and optional direct marketplace submission limits.
+                        Stored in <code className="rounded bg-muted px-1 font-mono text-[10px]">module_configs.claim_agent_config</code>.
+                      </p>
+                    </div>
+                  </div>
                 </div>
-              </div>
+
+                {claimAgentLoading ? (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Loading agent settings…
+                  </div>
+                ) : (
+                  <>
+                    <div className="space-y-4 rounded-xl border border-border bg-muted/10 p-4">
+                      <label className="flex cursor-pointer items-start gap-3">
+                        <input
+                          type="checkbox"
+                          className="mt-1 h-4 w-4 rounded accent-rose-600"
+                          checked={claimAgentLocal.auto_generate_pdf_reports ?? true}
+                          onChange={(e) =>
+                            setClaimAgentLocal((p) => ({ ...p, auto_generate_pdf_reports: e.target.checked }))
+                          }
+                        />
+                        <span>
+                          <span className="block text-sm font-semibold">Auto-generate PDF reports</span>
+                          <span className="text-xs text-muted-foreground">
+                            When enabled, daily claim PDFs are generated automatically for eligible submissions (default: on).
+                          </span>
+                        </span>
+                      </label>
+
+                      <label className="flex cursor-pointer items-start gap-3 border-t border-border pt-4">
+                        <input
+                          type="checkbox"
+                          className="mt-1 h-4 w-4 rounded accent-rose-600"
+                          checked={claimAgentLocal.allow_agent_direct_submit ?? false}
+                          onChange={(e) =>
+                            setClaimAgentLocal((p) => ({ ...p, allow_agent_direct_submit: e.target.checked }))
+                          }
+                        />
+                        <span>
+                          <span className="block text-sm font-semibold">Allow agent to submit directly to marketplace</span>
+                          <span className="text-xs text-muted-foreground">
+                            Permits automated filing where supported; keep off for manual review (default: off).
+                          </span>
+                        </span>
+                      </label>
+
+                      <label className="flex cursor-pointer items-start gap-3 border-t border-border pt-4">
+                        <input
+                          type="checkbox"
+                          className="mt-1 h-4 w-4 rounded accent-rose-600"
+                          checked={claimAgentLocal.autonomous_claim_submission_0_50_usd ?? false}
+                          onChange={(e) =>
+                            setClaimAgentLocal((p) => ({
+                              ...p,
+                              autonomous_claim_submission_0_50_usd: e.target.checked,
+                            }))
+                          }
+                        />
+                        <span>
+                          <span className="block text-sm font-semibold">Autonomous Claim Submission ($0–$50)</span>
+                          <span className="text-xs text-muted-foreground">
+                            When enabled with direct submit, the agent may file small claims automatically (default: off).
+                          </span>
+                        </span>
+                      </label>
+
+                      <label className="flex cursor-pointer items-start gap-3 border-t border-border pt-4">
+                        <input
+                          type="checkbox"
+                          className="mt-1 h-4 w-4 rounded accent-rose-600"
+                          checked={claimAgentLocal.require_manual_approval_bulk_submission ?? true}
+                          onChange={(e) =>
+                            setClaimAgentLocal((p) => ({
+                              ...p,
+                              require_manual_approval_bulk_submission: e.target.checked,
+                            }))
+                          }
+                        />
+                        <span>
+                          <span className="block text-sm font-semibold">Require Manual Approval for Bulk Submission</span>
+                          <span className="text-xs text-muted-foreground">
+                            Extra guardrail for white-label tenants before bulk marketplace actions (default: on).
+                          </span>
+                        </span>
+                      </label>
+                    </div>
+
+                    <div>
+                      <label className={LABEL_CLS}>Default Marketplace Adapter</label>
+                      <p className={HINT_CLS}>
+                        Store used as the default routing context for claim automation (from your connected stores).
+                      </p>
+                      <select
+                        className={`${INPUT_CLS} mt-2 max-w-md`}
+                        value={claimAgentLocal.default_marketplace_adapter_store_id ?? ""}
+                        onChange={(e) =>
+                          setClaimAgentLocal((p) => ({
+                            ...p,
+                            default_marketplace_adapter_store_id: e.target.value || null,
+                          }))
+                        }
+                        disabled={storesListLoading}
+                      >
+                        <option value="">— Select store —</option>
+                        {storesList.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.name}
+                            {s.platform ? ` (${s.platform})` : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className={LABEL_CLS}>
+                        Maximum claim amount for auto-submit (USD)
+                      </label>
+                      <p className={HINT_CLS}>
+                        Claims at or below this amount may be auto-submitted when direct submit is allowed. Range $0–$50,000.
+                      </p>
+                      <div className="mt-2 flex flex-col gap-3 sm:flex-row sm:items-center">
+                        <input
+                          type="range"
+                          min={0}
+                          max={50000}
+                          step={50}
+                          value={Math.min(
+                            50000,
+                            Math.max(0, Number(claimAgentLocal.max_auto_submit_amount_usd ?? 500)),
+                          )}
+                          onChange={(e) =>
+                            setClaimAgentLocal((p) => ({
+                              ...p,
+                              max_auto_submit_amount_usd: Number(e.target.value),
+                            }))
+                          }
+                          className="h-2 w-full max-w-md cursor-pointer accent-rose-600"
+                        />
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-mono font-semibold tabular-nums">
+                            ${Number(claimAgentLocal.max_auto_submit_amount_usd ?? 500).toLocaleString("en-US")}
+                          </span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={50000}
+                            step={1}
+                            value={claimAgentLocal.max_auto_submit_amount_usd ?? 500}
+                            onChange={(e) =>
+                              setClaimAgentLocal((p) => ({
+                                ...p,
+                                max_auto_submit_amount_usd: Number(e.target.value),
+                              }))
+                            }
+                            className={`${INPUT_CLS} w-28 font-mono`}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="submit"
+                        disabled={claimAgentSaving}
+                        className="inline-flex items-center gap-2 rounded-xl bg-rose-600 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-rose-500 disabled:opacity-50"
+                      >
+                        {claimAgentSaving ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Save className="h-4 w-4" />
+                        )}
+                        Save agent settings
+                      </button>
+                      <button
+                        type="button"
+                        disabled={claimAgentSaving}
+                        onClick={() => setClaimAgentLocal(claimAgentSaved)}
+                        className="inline-flex items-center gap-2 rounded-xl border border-border px-4 py-2.5 text-sm font-semibold text-muted-foreground transition hover:bg-accent disabled:opacity-50"
+                      >
+                        <RotateCcw className="h-4 w-4" />
+                        Reset
+                      </button>
+                    </div>
+                  </>
+                )}
+              </form>
             </div>
           )}
 

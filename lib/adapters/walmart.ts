@@ -8,7 +8,13 @@ type WalmartMockClaim = {
   claim_type: string;
   amount: number;
   status: "pending" | "recovered" | "suspicious";
-  amazon_order_id: string; // reused as generic order_id column
+  amazon_order_id: string;
+  item_name?: string;
+  asin?: string;
+  fnsku?: string;
+  sku?: string;
+  marketplace_claim_id?: string;
+  marketplace_link_status?: string;
 };
 
 const WALMART_CLAIM_TYPES: { claim_type: string; status: WalmartMockClaim["status"] }[] = [
@@ -32,11 +38,17 @@ function fakeWalmartOrderId(): string {
 function generateMockWalmartClaims(): WalmartMockClaim[] {
   const count = Math.floor(Math.random() * 3) + 3; // 3, 4, or 5
   const shuffled = [...WALMART_CLAIM_TYPES].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, count).map((type) => ({
+  return shuffled.slice(0, count).map((type, i) => ({
     claim_type: type.claim_type,
     amount: randomBetween(15, 300),
     status: type.status,
     amazon_order_id: fakeWalmartOrderId(),
+    item_name: `Walmart return item ${i + 1}`,
+    asin: `B0${String(Math.floor(Math.random() * 1e7)).padStart(7, "0")}`,
+    fnsku: `X00${String(Math.floor(Math.random() * 1e5)).padStart(5, "0")}`,
+    sku: `WMT-SKU-${String(Math.floor(Math.random() * 1e6))}`,
+    marketplace_claim_id: `WMT-CLM-${String(Math.floor(Math.random() * 1e9))}`,
+    marketplace_link_status: "pending",
   }));
 }
 

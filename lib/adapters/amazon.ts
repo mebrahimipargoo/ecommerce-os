@@ -4,12 +4,18 @@ import { ADAPTER_CONFIGS } from "./configs";
 
 const config = ADAPTER_CONFIGS.amazon_sp_api;
 
-/** Matches the exact snake_case columns in the claims table */
+/** Matches snake_case columns written to the claims table (adapter sync). */
 export type MockClaim = {
   claim_type: string;
   amount: number;
   status: "pending" | "recovered" | "suspicious";
   amazon_order_id: string;
+  item_name?: string;
+  asin?: string;
+  fnsku?: string;
+  sku?: string;
+  marketplace_claim_id?: string;
+  marketplace_link_status?: string;
 };
 
 const MOCK_CLAIM_TYPES: { claim_type: string; status: MockClaim["status"] }[] = [
@@ -35,11 +41,17 @@ function fakeOrderId(): string {
 export function generateMockAmazonClaims(): MockClaim[] {
   const count = Math.floor(Math.random() * 3) + 3; // 3, 4, or 5
   const shuffled = [...MOCK_CLAIM_TYPES].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, count).map((type) => ({
+  return shuffled.slice(0, count).map((type, i) => ({
     claim_type: type.claim_type,
     amount: randomBetween(15, 300),
     status: type.status,
     amazon_order_id: fakeOrderId(),
+    item_name: `Synced SKU — Return line ${i + 1}`,
+    asin: `B0${String(Math.floor(Math.random() * 1e7)).padStart(7, "0")}`,
+    fnsku: `X00${String(Math.floor(Math.random() * 1e5)).padStart(5, "0")}`,
+    sku: `MSKU-${String(Math.floor(Math.random() * 1e6))}`,
+    marketplace_claim_id: `AMZ-CLM-${String(Math.floor(Math.random() * 1e9))}`,
+    marketplace_link_status: "pending",
   }));
 }
 

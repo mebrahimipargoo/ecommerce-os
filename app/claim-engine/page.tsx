@@ -1,56 +1,44 @@
-import { supabaseServer } from "../../lib/supabase-server";
-import {
-  listClaimPipelineReturns,
-  listPallets,
-  listPackages,
-} from "../returns/actions";
+import { resolveOrganizationId } from "../../lib/organization";
+import { getCoreSettings } from "../settings/workspace-settings-actions";
+import { listStores } from "../settings/adapters/actions";
 import { ClaimEngineClient } from "./ClaimEngineClient";
+import { listClaimRowsForClaimEngine } from "./claim-actions";
+import { getClaimEngineKpis } from "./claim-crm-actions";
+import { listClaimSubmissions } from "./claim-submission-actions";
 
-const DEFAULT_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001";
-
-type ClaimRow = {
-  id: string;
-  amount: number;
-  status: "pending" | "recovered" | "suspicious";
-  claim_type: string | null;
-  marketplace_provider: string | null;
-  created_at: string;
-  amazon_order_id: string | null;
-};
+export const dynamic = "force-dynamic";
 
 export default async function ClaimEnginePage() {
-  let claims: ClaimRow[] = [];
-  let claimsError: string | null = null;
-  try {
-    const { data, error } = await supabaseServer
-      .from("claims")
-      .select(
-        "id, amount, status, claim_type, marketplace_provider, created_at, amazon_order_id",
-      )
-      .eq("organization_id", DEFAULT_ORGANIZATION_ID)
-      .order("created_at", { ascending: false })
-      .limit(50);
+  const DEFAULT_ORGANIZATION_ID = resolveOrganizationId();
+  const claimsRes = await listClaimRowsForClaimEngine(DEFAULT_ORGANIZATION_ID);
+  const claims = claimsRes.ok ? claimsRes.data : [];
+  const claimsError = claimsRes.ok ? null : claimsRes.error ?? null;
 
-    if (error) throw new Error(error.message);
-    claims = (data ?? []) as ClaimRow[];
-  } catch (err) {
-    claimsError = err instanceof Error ? err.message : "Failed to load claims.";
-  }
-
-  const [pipeRes, palRes, pkgRes] = await Promise.all([
-    listClaimPipelineReturns(DEFAULT_ORGANIZATION_ID),
-    listPallets(DEFAULT_ORGANIZATION_ID),
-    listPackages(DEFAULT_ORGANIZATION_ID),
+  const [coreSettings, storesRes, subRes, kpiRes] = await Promise.all([
+    getCoreSettings(),
+    listStores(),
+    listClaimSubmissions(DEFAULT_ORGANIZATION_ID),
+    getClaimEngineKpis(DEFAULT_ORGANIZATION_ID),
   ]);
+
+  const stores =
+    storesRes.ok && storesRes.data
+      ? storesRes.data
+          .filter((s) => s.is_active !== false)
+          .map((s) => ({ id: s.id, name: s.name, platform: s.platform }))
+      : [];
 
   return (
     <ClaimEngineClient
       claims={claims}
-      claimPipelineItems={pipeRes.ok ? pipeRes.data ?? [] : []}
-      pallets={palRes.ok ? palRes.data ?? [] : []}
-      packages={pkgRes.ok ? pkgRes.data ?? [] : []}
       claimsError={claimsError}
-      pipelineError={pipeRes.ok ? null : pipeRes.error ?? null}
+      coreSettings={coreSettings}
+      stores={stores}
+      organizationId={DEFAULT_ORGANIZATION_ID}
+      claimSubmissions={subRes.ok ? subRes.data : []}
+      submissionsError={subRes.ok ? null : subRes.error ?? null}
+      kpis={kpiRes.ok && kpiRes.data ? kpiRes.data : null}
+      kpisError={kpiRes.ok ? null : kpiRes.error ?? null}
     />
   );
 }

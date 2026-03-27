@@ -2,9 +2,11 @@
 
 import { supabaseServer } from "../../lib/supabase-server";
 import {
+  DEFAULT_CLAIM_AGENT_CONFIG,
   DEFAULT_CORE_SETTINGS,
   DEFAULT_FEFO,
   DEFAULT_WORKSPACE_SETTINGS,
+  type ClaimAgentConfig,
   type CoreSettings,
   type InventoryModuleConfig,
   type ModuleConfigs,
@@ -42,9 +44,17 @@ export async function getWorkspaceSettings(): Promise<WorkspaceSettings> {
  */
 export async function getCoreSettings(): Promise<CoreSettings> {
   const ws = await getWorkspaceSettings();
-  return {
+  const merged = {
     ...DEFAULT_CORE_SETTINGS,
     ...(ws.core_settings as CoreSettings),
+  };
+  const logo =
+    (typeof merged.company_logo_url === "string" && merged.company_logo_url) ||
+    (typeof merged.logo_url === "string" && merged.logo_url) ||
+    "";
+  return {
+    ...merged,
+    company_logo_url: logo,
   };
 }
 
@@ -57,6 +67,50 @@ export async function getFefoSettings(): Promise<InventoryModuleConfig> {
     fefo_critical_days: ws.module_configs.inventory?.fefo_critical_days ?? DEFAULT_FEFO.fefo_critical_days,
     fefo_warning_days:  ws.module_configs.inventory?.fefo_warning_days  ?? DEFAULT_FEFO.fefo_warning_days,
   };
+}
+
+export async function getClaimAgentConfig(): Promise<ClaimAgentConfig> {
+  const ws = await getWorkspaceSettings();
+  return {
+    ...DEFAULT_CLAIM_AGENT_CONFIG,
+    ...(ws.module_configs.claim_agent_config ?? {}),
+  };
+}
+
+export async function saveClaimAgentConfig(
+  patch: Partial<ClaimAgentConfig>,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const existing = await getWorkspaceSettings();
+    const merged: ClaimAgentConfig = {
+      ...DEFAULT_CLAIM_AGENT_CONFIG,
+      ...(existing.module_configs.claim_agent_config ?? {}),
+      ...patch,
+    };
+    const newModuleConfigs: ModuleConfigs = {
+      ...existing.module_configs,
+      claim_agent_config: merged,
+    };
+
+    if (existing.id) {
+      const { error } = await supabaseServer
+        .from("workspace_settings")
+        .update({ module_configs: newModuleConfigs })
+        .eq("id", existing.id);
+      if (error) return { ok: false, error: error.message };
+    } else {
+      const { error } = await supabaseServer
+        .from("workspace_settings")
+        .insert({
+          core_settings: existing.core_settings ?? {},
+          module_configs: newModuleConfigs,
+        });
+      if (error) return { ok: false, error: error.message };
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Unknown error" };
+  }
 }
 
 // ─── Write ────────────────────────────────────────────────────────────────────

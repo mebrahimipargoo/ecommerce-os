@@ -301,7 +301,7 @@ export default function ReturnsPage() {
             allReturns={visibleReturns}
             onClose={closeDrawer}
             onPackageUpdated={(p) => { updatePackage_(p); setDrawerStack((prev) => prev.map((d) => d.type === "package" && d.record.id === p.id ? { type: "package", record: p } : d)); }}
-            onItemAdded={(r) => { addReturn(r); showToast(`✓ Item logged — ${r.product_identifier ?? r.item_name}`); }}
+            onItemAdded={(r) => { addReturn(r); showToast(`✓ Item logged — ${r.asin ?? r.fnsku ?? r.sku ?? r.item_name}`); }}
             onPackageDeleted={(id) => { removePackage(id); closeDrawer(); showToast("Package deleted.", "warning"); }}
             onOpenItem={(r) => pushDrawer({ type: "item", record: r })}
             showToast={showToast as (msg: string, kind?: ToastKind) => void}
@@ -327,7 +327,7 @@ export default function ReturnsPage() {
       {wizardOpen && (
         <SingleItemWizardModal
           onClose={() => { setWizardOpen(false); setWizardInherited(undefined); }}
-          onSuccess={(r, photos) => { addReturn(r, photos); showToast(`✓ Return logged — ${r.product_identifier ?? r.item_name}`); }}
+          onSuccess={(r, photos) => { addReturn(r, photos); showToast(`✓ Return logged — ${r.asin ?? r.fnsku ?? r.sku ?? r.item_name}`); }}
           actor={actor}
           openPackages={openPackages}
           openPallets={openPallets}
@@ -336,6 +336,7 @@ export default function ReturnsPage() {
           inheritedContext={wizardInherited}
           aiLabelEnabled={orgSettings.is_ai_label_ocr_enabled}
           onSoftPackageWarning={() => showToast("Warning: This item is not on the package's expected list.", "warning")}
+          onToast={showToast}
         />
       )}
 

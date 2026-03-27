@@ -139,15 +139,39 @@ export async function syncClaims(
     const claims = result.claims ?? [];
     if (claims.length === 0) return { ok: true, claimsCount: 0 };
 
-    const { error: insertError } = await supabaseServer
-      .from("claims")
-      .insert(
-        claims.map((claim) => ({
-          ...claim,
-          organization_id: row.organization_id,
+    const { CLAIM_SUBMISSIONS_TABLE } = await import("../../claim-engine/claim-submissions-constants");
+
+    const rows = claims.map((claim) => {
+      const c = claim as Record<string, unknown>;
+      const rawStatus = String(c.status ?? "pending");
+      const status =
+        rawStatus === "recovered"
+          ? "accepted"
+          : rawStatus === "suspicious"
+            ? "evidence_requested"
+            : "submitted";
+      return {
+        organization_id: row.organization_id,
+        return_id: null,
+        claim_amount: Number(c.amount) || 0,
+        status,
+        submission_id: typeof c.marketplace_claim_id === "string" ? c.marketplace_claim_id : null,
+        report_url: null,
+        store_id: null,
+        source_payload: {
+          claim_type: c.claim_type,
+          amazon_order_id: c.amazon_order_id,
+          item_name: c.item_name,
+          asin: c.asin,
+          fnsku: c.fnsku,
+          sku: c.sku,
+          marketplace_link_status: c.marketplace_link_status,
           marketplace_provider: row.provider,
-        }))
-      );
+        },
+      };
+    });
+
+    const { error: insertError } = await supabaseServer.from(CLAIM_SUBMISSIONS_TABLE).insert(rows);
 
     if (insertError) throw new Error(insertError.message);
 

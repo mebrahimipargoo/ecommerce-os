@@ -1,8 +1,17 @@
 import Link from "next/link";
-import { Search, Package2, Boxes, RotateCcw } from "lucide-react";
+import { Search, Package2, Boxes, RotateCcw, Send, DollarSign } from "lucide-react";
 import { getDashboardSnapshot } from "./returns/actions";
 
 const DEFAULT_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001";
+
+function formatUsdSafe(n: number): string {
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(Number.isFinite(n) ? n : 0);
+}
 
 export default async function Page() {
   const snapRes = await getDashboardSnapshot(DEFAULT_ORGANIZATION_ID);
@@ -78,6 +87,40 @@ export default async function Page() {
                 </div>
                 <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
                   <Package2 className="h-5 w-5" />
+                </span>
+              </div>
+            </div>
+
+            <div className="relative overflow-hidden rounded-2xl border border-slate-200 bg-white px-4 py-5 shadow-sm ring-1 ring-slate-200/80 dark:border-slate-800 dark:bg-slate-950/70 dark:ring-slate-800">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">Claims ready to send</p>
+                  <p className="mt-1 text-3xl font-semibold tabular-nums text-slate-900 dark:text-slate-50">
+                    {snap?.claimsReadyToSend ?? "—"}
+                  </p>
+                  <p className="mt-2 text-[11px] text-muted-foreground">
+                    Submission queue — <code className="rounded bg-muted px-1 font-mono text-[10px]">ready_to_send</code> for Agent polling.
+                  </p>
+                </div>
+                <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/10 text-sky-600 dark:text-sky-400">
+                  <Send className="h-5 w-5" />
+                </span>
+              </div>
+            </div>
+
+            <div className="relative overflow-hidden rounded-2xl border border-slate-200 bg-white px-4 py-5 shadow-sm ring-1 ring-slate-200/80 dark:border-slate-800 dark:bg-slate-950/70 dark:ring-slate-800">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">Returns est. value</p>
+                  <p className="mt-1 text-2xl font-semibold tabular-nums text-slate-900 dark:text-slate-50 sm:text-3xl">
+                    {snap ? formatUsdSafe(snap.returnsEstimatedValueUsd) : "—"}
+                  </p>
+                  <p className="mt-2 text-[11px] text-muted-foreground">
+                    Sum of <code className="rounded bg-muted px-1 font-mono text-[10px]">returns.estimated_value</code> (null → $0.00).
+                  </p>
+                </div>
+                <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                  <DollarSign className="h-5 w-5" />
                 </span>
               </div>
             </div>

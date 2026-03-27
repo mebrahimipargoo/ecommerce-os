@@ -2,6 +2,7 @@
 
 import { supabaseServer } from "../../lib/supabase-server";
 import { isUuidString } from "../../lib/uuid";
+import { RETURN_SELECT } from "./returns-constants";
 
 const DEFAULT_ORG   = "00000000-0000-0000-0000-000000000001";
 /** Legacy default label for audit logs (TEXT only — never write to UUID columns). */
@@ -215,8 +216,6 @@ export type PackageUpdatePayload = Partial<Pick<
 export type ReturnInsertPayload = {
   /** Optional orphan label / LPN when item is not tied to a package (tracking lives on package). */
   lpn?: string;
-  /** ASIN / UPC / FNSKU — primary product identifier at item level. */
-  product_identifier?: string;
   marketplace: string; item_name: string;
   /** Amazon Standard Identification Number */
   asin?: string;
@@ -242,8 +241,6 @@ export type ReturnInsertPayload = {
 export type ReturnRecord = {
   id: string; organization_id: string;
   lpn: string | null;
-  // Post-migration fields — null until 20250325_returns_product_inherited_tracking.sql is applied
-  product_identifier?: string | null;
   inherited_tracking_number?: string | null;
   inherited_carrier?: string | null;
   marketplace: string; item_name: string;
@@ -273,6 +270,8 @@ export type ReturnRecord = {
   updated_by?: string | null;
   updated_by_id?: string | null;
   created_at: string; updated_at: string;
+  /** Expected item value for claims — migration 20260331_returns_estimated_value_reimbursement.sql */
+  estimated_value?: number | null;
 };
 
 export type ReturnUpdatePayload = Partial<Pick<
@@ -281,7 +280,7 @@ export type ReturnUpdatePayload = Partial<Pick<
   | "conditions" | "expiration_date" | "batch_number"
   | "package_id" | "pallet_id"
   | "photo_evidence" | "photo_item_url" | "photo_expiry_url"
-  | "asin" | "fnsku" | "sku" | "product_identifier" | "store_id" | "marketplace"
+  | "asin" | "fnsku" | "sku" | "store_id" | "marketplace"
 >>;
 
 // ─── Audit Log Types ──────────────────────────────────────────────────────────
@@ -298,16 +297,15 @@ export type AuditLogRecord = {
 
 // NOTE: The following columns are only available AFTER their respective migrations are applied.
 // They are omitted from SELECT to prevent PostgREST 400 errors that silently blank all data.
-//   • product_identifier / inherited_tracking_number / inherited_carrier / bol_photo_url
+//   • inherited_tracking_number / inherited_carrier / bol_photo_url
 //       → migration: 20250325_returns_product_inherited_tracking.sql
 //   • order_id / customer_id
 //       → migration: 20250324_returns_order_customer_ids.sql
-//   • asin / fnsku (included in RETURN_SELECT)
+//   • asin / fnsku (included in RETURN_SELECT in returns-constants.ts)
 //       → migration: 20260326_returns_asin_fnsku_name.sql  (run this before deploying)
 // NOTE: store_id in PALLET_SELECT requires migration 20260325_pallets_store_id.sql to be applied first.
 const PALLET_SELECT = "id,organization_id,pallet_number,manifest_photo_url,store_id,status,notes,item_count,created_by,created_by_id,updated_by,updated_by_id,created_at,updated_at";
 const PKG_SELECT    = "id,organization_id,package_number,tracking_number,carrier_name,rma_number,expected_item_count,actual_item_count,pallet_id,store_id,status,discrepancy_note,manifest_url,photo_closed_url,photo_opened_url,photo_return_label_url,created_by,created_by_id,updated_by,updated_by_id,created_at,updated_at";
-const RETURN_SELECT = "id,organization_id,lpn,marketplace,item_name,asin,fnsku,sku,conditions,status,notes,photo_evidence,expiration_date,batch_number,photo_item_url,photo_expiry_url,store_id,stores(name,platform),pallet_id,package_id,created_by,created_by_id,updated_by,updated_by_id,created_at,updated_at";
 
 /** Supabase relation embeds: live child counts + joined store name/platform. */
 const PKG_LIST_SELECT = `${PKG_SELECT},stores(name,platform),returns(count)`;
@@ -609,11 +607,6 @@ export async function insertReturn(
       created_by_id:   resolveActorUserId(payload.created_by),
     };
     // Post-migration columns — only written once their migrations are applied
-    // NOTE: product_identifier is intentionally excluded here because the column does not yet
-    // exist in the DB schema (migration 20250325_returns_product_inherited_tracking.sql is pending).
-    // Trying to INSERT it causes a PostgREST 400 / schema cache error.
-    // Re-enable after running the migration:
-    //   if (payload.product_identifier) insertRow.product_identifier = payload.product_identifier.trim();
     if (payload.store_id)         insertRow.store_id         = payload.store_id;
     if (payload.asin)             insertRow.asin             = payload.asin.trim();
     if (payload.fnsku)            insertRow.fnsku            = payload.fnsku.trim();
@@ -657,6 +650,7 @@ export async function updateReturn(
     delete patch.inherited_carrier;
     delete patch.order_id;
     delete patch.customer_id;
+    delete (patch as Record<string, unknown>).product_identifier;
     // Inherit pallet_id from package when package_id is set to a real package
     if ("package_id" in updates && updates.package_id) {
       const { data: pkg } = await supabaseServer.from("packages")
@@ -757,6 +751,10 @@ export type DashboardSnapshot = {
   returnsToday: number;
   palletCount: number;
   packageCount: number;
+  /** `claim_submissions` rows awaiting marketplace filing (Agent / ops). */
+  claimsReadyToSend: number;
+  /** Sum of `returns.estimated_value` (null treated as 0) for ROI-style dashboard. */
+  returnsEstimatedValueUsd: number;
 };
 
 export async function getDashboardSnapshot(
@@ -771,20 +769,40 @@ export async function getDashboardSnapshot(
       { count: returnsToday, error: e1 },
       { count: palletCount, error: e2 },
       { count: packageCount, error: e3 },
+      { count: claimsReadyToSend, error: e4 },
+      { data: estRows, error: e5 },
     ] = await Promise.all([
       supabaseServer.from("returns").select("id", { count: "exact", head: true }).eq("organization_id", org).gte("created_at", iso).is("deleted_at", null),
       supabaseServer.from("pallets").select("id", { count: "exact", head: true }).eq("organization_id", org).is("deleted_at", null),
       supabaseServer.from("packages").select("id", { count: "exact", head: true }).eq("organization_id", org).is("deleted_at", null),
+      supabaseServer
+        .from("claim_submissions")
+        .select("id", { count: "exact", head: true })
+        .eq("organization_id", org)
+        .eq("status", "ready_to_send"),
+      supabaseServer.from("returns").select("estimated_value").eq("organization_id", org).is("deleted_at", null).limit(10000),
     ]);
     if (e1) throw new Error(e1.message);
     if (e2) throw new Error(e2.message);
     if (e3) throw new Error(e3.message);
+    if (e4) throw new Error(e4.message);
+    if (e5) throw new Error(e5.message);
+
+    let returnsEstimatedValueUsd = 0;
+    for (const row of estRows ?? []) {
+      const raw = (row as { estimated_value?: unknown }).estimated_value;
+      const n = Number(raw);
+      if (Number.isFinite(n)) returnsEstimatedValueUsd += n;
+    }
+
     return {
       ok: true,
       data: {
         returnsToday: returnsToday ?? 0,
         palletCount: palletCount ?? 0,
         packageCount: packageCount ?? 0,
+        claimsReadyToSend: claimsReadyToSend ?? 0,
+        returnsEstimatedValueUsd: Math.round(returnsEstimatedValueUsd * 100) / 100,
       },
     };
   } catch (err) {

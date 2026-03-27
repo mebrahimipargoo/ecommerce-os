@@ -7,10 +7,11 @@ import Link from "next/link";
 import {
   AlertTriangle, ArrowLeft, ArrowRight, Barcode, Boxes, Calendar, CalendarX2,
   Camera, CheckCircle2, CheckSquare, ChevronDown, ChevronRight, ChevronUp, CircleDot, ClipboardCheck,
-  Clock, Copy, Eye, FileImage, FileText, Loader2, Minus, MoreHorizontal, Package2,
+  Clock, Copy, ExternalLink, Eye, FileImage, FileText, Loader2, Minus, MoreHorizontal, Package2, Store,
   PackageCheck, PackageX, Pencil, Plus, QrCode, Save, ScanLine, Search,
   ShieldAlert, ShieldCheck, Sparkles, Tag, Trash2, Truck, User, X, XCircle, Zap, ZoomIn,
 } from "lucide-react";
+import { ReturnIdentifiersColumn } from "../../components/ReturnIdentifiersColumn";
 import { SmartCameraUpload } from "../../components/ui/SmartCameraUpload";
 import { BarcodeScannerModal } from "../../components/ui/BarcodeScannerModal";
 import {
@@ -23,6 +24,7 @@ import {
   createPackage, updatePackage, closePackage, deletePackage,
   listReturnsByPackage,
 } from "./actions";
+import { marketplaceSearchUrl as marketplaceSearchUrlLib } from "../../lib/marketplace-search-url";
 import { itemMatchesPackageExpectation } from "../../lib/package-expectations";
 import { getBarcodeModeFromStorage, getDefaultStoreIdFromStorage } from "../../lib/openai-settings";
 import { parseBarcodeSource } from "../../lib/utils/barcode-parser";
@@ -382,7 +384,7 @@ export async function simulatePackingSlipOcr(_file: File): Promise<{ ok: boolean
 /** Whether a return row matches an expected slip line (by barcode or product name). */
 function physicalItemMatchesExpectedLine(it: ReturnRecord, exp: SlipExpectedItem): boolean {
   const name = it.item_name.toLowerCase();
-  const pid  = (it.product_identifier ?? "").toLowerCase();
+  const pid  = (it.asin ?? it.fnsku ?? it.sku ?? "").toLowerCase();
   const bc   = exp.barcode.trim().toLowerCase();
   const nm   = exp.name.trim().toLowerCase();
   const nameChunk = nm.split(/\s+/).slice(0, 3).join(" ");
@@ -392,7 +394,7 @@ function physicalItemMatchesExpectedLine(it: ReturnRecord, exp: SlipExpectedItem
   );
 }
 
-type LabelOcrResult = { lpn: string; product_identifier?: string; marketplace: string; confidence: number };
+type LabelOcrResult = { lpn: string; scan_code?: string; marketplace: string; confidence: number };
 
 export async function mockLabelOcr(_f: File): Promise<{ ok: boolean; data?: LabelOcrResult; error?: string }> {
   await new Promise((r) => setTimeout(r, 1900));
@@ -401,7 +403,7 @@ export async function mockLabelOcr(_f: File): Promise<{ ok: boolean; data?: Labe
     ok: true,
     data: {
       lpn:        `LPN${Math.random().toString(36).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 9)}`,
-      product_identifier: `B0${String(Math.floor(Math.random() * 1e7)).padStart(7, "0")}`,
+      scan_code: `B0${String(Math.floor(Math.random() * 1e7)).padStart(7, "0")}`,
       marketplace: "amazon",
       confidence:  0.82 + Math.random() * 0.16,
     },
@@ -564,18 +566,7 @@ export function platformToMarketplace(platform: string): Marketplace {
 
 /** Opens the marketplace catalog search with the given product code (prefills site search). */
 export function marketplaceSearchUrl(platformOrMarketplace: string | null | undefined, query: string): string | null {
-  const q = query.trim();
-  if (!q) return null;
-  const raw = (platformOrMarketplace ?? "").toLowerCase();
-  let channel: Marketplace = "amazon";
-  if (raw.includes("walmart")) channel = "walmart";
-  else if (raw.includes("ebay")) channel = "ebay";
-  else if ((MARKETPLACES as readonly string[]).includes(raw)) channel = raw as Marketplace;
-  else if (raw.includes("amazon")) channel = "amazon";
-
-  if (channel === "walmart") return `https://www.walmart.com/search?q=${encodeURIComponent(q)}`;
-  if (channel === "ebay") return `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(q)}`;
-  return `https://www.amazon.com/s?k=${encodeURIComponent(q)}`;
+  return marketplaceSearchUrlLib(platformOrMarketplace, query);
 }
 
 /** Amazon search results for a product code (ASIN / FNSKU / SKU) — paste-friendly in the site search box. */
@@ -621,6 +612,46 @@ function PlatformBadge({ platform }: { platform?: string | null }) {
 }
 
 // ─── Evidence Photo Thumbnail ──────────────────────────────────────────────────
+
+/** One-tap copy for tracking / LPN / pallet / package numbers (tables & drawers). Parent should use `group` for hover-reveal. */
+export function InlineCopy({
+  value,
+  label,
+  onToast,
+  stopPropagation,
+  revealOnHover = true,
+  className = "inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-500 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800",
+}: {
+  value: string;
+  label?: string;
+  onToast?: (msg: string, kind?: ToastKind) => void;
+  stopPropagation?: boolean;
+  /** When true (default), hide the icon until the parent `group` is hovered (lazy mode). */
+  revealOnHover?: boolean;
+  className?: string;
+}) {
+  const v = value.trim();
+  if (!v) return null;
+  const hoverCls = revealOnHover
+    ? "opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
+    : "";
+  return (
+    <button
+      type="button"
+      title={label ? `Copy ${label}` : "Copy"}
+      className={`${className} ${hoverCls}`.trim()}
+      onClick={(e) => {
+        if (stopPropagation) e.stopPropagation();
+        void navigator.clipboard
+          .writeText(v)
+          .then(() => onToast?.(`Copied ${label ?? ""}`.trim(), "success"))
+          .catch(() => onToast?.("Copy failed", "error"));
+      }}
+    >
+      <Copy className="h-3.5 w-3.5" />
+    </button>
+  );
+}
 
 function PhotoThumb({ url, alt = "Evidence photo" }: { url: string; alt?: string }) {
   const [open, setOpen] = useState(false);
@@ -688,7 +719,7 @@ function sortKeyItem(
   const linkedPlt = r.pallet_id ? pltMap.get(r.pallet_id) : undefined;
   const trackEff = (r.inherited_tracking_number ?? linkedPkg?.tracking_number ?? "").trim();
   switch (field) {
-    case "product_identifier": return (r.product_identifier ?? "").toLowerCase();
+    case "product_identifier": return (r.asin ?? r.fnsku ?? r.sku ?? "").toLowerCase();
     case "inherited_tracking_number":
     case "tracking_effective": return trackEff.toLowerCase();
     case "lpn": return (r.lpn ?? "").toLowerCase();
@@ -1115,7 +1146,7 @@ function ItemsSubTable({ items, role, actor, onItemClick, onItemDeleted, showToa
     let d = [...items];
     if (search) {
       const q = search.toLowerCase();
-      d = d.filter((r) => [r.lpn ?? "", r.item_name, r.product_identifier ?? "", r.id].some((v) => v.toLowerCase().includes(q)));
+      d = d.filter((r) => [r.lpn ?? "", r.item_name, r.asin ?? "", r.fnsku ?? "", r.sku ?? "", r.id].some((v) => v.toLowerCase().includes(q)));
     }
     if (statusF) d = d.filter((r) => r.status === statusF);
     return d;
@@ -1149,8 +1180,13 @@ function ItemsSubTable({ items, role, actor, onItemClick, onItemDeleted, showToa
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                 {filtered.map((r) => (
-                  <tr key={r.id} onClick={() => onItemClick(r)} className="cursor-pointer transition hover:bg-sky-50/50 dark:hover:bg-sky-950/20">
-                    <td className="px-3 py-2.5 font-mono font-bold text-slate-700 dark:text-slate-300">{r.lpn ?? "—"}</td>
+                  <tr key={r.id} onClick={() => onItemClick(r)} className="group cursor-pointer transition hover:bg-sky-50/50 dark:hover:bg-sky-950/20">
+                    <td className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-center gap-1.5 font-mono font-bold text-slate-700 dark:text-slate-300">
+                        <span>{r.lpn ?? "—"}</span>
+                        {r.lpn ? <InlineCopy value={r.lpn} label="LPN" onToast={showToast} stopPropagation /> : null}
+                      </div>
+                    </td>
                     <td className="min-w-0 max-w-none truncate px-3 py-2.5 text-slate-600 dark:text-slate-300">{r.item_name}</td>
                     <td className="hidden px-3 py-2.5 sm:table-cell"><StatusBadge status={r.status} /></td>
                     <td className="px-3 py-2.5 text-slate-400">{fmt(r.created_at)}</td>
@@ -1176,8 +1212,9 @@ function ItemsSubTable({ items, role, actor, onItemClick, onItemDeleted, showToa
 
 // ─── Packages Sub-Table (inside Pallet Drawer) ─────────────────────────────────
 
-function PackagesSubTable({ palletId, packages, onPackageClick }: {
+function PackagesSubTable({ palletId, packages, onPackageClick, showToast }: {
   palletId: string; packages: PackageRecord[]; onPackageClick: (p: PackageRecord) => void;
+  showToast?: (msg: string, kind?: ToastKind) => void;
 }) {
   const rows = useMemo(() => packages.filter((p) => p.pallet_id === palletId), [packages, palletId]);
   if (rows.length === 0) return <p className="py-4 text-center text-xs text-slate-400">No packages linked to this pallet yet.</p>;
@@ -1194,8 +1231,13 @@ function PackagesSubTable({ palletId, packages, onPackageClick }: {
         </thead>
         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
           {rows.map((p) => (
-            <tr key={p.id} onClick={() => onPackageClick(p)} className="cursor-pointer transition hover:bg-violet-50/50 dark:hover:bg-violet-950/20">
-              <td className="px-3 py-2.5 font-mono font-bold text-foreground">{p.package_number}</td>
+            <tr key={p.id} onClick={() => onPackageClick(p)} className="group cursor-pointer transition hover:bg-violet-50/50 dark:hover:bg-violet-950/20">
+              <td className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center gap-1.5 font-mono font-bold text-foreground">
+                  <span>{p.package_number}</span>
+                  <InlineCopy value={p.package_number} label="Package #" onToast={showToast} stopPropagation />
+                </div>
+              </td>
               <td className="hidden px-3 py-2.5 text-muted-foreground sm:table-cell">{p.carrier_name ?? "—"}</td>
               <td className="px-3 py-2.5 font-bold text-slate-700 dark:text-slate-300">{p.actual_item_count}/{p.expected_item_count > 0 ? p.expected_item_count : "?"}</td>
               <td className="px-3 py-2.5"><PkgStatusBadge status={p.status} /></td>
@@ -1224,7 +1266,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   const [deleting,   setDeleting]   = useState(false);
   const [err,        setErr]        = useState("");
   const [editLpn,    setEditLpn]    = useState(record.lpn ?? "");
-  const [editProductId, setEditProductId] = useState(record.product_identifier ?? "");
+  const [editProductId, setEditProductId] = useState(record.asin ?? record.fnsku ?? record.sku ?? "");
   const [editAsin,   setEditAsin]   = useState(record.asin ?? "");
   const [editFnsku,  setEditFnsku]  = useState(record.fnsku ?? "");
   const [editSku, setEditSku] = useState(record.sku ?? "");
@@ -1267,7 +1309,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
 
   useEffect(() => {
     setEditLpn(record.lpn ?? "");
-    setEditProductId(record.product_identifier ?? "");
+    setEditProductId(record.asin ?? record.fnsku ?? record.sku ?? "");
     setEditAsin(record.asin ?? "");
     setEditFnsku(record.fnsku ?? "");
     setEditSku(record.sku ?? "");
@@ -1281,7 +1323,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     setEditPhotoExpiryUrl(record.photo_expiry_url ?? "");
     setEditCatalogStatus("idle");
     setEditCatalogPreview(null);
-  }, [record.id, record.lpn, record.product_identifier, record.asin, record.fnsku, record.sku, record.store_id, record.item_name, record.notes, record.status, record.photo_evidence, record.expiration_date, record.photo_item_url, record.photo_expiry_url]);
+  }, [record.id, record.lpn, record.asin, record.fnsku, record.sku, record.store_id, record.item_name, record.notes, record.status, record.photo_evidence, record.expiration_date, record.photo_item_url, record.photo_expiry_url]);
 
   async function handleItemEvidencePhoto(
     e: React.ChangeEvent<HTMLInputElement>,
@@ -1396,10 +1438,9 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
       photo_evidence:   Object.keys(mergedPhotoEvidence).length ? mergedPhotoEvidence : undefined,
       photo_item_url:   editPhotoItemUrl   || undefined,
       photo_expiry_url: editPhotoExpiryUrl || undefined,
-      asin: editAsin.trim() || null,
+      asin: editAsin.trim() || editProductId.trim() || null,
       fnsku: editFnsku.trim() || null,
       sku: editSku.trim() || null,
-      product_identifier: editProductId.trim() || null,
       store_id: editStoreId.trim() || null,
       marketplace: pickedStore ? platformToMarketplace(pickedStore.platform) : record.marketplace,
     }, actor);
@@ -1469,7 +1510,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                 <button type="button" title="Copy ASIN" className={drawerEditIdBtn} onClick={() => void copyEditCode(editAsin, "ASIN")} disabled={!editAsin.trim()}><Copy className="h-4 w-4" /></button>
                 <button
                   type="button"
-                  title="Search marketplace"
+                  title="Open marketplace search"
                   className={drawerEditIdBtn}
                   disabled={!marketplaceSearchUrl(editStorePlatform, editAsin)}
                   onClick={() => {
@@ -1477,7 +1518,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                     if (u) window.open(u, "_blank", "noopener,noreferrer");
                   }}
                 >
-                  <Search className="h-4 w-4" />
+                  <Store className="h-4 w-4" aria-hidden />
                 </button>
               </div>
             </div>
@@ -1490,7 +1531,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                 <button type="button" title="Copy FNSKU" className={drawerEditIdBtn} onClick={() => void copyEditCode(editFnsku, "FNSKU")} disabled={!editFnsku.trim()}><Copy className="h-4 w-4" /></button>
                 <button
                   type="button"
-                  title="Search marketplace"
+                  title="Open marketplace search"
                   className={drawerEditIdBtn}
                   disabled={!marketplaceSearchUrl(editStorePlatform, editFnsku)}
                   onClick={() => {
@@ -1498,7 +1539,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                     if (u) window.open(u, "_blank", "noopener,noreferrer");
                   }}
                 >
-                  <Search className="h-4 w-4" />
+                  <Store className="h-4 w-4" aria-hidden />
                 </button>
               </div>
             </div>
@@ -1511,7 +1552,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                 <button type="button" title="Copy SKU" className={drawerEditIdBtn} onClick={() => void copyEditCode(editSku, "SKU")} disabled={!editSku.trim()}><Copy className="h-4 w-4" /></button>
                 <button
                   type="button"
-                  title="Search marketplace"
+                  title="Open marketplace search"
                   className={drawerEditIdBtn}
                   disabled={!marketplaceSearchUrl(editStorePlatform, editSku)}
                   onClick={() => {
@@ -1519,7 +1560,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                     if (u) window.open(u, "_blank", "noopener,noreferrer");
                   }}
                 >
-                  <Search className="h-4 w-4" />
+                  <Store className="h-4 w-4" aria-hidden />
                 </button>
               </div>
             </div>
@@ -1673,7 +1714,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
               onClick={() => {
                 setEditing(false);
                 setEditLpn(record.lpn ?? "");
-                setEditProductId(record.product_identifier ?? "");
+                setEditProductId(record.asin ?? record.fnsku ?? record.sku ?? "");
                 setEditAsin(record.asin ?? "");
                 setEditFnsku(record.fnsku ?? "");
                 setEditSku(record.sku ?? "");
@@ -1704,36 +1745,32 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                   Pallet and package hierarchy with copyable product codes for your claim.
                 </p>
                 <div className="mb-4 grid gap-2 sm:grid-cols-2">
-                  <div className="flex min-w-0 items-center gap-2 rounded-xl border border-violet-200 bg-white/80 px-3 py-2 dark:border-violet-800/60 dark:bg-slate-900/50">
+                  <div className="group flex min-w-0 items-center gap-2 rounded-xl border border-violet-200 bg-white/80 px-3 py-2 dark:border-violet-800/60 dark:bg-slate-900/50">
                     <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide text-violet-600 dark:text-violet-400">Pallet #</span>
                     <span className="min-w-0 flex-1 truncate font-mono text-sm font-semibold text-foreground">{linkedPallet?.pallet_number ?? "—"}</span>
                     {linkedPallet?.pallet_number ? (
-                      <button type="button" title="Copy Pallet #" className={drawerEditIdBtn} onClick={() => void copyEditCode(linkedPallet.pallet_number, "Pallet #")}><Copy className="h-4 w-4" /></button>
+                      <InlineCopy value={linkedPallet.pallet_number} label="Pallet #" onToast={onToast} />
                     ) : null}
                   </div>
-                  <div className="flex min-w-0 items-center gap-2 rounded-xl border border-violet-200 bg-white/80 px-3 py-2 dark:border-violet-800/60 dark:bg-slate-900/50">
+                  <div className="group flex min-w-0 items-center gap-2 rounded-xl border border-violet-200 bg-white/80 px-3 py-2 dark:border-violet-800/60 dark:bg-slate-900/50">
                     <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide text-violet-600 dark:text-violet-400">Package #</span>
                     <span className="min-w-0 flex-1 truncate font-mono text-sm font-semibold text-foreground">{linkedPkg?.package_number ?? "—"}</span>
                     {linkedPkg?.package_number ? (
-                      <button type="button" title="Copy Package #" className={drawerEditIdBtn} onClick={() => void copyEditCode(linkedPkg.package_number, "Package #")}><Copy className="h-4 w-4" /></button>
+                      <InlineCopy value={linkedPkg.package_number} label="Package #" onToast={onToast} />
                     ) : null}
                   </div>
                 </div>
-                <p className="mb-2 text-[10px] font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">Product title &amp; identifiers</p>
-                <ItemIdentifiersCell
+                <p className="mb-2 text-[10px] font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                  Product title &amp; identifiers
+                </p>
+                <ReturnIdentifiersColumn
                   itemName={record.item_name}
                   asin={record.asin}
                   fnsku={record.fnsku}
                   sku={record.sku}
                   storePlatform={record.stores?.platform}
                   onToast={onToast}
-                  alwaysShowCodeRows
                 />
-                {record.product_identifier ? (
-                  <p className="mt-3 font-mono text-[11px] text-slate-500 dark:text-slate-400" title="Barcode / UPC scan">
-                    UPC / scan: <span className="text-foreground/90">{record.product_identifier}</span>
-                  </p>
-                ) : null}
               </div>
             ) : (
               <div className="col-span-2 rounded-2xl border border-slate-200 bg-slate-50/90 p-4 dark:border-slate-700 dark:bg-slate-900/50">
@@ -1741,24 +1778,26 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                 <p className="mb-3 text-[10px] leading-relaxed text-slate-500 dark:text-slate-500">
                   ASIN = Amazon catalog ID · FNSKU = your FBA label on Amazon · SKU = Seller / warehouse SKU (MSKU)
                 </p>
-                <ItemIdentifiersCell
-                  showItemHeading={false}
-                  alwaysShowCodeRows
-                  itemName=""
+                <ReturnIdentifiersColumn
+                  hideItemName
+                  itemName={record.item_name}
                   asin={record.asin}
                   fnsku={record.fnsku}
                   sku={record.sku}
                   storePlatform={record.stores?.platform}
                   onToast={onToast}
                 />
-                {record.product_identifier ? (
-                  <p className="mt-3 font-mono text-[11px] text-slate-500 dark:text-slate-400" title="Barcode / UPC scan">
-                    UPC / scan: <span className="text-foreground/90">{record.product_identifier}</span>
-                  </p>
-                ) : null}
               </div>
             )}
-            {record.lpn && <div><p className="text-xs text-slate-400">LPN</p><p className="font-mono font-bold text-foreground">{record.lpn}</p></div>}
+            {record.lpn && (
+              <div className="group flex flex-wrap items-center gap-2">
+                <div>
+                  <p className="text-xs text-slate-400">LPN</p>
+                  <p className="font-mono font-bold text-foreground">{record.lpn}</p>
+                </div>
+                <InlineCopy value={record.lpn} label="LPN" onToast={onToast} />
+              </div>
+            )}
             {record.expiration_date && (
               <div className="col-span-2 rounded-xl border border-orange-200 bg-orange-50 px-3 py-2 dark:border-orange-700/40 dark:bg-orange-950/30">
                 <p className="text-[10px] font-bold uppercase tracking-wide text-orange-500 mb-0.5">Expiry (FEFO)</p>
@@ -1777,7 +1816,16 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
             {(record.inherited_tracking_number || linkedPkg?.tracking_number) && (
               <div className="col-span-2">
                 <p className="text-xs text-slate-400">Tracking (from package)</p>
-                <p className="font-mono text-sm text-foreground">{record.inherited_tracking_number ?? linkedPkg?.tracking_number ?? "—"}</p>
+                <div className="group flex flex-wrap items-center gap-2">
+                  <p className="font-mono text-sm text-foreground">
+                    {record.inherited_tracking_number ?? linkedPkg?.tracking_number ?? "—"}
+                  </p>
+                  <InlineCopy
+                    value={(record.inherited_tracking_number ?? linkedPkg?.tracking_number ?? "").trim()}
+                    label="Tracking #"
+                    onToast={onToast}
+                  />
+                </div>
                 {(record.inherited_carrier || linkedPkg?.carrier_name) && (
                   <p className="text-xs text-muted-foreground">{record.inherited_carrier ?? linkedPkg?.carrier_name}</p>
                 )}
@@ -1865,7 +1913,7 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
   const currentIds = useMemo(() => new Set(currentItems.map((i) => i.id)), [currentItems]);
   const candidates = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return allReturns.filter((r) => !currentIds.has(r.id) && (!q || [r.item_name, r.product_identifier ?? ""].join(" ").toLowerCase().includes(q)));
+    return allReturns.filter((r) => !currentIds.has(r.id) && (!q || [r.item_name, r.asin ?? "", r.fnsku ?? "", r.sku ?? ""].join(" ").toLowerCase().includes(q)));
   }, [allReturns, currentIds, search]);
 
   async function handleAssign(item: ReturnRecord) {
@@ -1899,7 +1947,7 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
                 className="flex w-full items-start gap-3 rounded-xl border border-border px-3 py-2.5 text-left hover:bg-accent transition">
                 <div className="flex-1 min-w-0">
                   <p className="truncate text-sm font-semibold text-foreground">{r.item_name}</p>
-                  <p className="font-mono text-xs text-muted-foreground">{r.product_identifier ?? "—"}</p>
+                  <p className="font-mono text-xs text-muted-foreground">{r.asin ?? r.fnsku ?? r.sku ?? "—"}</p>
                 </div>
                 {r.package_id && r.package_id !== pkg.id
                   ? <span className="shrink-0 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">Move from other pkg</span>
@@ -2103,8 +2151,20 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
       <div className="flex flex-wrap gap-2">
         <PkgStatusBadge status={pkg.status} />
         {pkg.carrier_name && <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"><Truck className="h-3 w-3" />{pkg.carrier_name}</span>}
-        {pkg.tracking_number && <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 font-mono text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400"><QrCode className="h-3 w-3" />{pkg.tracking_number}</span>}
-        {pkg.rma_number && <span className="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 font-mono text-xs text-amber-700 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-300"><Tag className="h-3 w-3" />{pkg.rma_number}</span>}
+        {pkg.tracking_number && (
+          <span className="group inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 font-mono text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400">
+            <QrCode className="h-3 w-3" />
+            {pkg.tracking_number}
+            <InlineCopy value={pkg.tracking_number} label="Tracking #" onToast={showToast} />
+          </span>
+        )}
+        {pkg.rma_number && (
+          <span className="group inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 font-mono text-xs text-amber-700 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-300">
+            <Tag className="h-3 w-3" />
+            {pkg.rma_number}
+            <InlineCopy value={pkg.rma_number} label="RMA #" onToast={showToast} />
+          </span>
+        )}
       </div>
 
       {/* Count KPI */}
@@ -2235,7 +2295,10 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
           {pkg.rma_number && (
             <div className="col-span-2">
               <p className="text-xs text-slate-400">RMA #</p>
-              <p className="font-mono font-bold text-foreground">{pkg.rma_number}</p>
+              <div className="group flex flex-wrap items-center gap-2">
+                <p className="font-mono font-bold text-foreground">{pkg.rma_number}</p>
+                <InlineCopy value={pkg.rma_number} label="RMA #" onToast={showToast} />
+              </div>
             </div>
           )}
           <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{operatorDisplayLabel(pkg)}</p></div>
@@ -2401,7 +2464,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
                       <tr key={it.id} className="bg-amber-50/70 dark:bg-amber-950/20">
                         <td className="px-3 py-2.5">
                           <p className="font-semibold text-slate-700 dark:text-slate-300">{it.item_name}</p>
-                          <p className="font-mono text-slate-400">{it.product_identifier ?? "—"}</p>
+                          <p className="font-mono text-slate-400">{it.asin ?? it.fnsku ?? it.sku ?? "—"}</p>
                         </td>
                         <td className="px-3 py-2.5 text-center text-slate-400">—</td>
                         <td className="px-3 py-2.5 text-center font-bold text-amber-600">1</td>
@@ -2446,7 +2509,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
         return (
           <SingleItemWizardModal
             onClose={() => setWizardOpen(false)}
-            onSuccess={(r) => { handleItemAdded(r); showToast(`✓ Item logged to ${pkg.package_number} — ${r.product_identifier ?? r.item_name}`); }}
+            onSuccess={(r) => { handleItemAdded(r); showToast(`✓ Item logged to ${pkg.package_number} — ${r.asin ?? r.fnsku ?? r.sku ?? r.item_name}`); }}
             actor={actor}
             openPackages={[pkgWithExpected]}
             openPallets={[]}
@@ -2497,7 +2560,7 @@ export function PalletDrawerContent({ pallet, role, actor, packages, onClose, on
       {/* Packages sub-table */}
       <div>
         <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-400">Packages in this Pallet</p>
-        <PackagesSubTable palletId={plt.id} packages={packages} onPackageClick={onOpenPackage} />
+        <PackagesSubTable palletId={plt.id} packages={packages} onPackageClick={onOpenPackage} showToast={showToast} />
       </div>
 
       {/* Pallet info note: drill into packages above to see items */}
@@ -2718,7 +2781,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
       setState((p) => ({
         ...p,
         lpn: res.data!.lpn,
-        product_identifier: res.data!.product_identifier ?? p.product_identifier,
+        product_identifier: res.data!.scan_code ?? p.product_identifier,
         marketplace: res.data!.marketplace as typeof p.marketplace,
       }));
       setOcrBanner({ ok: true, msg: `AI Scan — ${Math.round(res.data.confidence * 100)}% confidence. Verify fields below.` });
@@ -2925,7 +2988,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
             <button type="button" title="Copy ASIN" className={wizardIdIconBtn} onClick={() => void copyWizardCode(state.asin)} disabled={!state.asin.trim()}><Copy className="h-4 w-4" /></button>
             <button
               type="button"
-              title="Search marketplace"
+              title="Open marketplace search"
               className={wizardIdIconBtn}
               disabled={!marketplaceSearchUrl(wizardStorePlatform, state.asin)}
               onClick={() => {
@@ -2933,7 +2996,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
                 if (url) window.open(url, "_blank", "noopener,noreferrer");
               }}
             >
-              <Search className="h-4 w-4" />
+              <Store className="h-4 w-4" aria-hidden />
             </button>
           </div>
         </div>
@@ -2947,7 +3010,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
             <button type="button" title="Copy FNSKU" className={wizardIdIconBtn} onClick={() => void copyWizardCode(state.fnsku)} disabled={!state.fnsku.trim()}><Copy className="h-4 w-4" /></button>
             <button
               type="button"
-              title="Search marketplace"
+              title="Open marketplace search"
               className={wizardIdIconBtn}
               disabled={!marketplaceSearchUrl(wizardStorePlatform, state.fnsku)}
               onClick={() => {
@@ -2955,7 +3018,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
                 if (url) window.open(url, "_blank", "noopener,noreferrer");
               }}
             >
-              <Search className="h-4 w-4" />
+              <Store className="h-4 w-4" aria-hidden />
             </button>
           </div>
         </div>
@@ -2969,7 +3032,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
             <button type="button" title="Copy SKU" className={wizardIdIconBtn} onClick={() => void copyWizardCode(state.sku)} disabled={!state.sku.trim()}><Copy className="h-4 w-4" /></button>
             <button
               type="button"
-              title="Search marketplace"
+              title="Open marketplace search"
               className={wizardIdIconBtn}
               disabled={!marketplaceSearchUrl(wizardStorePlatform, state.sku)}
               onClick={() => {
@@ -2977,7 +3040,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
                 if (url) window.open(url, "_blank", "noopener,noreferrer");
               }}
             >
-              <Search className="h-4 w-4" />
+              <Store className="h-4 w-4" aria-hidden />
             </button>
           </div>
         </div>
@@ -3165,11 +3228,12 @@ export function WizardStep2({ state, setState, conditions, photoCtx }: {
   );
 }
 
-export function WizardStep3({ state, conditions, packages, pallets, inherited, onNotesChange, packageExpectationMismatch }: {
+export function WizardStep3({ state, conditions, packages, pallets, inherited, onNotesChange, packageExpectationMismatch, onToast }: {
   state: WizardState; conditions: string[]; packages: PackageRecord[]; pallets: PalletRecord[];
   inherited?: WizardInheritedContext; onNotesChange: (v: string) => void;
   /** Soft warning — does not block submit */
   packageExpectationMismatch?: boolean;
+  onToast?: (msg: string, kind?: ToastKind) => void;
 }) {
   const photoTotal = Object.values(state.photos).reduce((a, files) => a + files.length, 0);
   const linkedPkg  = packages.find((p) => p.id === ((inherited?.packageId) ?? state.package_link_id));
@@ -3189,7 +3253,15 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
         <p className="text-xs font-bold uppercase tracking-widest text-slate-400">Review Summary</p>
         <div className="grid grid-cols-2 gap-y-3 gap-x-6 text-sm">
           <div><p className="text-xs text-slate-400">Product ID</p><p className="font-mono font-bold">{state.product_identifier || "—"}</p></div>
-          {state.lpn && <div><p className="text-xs text-slate-400">LPN (optional)</p><p className="font-mono font-bold">{state.lpn}</p></div>}
+          {state.lpn && (
+            <div className="group flex flex-wrap items-center gap-2">
+              <div>
+                <p className="text-xs text-slate-400">LPN (optional)</p>
+                <p className="font-mono font-bold">{state.lpn}</p>
+              </div>
+              <InlineCopy value={state.lpn} label="LPN" onToast={onToast} />
+            </div>
+          )}
           <div>
             <p className="text-xs text-slate-400">Sales Channel</p>
             <p className="font-bold">
@@ -3206,12 +3278,26 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
         {(linkedPkg || linkedPlt) && (
           <div className="flex flex-col gap-2">
             <div className="flex flex-wrap gap-2">
-              {linkedPkg && <span className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 py-0.5 text-xs font-semibold text-sky-700 dark:border-sky-700/60 dark:bg-sky-950/40 dark:text-sky-300"><Tag className="h-3 w-3" />{linkedPkg.package_number}</span>}
-              {linkedPlt && <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-100 px-2.5 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"><Boxes className="h-3 w-3" />{linkedPlt.pallet_number}</span>}
+              {linkedPkg && (
+                <span className="group inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 py-0.5 text-xs font-semibold text-sky-700 dark:border-sky-700/60 dark:bg-sky-950/40 dark:text-sky-300">
+                  <Tag className="h-3 w-3" />
+                  {linkedPkg.package_number}
+                  <InlineCopy value={linkedPkg.package_number} label="Package #" onToast={onToast} />
+                </span>
+              )}
+              {linkedPlt && (
+                <span className="group inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-100 px-2.5 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">
+                  <Boxes className="h-3 w-3" />
+                  {linkedPlt.pallet_number}
+                  <InlineCopy value={linkedPlt.pallet_number} label="Pallet #" onToast={onToast} />
+                </span>
+              )}
             </div>
             {linkedPkg?.tracking_number && (
-              <p className="text-xs text-muted-foreground"><span className="font-semibold text-foreground">Inherits tracking:</span>{" "}
+              <p className="group text-xs text-muted-foreground">
+                <span className="font-semibold text-foreground">Inherits tracking:</span>{" "}
                 <span className="font-mono">{linkedPkg.tracking_number}</span>
+                <InlineCopy value={linkedPkg.tracking_number} label="Tracking #" className="ml-1 align-middle" onToast={onToast} />
                 {linkedPkg.carrier_name ? <span> · {linkedPkg.carrier_name}</span> : null}
               </p>
             )}
@@ -3246,7 +3332,7 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
 
 // ─── Single Item Wizard Modal ──────────────────────────────────────────────────
 
-export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning }: {
+export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast }: {
   onClose: () => void;
   /** Called with the saved record AND the in-session photo files for gallery display. */
   onSuccess: (r: ReturnRecord, photos: Record<string, File[]>) => void;
@@ -3256,6 +3342,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
   aiLabelEnabled?: boolean;
   /** Non-blocking: called when item may not match package manifest (simulated) — save still proceeds. */
   onSoftPackageWarning?: () => void;
+  onToast?: (msg: string, kind?: ToastKind) => void;
 }) {
   const [step, setStep] = useState(1);
   const [state, setState] = useState<WizardState>({ ...EMPTY_WIZARD, package_link_id: inheritedContext?.packageId ?? "" });
@@ -3285,9 +3372,8 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
     const photoEvidence = Object.fromEntries(Object.entries(state.photos).map(([k, v]) => [k, v.length]));
     const res = await insertReturn({
       lpn: state.lpn || undefined,
-      product_identifier: state.product_identifier.trim(),
       marketplace: state.marketplace as string, item_name: state.item_name, conditions,
-      asin: state.asin.trim() || undefined,
+      asin: state.asin.trim() || state.product_identifier.trim() || undefined,
       fnsku: state.fnsku.trim() || undefined,
       sku: state.sku.trim() || undefined,
       notes: state.notes, photo_evidence: photoEvidence,
@@ -3336,7 +3422,18 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
               }}
             />
           )}
-          {step === 3 && <WizardStep3 state={state} conditions={conditions} packages={openPackages} pallets={openPallets} inherited={inheritedContext} onNotesChange={(v) => setState((p) => ({ ...p, notes: v }))} packageExpectationMismatch={packageExpectationMismatch} />}
+          {step === 3 && (
+            <WizardStep3
+              state={state}
+              conditions={conditions}
+              packages={openPackages}
+              pallets={openPallets}
+              inherited={inheritedContext}
+              onNotesChange={(v) => setState((p) => ({ ...p, notes: v }))}
+              packageExpectationMismatch={packageExpectationMismatch}
+              onToast={onToast}
+            />
+          )}
         </div>
         {submitErr && <p className="shrink-0 px-4 sm:px-6 pb-2 text-sm font-semibold text-rose-600 dark:text-rose-400">{submitErr}</p>}
         <div className="flex shrink-0 items-center gap-3 border-t border-slate-200 px-4 py-3 sm:px-6 sm:py-4 dark:border-slate-700">
@@ -3816,110 +3913,6 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
   );
 }
 
-// ─── Item / Identifiers cell (stacked + copy + Amazon search) ─────────────────
-
-export function ItemIdentifiersCell({
-  itemName,
-  asin,
-  fnsku,
-  sku,
-  storePlatform,
-  compact,
-  onToast,
-  showItemHeading = true,
-  /** When true, show placeholder rows even if all codes empty (detail drawer). */
-  alwaysShowCodeRows = false,
-}: {
-  itemName: string | null | undefined;
-  asin: string | null | undefined;
-  fnsku: string | null | undefined;
-  /** Stock Keeping Unit (Seller / warehouse MSKU) */
-  sku?: string | null | undefined;
-  /** Connected store `platform` (e.g. amazon, walmart) — drives marketplace search URL. */
-  storePlatform?: string | null | undefined;
-  /** Smaller typography for nested package / pallet sub-tables */
-  compact?: boolean;
-  onToast?: (msg: string, kind?: ToastKind) => void;
-  /** When false, only code rows (e.g. item drawer under a separate title) */
-  showItemHeading?: boolean;
-  alwaysShowCodeRows?: boolean;
-}) {
-  const a = (asin ?? "").trim();
-  const f = (fnsku ?? "").trim();
-  const s = (sku ?? "").trim();
-  const textCls = compact ? "text-[11px] text-muted-foreground" : "text-xs text-muted-foreground";
-  const iconBtn =
-    "inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md border border-border bg-background text-muted-foreground/90 transition hover:bg-accent hover:text-foreground";
-  async function copyVal(v: string, label: string) {
-    if (!v) return;
-    try {
-      await navigator.clipboard.writeText(v);
-      onToast?.(`Copied ${label}`, "success");
-    } catch {
-      onToast?.("Copy failed", "error");
-    }
-  }
-  function openMarketplaceSearch(q: string) {
-    const url = marketplaceSearchUrl(storePlatform, q);
-    if (!url) return;
-    window.open(url, "_blank", "noopener,noreferrer");
-  }
-  const showRows = alwaysShowCodeRows || !!a || !!f || !!s;
-
-  return (
-    <div className="min-w-0">
-      {showItemHeading ? (
-        <p className={`font-bold text-slate-800 dark:text-slate-100 leading-tight truncate ${compact ? "text-xs max-w-[160px]" : "text-sm max-w-[200px]"}`}>
-          {itemName || "Unknown Item"}
-        </p>
-      ) : null}
-      {showRows ? (
-        <div className={`${showItemHeading ? "mt-1" : ""} flex flex-col gap-1 font-mono leading-snug ${textCls}`}>
-          <div
-            className="flex min-w-0 items-center gap-1"
-            title="ASIN — Amazon Standard Identification Number (catalog product ID)"
-          >
-            <span className="w-14 shrink-0 font-semibold text-slate-500 dark:text-slate-400">ASIN</span>
-            <span className="min-w-0 flex-1 truncate text-foreground/90">{a || "—"}</span>
-            {a ? (
-              <>
-                <button type="button" title="Copy ASIN" className={iconBtn} onClick={(e) => { e.stopPropagation(); void copyVal(a, "ASIN"); }}><Copy className="h-3 w-3" /></button>
-                <button type="button" title="Search marketplace" className={iconBtn} onClick={(e) => { e.stopPropagation(); openMarketplaceSearch(a); }}><Search className="h-3 w-3" /></button>
-              </>
-            ) : null}
-          </div>
-          <div
-            className="flex min-w-0 items-center gap-1"
-            title="FNSKU — Fulfillment Network SKU: your FBA label / identifier for this listing on Amazon"
-          >
-            <span className="w-14 shrink-0 font-semibold text-slate-500 dark:text-slate-400">FNSKU</span>
-            <span className="min-w-0 flex-1 truncate text-foreground/90">{f || "—"}</span>
-            {f ? (
-              <>
-                <button type="button" title="Copy FNSKU" className={iconBtn} onClick={(e) => { e.stopPropagation(); void copyVal(f, "FNSKU"); }}><Copy className="h-3 w-3" /></button>
-                <button type="button" title="Search marketplace" className={iconBtn} onClick={(e) => { e.stopPropagation(); openMarketplaceSearch(f); }}><Search className="h-3 w-3" /></button>
-              </>
-            ) : null}
-          </div>
-          <div
-            className="flex min-w-0 items-center gap-1"
-            title="SKU — Seller SKU (MSKU): warehouse / Seller Central product code (not the same as FNSKU)"
-          >
-            <span className="w-14 shrink-0 font-semibold text-slate-500 dark:text-slate-400">SKU</span>
-            <span className="min-w-0 flex-1 truncate text-foreground/90">{s || "—"}</span>
-            {s ? (
-              <>
-                <button type="button" title="Copy SKU" className={iconBtn} onClick={(e) => { e.stopPropagation(); void copyVal(s, "SKU"); }}><Copy className="h-3 w-3" /></button>
-                <button type="button" title="Search marketplace" className={iconBtn} onClick={(e) => { e.stopPropagation(); openMarketplaceSearch(s); }}><Search className="h-3 w-3" /></button>
-              </>
-            ) : null}
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 // ─── Items Data Table ──────────────────────────────────────────────────────────
 
 export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSettings, onRowClick, onRowEdit, onBulkDeleted, onBulkMoved, onNewItem, externalSearch = "", onToast }: {
@@ -3960,7 +3953,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
         const blob = [
           r.id, r.lpn, r.item_name, r.marketplace,
           formatMarketplaceSource(r.marketplace),
-          r.product_identifier ?? "", r.inherited_tracking_number ?? "",
+          r.inherited_tracking_number ?? "",
           r.asin ?? "", r.fnsku ?? "", r.sku ?? "",
           pkg?.tracking_number ?? "", pkg?.package_number ?? "",
         ].join(" ").toLowerCase();
@@ -4025,7 +4018,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                     <input type="checkbox" checked={allSelected} onChange={(e) => setSelectedIds(e.target.checked ? new Set(filtered.map((r) => r.id)) : new Set())} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                   </div>
                 </th>
-                <th className="px-4 py-3 text-left"><SortButton field="item_name" label="Item / Identifiers" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
+                <th className="px-4 py-3 text-left"><SortButton field="item_name" label="Identifiers" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="tracking_effective" label="Tracking" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="lpn" label="LPN" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="store_name" label="Sales Channel" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
@@ -4048,14 +4041,14 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                 const track = r.inherited_tracking_number ?? linkedPkg?.tracking_number ?? "";
                 const expiryStatus = getExpiryStatus(r.expiration_date, fefo_critical, fefo_warning);
                 return (
-                  <tr key={r.id} onClick={() => onRowClick(r)} className="cursor-pointer transition hover:bg-sky-50/50 dark:hover:bg-sky-950/20">
+                  <tr key={r.id} onClick={() => onRowClick(r)} className="group cursor-pointer transition hover:bg-sky-50/50 dark:hover:bg-sky-950/20">
                     <td className={TD_CHK} onClick={(e) => e.stopPropagation()}>
                       <div className={CHK_FLEX}>
                         <input type="checkbox" checked={selectedIds.has(r.id)} onChange={(e) => { const s = new Set(selectedIds); e.target.checked ? s.add(r.id) : s.delete(r.id); setSelectedIds(s); }} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                       </div>
                     </td>
-                    <td className="px-4 py-3 min-w-[180px]">
-                      <ItemIdentifiersCell
+                    <td className="px-4 py-3 min-w-[200px]">
+                      <ReturnIdentifiersColumn
                         itemName={r.item_name}
                         asin={r.asin}
                         fnsku={r.fnsku}
@@ -4064,8 +4057,18 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                         onToast={onToast}
                       />
                     </td>
-                    <td className="hidden px-4 py-3 font-mono text-[11px] text-muted-foreground md:table-cell">{track || "—"}</td>
-                    <td className="hidden px-4 py-3 font-mono text-xs text-muted-foreground sm:table-cell">{r.lpn ?? "—"}</td>
+                    <td className="hidden px-4 py-3 md:table-cell" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-center gap-1 font-mono text-[11px] text-muted-foreground">
+                        <span className="min-w-0 truncate">{track || "—"}</span>
+                        {track ? <InlineCopy value={track} label="Tracking #" onToast={onToast} stopPropagation /> : null}
+                      </div>
+                    </td>
+                    <td className="hidden px-4 py-3 font-mono text-xs text-muted-foreground sm:table-cell" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-center gap-1">
+                        <span>{r.lpn ?? "—"}</span>
+                        {r.lpn ? <InlineCopy value={r.lpn} label="LPN" onToast={onToast} stopPropagation /> : null}
+                      </div>
+                    </td>
                     <td className="hidden px-4 py-3 sm:table-cell">
                       {r.stores ? (
                         <span className="max-w-[140px] truncate text-xs font-medium text-slate-700 dark:text-slate-300" title={r.stores.name}>{r.stores.name}</span>
@@ -4237,7 +4240,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                 const pkgItems = allReturns.filter((r) => r.package_id === p.id);
                 return (
                   <React.Fragment key={p.id}>
-                    <tr onClick={() => onRowClick(p)} className="cursor-pointer transition hover:bg-violet-50/50 dark:hover:bg-violet-950/20">
+                    <tr onClick={() => onRowClick(p)} className="group cursor-pointer transition hover:bg-violet-50/50 dark:hover:bg-violet-950/20">
                       <td className={TD_EXP} onClick={(e) => toggleExpand(p.id, e)}>
                         <button type="button" className="flex h-6 w-6 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300" title={isExpanded ? "Collapse items" : `Show ${pkgItems.length} item(s)`}>
                           {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
@@ -4248,7 +4251,12 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                           <input type="checkbox" checked={selectedIds.has(p.id)} onChange={(e) => { const s = new Set(selectedIds); e.target.checked ? s.add(p.id) : s.delete(p.id); setSelectedIds(s); }} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                         </div>
                       </td>
-                      <td className="px-4 py-3 font-mono text-xs font-bold text-foreground">{p.package_number}</td>
+                      <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex items-center gap-1.5 font-mono text-xs font-bold text-foreground">
+                          <span>{p.package_number}</span>
+                          <InlineCopy value={p.package_number} label="Package #" onToast={onToast} stopPropagation />
+                        </div>
+                      </td>
                       <td className="hidden px-4 py-3 md:table-cell">
                         {p.stores ? (
                           <span className="max-w-[140px] truncate text-xs font-medium text-slate-700 dark:text-slate-300" title={p.stores.name}>{p.stores.name}</span>
@@ -4256,7 +4264,22 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                           <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-400 dark:border-slate-700 dark:bg-slate-900">Mixed / Unassigned</span>
                         )}
                       </td>
-                      <td className="hidden px-4 py-3 sm:table-cell"><div className="flex flex-col gap-0.5">{p.carrier_name && <span className="flex items-center gap-1 text-xs text-slate-600 dark:text-slate-300"><Truck className="h-3 w-3" />{p.carrier_name}</span>}{p.tracking_number && <span className="font-mono text-[10px] text-slate-400">{p.tracking_number}</span>}</div></td>
+                      <td className="hidden px-4 py-3 sm:table-cell" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex flex-col gap-0.5">
+                          {p.carrier_name && (
+                            <span className="flex items-center gap-1 text-xs text-slate-600 dark:text-slate-300">
+                              <Truck className="h-3 w-3" />
+                              {p.carrier_name}
+                            </span>
+                          )}
+                          {p.tracking_number && (
+                            <span className="flex items-center gap-1 font-mono text-[10px] text-slate-400">
+                              <span className="min-w-0 truncate">{p.tracking_number}</span>
+                              <InlineCopy value={p.tracking_number} label="Tracking #" onToast={onToast} stopPropagation />
+                            </span>
+                          )}
+                        </div>
+                      </td>
                       <td className="px-4 py-3"><div className="flex items-center gap-2"><span className="text-sm font-bold text-slate-700 dark:text-slate-300">{p.actual_item_count}/{p.expected_item_count > 0 ? p.expected_item_count : "?"}</span>{pct !== null && <div className="hidden h-1.5 w-12 overflow-hidden rounded-full bg-muted sm:block"><div className={`h-full rounded-full ${pct >= 100 ? "bg-emerald-500" : "bg-sky-500"}`} style={{ width: `${pct}%` }} /></div>}</div></td>
                       <td className="px-4 py-3"><PkgStatusBadge status={p.status} /></td>
                       <td className="hidden px-4 py-3 text-xs capitalize text-slate-400 md:table-cell">{operatorDisplayLabel(p)}</td>
@@ -4287,7 +4310,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                                     {pkgItems.map((r) => (
                                       <tr key={r.id} className="hover:bg-violet-50 dark:hover:bg-violet-950/20">
                                         <td className="px-3 py-2">
-                                          <ItemIdentifiersCell
+                                          <ReturnIdentifiersColumn
                                             compact
                                             itemName={r.item_name}
                                             asin={r.asin}
@@ -4452,7 +4475,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                 const pltPackages = allPackages.filter((pk) => pk.pallet_id === p.id);
                 return (
                   <React.Fragment key={p.id}>
-                    <tr onClick={() => onRowClick(p)} className="cursor-pointer transition hover:bg-accent hover:text-accent-foreground/50">
+                    <tr onClick={() => onRowClick(p)} className="group cursor-pointer transition hover:bg-accent hover:text-accent-foreground/50">
                       <td className={TD_EXP} onClick={(e) => toggleExpand(p.id, e)}>
                         <button type="button" className="flex h-6 w-6 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300" title={isExpanded ? "Collapse packages" : `Show ${pltPackages.length} package(s)`}>
                           {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
@@ -4463,7 +4486,12 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                           <input type="checkbox" checked={selectedIds.has(p.id)} onChange={(e) => { const s = new Set(selectedIds); e.target.checked ? s.add(p.id) : s.delete(p.id); setSelectedIds(s); }} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                         </div>
                       </td>
-                      <td className="px-4 py-3 font-mono text-xs font-bold text-foreground">{p.pallet_number}</td>
+                      <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex items-center gap-1.5 font-mono text-xs font-bold text-foreground">
+                          <span>{p.pallet_number}</span>
+                          <InlineCopy value={p.pallet_number} label="Pallet #" onToast={onToast} stopPropagation />
+                        </div>
+                      </td>
                       <td className="hidden px-4 py-3 md:table-cell">
                         {p.stores ? (
                           <span className="max-w-[140px] truncate text-xs font-medium text-slate-700 dark:text-slate-300" title={p.stores.name}>{p.stores.name}</span>
@@ -4507,15 +4535,27 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                                       const pct = pk.expected_item_count > 0 ? Math.min(100, (pk.actual_item_count / pk.expected_item_count) * 100) : null;
                                       return (
                                         <React.Fragment key={pk.id}>
-                                          <tr className="hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                          <tr className="group hover:bg-slate-50 dark:hover:bg-slate-800/50">
                                             <td className={TD_EXP} onClick={(e) => toggleNestedPkgExpand(pk.id, e)}>
                                               <button type="button" className="flex h-6 w-6 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-200 hover:text-slate-600 dark:hover:bg-slate-700 dark:hover:text-slate-300" title={nestedOpen ? "Collapse items" : `Show ${pkgItems.length} item(s)`}>
                                                 {nestedOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
                                               </button>
                                             </td>
-                                            <td className="px-3 py-2 font-mono font-semibold text-slate-700 dark:text-slate-300">{pk.package_number}</td>
+                                            <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
+                                              <div className="flex items-center gap-1 font-mono font-semibold text-slate-700 dark:text-slate-300">
+                                                <span>{pk.package_number}</span>
+                                                <InlineCopy value={pk.package_number} label="Package #" onToast={onToast} stopPropagation />
+                                              </div>
+                                            </td>
                                             <td className="px-3 py-2 text-slate-500">{pk.carrier_name ?? "—"}</td>
-                                            <td className="px-3 py-2 font-mono text-slate-400">{pk.tracking_number ?? "—"}</td>
+                                            <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
+                                              <div className="flex items-center gap-1 font-mono text-slate-400">
+                                                <span className="min-w-0 truncate">{pk.tracking_number ?? "—"}</span>
+                                                {pk.tracking_number ? (
+                                                  <InlineCopy value={pk.tracking_number} label="Tracking #" onToast={onToast} stopPropagation />
+                                                ) : null}
+                                              </div>
+                                            </td>
                                             <td className="px-3 py-2">
                                               <div className="flex items-center gap-2">
                                                 <span className="font-bold text-slate-600 dark:text-slate-300">{pkItemCount}/{pk.expected_item_count > 0 ? pk.expected_item_count : "?"}</span>
@@ -4544,7 +4584,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                                                           {pkgItems.map((r) => (
                                                             <tr key={r.id} className="hover:bg-slate-50 dark:hover:bg-slate-950/30">
                                                               <td className="px-2 py-1.5">
-                                                                <ItemIdentifiersCell
+                                                                <ReturnIdentifiersColumn
                                                                   compact
                                                                   itemName={r.item_name}
                                                                   asin={r.asin}
