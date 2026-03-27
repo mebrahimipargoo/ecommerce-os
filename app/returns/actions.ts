@@ -2,6 +2,11 @@
 
 import { supabaseServer } from "../../lib/supabase-server";
 import { isUuidString } from "../../lib/uuid";
+import {
+  CLAIM_SUBMISSION_RETURN_ID_COLUMN,
+  CLAIM_SUBMISSIONS_TABLE,
+} from "../claim-engine/claim-submissions-constants";
+import { defectReasonsPayload } from "./claim-condition-labels";
 import { RETURN_SELECT } from "./returns-constants";
 
 const DEFAULT_ORG   = "00000000-0000-0000-0000-000000000001";
@@ -72,14 +77,74 @@ const CLAIM_CONDITIONS = new Set([
   "wrong_item_junk", "wrong_item_different", "missing_parts", "expired",
 ]);
 
+/** True when the package has outer-box + return-label photos operators can inherit for claims. */
+async function fetchPackageInheritedClaimPhotosReady(packageId: string | null | undefined): Promise<boolean> {
+  if (!packageId) return false;
+  const { data } = await supabaseServer
+    .from("packages")
+    .select("photo_opened_url, photo_closed_url, photo_return_label_url")
+    .eq("id", packageId)
+    .maybeSingle();
+  if (!data) return false;
+  const outer = !!(data.photo_opened_url || data.photo_closed_url);
+  const label = !!data.photo_return_label_url;
+  return outer && label;
+}
+
 function deriveStatus(
   conditions: string[],
   photoEvidence: Record<string, number> | null | undefined,
+  opts?: {
+    /** Package has outer/box + return-label photos — counts toward ready_for_claim without per-item box uploads. */
+    packageHasInheritedClaimPhotos?: boolean;
+    /** Item-level evidence URLs (item photo / expiry photo). */
+    hasItemEvidenceUrls?: boolean;
+  },
 ): string {
   const needsClaim = conditions.some((c) => CLAIM_CONDITIONS.has(c));
   if (!needsClaim) return "received";
-  const hasPhotos = photoEvidence != null && Object.values(photoEvidence).some((n) => n > 0);
-  return hasPhotos ? "ready_for_claim" : "pending_evidence";
+  const hasCategoryPhotos = photoEvidence != null && Object.values(photoEvidence).some((n) => n > 0);
+  const inherited = !!opts?.packageHasInheritedClaimPhotos;
+  const itemUrls = !!opts?.hasItemEvidenceUrls;
+  if (hasCategoryPhotos || inherited || itemUrls) return "ready_for_claim";
+  return "pending_evidence";
+}
+
+function buildClaimSourcePayload(
+  conditions: string[],
+  orderId: string | null | undefined,
+): Record<string, unknown> {
+  const oid = orderId?.trim();
+  const payload: Record<string, unknown> = {
+    ...defectReasonsPayload(conditions),
+    claim_type: conditions.find((c) => CLAIM_CONDITIONS.has(c)) ?? null,
+  };
+  if (oid) payload.amazon_order_id = oid;
+  return payload;
+}
+
+/** Queues a `claim_submissions` row for the Python agent (`ready_to_send`). */
+async function upsertClaimSubmissionForReadyReturn(opts: {
+  organizationId: string;
+  returnId: string;
+  storeId: string | null | undefined;
+  claimAmount: number;
+  sourcePayload: Record<string, unknown>;
+}): Promise<{ error: { message: string } | null }> {
+  const { error } = await supabaseServer.from(CLAIM_SUBMISSIONS_TABLE).upsert(
+    {
+      organization_id: opts.organizationId,
+      [CLAIM_SUBMISSION_RETURN_ID_COLUMN]: opts.returnId,
+      store_id: opts.storeId ?? null,
+      status: "ready_to_send",
+      claim_amount: opts.claimAmount,
+      report_url: null,
+      source_payload: opts.sourcePayload,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "return_id" },
+  );
+  return { error: error ? { message: error.message } : null };
 }
 
 // ─── Internal audit helpers ───────────────────────────────────────────────────
@@ -281,6 +346,7 @@ export type ReturnUpdatePayload = Partial<Pick<
   | "package_id" | "pallet_id"
   | "photo_evidence" | "photo_item_url" | "photo_expiry_url"
   | "asin" | "fnsku" | "sku" | "store_id" | "marketplace"
+  | "order_id"
 >>;
 
 // ─── Audit Log Types ──────────────────────────────────────────────────────────
@@ -580,8 +646,13 @@ export async function insertReturn(
   payload: ReturnInsertPayload,
 ): Promise<{ ok: boolean; data?: ReturnRecord; error?: string }> {
   try {
-    const orgId  = payload.organization_id ?? DEFAULT_ORG;
-    const status = deriveStatus(payload.conditions, payload.photo_evidence ?? null);
+    const orgId = payload.organization_id ?? DEFAULT_ORG;
+    const packageInherited = await fetchPackageInheritedClaimPhotosReady(payload.package_id ?? null);
+    const hasItemUrls = !!(payload.photo_item_url?.trim() || payload.photo_expiry_url?.trim());
+    const status = deriveStatus(payload.conditions, payload.photo_evidence ?? null, {
+      packageHasInheritedClaimPhotos: packageInherited,
+      hasItemEvidenceUrls: hasItemUrls,
+    });
 
     // Inherit pallet_id from package when not explicitly provided
     let effectivePalletId = payload.pallet_id ?? null;
@@ -621,6 +692,28 @@ export async function insertReturn(
 
     if (error) throw new Error(parseDuplicateError(error.message));
     const rec = data as unknown as ReturnRecord;
+
+    if (status === "ready_for_claim") {
+      const ev = rec.estimated_value;
+      const n = Number(ev);
+      const claimAmount = Number.isFinite(n) && n > 0 ? n : 100;
+      const sourcePayload = buildClaimSourcePayload(payload.conditions, payload.order_id ?? null);
+
+      const { error: subErr } = await upsertClaimSubmissionForReadyReturn({
+        organizationId: rec.organization_id ?? orgId,
+        returnId: rec.id,
+        storeId: rec.store_id ?? payload.store_id ?? null,
+        claimAmount,
+        sourcePayload,
+      });
+      if (subErr) {
+        await supabaseServer.from("returns").delete().eq("id", rec.id);
+        throw new Error(
+          `Return could not be queued for claims: ${subErr.message}. Check claim_submissions columns and RLS.`,
+        );
+      }
+    }
+
     void logReturnAudit({
       organizationId: orgId,
       returnId: rec.id,
@@ -642,15 +735,37 @@ export async function updateReturn(
   actor?: string,
 ): Promise<{ ok: boolean; data?: ReturnRecord; error?: string }> {
   try {
+    const { data: existing, error: loadErr } = await supabaseServer
+      .from("returns")
+      .select(RETURN_SELECT)
+      .eq("id", returnId)
+      .single();
+    if (loadErr || !existing) throw new Error(loadErr?.message ?? "Return not found.");
+
     const patch: Record<string, unknown> = { ...updates, updated_by_id: resolveActorUserId(actor) };
     delete patch.updated_by;
     delete patch.created_by;
     // Remove post-migration columns from patch — they may not be in the DB yet
     delete patch.inherited_tracking_number;
     delete patch.inherited_carrier;
-    delete patch.order_id;
     delete patch.customer_id;
     delete (patch as Record<string, unknown>).product_identifier;
+
+    const ex = existing as unknown as ReturnRecord;
+    const nextConditions = (updates.conditions !== undefined ? updates.conditions : ex.conditions) ?? [];
+    const nextPhotoEvidence = updates.photo_evidence !== undefined ? updates.photo_evidence : ex.photo_evidence;
+    const nextPackageId =
+      updates.package_id !== undefined ? updates.package_id : ex.package_id;
+    const nextPhotoItem =
+      updates.photo_item_url !== undefined ? updates.photo_item_url : ex.photo_item_url;
+    const nextPhotoExpiry =
+      updates.photo_expiry_url !== undefined ? updates.photo_expiry_url : ex.photo_expiry_url;
+    const packageInherited = await fetchPackageInheritedClaimPhotosReady(nextPackageId);
+    const hasItemUrls = !!(String(nextPhotoItem ?? "").trim() || String(nextPhotoExpiry ?? "").trim());
+    patch.status = deriveStatus(nextConditions, nextPhotoEvidence ?? null, {
+      packageHasInheritedClaimPhotos: packageInherited,
+      hasItemEvidenceUrls: hasItemUrls,
+    });
     // Inherit pallet_id from package when package_id is set to a real package
     if ("package_id" in updates && updates.package_id) {
       const { data: pkg } = await supabaseServer.from("packages")
@@ -667,8 +782,25 @@ export async function updateReturn(
       .update(clean)
       .eq("id", returnId).select(RETURN_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
+    const rec = data as unknown as ReturnRecord;
+
+    if (rec.status === "ready_for_claim") {
+      const ev = rec.estimated_value;
+      const n = Number(ev);
+      const claimAmount = Number.isFinite(n) && n > 0 ? n : 100;
+      const sourcePayload = buildClaimSourcePayload(rec.conditions ?? [], rec.order_id ?? null);
+      const { error: subErr } = await upsertClaimSubmissionForReadyReturn({
+        organizationId: rec.organization_id ?? DEFAULT_ORG,
+        returnId: rec.id,
+        storeId: rec.store_id,
+        claimAmount,
+        sourcePayload,
+      });
+      if (subErr) throw new Error(`Claim queue update failed: ${subErr.message}`);
+    }
+
     void logReturnAudit({ organizationId: DEFAULT_ORG, returnId, action: "updated", actor: actor ?? DEFAULT_ACTOR });
-    return { ok: true, data: data as unknown as ReturnRecord };
+    return { ok: true, data: rec };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Failed to update return." };
   }

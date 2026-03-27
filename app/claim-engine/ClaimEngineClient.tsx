@@ -56,6 +56,7 @@ import {
   type ClaimSubmissionListRow,
 } from "./claim-submission-actions";
 import { downloadBulkClaimsPdf } from "./claim-pdf-download";
+import { prepareClaimEnginePdfPages } from "./claim-pdf-batch-actions";
 import { markClaimSubmissionsPrintedLocally, type ReadyToSendPrintRow } from "./claim-print-html-actions";
 import { CLAIM_SUBMISSIONS_WITH_RETURNS_EMBED } from "./claim-submissions-constants";
 import { ClaimDetailModal } from "./ClaimDetailModal";
@@ -228,6 +229,7 @@ export function ClaimEngineClient({
   const [historySubmissionId, setHistorySubmissionId] = useState<string | null>(null);
   /** Submission-queue row selection for PDF batch (takes priority over workspace selection). */
   const [queueSelectedIds, setQueueSelectedIds] = useState<Set<string>>(new Set());
+  const [queueBulkPdfBusy, setQueueBulkPdfBusy] = useState(false);
 
   const claimsSf = useSortFilterState();
   const queueSf = useSortFilterState();
@@ -628,6 +630,39 @@ ${blocks}
     }
   }
 
+  async function handlePrepareBulkQueuePdfReport() {
+    const ids = [...queueSelectedIds];
+    if (ids.length === 0) return;
+    setQueueBulkPdfBusy(true);
+    try {
+      const res = await prepareClaimEnginePdfPages(organizationId, ids);
+      if (!res.ok || !res.pages?.length) {
+        showToast(res.error ?? "Could not build PDF report", "error");
+        return;
+      }
+      await downloadBulkClaimsPdf({
+        tenant: coreSettings,
+        pages: res.pages.map((p) => ({
+          storeName: p.storeName,
+          storePlatform: p.storePlatform,
+          detail: p.detail,
+          claimAmountNote: p.claimAmountNote,
+          marketplaceClaimIdNote: p.marketplaceClaimIdNote,
+        })),
+        filename: `claims-bulk-report-${Date.now()}.pdf`,
+        reportKind: "batch",
+      });
+      showToast(
+        `Prepared PDF with ${res.pagesBuilt ?? res.pages.length} page(s).`,
+        "success",
+      );
+    } catch {
+      showToast("Bulk PDF report failed.", "error");
+    } finally {
+      setQueueBulkPdfBusy(false);
+    }
+  }
+
   async function handleApproveClaim(claim: ClaimRecord) {
     if (claim.status === "accepted") return;
     setApproveBusyId(claim.id);
@@ -655,6 +690,23 @@ ${blocks}
           }`}
         >
           {toast.msg}
+        </div>
+      ) : null}
+
+      {activeTab === "queue" && queueSelectedIds.size > 0 ? (
+        <div className="pointer-events-auto fixed bottom-20 left-1/2 z-[470] flex w-[min(100vw-2rem,36rem)] max-w-[calc(100vw-2rem)] -translate-x-1/2 flex-col gap-3 rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 shadow-xl backdrop-blur-md dark:border-slate-700 dark:bg-slate-900/95 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-center text-sm font-semibold text-slate-800 dark:text-slate-100 sm:text-left">
+            {queueSelectedIds.size} claim{queueSelectedIds.size === 1 ? "" : "s"} selected
+          </p>
+          <button
+            type="button"
+            disabled={queueBulkPdfBusy}
+            onClick={() => void handlePrepareBulkQueuePdfReport()}
+            className="inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-emerald-500 disabled:opacity-50"
+          >
+            {queueBulkPdfBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
+            Prepare bulk PDF report
+          </button>
         </div>
       ) : null}
 

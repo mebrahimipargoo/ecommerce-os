@@ -304,6 +304,7 @@ export default function ReturnsPage() {
             onItemAdded={(r) => { addReturn(r); showToast(`✓ Item logged — ${r.asin ?? r.fnsku ?? r.sku ?? r.item_name}`); }}
             onPackageDeleted={(id) => { removePackage(id); closeDrawer(); showToast("Package deleted.", "warning"); }}
             onOpenItem={(r) => pushDrawer({ type: "item", record: r })}
+            onOpenPallet={(plt) => pushDrawer({ type: "pallet", record: plt })}
             showToast={showToast as (msg: string, kind?: ToastKind) => void}
           />
         )}
@@ -327,7 +328,7 @@ export default function ReturnsPage() {
       {wizardOpen && (
         <SingleItemWizardModal
           onClose={() => { setWizardOpen(false); setWizardInherited(undefined); }}
-          onSuccess={(r, photos) => { addReturn(r, photos); showToast(`✓ Return logged — ${r.asin ?? r.fnsku ?? r.sku ?? r.item_name}`); }}
+          onSuccess={(r, photos) => { addReturn(r, photos); }}
           actor={actor}
           openPackages={openPackages}
           openPallets={openPallets}
@@ -337,6 +338,24 @@ export default function ReturnsPage() {
           aiLabelEnabled={orgSettings.is_ai_label_ocr_enabled}
           onSoftPackageWarning={() => showToast("Warning: This item is not on the package's expected list.", "warning")}
           onToast={showToast}
+          onNavigateToPackage={(id) => {
+            const p = packages.find((x) => x.id === id);
+            if (p) {
+              setWizardOpen(false);
+              setWizardInherited(undefined);
+              setActiveTab("packages");
+              openDrawer({ type: "package", record: p });
+            }
+          }}
+          onNavigateToPallet={(palletId) => {
+            const pl = pallets.find((x) => x.id === palletId);
+            if (pl) {
+              setWizardOpen(false);
+              setWizardInherited(undefined);
+              setActiveTab("pallets");
+              openDrawer({ type: "pallet", record: pl });
+            }
+          }}
         />
       )}
 

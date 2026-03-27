@@ -42,6 +42,11 @@ export interface ClaimAgentConfig {
   require_manual_approval_bulk_submission?: boolean;
   /** Preferred store for adapter routing (FK to `stores.id`). */
   default_marketplace_adapter_store_id?: string | null;
+
+  /** Logistics: periodic sync of `ready_for_claim` returns → `claim_submissions` (UI/cron hint). */
+  logistics_background_sync_enabled?: boolean;
+  /** Hours between background sync runs (e.g. 2). */
+  logistics_sync_interval_hours?: number;
 }
 
 export interface ModuleConfigs {
@@ -74,6 +79,8 @@ export const DEFAULT_CLAIM_AGENT_CONFIG: ClaimAgentConfig = {
   autonomous_claim_submission_0_50_usd: false,
   require_manual_approval_bulk_submission: true,
   default_marketplace_adapter_store_id: null,
+  logistics_background_sync_enabled: false,
+  logistics_sync_interval_hours: 2,
 };
 
 export const DEFAULT_WORKSPACE_SETTINGS: WorkspaceSettings = {

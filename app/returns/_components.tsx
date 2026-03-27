@@ -27,6 +27,7 @@ import {
 import { marketplaceSearchUrl as marketplaceSearchUrlLib } from "../../lib/marketplace-search-url";
 import { itemMatchesPackageExpectation } from "../../lib/package-expectations";
 import { getBarcodeModeFromStorage, getDefaultStoreIdFromStorage } from "../../lib/openai-settings";
+import { classifyProductBarcode } from "../../lib/product-barcode-classify";
 import { parseBarcodeSource } from "../../lib/utils/barcode-parser";
 import { supabase as supabaseBrowser } from "../../src/lib/supabase";
 import { uploadToStorage } from "../../lib/supabase/storage";
@@ -323,10 +324,14 @@ export const FLAT_CONDITION_CARDS = CONDITION_CHIP_DEFS;
 
 export function getCategoriesForConditions(
   conditions: string[],
-  ctx?: { hasPackageLink?: boolean; orphanLpn?: boolean },
+  ctx?: { hasPackageLink?: boolean; orphanLpn?: boolean; packageInheritsBoxPhotos?: boolean },
 ): PhotoCategoryDef[] {
   if (!conditions.length || conditions.includes("sellable")) return [];
-  const ids = new Set<string>(["outer_box", "fnsku_label"]);
+  const ids = new Set<string>();
+  if (!ctx?.packageInheritsBoxPhotos) {
+    ids.add("outer_box");
+    ids.add("fnsku_label");
+  }
   for (const c of conditions) {
     if (c === "empty_box" || c === "missing_item") ids.add("empty_interior");
     if (c === "damaged_box" || c.startsWith("damaged_") || c === "scratched") ids.add("damage_closeup");
@@ -442,6 +447,8 @@ export type WizardState = {
   photo_expiry_url: string;
   /** Connected store UUID — links this item to a specific store account. */
   store_id: string;
+  /** Optional Amazon order ID — stored on `returns.order_id` and `claim_submissions.source_payload.amazon_order_id`. */
+  amazon_order_id: string;
 };
 
 export const EMPTY_WIZARD: WizardState = {
@@ -452,6 +459,7 @@ export const EMPTY_WIZARD: WizardState = {
   notes: "", photos: {},
   photo_item_url: "", photo_expiry_url: "",
   store_id: "",
+  amazon_order_id: "",
 };
 
 // ─── Toast ─────────────────────────────────────────────────────────────────────
@@ -1274,7 +1282,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   const [itemStoresList, setItemStoresList] = useState<{ id: string; name: string; platform: string }[]>([]);
   const [editItem,   setEditItem]   = useState(record.item_name);
   const [editNotes,  setEditNotes]  = useState(record.notes ?? "");
-  const [editStatus, setEditStatus] = useState(record.status);
+  const [editOrderId, setEditOrderId] = useState(record.order_id ?? "");
   /**
    * Mutable copy of `photo_evidence` counts for edit mode.
    * Each key is a category slug, value is the remaining count of photos in that bucket.
@@ -1316,14 +1324,14 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     setEditStoreId(record.store_id ?? "");
     setEditItem(record.item_name);
     setEditNotes(record.notes ?? "");
-    setEditStatus(record.status);
+    setEditOrderId(record.order_id ?? "");
     setEditPhotoEvidence(record.photo_evidence ?? {});
     setEditExpiryDate(record.expiration_date ?? "");
     setEditPhotoItemUrl(record.photo_item_url ?? "");
     setEditPhotoExpiryUrl(record.photo_expiry_url ?? "");
     setEditCatalogStatus("idle");
     setEditCatalogPreview(null);
-  }, [record.id, record.lpn, record.asin, record.fnsku, record.sku, record.store_id, record.item_name, record.notes, record.status, record.photo_evidence, record.expiration_date, record.photo_item_url, record.photo_expiry_url]);
+  }, [record.id, record.lpn, record.asin, record.fnsku, record.sku, record.store_id, record.item_name, record.notes, record.order_id, record.photo_evidence, record.expiration_date, record.photo_item_url, record.photo_expiry_url]);
 
   async function handleItemEvidencePhoto(
     e: React.ChangeEvent<HTMLInputElement>,
@@ -1353,6 +1361,17 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     if (!barcode.trim()) { setEditCatalogStatus("idle"); return; }
     setEditCatalogStatus("loading");
     setEditCatalogPreview(null);
+
+    const classified = classifyProductBarcode(barcode.trim());
+    if (classified.kind === "fnsku") {
+      setEditFnsku(classified.normalized);
+      setEditProductId(classified.normalized);
+    } else if (classified.kind === "asin") {
+      setEditAsin(classified.normalized);
+      setEditProductId(classified.normalized);
+    } else if (classified.kind === "upc_ean") {
+      setEditProductId(classified.normalized);
+    }
 
     const { data: local } = await supabaseBrowser
       .from("products")
@@ -1433,7 +1452,8 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     const res = await updateReturn(record.id, {
       lpn: editLpn || undefined,
       item_name: editItem,
-      notes: editNotes || undefined, status: editStatus,
+      notes: editNotes || undefined,
+      order_id: editOrderId.trim() || null,
       expiration_date:  editExpiryDate  || undefined,
       photo_evidence:   Object.keys(mergedPhotoEvidence).length ? mergedPhotoEvidence : undefined,
       photo_item_url:   editPhotoItemUrl   || undefined,
@@ -1624,29 +1644,39 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
               </label>
             )}
 
-            {/* Expiry label photo */}
-            {editPhotoExpiryUrl ? (
-              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Expiry date photo saved ✓</span>
-                <button type="button" onClick={() => setEditPhotoExpiryUrl("")} className="text-xs text-slate-400 underline">Remove</button>
-              </div>
-            ) : (
-              <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${expiryPhotoUploading ? "border-orange-300 text-orange-500" : editExpiryDate ? "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100 dark:border-rose-700/60 dark:bg-rose-950/30 dark:text-rose-300" : "border-orange-300 bg-orange-50 text-orange-700 hover:bg-orange-100 dark:border-orange-700/60 dark:bg-orange-950/30 dark:text-orange-300"}`}>
-                {expiryPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                {expiryPhotoUploading ? "Uploading…" : "📸 Upload Expiry Date Photo"}
-                <input type="file" accept="image/*" capture="environment" className="hidden" disabled={expiryPhotoUploading} onChange={(e) => handleItemEvidencePhoto(e, "photo_expiry_url")} />
-              </label>
+            {editExpiryDate.trim() && (
+              <>
+                <p className="text-xs font-semibold text-sky-700 dark:text-sky-300">Expiry label photo</p>
+                {editPhotoExpiryUrl ? (
+                  <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                    <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                    <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Expiry date photo saved ✓</span>
+                    <button type="button" onClick={() => setEditPhotoExpiryUrl("")} className="text-xs text-slate-400 underline">Remove</button>
+                  </div>
+                ) : (
+                  <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-rose-300 bg-rose-50/80 py-3 text-sm font-semibold text-rose-800 transition hover:bg-rose-100 dark:border-rose-800/60 dark:bg-rose-950/40 dark:text-rose-200 ${expiryPhotoUploading ? "opacity-70" : ""}`}>
+                    {expiryPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                    {expiryPhotoUploading ? "Uploading…" : "Upload expiry label photo"}
+                    <input type="file" accept="image/*" capture="environment" className="hidden" disabled={expiryPhotoUploading} onChange={(e) => handleItemEvidencePhoto(e, "photo_expiry_url")} />
+                  </label>
+                )}
+              </>
             )}
           </div>
 
-          {canEdit(role) && (
-            <div><label className={LABEL}>Status</label>
-              <select className={INPUT} value={editStatus} onChange={(e) => setEditStatus(e.target.value)}>
-                {Object.entries(STATUS_CFG).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
-              </select>
-            </div>
-          )}
+          <div>
+            <label className={LABEL}>Amazon order ID <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+            <input
+              className={`${INPUT} font-mono`}
+              value={editOrderId}
+              onChange={(e) => setEditOrderId(e.target.value)}
+              placeholder="e.g. 111-1234567-8901234"
+              autoComplete="off"
+            />
+          </div>
+          <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-300">
+            Status is recalculated on save from defect reasons, photos, and linked package box/label shots (for claims).
+          </p>
           <div><label className={LABEL}>Notes</label><textarea rows={3} className="w-full resize-none rounded-2xl border border-slate-200 bg-white p-4 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" value={editNotes} onChange={(e) => setEditNotes(e.target.value)} /></div>
 
           {/* ── Photo Evidence Edit ───────────────────────────────────────────── */}
@@ -1977,7 +2007,7 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
 
 // ─── Package Drawer Content ────────────────────────────────────────────────────
 
-export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = [], allReturns = [], onClose, onPackageUpdated, onItemAdded, onPackageDeleted, onOpenItem, showToast }: {
+export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = [], allReturns = [], onClose, onPackageUpdated, onItemAdded, onPackageDeleted, onOpenItem, onOpenPallet, showToast }: {
   pkg: PackageRecord; role: UserRole; actor: string;
   openPallets?: PalletRecord[];
   /** Full returns list from page state — used for the "Assign Existing Item" flow. */
@@ -1987,6 +2017,8 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
   onItemAdded: (r: ReturnRecord) => void;
   onPackageDeleted: (id: string) => void;
   onOpenItem: (r: ReturnRecord) => void;
+  /** Open pallet drawer from wizard (PLT link). */
+  onOpenPallet?: (pallet: PalletRecord) => void;
   showToast: (msg: string, kind?: ToastKind) => void;
 }) {
   const [pkg,        setPkg]        = useState(initPkg);
@@ -2509,14 +2541,23 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
         return (
           <SingleItemWizardModal
             onClose={() => setWizardOpen(false)}
-            onSuccess={(r) => { handleItemAdded(r); showToast(`✓ Item logged to ${pkg.package_number} — ${r.asin ?? r.fnsku ?? r.sku ?? r.item_name}`); }}
+            onSuccess={(r) => { handleItemAdded(r); }}
             actor={actor}
             openPackages={[pkgWithExpected]}
-            openPallets={[]}
+            openPallets={openPallets}
             onCreatePackage={() => {}}
             onCreatePallet={() => {}}
-            inheritedContext={{ packageId: pkg.id, packageLabel: pkg.package_number }}
+            inheritedContext={{ packageId: pkg.id, packageLabel: pkg.package_number, palletId: pkg.pallet_id ?? undefined, palletLabel: openPallets.find((p) => p.id === pkg.pallet_id)?.pallet_number }}
             onSoftPackageWarning={() => showToast("⚠ This item is not on the scanned packing slip.", "warning")}
+            onToast={showToast}
+            onNavigateToPackage={(id) => { if (id === pkg.id) setWizardOpen(false); }}
+            onNavigateToPallet={(palletId) => {
+              const plt = openPallets.find((p) => p.id === palletId);
+              if (plt) {
+                setWizardOpen(false);
+                onOpenPallet?.(plt);
+              }
+            }}
           />
         );
       })()}
@@ -2608,7 +2649,7 @@ export function DiscrepancyModal({ pkg, onConfirm, onCancel }: {
 
 // ─── Wizard Steps ──────────────────────────────────────────────────────────────
 
-export function WizardStep1({ state, setState, openPackages, openPallets, onCreatePackage, onCreatePallet, inherited, aiLabelEnabled = false, onAdvance }: {
+export function WizardStep1({ state, setState, openPackages, openPallets, onCreatePackage, onCreatePallet, inherited, aiLabelEnabled = false, onAdvance, onNavigateToPackage, onNavigateToPallet }: {
   state: WizardState; setState: React.Dispatch<React.SetStateAction<WizardState>>;
   openPackages: PackageRecord[]; openPallets: PalletRecord[];
   onCreatePackage: () => void; onCreatePallet: () => void;
@@ -2616,6 +2657,8 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   aiLabelEnabled?: boolean;
   /** Scanner UX: called when Enter is pressed on the last wizard field and all step-1 fields are valid. */
   onAdvance?: () => void;
+  onNavigateToPackage?: (packageId: string) => void;
+  onNavigateToPallet?: (palletId: string) => void;
 }) {
   const up = (k: keyof WizardState, v: unknown) => setState((p) => ({ ...p, [k]: v }));
   const pkgOpts = openPackages.map((p) => ({ id: p.id, label: p.package_number, sublabel: `${p.actual_item_count}/${p.expected_item_count > 0 ? p.expected_item_count : "?"} items` }));
@@ -2692,6 +2735,17 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
     if (!barcode.trim()) { setCatalogStatus("idle"); return; }
     setCatalogStatus("loading");
     setCatalogPreview(null);
+
+    const classified = classifyProductBarcode(barcode.trim());
+    if (classified.kind === "fnsku") {
+      up("fnsku", classified.normalized);
+      up("product_identifier", classified.normalized);
+    } else if (classified.kind === "asin") {
+      up("asin", classified.normalized);
+      up("product_identifier", classified.normalized);
+    } else if (classified.kind === "upc_ean") {
+      up("product_identifier", classified.normalized);
+    }
 
     // Auto-detect marketplace from barcode prefix (Amazon FNSKU: X00… / B00…)
     const detectedSource = parseBarcodeSource(barcode.trim(), state.marketplace);
@@ -2820,9 +2874,62 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
       {inherited && (
         <div className="flex items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-700/50 dark:bg-emerald-950/30">
           <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400" />
-          <div><p className="text-xs font-bold text-emerald-700 dark:text-emerald-300">Context Inherited — fields pre-filled</p>
-            <p className="text-xs text-emerald-600 dark:text-emerald-400">{inherited.packageLabel && <>Package: <span className="font-mono font-bold">{inherited.packageLabel}</span></>}{inherited.palletLabel && <> · Pallet: <span className="font-mono font-bold">{inherited.palletLabel}</span></>}</p>
+          <div className="min-w-0 flex-1">
+            <p className="text-xs font-bold text-emerald-700 dark:text-emerald-300">Context inherited — fields pre-filled</p>
+            <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-emerald-600 dark:text-emerald-400">
+              {inherited.packageId && inherited.packageLabel && (
+                <>
+                  <Tag className="h-3 w-3 shrink-0" />
+                  <span>PKG</span>
+                  {onNavigateToPackage ? (
+                    <button
+                      type="button"
+                      onClick={() => onNavigateToPackage(inherited.packageId!)}
+                      className="font-mono font-bold text-sky-700 underline decoration-sky-400/80 underline-offset-2 hover:text-sky-800 dark:text-sky-300 dark:hover:text-sky-200"
+                    >
+                      {inherited.packageLabel}
+                    </button>
+                  ) : (
+                    <span className="font-mono font-bold">{inherited.packageLabel}</span>
+                  )}
+                </>
+              )}
+              {inherited.palletId && inherited.palletLabel && (
+                <>
+                  <span className="text-emerald-500/80">·</span>
+                  <Boxes className="h-3 w-3 shrink-0" />
+                  <span>PLT</span>
+                  {onNavigateToPallet ? (
+                    <button
+                      type="button"
+                      onClick={() => onNavigateToPallet(inherited.palletId!)}
+                      className="font-mono font-bold text-slate-700 underline decoration-slate-400/80 underline-offset-2 hover:text-slate-900 dark:text-slate-200 dark:hover:text-white"
+                    >
+                      {inherited.palletLabel}
+                    </button>
+                  ) : (
+                    <span className="font-mono font-bold">{inherited.palletLabel}</span>
+                  )}
+                </>
+              )}
+            </p>
           </div>
+        </div>
+      )}
+      {!inherited && state.package_link_id && (
+        <div className="rounded-xl border border-sky-200 bg-sky-50/80 px-3 py-2 text-xs dark:border-sky-800/50 dark:bg-sky-950/20">
+          <span className="font-semibold text-sky-800 dark:text-sky-200">Linked package: </span>
+          {onNavigateToPackage ? (
+            <button
+              type="button"
+              onClick={() => onNavigateToPackage(state.package_link_id)}
+              className="font-mono font-bold text-sky-700 underline underline-offset-2 hover:text-sky-900 dark:text-sky-300"
+            >
+              {openPackages.find((p) => p.id === state.package_link_id)?.package_number ?? state.package_link_id.slice(0, 8) + "…"}
+            </button>
+          ) : (
+            <span className="font-mono font-bold">{openPackages.find((p) => p.id === state.package_link_id)?.package_number ?? "—"}</span>
+          )}
         </div>
       )}
       {/* AI Label OCR — premium feature, only shown when org has the flag enabled */}
@@ -2921,6 +3028,9 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
             ⚠️ Unknown Item — Not found locally or on Amazon.
           </div>
         )}
+        <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+          Smart scan: <span className="font-mono">X00…</span> → FNSKU · <span className="font-mono">B…</span> (10 chars) → ASIN · 8–13 digits → UPC/EAN.
+        </p>
       </div>
       {!hasPackageLink && (
         <div>
@@ -3109,17 +3219,25 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   );
 }
 
-export function WizardStep2({ state, setState, conditions, photoCtx }: {
+export function WizardStep2({ state, setState, conditions, photoCtx, inheritedPackagePhotos, packageInheritsBoxPhotos }: {
   state: WizardState; setState: React.Dispatch<React.SetStateAction<WizardState>>;
   conditions: string[];
-  photoCtx?: { hasPackageLink: boolean; orphanLpn: boolean };
+  photoCtx?: { hasPackageLink?: boolean; orphanLpn?: boolean; packageInheritsBoxPhotos?: boolean };
+  inheritedPackagePhotos: {
+    photo_opened_url: string | null;
+    photo_closed_url: string | null;
+    photo_return_label_url: string | null;
+  } | null;
+  packageInheritsBoxPhotos: boolean;
 }) {
-  const categories = getCategoriesForConditions(conditions, photoCtx);
+  const categories = getCategoriesForConditions(conditions, { ...photoCtx, packageInheritsBoxPhotos });
+  const outerUrl = inheritedPackagePhotos?.photo_opened_url || inheritedPackagePhotos?.photo_closed_url || null;
+  const labelUrl = inheritedPackagePhotos?.photo_return_label_url ?? null;
+  const showExpiryPhotoSlot = !!state.expiration_date?.trim();
 
-  // ── Item Condition & Evidence: upload states ─────────────────────────────
-  const [itemPhotoUploading,   setItemPhotoUploading]   = useState(false);
+  const [itemPhotoUploading, setItemPhotoUploading] = useState(false);
   const [expiryPhotoUploading, setExpiryPhotoUploading] = useState(false);
-  const itemPhotoRef   = useRef<HTMLInputElement>(null);
+  const itemPhotoRef = useRef<HTMLInputElement>(null);
   const expiryPhotoRef = useRef<HTMLInputElement>(null);
 
   async function uploadEvidencePhoto(
@@ -3146,60 +3264,117 @@ export function WizardStep2({ state, setState, conditions, photoCtx }: {
 
   return (
     <div className="space-y-5">
-      {/* ── Item Condition & Evidence ──────────────────────────────────────── */}
-      <div className="rounded-2xl border-2 border-sky-200 bg-sky-50 p-4 space-y-4 dark:border-sky-700/50 dark:bg-sky-950/20">
-        <div className="flex items-center gap-2">
-          <Camera className="h-4 w-4 text-sky-600 dark:text-sky-400" />
-          <p className="text-sm font-bold text-sky-800 dark:text-sky-200">Item Condition &amp; Evidence</p>
-          <span className="ml-auto rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-sky-600 dark:bg-sky-900/40 dark:text-sky-300">Claim Photos</span>
+      <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-900/80">
+        <div className="mb-3 flex items-center gap-2">
+          <Camera className="h-4 w-4 text-slate-600 dark:text-slate-300" />
+          <p className="text-sm font-bold uppercase tracking-wide text-slate-600 dark:text-slate-300">Evidence</p>
         </div>
+        <p className="mb-4 text-xs text-slate-500 dark:text-slate-400">
+          Outer Box Photo and Box Label are pulled from the linked package when available. Add item-specific shots below.
+        </p>
 
-        {/* Item photo */}
-        <div>
-          <p className="mb-1.5 text-xs font-semibold text-sky-700 dark:text-sky-300">
-            Item Photo <span className="font-normal text-slate-400">(optional)</span>
+        {packageInheritsBoxPhotos && (outerUrl || labelUrl) && (
+          <div className="mb-4 grid gap-3 sm:grid-cols-2">
+            {outerUrl && (
+              <a href={outerUrl} target="_blank" rel="noreferrer" className="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-600 dark:bg-slate-950">
+                <img src={outerUrl} alt="Outer box from package" className="h-28 w-full object-cover" />
+                <p className="border-t border-slate-100 px-2 py-1.5 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
+                  Outer Box Photo (package)
+                </p>
+              </a>
+            )}
+            {labelUrl && (
+              <a href={labelUrl} target="_blank" rel="noreferrer" className="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-600 dark:bg-slate-950">
+                <img src={labelUrl} alt="Return label from package" className="h-28 w-full object-cover" />
+                <p className="border-t border-slate-100 px-2 py-1.5 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
+                  Box Label (package)
+                </p>
+              </a>
+            )}
+          </div>
+        )}
+        {!packageInheritsBoxPhotos && photoCtx?.hasPackageLink && (
+          <p className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-200">
+            Add <strong>outer box</strong> and <strong>return label</strong> photos on the package record to inherit them here and speed up claims.
           </p>
-          {state.photo_item_url ? (
-            <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-              <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-              <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Item photo saved ✓</span>
-              <button type="button" onClick={() => setState((p) => ({ ...p, photo_item_url: "" }))} className="text-xs text-slate-400 underline hover:text-slate-600">Remove</button>
-            </div>
-          ) : (
-            <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${itemPhotoUploading ? "border-sky-300 bg-sky-50 text-sky-500" : "border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:border-sky-700/60 dark:bg-sky-950/30 dark:text-sky-300"}`}>
-              {itemPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-              {itemPhotoUploading ? "Uploading…" : "📸 Upload Item Photo"}
-              <input ref={itemPhotoRef} type="file" accept="image/*" capture="environment" className="hidden" disabled={itemPhotoUploading}
-                onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadEvidencePhoto(f, "photo_item_url", setItemPhotoUploading); }} />
-            </label>
-          )}
-        </div>
+        )}
 
-        {/* Expiry date photo */}
-        <div>
-          <p className="mb-1.5 text-xs font-semibold text-sky-700 dark:text-sky-300">
-            Expiry Date Photo
-            {state.expiration_date && <span className="ml-1.5 text-rose-500 font-bold">— Required (expiry set)</span>}
-            {!state.expiration_date && <span className="font-normal text-slate-400">(recommended if expiry label exists)</span>}
-          </p>
-          {state.photo_expiry_url ? (
-            <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-              <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-              <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Expiry photo saved ✓</span>
-              <button type="button" onClick={() => setState((p) => ({ ...p, photo_expiry_url: "" }))} className="text-xs text-slate-400 underline hover:text-slate-600">Remove</button>
+        <div className="space-y-4 border-t border-slate-200 pt-4 dark:border-slate-600">
+          <div>
+            <p className="mb-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
+              Item photo <span className="font-normal text-slate-400">(optional)</span>
+            </p>
+            {state.photo_item_url ? (
+              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Saved ✓</span>
+                <button type="button" onClick={() => setState((p) => ({ ...p, photo_item_url: "" }))} className="text-xs text-slate-400 underline hover:text-slate-600">
+                  Remove
+                </button>
+              </div>
+            ) : (
+              <label
+                className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-300 py-3 text-sm font-semibold transition hover:bg-white dark:border-slate-600 dark:hover:bg-slate-800 ${itemPhotoUploading ? "text-slate-400" : "text-slate-700 dark:text-slate-200"}`}
+              >
+                {itemPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                {itemPhotoUploading ? "Uploading…" : "Upload item photo"}
+                <input
+                  ref={itemPhotoRef}
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  className="hidden"
+                  disabled={itemPhotoUploading}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    e.target.value = "";
+                    if (f) void uploadEvidencePhoto(f, "photo_item_url", setItemPhotoUploading);
+                  }}
+                />
+              </label>
+            )}
+          </div>
+
+          {showExpiryPhotoSlot && (
+            <div>
+              <p className="mb-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
+                Expiry label photo <span className="text-rose-500">*</span>
+              </p>
+              {state.photo_expiry_url ? (
+                <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                  <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Saved ✓</span>
+                  <button type="button" onClick={() => setState((p) => ({ ...p, photo_expiry_url: "" }))} className="text-xs text-slate-400 underline hover:text-slate-600">
+                    Remove
+                  </button>
+                </div>
+              ) : (
+                <label
+                  className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-rose-300 bg-rose-50/80 py-3 text-sm font-semibold text-rose-800 hover:bg-rose-100 dark:border-rose-800/60 dark:bg-rose-950/40 dark:text-rose-200 ${expiryPhotoUploading ? "opacity-70" : ""}`}
+                >
+                  {expiryPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                  {expiryPhotoUploading ? "Uploading…" : "Upload expiry label photo"}
+                  <input
+                    ref={expiryPhotoRef}
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    className="hidden"
+                    disabled={expiryPhotoUploading}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      e.target.value = "";
+                      if (f) void uploadEvidencePhoto(f, "photo_expiry_url", setExpiryPhotoUploading);
+                    }}
+                  />
+                </label>
+              )}
             </div>
-          ) : (
-            <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${expiryPhotoUploading ? "border-orange-300 bg-orange-50 text-orange-500" : state.expiration_date ? "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100 dark:border-rose-700/60 dark:bg-rose-950/30 dark:text-rose-300" : "border-orange-300 bg-orange-50 text-orange-700 hover:bg-orange-100 dark:border-orange-700/60 dark:bg-orange-950/30 dark:text-orange-300"}`}>
-              {expiryPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-              {expiryPhotoUploading ? "Uploading…" : "📸 Upload Expiry Date Photo"}
-              <input ref={expiryPhotoRef} type="file" accept="image/*" capture="environment" className="hidden" disabled={expiryPhotoUploading}
-                onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void uploadEvidencePhoto(f, "photo_expiry_url", setExpiryPhotoUploading); }} />
-            </label>
           )}
         </div>
       </div>
 
-      {/* ── Existing condition-based photo categories ─────────────────────── */}
+      {/* ── Condition-based photo categories ─────────────────────── */}
       {categories.length > 0 && (
         <>
           <p className="text-xs text-muted-foreground">Packing slip / manifest scans belong to <span className="font-semibold">Package</span> setup only — not here.</p>
@@ -3218,22 +3393,25 @@ export function WizardStep2({ state, setState, conditions, photoCtx }: {
         </>
       )}
       {categories.length === 0 && (
-        <div className="flex flex-col items-center gap-3 py-8 text-center">
-          <CheckCircle2 className="h-10 w-10 text-emerald-500" />
-          <p className="font-bold text-foreground">No Condition Photos Required</p>
-          <p className="text-sm text-slate-400">Use the evidence buttons above if you have a claim photo.</p>
+        <div className="flex flex-col items-center gap-2 py-6 text-center">
+          <CheckCircle2 className="h-8 w-8 text-emerald-500" />
+          <p className="text-sm font-semibold text-foreground">No extra condition photos required</p>
+          <p className="text-xs text-slate-400">Use the item photo above if the issue is visible on the unit.</p>
         </div>
       )}
     </div>
   );
 }
 
-export function WizardStep3({ state, conditions, packages, pallets, inherited, onNotesChange, packageExpectationMismatch, onToast }: {
+export function WizardStep3({ state, conditions, packages, pallets, inherited, onNotesChange, onAmazonOrderIdChange, packageExpectationMismatch, onToast, onNavigateToPackage, onNavigateToPallet }: {
   state: WizardState; conditions: string[]; packages: PackageRecord[]; pallets: PalletRecord[];
   inherited?: WizardInheritedContext; onNotesChange: (v: string) => void;
+  onAmazonOrderIdChange: (v: string) => void;
   /** Soft warning — does not block submit */
   packageExpectationMismatch?: boolean;
   onToast?: (msg: string, kind?: ToastKind) => void;
+  onNavigateToPackage?: (packageId: string) => void;
+  onNavigateToPallet?: (palletId: string) => void;
 }) {
   const photoTotal = Object.values(state.photos).reduce((a, files) => a + files.length, 0);
   const linkedPkg  = packages.find((p) => p.id === ((inherited?.packageId) ?? state.package_link_id));
@@ -3247,6 +3425,19 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
             <p className="text-sm font-bold text-amber-900 dark:text-amber-200">Warning: This item is not on the package&apos;s expected list.</p>
             <p className="mt-1 text-xs text-amber-800/90 dark:text-amber-300/90">You can still submit — this is informational only.</p>
           </div>
+        </div>
+      )}
+      {conditions.length > 0 && (
+        <div className="rounded-2xl border border-violet-200 bg-violet-50/95 p-4 dark:border-violet-800/50 dark:bg-violet-950/35">
+          <p className="text-xs font-bold uppercase tracking-wide text-violet-700 dark:text-violet-300">Defect reasons (issues)</p>
+          <ul className="mt-2 space-y-1.5">
+            {conditions.map((c) => (
+              <li key={c} className="flex items-start gap-2 text-sm font-semibold text-foreground">
+                <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-violet-500" aria-hidden />
+                {CONDITION_CHIP_DEFS.find((d) => d.key === c)?.label ?? c}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
       <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5 dark:border-slate-700 dark:bg-slate-900 space-y-3">
@@ -3274,21 +3465,44 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
           </div>
           <div className="col-span-2"><p className="text-xs text-slate-400">Item</p><p className="font-bold">{state.item_name}</p></div>
         </div>
-        <div><p className="text-xs text-slate-400 mb-1.5">Conditions</p><div className="flex flex-wrap gap-1.5">{conditions.map((c) => <ConditionBadge key={c} value={c} />)}</div></div>
+        <div>
+          <p className="mb-1.5 text-xs text-slate-400">Defect tags</p>
+          <div className="flex flex-wrap gap-1.5">{conditions.map((c) => <ConditionBadge key={c} value={c} />)}</div>
+        </div>
         {(linkedPkg || linkedPlt) && (
           <div className="flex flex-col gap-2">
             <div className="flex flex-wrap gap-2">
               {linkedPkg && (
                 <span className="group inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 py-0.5 text-xs font-semibold text-sky-700 dark:border-sky-700/60 dark:bg-sky-950/40 dark:text-sky-300">
                   <Tag className="h-3 w-3" />
-                  {linkedPkg.package_number}
+                  {onNavigateToPackage ? (
+                    <button
+                      type="button"
+                      onClick={() => onNavigateToPackage(linkedPkg.id)}
+                      className="font-mono underline decoration-sky-400/80 underline-offset-2 hover:text-sky-900 dark:hover:text-sky-100"
+                    >
+                      {linkedPkg.package_number}
+                    </button>
+                  ) : (
+                    <span className="font-mono">{linkedPkg.package_number}</span>
+                  )}
                   <InlineCopy value={linkedPkg.package_number} label="Package #" onToast={onToast} />
                 </span>
               )}
               {linkedPlt && (
                 <span className="group inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-100 px-2.5 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">
                   <Boxes className="h-3 w-3" />
-                  {linkedPlt.pallet_number}
+                  {onNavigateToPallet ? (
+                    <button
+                      type="button"
+                      onClick={() => onNavigateToPallet(linkedPlt.id)}
+                      className="font-mono underline decoration-slate-400/80 underline-offset-2 hover:text-slate-900 dark:hover:text-slate-100"
+                    >
+                      {linkedPlt.pallet_number}
+                    </button>
+                  ) : (
+                    <span className="font-mono">{linkedPlt.pallet_number}</span>
+                  )}
                   <InlineCopy value={linkedPlt.pallet_number} label="Pallet #" onToast={onToast} />
                 </span>
               )}
@@ -3321,6 +3535,18 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
         )}
       </div>
       <div>
+        <label className={LABEL}>Amazon order ID <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+        <input
+          type="text"
+          inputMode="text"
+          autoComplete="off"
+          placeholder="e.g. 111-1234567-8901234"
+          value={state.amazon_order_id}
+          onChange={(e) => onAmazonOrderIdChange(e.target.value)}
+          className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-mono placeholder:text-slate-400 focus:border-sky-400 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+        />
+      </div>
+      <div>
         <label className={LABEL}>Operator Notes <span className="text-xs font-normal text-slate-400">(optional)</span></label>
         <textarea rows={3} placeholder="Any additional observations…" value={state.notes} onChange={(e) => onNotesChange(e.target.value)}
           className="w-full resize-none rounded-2xl border border-slate-200 bg-white p-4 text-sm placeholder:text-slate-400 focus:border-sky-400 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
@@ -3332,7 +3558,7 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
 
 // ─── Single Item Wizard Modal ──────────────────────────────────────────────────
 
-export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast }: {
+export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast, onNavigateToPackage, onNavigateToPallet }: {
   onClose: () => void;
   /** Called with the saved record AND the in-session photo files for gallery display. */
   onSuccess: (r: ReturnRecord, photos: Record<string, File[]>) => void;
@@ -3343,12 +3569,64 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
   /** Non-blocking: called when item may not match package manifest (simulated) — save still proceeds. */
   onSoftPackageWarning?: () => void;
   onToast?: (msg: string, kind?: ToastKind) => void;
+  onNavigateToPackage?: (packageId: string) => void;
+  onNavigateToPallet?: (palletId: string) => void;
 }) {
   const [step, setStep] = useState(1);
   const [state, setState] = useState<WizardState>({ ...EMPTY_WIZARD, package_link_id: inheritedContext?.packageId ?? "" });
   const [submitting, setSubmitting] = useState(false);
   const [submitErr, setSubmitErr] = useState("");
   const [flash, setFlash] = useState(false);
+  const [fetchedPkgPhotos, setFetchedPkgPhotos] = useState<{
+    photo_opened_url: string | null;
+    photo_closed_url: string | null;
+    photo_return_label_url: string | null;
+  } | null>(null);
+
+  const resolvedPkgId = inheritedContext?.packageId ?? state.package_link_id ?? "";
+
+  useEffect(() => {
+    if (!resolvedPkgId) {
+      setFetchedPkgPhotos(null);
+      return;
+    }
+    const local = openPackages.find((p) => p.id === resolvedPkgId);
+    if (local) {
+      setFetchedPkgPhotos({
+        photo_opened_url: local.photo_opened_url ?? null,
+        photo_closed_url: local.photo_closed_url ?? null,
+        photo_return_label_url: local.photo_return_label_url ?? null,
+      });
+      return;
+    }
+    let cancelled = false;
+    void supabaseBrowser
+      .from("packages")
+      .select("photo_opened_url, photo_closed_url, photo_return_label_url")
+      .eq("id", resolvedPkgId)
+      .eq("organization_id", MVP_ORGANIZATION_ID)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (cancelled) return;
+        if (!data) {
+          setFetchedPkgPhotos(null);
+          return;
+        }
+        setFetchedPkgPhotos({
+          photo_opened_url: (data.photo_opened_url as string) ?? null,
+          photo_closed_url: (data.photo_closed_url as string) ?? null,
+          photo_return_label_url: (data.photo_return_label_url as string) ?? null,
+        });
+      });
+    return () => { cancelled = true; };
+  }, [resolvedPkgId, openPackages]);
+
+  const inheritedPackagePhotos = fetchedPkgPhotos;
+  const packageInheritsBoxPhotos = !!(
+    inheritedPackagePhotos &&
+    (inheritedPackagePhotos.photo_opened_url || inheritedPackagePhotos.photo_closed_url) &&
+    inheritedPackagePhotos.photo_return_label_url
+  );
 
   const conditions = conditionsFromKeys(state.condition_keys);
   const pkgIdForWarn = (inheritedContext?.packageId ?? state.package_link_id) || undefined;
@@ -3370,27 +3648,45 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
       if (pkg && !itemMatchesPackageExpectation(state.item_name, pkg)) onSoftPackageWarning();
     }
     const photoEvidence = Object.fromEntries(Object.entries(state.photos).map(([k, v]) => [k, v.length]));
-    const res = await insertReturn({
-      lpn: state.lpn || undefined,
-      marketplace: state.marketplace as string, item_name: state.item_name, conditions,
-      asin: state.asin.trim() || state.product_identifier.trim() || undefined,
-      fnsku: state.fnsku.trim() || undefined,
-      sku: state.sku.trim() || undefined,
-      notes: state.notes, photo_evidence: photoEvidence,
-      expiration_date: state.expiration_date || undefined,
-      batch_number: state.batch_number || undefined,
-      photo_item_url:   state.photo_item_url   || undefined,
-      photo_expiry_url: state.photo_expiry_url || undefined,
-      package_id: pkgId,
-      store_id:   state.store_id || undefined,
-      created_by: actor,
-    });
-    setSubmitting(false);
-    if (res.ok && res.data) {
-      onSuccess(res.data, state.photos);
-      setFlash(true);
-      setTimeout(() => { setFlash(false); setStep(1); setState({ ...EMPTY_WIZARD, package_link_id: inheritedContext?.packageId ?? "" }); setSubmitErr(""); }, 700);
-    } else setSubmitErr(res.error ?? "Submission failed.");
+    const orderId = state.amazon_order_id.trim() || undefined;
+    try {
+      const res = await insertReturn({
+        lpn: state.lpn || undefined,
+        marketplace: state.marketplace as string, item_name: state.item_name, conditions,
+        asin: state.asin.trim() || state.product_identifier.trim() || undefined,
+        fnsku: state.fnsku.trim() || undefined,
+        sku: state.sku.trim() || undefined,
+        order_id: orderId,
+        notes: state.notes, photo_evidence: photoEvidence,
+        expiration_date: state.expiration_date || undefined,
+        batch_number: state.batch_number || undefined,
+        photo_item_url:   state.photo_item_url   || undefined,
+        photo_expiry_url: state.photo_expiry_url || undefined,
+        package_id: pkgId,
+        store_id:   state.store_id || undefined,
+        created_by: actor,
+      });
+      if (res.ok && res.data) {
+        onSuccess(res.data, state.photos);
+        if (res.data.status === "ready_for_claim") {
+          onToast?.("Success: return saved and claim queued (ready_to_send) for the agent.", "success");
+        } else {
+          onToast?.("Success: return saved.", "success");
+        }
+        setFlash(true);
+        setTimeout(() => { setFlash(false); setStep(1); setState({ ...EMPTY_WIZARD, package_link_id: inheritedContext?.packageId ?? "" }); setSubmitErr(""); }, 700);
+      } else {
+        const msg = res.error ?? "Submission failed.";
+        setSubmitErr(msg);
+        onToast?.(msg, "error");
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Submission failed.";
+      setSubmitErr(msg);
+      onToast?.(msg, "error");
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -3410,15 +3706,32 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
           <StepIndicator step={step} total={3} />
         </div>
         <div className="flex-1 overflow-y-auto p-4 sm:p-6">
-          {step === 1 && <WizardStep1 state={state} setState={setState} openPackages={openPackages} openPallets={openPallets} onCreatePackage={onCreatePackage} onCreatePallet={onCreatePallet} inherited={inheritedContext} aiLabelEnabled={aiLabelEnabled} onAdvance={step1Valid ? () => setStep(2) : undefined} />}
+          {step === 1 && (
+            <WizardStep1
+              state={state}
+              setState={setState}
+              openPackages={openPackages}
+              openPallets={openPallets}
+              onCreatePackage={onCreatePackage}
+              onCreatePallet={onCreatePallet}
+              inherited={inheritedContext}
+              aiLabelEnabled={aiLabelEnabled}
+              onAdvance={step1Valid ? () => setStep(2) : undefined}
+              onNavigateToPackage={onNavigateToPackage}
+              onNavigateToPallet={onNavigateToPallet}
+            />
+          )}
           {step === 2 && (
             <WizardStep2
               state={state}
               setState={setState}
               conditions={conditions}
+              inheritedPackagePhotos={inheritedPackagePhotos}
+              packageInheritsBoxPhotos={packageInheritsBoxPhotos}
               photoCtx={{
                 hasPackageLink: !!(inheritedContext?.packageId ?? state.package_link_id),
                 orphanLpn: !!state.lpn.trim(),
+                packageInheritsBoxPhotos,
               }}
             />
           )}
@@ -3430,8 +3743,11 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
               pallets={openPallets}
               inherited={inheritedContext}
               onNotesChange={(v) => setState((p) => ({ ...p, notes: v }))}
+              onAmazonOrderIdChange={(v) => setState((p) => ({ ...p, amazon_order_id: v }))}
               packageExpectationMismatch={packageExpectationMismatch}
               onToast={onToast}
+              onNavigateToPackage={onNavigateToPackage}
+              onNavigateToPallet={onNavigateToPallet}
             />
           )}
         </div>

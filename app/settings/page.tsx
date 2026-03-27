@@ -6,7 +6,7 @@ import {
   ArrowLeft, BadgeCheck, BarChart3, Building2, CheckCircle2, ChevronUp, CreditCard, Cpu, Crown,
   Globe, HardDrive, ImageIcon, KeyRound, Loader2, Package, PackageX, Pencil, Plus, Printer,
   RefreshCw, RotateCcw, Save, ScanLine, Settings, ShieldAlert, ShieldCheck, Store, Tag, Trash2,
-  TriangleAlert, UserCog, Users, Wifi, X, Zap,
+  Truck, TriangleAlert, UserCog, Users, Wifi, X, Zap,
 } from "lucide-react";
 import {
   getClaimAgentConfig,
@@ -52,6 +52,7 @@ import {
   updateMarketplace, testConnection, deleteStore, updateStore,
   type StorePublicRow,
 } from "./adapters/actions";
+import { getClaimQueueSyncStatus, syncClaimQueueNow } from "../claim-engine/logistics-sync-actions";
 
 // ─── Types & Constants ────────────────────────────────────────────────────────
 
@@ -347,6 +348,14 @@ export default function SettingsPage() {
   const [claimAgentLoading, setClaimAgentLoading] = useState(false);
   const [claimAgentSaving, setClaimAgentSaving] = useState(false);
 
+  const [logisticsSyncStatus, setLogisticsSyncStatus] = useState<{
+    pendingSyncCount: number;
+    systemUpToDate: boolean;
+    readyForClaimCount?: number;
+  } | null>(null);
+  const [logisticsSyncLoading, setLogisticsSyncLoading] = useState(false);
+  const [logisticsSyncBusy, setLogisticsSyncBusy] = useState(false);
+
   const [toast, setToast] = useState<ToastState>(null);
 
   // ── Hydrate from localStorage ──────────────────────────────────────────────
@@ -408,6 +417,28 @@ export default function SettingsPage() {
     }
     loadClaimAgent();
   }, [mounted]);
+
+  // ── Claim queue sync status (Logistics AI Agent) ──────────────────────────
+  useEffect(() => {
+    if (!mounted || activeTab !== "claim_engine") return;
+    let cancelled = false;
+    setLogisticsSyncLoading(true);
+    getClaimQueueSyncStatus()
+      .then((r) => {
+        if (cancelled || !r.ok) return;
+        setLogisticsSyncStatus({
+          pendingSyncCount: r.pendingSyncCount ?? 0,
+          systemUpToDate: r.systemUpToDate ?? true,
+          readyForClaimCount: r.readyForClaimCount,
+        });
+      })
+      .finally(() => {
+        if (!cancelled) setLogisticsSyncLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mounted, activeTab]);
 
   // ── Load connected marketplace credentials ─────────────────────────────────
   useEffect(() => {
@@ -664,6 +695,29 @@ export default function SettingsPage() {
     showToast("Inventory / FEFO settings saved.", true);
   }
 
+  async function handleLogisticsSyncNow() {
+    if (mockPlan === "Free Tier") return;
+    setLogisticsSyncBusy(true);
+    try {
+      const res = await syncClaimQueueNow();
+      if (!res.ok) {
+        showToast(res.error ?? "Sync failed.", false);
+        return;
+      }
+      showToast(`Synced ${res.generated ?? 0} submission(s).`, true);
+      const st = await getClaimQueueSyncStatus();
+      if (st.ok) {
+        setLogisticsSyncStatus({
+          pendingSyncCount: st.pendingSyncCount ?? 0,
+          systemUpToDate: st.systemUpToDate ?? true,
+          readyForClaimCount: st.readyForClaimCount,
+        });
+      }
+    } finally {
+      setLogisticsSyncBusy(false);
+    }
+  }
+
   async function handleSaveClaimAgent(e: React.FormEvent) {
     e.preventDefault();
     if (mockPlan === "Free Tier") {
@@ -675,6 +729,11 @@ export default function SettingsPage() {
       showToast("Maximum auto-submit amount must be zero or positive.", false);
       return;
     }
+    const intervalH = Math.max(1, Math.min(168, Number(claimAgentLocal.logistics_sync_interval_hours ?? 2)));
+    if (Number.isNaN(intervalH)) {
+      showToast("Sync frequency must be between 1 and 168 hours.", false);
+      return;
+    }
     setClaimAgentSaving(true);
     const res = await saveClaimAgentConfig({
       auto_generate_pdf_reports: claimAgentLocal.auto_generate_pdf_reports ?? true,
@@ -684,6 +743,8 @@ export default function SettingsPage() {
       require_manual_approval_bulk_submission: claimAgentLocal.require_manual_approval_bulk_submission ?? true,
       default_marketplace_adapter_store_id:
         claimAgentLocal.default_marketplace_adapter_store_id?.trim() || null,
+      logistics_background_sync_enabled: claimAgentLocal.logistics_background_sync_enabled ?? false,
+      logistics_sync_interval_hours: intervalH,
     });
     setClaimAgentSaving(false);
     if (!res.ok) {
@@ -694,6 +755,7 @@ export default function SettingsPage() {
       ...DEFAULT_CLAIM_AGENT_CONFIG,
       ...claimAgentLocal,
       max_auto_submit_amount_usd: maxUsd,
+      logistics_sync_interval_hours: intervalH,
     };
     setClaimAgentSaved(merged);
     setClaimAgentLocal(merged);
@@ -2043,10 +2105,117 @@ export default function SettingsPage() {
               <form
                 onSubmit={handleSaveClaimAgent}
                 className={[
-                  "rounded-2xl border border-border bg-card p-6 shadow-sm space-y-6 transition-all",
+                  "space-y-6 transition-all",
                   mockPlan === "Free Tier" ? "opacity-50 pointer-events-none select-none" : "",
                 ].join(" ")}
               >
+                <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-5">
+                  <div className="flex items-start gap-3">
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-100 dark:bg-sky-950/50">
+                      <Truck className="h-5 w-5 text-sky-600 dark:text-sky-400" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <h3 className="text-sm font-bold text-foreground">Logistics AI Agent</h3>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        Align the claim queue with returns marked ready for claim. Manual sync enqueues missing submissions; background
+                        processing uses the interval below (for cron or worker hints).
+                      </p>
+                    </div>
+                  </div>
+
+                  {logisticsSyncLoading ? (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Checking queue…
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-3 rounded-xl border border-border bg-muted/10 p-4 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="text-xs text-muted-foreground">
+                        {logisticsSyncStatus ? (
+                          logisticsSyncStatus.systemUpToDate ? (
+                            <span className="font-semibold text-emerald-600 dark:text-emerald-400">System up to date</span>
+                          ) : (
+                            <span>
+                              <span className="font-semibold tabular-nums text-foreground">
+                                {logisticsSyncStatus.pendingSyncCount}
+                              </span>{" "}
+                              return(s) need a queue row
+                              {typeof logisticsSyncStatus.readyForClaimCount === "number" ? (
+                                <span className="text-muted-foreground">
+                                  {" "}
+                                  ({logisticsSyncStatus.readyForClaimCount} ready for claim total)
+                                </span>
+                              ) : null}
+                            </span>
+                          )
+                        ) : (
+                          <span>Queue status unavailable.</span>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        disabled={
+                          mockPlan === "Free Tier" ||
+                          logisticsSyncBusy ||
+                          logisticsSyncLoading ||
+                          (logisticsSyncStatus?.systemUpToDate ?? false)
+                        }
+                        onClick={() => void handleLogisticsSyncNow()}
+                        className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-sky-600 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-sky-500 disabled:opacity-50"
+                      >
+                        {logisticsSyncBusy ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-4 w-4" />
+                        )}
+                        {logisticsSyncStatus?.systemUpToDate ? "System up to date" : "Sync now"}
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="space-y-4 rounded-xl border border-border bg-muted/10 p-4">
+                    <label className="flex cursor-pointer items-start gap-3">
+                      <input
+                        type="checkbox"
+                        className="mt-1 h-4 w-4 rounded accent-sky-600"
+                        checked={claimAgentLocal.logistics_background_sync_enabled ?? false}
+                        onChange={(e) =>
+                          setClaimAgentLocal((p) => ({
+                            ...p,
+                            logistics_background_sync_enabled: e.target.checked,
+                          }))
+                        }
+                      />
+                      <span>
+                        <span className="block text-sm font-semibold">Background processing</span>
+                        <span className="text-xs text-muted-foreground">
+                          When enabled, periodic sync runs can enqueue missing claim submissions (configure your scheduler using the
+                          interval below).
+                        </span>
+                      </span>
+                    </label>
+                    <div>
+                      <label className={LABEL_CLS}>Sync frequency (hours)</label>
+                      <p className={HINT_CLS}>How often background sync should run (e.g. 2 = every 2 hours). Range 1–168.</p>
+                      <input
+                        type="number"
+                        min={1}
+                        max={168}
+                        step={1}
+                        value={claimAgentLocal.logistics_sync_interval_hours ?? 2}
+                        onChange={(e) =>
+                          setClaimAgentLocal((p) => ({
+                            ...p,
+                            logistics_sync_interval_hours: Number(e.target.value),
+                          }))
+                        }
+                        className={`${INPUT_CLS} mt-2 max-w-[140px] font-mono tabular-nums`}
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-6">
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                   <div className="flex items-start gap-3">
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-100 dark:bg-violet-950/50">
@@ -2243,6 +2412,7 @@ export default function SettingsPage() {
                     </div>
                   </>
                 )}
+                </div>
               </form>
             </div>
           )}
