@@ -1,36 +1,41 @@
-
 from fastapi import FastAPI, HTTPException
 from supabase import create_client, Client
 from pydantic import BaseModel
 import os
+from dotenv import load_dotenv
+
+# Load environment variables securely from .env file
+load_dotenv()
 
 app = FastAPI(title="Logistics AI Agent API", version="1.0")
 
-# ⚠️ Insert your Supabase URL and Key here
-# Use the 'service_role' key so the backend bypasses RLS restrictions
-SUPABASE_URL = "https://oeuytozpnohtpmidptcp.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9ldXl0b3pwbm9odHBtaWRwdGNwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3Mzc3Mzk4MywiZXhwIjoyMDg5MzQ5OTgzfQ.uH8nDyC3iocdHNhox4DH7z637w4UAzX-nNNcy3_3Lec"
+# Fetch keys from environment
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# Connect to Database
+# Initialize Database Connection
 try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("✅ Connected to Supabase Successfully!")
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print("Error: Missing Supabase credentials in .env file!")
+    else:
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("Connected to Supabase Successfully!")
 except Exception as e:
-    print(f"❌ Database Connection Error: {e}")
+    print(f"Database Connection Error: {e}")
 
-# Model for receiving raw Amazon data
+# Data Model for Amazon SP-API Sync
 class AmazonOrderSync(BaseModel):
     amazon_order_id: str
     org_id: str
     store_id: str
     raw_data: dict
 
-# 1. Root API (For server health check)
+# 1. Root Endpoint (Health Check)
 @app.get("/")
 def read_root():
-    return {"status": "Agent Backend is Live! 🚀", "service": "AI Logistics"}
+    return {"status": "Agent Backend is Live!", "service": "AI Logistics"}
 
-# 2. Endpoint to fetch ready claims (Main task for your colleague tomorrow)
+# 2. Agent Queue Endpoint
 @app.get("/agent/pending-claims")
 async def get_pending_claims():
     try:
@@ -39,7 +44,7 @@ async def get_pending_claims():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# 3. Endpoint to store live Amazon data in the DB (JSONB layer)
+# 3. Landing Zone Endpoint for Live Amazon Data
 @app.post("/sync/order")
 async def save_raw_amazon_order(order: AmazonOrderSync):
     try:
