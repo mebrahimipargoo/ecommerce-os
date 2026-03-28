@@ -18,27 +18,68 @@ export const BULK_ITEM_GRID_MAX = 9;
 export const EVIDENCE_IMAGES_PER_PAGE = BULK_ITEM_GRID_MAX;
 export const BULK_GRID_SIZE = 3;
 
-/** A4 points (72 dpi) — used for bulk item grid math. */
+/** A4 points (72 dpi) — layout math for item-detail pages (must not overflow). */
 const A4_PT = { w: 595, h: 842 };
 const BULK_ITEM_PAD = 14;
-/** Global header + three metadata boxes + notes + section title + footer (item detail page). */
-const ITEM_GLOBAL_HEADER_PT = 52;
-const ITEM_META_BOX_PT = 108;
-const ITEM_NOTES_BLOCK_PT = 34;
-const ITEM_PHOTO_TITLE_PT = 12;
 const BULK_PAGE_FOOTER_PT = 18;
-const ITEM_DETAIL_TOP_STACK =
-  ITEM_GLOBAL_HEADER_PT + ITEM_META_BOX_PT + ITEM_NOTES_BLOCK_PT + ITEM_PHOTO_TITLE_PT + BULK_PAGE_FOOTER_PT + 10;
-/** Remaining height for 3×3 grid on item detail page (fits one A4 with header + meta + notes). */
-const BULK_GRID_BLOCK_H = A4_PT.h - 2 * BULK_ITEM_PAD - ITEM_DETAIL_TOP_STACK;
+
+/**
+ * Dynamic vertical budget for the 3×3 evidence grid (item detail + single-claim evidence p.1).
+ *
+ * Available_Height = PageInnerHeight − FooterBand − Fuzz − (Header + ItemLine + Metadata + Notes + PhotoTitle + GridTopMargin)
+ * Max_Row_Height = (Available_Height − 2×rowGap) / 3
+ *
+ * Image containers MUST use at most (Max_Row_Height − label − cell chrome); never force a minimum image height
+ * (that was breaking "one item per page" by pushing row 3 off the page).
+ */
+const PAGE_INNER_H = A4_PT.h - 2 * BULK_ITEM_PAD;
+const FOOTER_CONTENT_CLEARANCE_PT = 20;
+const LAYOUT_FUZZ_PT = 6;
+
+const RES_GLOBAL_HEADER_PT = 52;
+const RES_ITEM_CONTEXT_LINE_PT = 18;
+/** Conservative ceiling for CompactMetadataGrid (3 columns; links / long lines). */
+const RES_METADATA_MAX_PT = 140;
+const RES_META_MARGIN_BOTTOM_PT = 8;
+const RES_NOTES_BLOCK_PT = 38;
+const RES_PHOTO_SECTION_TITLE_PT = 18;
+const RES_GRID_WRAPPER_TOP_PT = 2;
+
+const RESERVED_ABOVE_EVIDENCE_GRID_PT =
+  RES_GLOBAL_HEADER_PT +
+  RES_ITEM_CONTEXT_LINE_PT +
+  RES_METADATA_MAX_PT +
+  RES_META_MARGIN_BOTTOM_PT +
+  RES_NOTES_BLOCK_PT +
+  RES_PHOTO_SECTION_TITLE_PT +
+  RES_GRID_WRAPPER_TOP_PT;
+
+/** Total vertical space allocated to the 3×3 block (three rows + two inter-row gaps). */
+const AVAILABLE_EVIDENCE_GRID_PT = Math.max(
+  120,
+  PAGE_INNER_H -
+    FOOTER_CONTENT_CLEARANCE_PT -
+    LAYOUT_FUZZ_PT -
+    RESERVED_ABOVE_EVIDENCE_GRID_PT,
+);
+
+const GRID_INTER_ROW_GAP_PT = 2;
+const BULK_GRID_BLOCK_H =
+  AVAILABLE_EVIDENCE_GRID_PT - 2 * GRID_INTER_ROW_GAP_PT;
 const BULK_GRID_ROW_H = BULK_GRID_BLOCK_H / BULK_GRID_SIZE;
-const BULK_GRID_GAP = 3;
+
 const BULK_CELL_LABEL_H = 10;
-/** Image box height inside each grid cell (proportional scaling via objectFit: contain). */
-const BULK_CELL_IMG_H = Math.max(150, BULK_GRID_ROW_H - BULK_CELL_LABEL_H - BULK_GRID_GAP);
-const BULK_CELL_W = (A4_PT.w - 2 * BULK_ITEM_PAD - 2 * BULK_GRID_GAP) / BULK_GRID_SIZE;
-/** Inner image width inside bordered cell (padding + border). */
-const BULK_GRID_IMG_INNER_W = BULK_CELL_W - 8;
+/** Border (2) + padding (4) + label (10) + label margin (1) — must fit inside BULK_GRID_ROW_H. */
+const GRID_CELL_CHROME_PT = 17;
+const BULK_CELL_IMG_H = Math.max(
+  1,
+  Math.floor(BULK_GRID_ROW_H - BULK_CELL_LABEL_H - GRID_CELL_CHROME_PT),
+);
+const BULK_GRID_GAP = GRID_INTER_ROW_GAP_PT;
+const BULK_CELL_W =
+  (A4_PT.w - 2 * BULK_ITEM_PAD - 2 * GRID_INTER_ROW_GAP_PT) / BULK_GRID_SIZE;
+/** Inner image width inside bordered cell (horizontal padding + border). */
+const BULK_GRID_IMG_INNER_W = Math.max(1, BULK_CELL_W - 8);
 
 const styles = StyleSheet.create({
   page: { padding: 32, fontSize: 9, fontFamily: "Helvetica", color: "#0f172a" },
@@ -223,9 +264,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#cbd5e1",
     borderRadius: 4,
-    padding: 6,
-    marginBottom: 6,
-    minHeight: 34,
+    paddingVertical: 5,
+    paddingHorizontal: 6,
+    marginBottom: 5,
+    minHeight: 28,
     backgroundColor: "#fafafa",
   },
   notesLabel: {
@@ -246,7 +288,6 @@ const styles = StyleSheet.create({
   grid3Row: {
     flexDirection: "row",
     justifyContent: "space-between",
-    marginBottom: BULK_GRID_GAP,
     height: BULK_GRID_ROW_H,
   },
   grid3Cell: {
@@ -258,8 +299,8 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     color: "#475569",
     textAlign: "center" as const,
-    marginBottom: 2,
-    maxHeight: BULK_CELL_LABEL_H,
+    marginBottom: 1,
+    height: BULK_CELL_LABEL_H,
   },
   grid3Img: {
     width: BULK_GRID_IMG_INNER_W,
@@ -271,6 +312,7 @@ const styles = StyleSheet.create({
   },
   grid3CellBox: {
     width: BULK_CELL_W,
+    height: BULK_GRID_ROW_H,
     borderWidth: 1,
     borderColor: "#cbd5e1",
     borderRadius: 2,
@@ -591,9 +633,16 @@ function EvidenceGrid3x3({ items }: { items: { label: string; dataUri: string }[
     rows.push(slots.slice(r * BULK_GRID_SIZE, r * BULK_GRID_SIZE + BULK_GRID_SIZE));
   }
   return (
-    <View style={{ marginTop: 2 }}>
+    <View style={{ marginTop: RES_GRID_WRAPPER_TOP_PT }}>
       {rows.map((row, ri) => (
-        <View key={ri} style={styles.grid3Row} wrap={false}>
+        <View
+          key={ri}
+          style={[
+            styles.grid3Row,
+            ri < BULK_GRID_SIZE - 1 ? { marginBottom: GRID_INTER_ROW_GAP_PT } : {},
+          ]}
+          wrap={false}
+        >
           {row.map((cell, ci) => (
             <View key={ci} style={styles.grid3Cell} wrap={false}>
               {cell.dataUri ? (
