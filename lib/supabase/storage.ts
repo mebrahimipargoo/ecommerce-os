@@ -1,32 +1,23 @@
-import { supabase } from "../../src/lib/supabase";
+import type { MediaUploadFolder } from "../media-upload-actions";
+import { uploadMediaFileAction } from "../media-upload-actions";
+import { resolveOrganizationId } from "../organization";
 
-const BUCKET = "media";
-
-export type UploadFolder =
-  | "packages"
-  | "packages/claim_closed"
-  | "packages/claim_opened"
-  | "packages/claim_return_label"
-  | "pallets";
+export type UploadFolder = MediaUploadFolder;
 
 /**
- * Uploads a File to Supabase Storage and returns the public URL.
- * Files are stored under `{folder}/{timestamp}-{random}.{ext}`.
+ * Uploads a File via a Server Action (service role) and returns the public URL.
+ * Passes `organization_id` so Storage paths and RLS policies can scope by tenant.
  */
 export async function uploadToStorage(
   file: File,
   folder: UploadFolder = "packages",
+  organizationId?: string,
 ): Promise<string> {
-  const ext = file.name.split(".").pop()?.toLowerCase() ?? "jpg";
-  const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const path = `${folder}/${unique}.${ext}`;
-
-  const { error } = await supabase.storage
-    .from(BUCKET)
-    .upload(path, file, { upsert: true });
-
-  if (error) throw new Error(error.message);
-
-  const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
-  return data.publicUrl;
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("folder", folder);
+  fd.append("organization_id", organizationId ?? resolveOrganizationId());
+  const res = await uploadMediaFileAction(fd);
+  if (!res.ok) throw new Error(res.error);
+  return res.publicUrl;
 }

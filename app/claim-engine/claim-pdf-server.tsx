@@ -40,6 +40,7 @@ export async function renderSingleClaimPdfBuffer(opts: {
       detail={opts.detail}
       claimAmountNote={opts.claimAmountNote}
       marketplaceClaimIdNote={opts.marketplaceClaimIdNote}
+      evidenceImages={[]}
     />,
   );
   const stream = await instance.toBuffer();

@@ -1,4 +1,5 @@
 import { resolveOrganizationId } from "../../lib/organization";
+import { getOrganizationClaimEvidenceDefaults } from "../settings/organization-claim-evidence-actions";
 import { getCoreSettings } from "../settings/workspace-settings-actions";
 import { listStores } from "../settings/adapters/actions";
 import { ClaimEngineClient } from "./ClaimEngineClient";
@@ -14,11 +15,12 @@ export default async function ClaimEnginePage() {
   const claims = claimsRes.ok ? claimsRes.data : [];
   const claimsError = claimsRes.ok ? null : claimsRes.error ?? null;
 
-  const [coreSettings, storesRes, subRes, kpiRes] = await Promise.all([
+  const [coreSettings, storesRes, subRes, kpiRes, claimEvDefaults] = await Promise.all([
     getCoreSettings(),
     listStores(),
     listClaimSubmissions(DEFAULT_ORGANIZATION_ID),
     getClaimEngineKpis(DEFAULT_ORGANIZATION_ID),
+    getOrganizationClaimEvidenceDefaults(DEFAULT_ORGANIZATION_ID),
   ]);
 
   const stores =
@@ -39,6 +41,7 @@ export default async function ClaimEnginePage() {
       submissionsError={subRes.ok ? null : subRes.error ?? null}
       kpis={kpiRes.ok && kpiRes.data ? kpiRes.data : null}
       kpisError={kpiRes.ok ? null : kpiRes.error ?? null}
+      defaultClaimEvidence={claimEvDefaults}
     />
   );
 }

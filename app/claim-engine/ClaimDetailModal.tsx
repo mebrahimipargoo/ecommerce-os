@@ -9,7 +9,8 @@ import {
   type ClaimDetailPayload,
   type ClaimRecord,
 } from "./claim-actions";
-import { downloadSingleClaimPdf } from "./claim-pdf-download";
+import type { ClaimEvidenceKey } from "./claim-evidence-settings";
+import { ClaimGenerationModal } from "./ClaimGenerationModal";
 import { ReturnIdentifiersColumn } from "../../components/ReturnIdentifiersColumn";
 import { InlineCopy } from "../returns/_components";
 
@@ -27,6 +28,7 @@ export function ClaimDetailModal({
   coreSettings,
   stores,
   organizationId,
+  defaultClaimEvidence,
   onToast,
   onUpdated,
 }: {
@@ -36,6 +38,7 @@ export function ClaimDetailModal({
   coreSettings: CoreSettings;
   stores: StoreRow[];
   organizationId: string;
+  defaultClaimEvidence: Record<ClaimEvidenceKey, boolean>;
   onToast: (msg: string, kind?: "success" | "error" | "warning") => void;
   onUpdated: () => void;
 }) {
@@ -46,7 +49,7 @@ export function ClaimDetailModal({
   const [claimIdField, setClaimIdField] = useState("");
   const [linkStatus, setLinkStatus] = useState("pending");
   const [saving, setSaving] = useState(false);
-  const [pdfBusy, setPdfBusy] = useState(false);
+  const [claimGenOpen, setClaimGenOpen] = useState(false);
 
   useEffect(() => {
     if (!open || !claim) {
@@ -106,27 +109,12 @@ export function ClaimDetailModal({
     } else onToast(res.error ?? "Save failed", "error");
   }
 
-  async function handleExportPdf() {
+  function handleOpenClaimPdf() {
     if (!detail) {
       onToast("Load claim details first", "warning");
       return;
     }
-    setPdfBusy(true);
-    try {
-      await downloadSingleClaimPdf({
-        tenant: coreSettings,
-        storeName,
-        storePlatform,
-        detail,
-        claimAmountNote: claimAmount.trim() || undefined,
-        marketplaceClaimIdNote: claimIdField.trim() || undefined,
-      });
-      onToast("PDF downloaded", "success");
-    } catch {
-      onToast("PDF export failed", "error");
-    } finally {
-      setPdfBusy(false);
-    }
+    setClaimGenOpen(true);
   }
 
   const ret = detail?.returnRow;
@@ -136,6 +124,19 @@ export function ClaimDetailModal({
   const sku = ret?.sku ?? claim.sku ?? "";
 
   return (
+    <>
+    <ClaimGenerationModal
+      open={claimGenOpen}
+      onClose={() => setClaimGenOpen(false)}
+      submissionId={claim?.id ?? null}
+      organizationId={organizationId}
+      coreSettings={coreSettings}
+      stores={stores}
+      defaultClaimEvidence={defaultClaimEvidence}
+      claimAmountNote={claimAmount.trim() || undefined}
+      marketplaceClaimIdNote={claimIdField.trim() || undefined}
+      onToast={onToast}
+    />
     <div className="fixed inset-0 z-[400] flex items-end justify-center bg-black/50 p-4 sm:items-center">
       <div
         role="dialog"
@@ -150,11 +151,11 @@ export function ClaimDetailModal({
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => void handleExportPdf()}
-              disabled={pdfBusy || loading || !detail}
+              onClick={() => handleOpenClaimPdf()}
+              disabled={loading || !detail}
               className="inline-flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-800 disabled:opacity-50 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-200"
             >
-              {pdfBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileDown className="h-4 w-4" />}
+              <FileDown className="h-4 w-4" />
               Export as Claim PDF
             </button>
             <button
@@ -334,6 +335,7 @@ export function ClaimDetailModal({
         </div>
       </div>
     </div>
+    </>
   );
 }
 

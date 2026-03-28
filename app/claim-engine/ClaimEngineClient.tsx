@@ -39,8 +39,8 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { useTableSortFilter, useSortFilterState, type SortDir } from "../../hooks/use-table-sort-filter";
-import { supabase } from "../../src/lib/supabase";
 import type { CoreSettings } from "../settings/workspace-settings-types";
+import type { ClaimEvidenceKey } from "./claim-evidence-settings";
 import type { PalletRecord, PackageRecord } from "../returns/actions";
 import { ReturnIdentifiersColumn } from "../../components/ReturnIdentifiersColumn";
 import { InlineCopy, StatusBadge } from "../returns/_components";
@@ -55,11 +55,10 @@ import {
   refreshClaimReportSignedUrl,
   type ClaimSubmissionListRow,
 } from "./claim-submission-actions";
-import { downloadBulkClaimsPdf } from "./claim-pdf-download";
+import { downloadBulkClaimsPdf, enrichBulkPagesWithDefaultEvidence } from "./claim-pdf-download";
 import { prepareClaimEnginePdfPages } from "./claim-pdf-batch-actions";
-import { markClaimSubmissionsPrintedLocally, type ReadyToSendPrintRow } from "./claim-print-html-actions";
-import { CLAIM_SUBMISSIONS_WITH_RETURNS_EMBED } from "./claim-submissions-constants";
 import { ClaimDetailModal } from "./ClaimDetailModal";
+import { ClaimGenerationModal } from "./ClaimGenerationModal";
 import { ClaimHistoryModal } from "./ClaimHistoryModal";
 
 type StoreRow = { id: string; name: string; platform: string };
@@ -203,6 +202,7 @@ export function ClaimEngineClient({
   submissionsError,
   kpis,
   kpisError,
+  defaultClaimEvidence,
 }: {
   claims: ClaimRecord[];
   claimsError: string | null;
@@ -213,6 +213,7 @@ export function ClaimEngineClient({
   submissionsError: string | null;
   kpis: ClaimEngineKpis | null;
   kpisError: string | null;
+  defaultClaimEvidence: Record<ClaimEvidenceKey, boolean>;
 }) {
   const router = useRouter();
   const [claims, setClaims] = useState<ClaimRecord[]>(initialClaims);
@@ -222,7 +223,6 @@ export function ClaimEngineClient({
   const [toast, setToast] = useState<{ msg: string; kind: "success" | "error" | "warning" } | null>(null);
   const [activeTab, setActiveTab] = useState<"workspace" | "queue">("workspace");
   const [generateBusy, setGenerateBusy] = useState(false);
-  const [pdfGenerating, setPdfGenerating] = useState(false);
   const [bulkSubmitBusy, setBulkSubmitBusy] = useState(false);
   const [queueBusyId, setQueueBusyId] = useState<string | null>(null);
   const [approveBusyId, setApproveBusyId] = useState<string | null>(null);
@@ -230,6 +230,8 @@ export function ClaimEngineClient({
   /** Submission-queue row selection for PDF batch (takes priority over workspace selection). */
   const [queueSelectedIds, setQueueSelectedIds] = useState<Set<string>>(new Set());
   const [queueBulkPdfBusy, setQueueBulkPdfBusy] = useState(false);
+  const [claimGenSubmissionId, setClaimGenSubmissionId] = useState<string | null>(null);
+  const [claimGenAmountNote, setClaimGenAmountNote] = useState<string | undefined>(undefined);
 
   const claimsSf = useSortFilterState();
   const queueSf = useSortFilterState();
@@ -301,180 +303,37 @@ export function ClaimEngineClient({
     columns: queueColumns,
   });
 
-  function marketplaceFaviconSrc(platform: string | null | undefined): string {
-    const p = (platform ?? "").toLowerCase();
-    if (p.includes("walmart")) return "https://www.google.com/s2/favicons?domain=walmart.com&sz=64";
-    if (p.includes("ebay")) return "https://www.google.com/s2/favicons?domain=ebay.com&sz=64";
-    return "https://www.google.com/s2/favicons?domain=amazon.com&sz=64";
-  }
-
-  function buildClaimSubmissionPrintHtml(
-    rows: ReadyToSendPrintRow[],
-    companyName: string,
-    logoUrl: string | null,
-  ): string {
-    const esc = (s: string) =>
-      s
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    const blocks = rows
-      .map((r) => {
-        const photos = (r.photo_urls ?? [])
-          .slice(0, 8)
-          .map(
-            (url) =>
-              `<img src="${esc(url)}" alt="" style="width:112px;height:112px;object-fit:contain;border:1px solid #e2e8f0;border-radius:6px;background:#f8fafc"/>`,
-          )
-          .join("");
-        const mpIcon = `<img src="${esc(marketplaceFaviconSrc(r.store_platform))}" width="22" height="22" alt="" style="vertical-align:middle;border-radius:4px"/>`;
-        return `<section style="page-break-inside:avoid;margin-bottom:20px;border:1px solid #e2e8f0;border-radius:10px;padding:16px;background:#fff">
-<div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start">
-<div style="min-width:0;flex:1">
-<div style="font-size:15px;font-weight:700;color:#0f172a">${esc(r.item_name ?? "—")}</div>
-<div style="margin-top:6px;font-size:12px;color:#475569;font-family:ui-monospace,monospace">ASIN ${esc((r.asin && String(r.asin).trim()) ? String(r.asin).trim() : "Unknown ASIN")} · FNSKU ${esc(r.fnsku?.trim() || "—")} · SKU ${esc(r.sku?.trim() || "—")}</div>
-<div style="margin-top:8px;font-size:13px">Claim amount: <strong>${esc(formatMoneyUsd2(r.claim_amount))}</strong></div>
-</div>
-<div style="text-align:right;font-size:12px;color:#64748b;max-width:40%">
-${mpIcon}
-<div style="margin-top:4px;font-weight:600;color:#0f172a">${esc(r.store_name ?? "Sales channel")}</div>
-<div style="font-size:11px;text-transform:capitalize">${esc(r.store_platform ?? "—")}</div>
-</div>
-</div>
-${photos ? `<div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px">${photos}</div>` : `<p style="margin:12px 0 0;font-size:11px;color:#94a3b8">No item photos on this return (add item/expiry photos or <code>photo_urls</code> in Returns).</p>`}
-</section>`;
-      })
-      .join("");
-    const logoBlock = logoUrl
-      ? `<div style="margin-bottom:12px"><img src="${esc(logoUrl)}" alt="" style="max-height:48px;max-width:220px;object-fit:contain"/></div>`
-      : "";
-    return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Claim submission report</title>
-<style>
-@page{margin:16mm}
-body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;padding:24px;color:#0f172a;background:#fff}
-h1{font-size:22px;margin:0 0 4px;font-weight:700}
-.sub{color:#64748b;font-size:12px;margin:0 0 20px}
-.footer{margin-top:24px;padding-top:12px;border-top:1px solid #e2e8f0;font-size:10px;color:#94a3b8;text-align:center}
-</style></head><body>
-${logoBlock}
-<h1>${esc(companyName)}</h1>
-<p class="sub">Claim submission report — ${esc(new Date().toLocaleString())} — ${rows.length} claim(s)</p>
-${blocks}
-<p class="footer">Generated locally · Save as PDF from the print dialog · E-commerce OS</p>
-</body></html>`;
-  }
-
-  /** Map browser Supabase row (with embedded `returns`) → print row shape. */
-  function mapClientSubmissionToPrintRow(row: Record<string, unknown>): ReadyToSendPrintRow {
-    const retRaw = row.returns;
-    const ret = (Array.isArray(retRaw) ? retRaw[0] : retRaw) as Record<string, unknown> | null | undefined;
-    const rawStores = ret?.stores as
-      | { name?: string; platform?: string }
-      | { name?: string; platform?: string }[]
-      | null
-      | undefined;
-    const stores = Array.isArray(rawStores) ? rawStores[0] : rawStores;
-    const photo_urls: string[] = [];
-    if (ret?.photo_item_url && String(ret.photo_item_url).trim()) photo_urls.push(String(ret.photo_item_url).trim());
-    if (ret?.photo_expiry_url && String(ret.photo_expiry_url).trim()) photo_urls.push(String(ret.photo_expiry_url).trim());
-    return {
-      id: String(row.id),
-      item_name: ret?.item_name != null ? String(ret.item_name) : null,
-      asin: ret?.asin != null ? String(ret.asin) : null,
-      fnsku: ret?.fnsku != null ? String(ret.fnsku) : null,
-      sku: ret?.sku != null ? String(ret.sku) : null,
-      claim_amount: Number(row.claim_amount ?? 0) || 0,
-      store_name: stores?.name?.trim() || null,
-      store_platform: stores?.platform?.trim() || null,
-      photo_urls,
-    };
-  }
-
-  /** Direct browser fetch → HTML → print → server mark (no reliance on SSR queue state). */
-  async function handleGeneratePdfReport() {
-    setPdfGenerating(true);
-    try {
-      const attempt = await supabase
-        .from("claim_submissions")
-        .select(CLAIM_SUBMISSIONS_WITH_RETURNS_EMBED)
-        .eq("status", "ready_to_send");
-      console.log("Generate PDF client fetch:", attempt.data, attempt.error);
-
-      let list = (attempt.data ?? []) as Record<string, unknown>[];
-      if (attempt.error || list.length === 0) {
-        const fallback = await supabase.from("claim_submissions").select("*").eq("status", "ready_to_send");
-        console.log("Generate PDF fallback fetch:", fallback.data, fallback.error);
-        if (fallback.error) {
-          showToast(fallback.error.message ?? "Supabase fetch failed", "error");
-          return;
-        }
-        list = (fallback.data ?? []) as Record<string, unknown>[];
-      }
-
-      if (list.length === 0) {
-        showToast("No ready_to_send rows in claim_submissions (check RLS / data).", "warning");
+  /**
+   * Opens the evidence picker for exactly one selected submission (queue or workspace claim row).
+   */
+  function handleGeneratePdfReport() {
+    if (activeTab === "queue") {
+      if (queueSelectedIds.size === 1) {
+        const id = [...queueSelectedIds][0];
+        const row = submissionQueueRows.find((r) => r.id === id);
+        setClaimGenAmountNote(row ? String(row.claim_amount ?? "") : undefined);
+        setClaimGenSubmissionId(id);
         return;
       }
-
-      const rows: ReadyToSendPrintRow[] = list.map((r) => mapClientSubmissionToPrintRow(r));
-      const company = (coreSettings.company_name ?? "").trim() || "Workspace";
-      const logoRaw = (coreSettings.company_logo_url ?? coreSettings.logo_url ?? "") as string;
-      const logoUrl = typeof logoRaw === "string" && logoRaw.trim() ? logoRaw.trim() : null;
-      const html = buildClaimSubmissionPrintHtml(rows, company, logoUrl);
-
-      const opened = window.open("", "_blank", "noopener,noreferrer");
-      if (!opened) {
-        showToast("Pop-up blocked. Allow pop-ups to print.", "error");
-        return;
-      }
-      const printWin: Window = opened;
-      printWin.document.open();
-      printWin.document.write(html);
-      printWin.document.close();
-
-      const ids = rows.map((r) => r.id);
-      let marked = false;
-      const runMark = async () => {
-        if (marked) return;
-        marked = true;
-        const up = await markClaimSubmissionsPrintedLocally(ids, undefined, { relaxStatus: false });
-        if (up.ok) {
-          showToast(
-            `Printed ${rows.length} claim report(s); queue marked submitted (report_url: generated_locally).`,
-            "success",
-          );
-          router.refresh();
-        } else {
-          showToast(up.error ?? "Print opened but database update failed.", "error");
-        }
-      };
-
-      const fallbackTimer = window.setTimeout(() => {
-        void runMark();
-      }, 2500);
-
-      function onAfterPrint() {
-        window.clearTimeout(fallbackTimer);
-        void runMark();
-        printWin.removeEventListener("afterprint", onAfterPrint);
-      }
-
-      printWin.addEventListener("afterprint", onAfterPrint);
-
-      window.setTimeout(() => {
-        try {
-          printWin.focus();
-          printWin.print();
-        } catch {
-          void runMark();
-        }
-      }, 100);
-    } catch {
-      showToast("PDF generation failed.", "error");
-    } finally {
-      setPdfGenerating(false);
+      showToast(
+        "Select exactly one submission in the queue (checkbox) to configure evidence, or use Generate PDF on a row.",
+        "warning",
+      );
+      return;
     }
+    if (selectedIds.size === 1) {
+      const id = [...selectedIds][0];
+      const claim = claims.find((c) => c.id === id);
+      setClaimGenAmountNote(claim ? String(claim.amount ?? "") : undefined);
+      setClaimGenSubmissionId(id);
+      return;
+    }
+    showToast("Select exactly one claim in the workspace table to configure evidence.", "warning");
+  }
+
+  function openClaimGenerationForRow(row: ClaimSubmissionListRow) {
+    setClaimGenAmountNote(String(row.claim_amount ?? ""));
+    setClaimGenSubmissionId(row.id);
   }
 
   async function handleEnqueuePipelineReports() {
@@ -623,7 +482,8 @@ ${blocks}
       };
     });
     try {
-      await downloadBulkClaimsPdf({ tenant: coreSettings, pages });
+      const enriched = await enrichBulkPagesWithDefaultEvidence(pages, defaultClaimEvidence);
+      await downloadBulkClaimsPdf({ tenant: coreSettings, pages: enriched });
       showToast("Bulk PDF downloaded", "success");
     } catch {
       showToast("Bulk PDF failed", "error");
@@ -640,15 +500,17 @@ ${blocks}
         showToast(res.error ?? "Could not build PDF report", "error");
         return;
       }
+      const mapped = res.pages.map((p) => ({
+        storeName: p.storeName,
+        storePlatform: p.storePlatform,
+        detail: p.detail,
+        claimAmountNote: p.claimAmountNote,
+        marketplaceClaimIdNote: p.marketplaceClaimIdNote,
+      }));
+      const enriched = await enrichBulkPagesWithDefaultEvidence(mapped, defaultClaimEvidence);
       await downloadBulkClaimsPdf({
         tenant: coreSettings,
-        pages: res.pages.map((p) => ({
-          storeName: p.storeName,
-          storePlatform: p.storePlatform,
-          detail: p.detail,
-          claimAmountNote: p.claimAmountNote,
-          marketplaceClaimIdNote: p.marketplaceClaimIdNote,
-        })),
+        pages: enriched,
         filename: `claims-bulk-report-${Date.now()}.pdf`,
         reportKind: "batch",
       });
@@ -710,6 +572,21 @@ ${blocks}
         </div>
       ) : null}
 
+      <ClaimGenerationModal
+        open={claimGenSubmissionId !== null}
+        onClose={() => {
+          setClaimGenSubmissionId(null);
+          setClaimGenAmountNote(undefined);
+        }}
+        submissionId={claimGenSubmissionId}
+        organizationId={organizationId}
+        coreSettings={coreSettings}
+        stores={stores}
+        defaultClaimEvidence={defaultClaimEvidence}
+        claimAmountNote={claimGenAmountNote}
+        onToast={showToast}
+      />
+
       <ClaimDetailModal
         open={modalClaim !== null}
         onClose={() => setModalClaim(null)}
@@ -717,6 +594,7 @@ ${blocks}
         coreSettings={coreSettings}
         stores={stores}
         organizationId={organizationId}
+        defaultClaimEvidence={defaultClaimEvidence}
         onToast={showToast}
         onUpdated={() => {
           setModalClaim(null);
@@ -900,11 +778,11 @@ ${blocks}
               </button>
               <button
                 type="button"
-                disabled={bulkBusy || pdfGenerating}
+                disabled={bulkBusy}
                 onClick={() => void handleGeneratePdfReport()}
                 className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-900 disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100"
               >
-                {pdfGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+                <FileText className="h-4 w-4" />
                 Generate PDF
               </button>
               <button
@@ -1195,12 +1073,11 @@ ${blocks}
                 <div className="flex flex-wrap gap-2">
                   <button
                     type="button"
-                    disabled={pdfGenerating}
                     onClick={() => void handleGeneratePdfReport()}
                     className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-900 disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100"
                   >
-                    {pdfGenerating ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-                    {pdfGenerating ? "Generating…" : "Generate PDF report"}
+                    <FileText className="h-4 w-4" />
+                    Generate PDF report
                   </button>
                   <button
                     type="button"
@@ -1268,10 +1145,6 @@ ${blocks}
                 <div className="border-b border-sky-300/80 bg-gradient-to-r from-sky-100/90 to-sky-50/90 px-4 py-3 dark:border-sky-800 dark:from-sky-950/80 dark:to-slate-950/60">
                   <p className="text-sm font-bold text-sky-950 dark:text-sky-100">
                     {readyToSendCount} claim{readyToSendCount === 1 ? "" : "s"} ready to send
-                  </p>
-                  <p className="mt-0.5 text-xs text-sky-900/90 dark:text-sky-200/90">
-                    Poll <code className="rounded bg-white/60 px-1 font-mono text-[11px] dark:bg-slate-900/80">claim_submissions</code> with{" "}
-                    <code className="rounded bg-white/60 px-1 font-mono text-[11px] dark:bg-slate-900/80">status = &apos;ready_to_send&apos;</code> for Agent submission testing.
                   </p>
                 </div>
               ) : null}
@@ -1352,6 +1225,14 @@ ${blocks}
                         >
                           {row.status.replace(/_/g, " ")}
                         </span>
+                        <button
+                          type="button"
+                          onClick={() => openClaimGenerationForRow(row)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100"
+                        >
+                          <FileText className="h-3.5 w-3.5" />
+                          Generate PDF
+                        </button>
                         <Link
                           href={`/claim-engine/investigation/${row.id}`}
                           className="inline-flex items-center gap-1.5 rounded-lg border border-violet-200 bg-violet-50 px-2.5 py-1.5 text-[11px] font-semibold text-violet-900 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-100"

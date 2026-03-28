@@ -53,6 +53,16 @@ import {
   type StorePublicRow,
 } from "./adapters/actions";
 import { getClaimQueueSyncStatus, syncClaimQueueNow } from "../claim-engine/logistics-sync-actions";
+import {
+  CLAIM_EVIDENCE_KEY_LABELS,
+  type ClaimEvidenceKey,
+  mergeDefaultClaimEvidence,
+  type DefaultClaimEvidence,
+} from "../claim-engine/claim-evidence-settings";
+import {
+  getOrganizationClaimEvidenceDefaults,
+  saveOrganizationClaimEvidenceDefaults,
+} from "./organization-claim-evidence-actions";
 
 // ─── Types & Constants ────────────────────────────────────────────────────────
 
@@ -348,6 +358,12 @@ export default function SettingsPage() {
   const [claimAgentLoading, setClaimAgentLoading] = useState(false);
   const [claimAgentSaving, setClaimAgentSaving] = useState(false);
 
+  const [claimEvidenceLocal, setClaimEvidenceLocal] = useState<Record<ClaimEvidenceKey, boolean>>(() =>
+    mergeDefaultClaimEvidence(null),
+  );
+  const [claimEvidenceLoading, setClaimEvidenceLoading] = useState(false);
+  const [claimEvidenceSaving, setClaimEvidenceSaving] = useState(false);
+
   const [logisticsSyncStatus, setLogisticsSyncStatus] = useState<{
     pendingSyncCount: number;
     systemUpToDate: boolean;
@@ -434,6 +450,24 @@ export default function SettingsPage() {
       })
       .finally(() => {
         if (!cancelled) setLogisticsSyncLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mounted, activeTab]);
+
+  // ── Default claim evidence (organization_settings.default_claim_evidence) ─
+  useEffect(() => {
+    if (!mounted || activeTab !== "claim_engine") return;
+    let cancelled = false;
+    setClaimEvidenceLoading(true);
+    getOrganizationClaimEvidenceDefaults()
+      .then((r) => {
+        if (cancelled) return;
+        setClaimEvidenceLocal(r);
+      })
+      .finally(() => {
+        if (!cancelled) setClaimEvidenceLoading(false);
       });
     return () => {
       cancelled = true;
@@ -760,6 +794,27 @@ export default function SettingsPage() {
     setClaimAgentSaved(merged);
     setClaimAgentLocal(merged);
     showToast("Claim agent settings saved.", true);
+  }
+
+  async function handleSaveClaimEvidence(e: React.FormEvent) {
+    e.preventDefault();
+    if (mockPlan === "Free Tier") {
+      showToast("Upgrade to Pro to configure default claim evidence.", false);
+      return;
+    }
+    setClaimEvidenceSaving(true);
+    const patch: DefaultClaimEvidence = {};
+    (Object.keys(CLAIM_EVIDENCE_KEY_LABELS) as ClaimEvidenceKey[]).forEach((k) => {
+      patch[k] = claimEvidenceLocal[k];
+    });
+    const res = await saveOrganizationClaimEvidenceDefaults(patch);
+    setClaimEvidenceSaving(false);
+    if (!res.ok) {
+      showToast(res.error ?? "Failed to save evidence defaults.", false);
+      return;
+    }
+    setClaimEvidenceLocal(mergeDefaultClaimEvidence(patch));
+    showToast("Default claim evidence saved.", true);
   }
 
   function handleSaveHardware(e: React.FormEvent) {
@@ -2101,6 +2156,61 @@ export default function SettingsPage() {
                   </div>
                 </div>
               )}
+
+              <form
+                onSubmit={handleSaveClaimEvidence}
+                className={[
+                  "space-y-6 transition-all",
+                  mockPlan === "Free Tier" ? "opacity-50 pointer-events-none select-none" : "",
+                ].join(" ")}
+              >
+                <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-4">
+                  <div className="flex items-start gap-3">
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-100 dark:bg-emerald-950/50">
+                      <ImageIcon className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <h3 className="text-sm font-bold text-foreground">Default Claim Evidence</h3>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        Choose which inherited photos are pre-selected when generating a claim PDF. Stored in{" "}
+                        <code className="rounded bg-muted px-1 font-mono text-[10px]">organization_settings.default_claim_evidence</code> (JSONB).
+                      </p>
+                    </div>
+                  </div>
+                  {claimEvidenceLoading ? (
+                    <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Loading…
+                    </div>
+                  ) : (
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      {(Object.keys(CLAIM_EVIDENCE_KEY_LABELS) as ClaimEvidenceKey[]).map((key) => (
+                        <label key={key} className="flex cursor-pointer items-start gap-3 rounded-xl border border-border bg-muted/10 p-3">
+                          <input
+                            type="checkbox"
+                            className="mt-0.5 h-4 w-4 rounded accent-emerald-600"
+                            checked={claimEvidenceLocal[key] ?? false}
+                            onChange={(e) =>
+                              setClaimEvidenceLocal((p) => ({ ...p, [key]: e.target.checked }))
+                            }
+                          />
+                          <span className="text-sm font-medium text-foreground">{CLAIM_EVIDENCE_KEY_LABELS[key]}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                  <div className="flex flex-wrap gap-2 border-t border-border pt-4">
+                    <button
+                      type="submit"
+                      disabled={claimEvidenceSaving || claimEvidenceLoading || mockPlan === "Free Tier"}
+                      className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white transition hover:bg-emerald-500 disabled:opacity-50"
+                    >
+                      {claimEvidenceSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                      Save evidence defaults
+                    </button>
+                  </div>
+                </div>
+              </form>
 
               <form
                 onSubmit={handleSaveClaimAgent}

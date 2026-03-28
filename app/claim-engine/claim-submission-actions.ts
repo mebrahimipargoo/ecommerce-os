@@ -3,6 +3,16 @@
 import { randomUUID } from "node:crypto";
 
 import { supabaseServer } from "../../lib/supabase-server";
+import { resolveOrganizationId } from "../../lib/organization";
+import { isUuidString } from "../../lib/uuid";
+import {
+  buildClaimSubmissionSourcePayloadForReturn,
+  resolveClaimSubmissionStoreId,
+} from "../returns/actions";
+import {
+  shouldAutoEnqueueAmazonClaimSubmission,
+  storePlatformFromEmbed,
+} from "../returns/claim-queue-helpers";
 import {
   CLAIM_SUBMISSION_RETURN_ID_COLUMN,
   CLAIM_SUBMISSIONS_TABLE,
@@ -51,8 +61,8 @@ async function signedUrlForPath(path: string | null): Promise<string | null> {
 }
 
 /**
- * Force-build submission queue: every `ready_for_claim` return gets a `claim_submissions` row
- * (`ready_to_send`) without PDF/identifier validation. Existing rows are upserted back to `ready_to_send`.
+ * Force-build submission queue: every Amazon `ready_for_claim` return gets a `claim_submissions` row
+ * (`ready_to_send`). Existing rows are upserted. Non-Amazon channels are skipped.
  */
 export async function approveClaimSubmission(
   submissionId: string,
@@ -77,7 +87,9 @@ export async function generateDailyClaimReports(
   try {
     const { data: readyRows, error: rErr } = await supabaseServer
       .from("returns")
-      .select("id, organization_id, store_id, estimated_value")
+      .select(
+        "id, organization_id, store_id, estimated_value, marketplace, conditions, order_id, package_id, expiration_date, batch_number, notes, stores(platform)",
+      )
       .eq("organization_id", organizationId)
       .eq("status", "ready_for_claim")
       .is("deleted_at", null);
@@ -91,23 +103,56 @@ export async function generateDailyClaimReports(
     const now = new Date().toISOString();
 
     for (const ret of rows) {
-      const returnId = ret.id as string;
-      const orgId = String(ret.organization_id ?? organizationId);
-      const storeId = (ret.store_id as string | null) ?? null;
-      const ev = ret.estimated_value;
+      const r = ret as {
+        id: string;
+        organization_id?: string;
+        store_id?: string | null;
+        estimated_value?: unknown;
+        marketplace?: string | null;
+        conditions?: string[] | null;
+        order_id?: string | null;
+        package_id?: string | null;
+        expiration_date?: string | null;
+        batch_number?: string | null;
+        notes?: string | null;
+        stores?: unknown;
+      };
+      const storePlat = storePlatformFromEmbed(r.stores);
+      if (!shouldAutoEnqueueAmazonClaimSubmission(r.marketplace, r.conditions ?? [], storePlat)) continue;
+
+      const returnId = r.id;
+      const rawOrg = String(r.organization_id ?? organizationId ?? "").trim();
+      const orgId = isUuidString(rawOrg) ? rawOrg : resolveOrganizationId();
+      const ev = r.estimated_value;
       const n = Number(ev);
       const claimAmount = Number.isFinite(n) && n > 0 ? n : 100;
       const submissionId = `test-${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+
+      const sourcePayload = await buildClaimSubmissionSourcePayloadForReturn(
+        r.conditions ?? [],
+        r.order_id ?? null,
+        r.package_id ?? null,
+        {
+          expirationDate: r.expiration_date ?? null,
+          batchNumber: r.batch_number ?? null,
+          operatorNotes: r.notes ?? null,
+        },
+      );
+      const storeIdResolved = await resolveClaimSubmissionStoreId(orgId, r.store_id, {
+        store_id: r.store_id ?? null,
+        package_id: r.package_id ?? null,
+      });
 
       const { error: upErr } = await supabaseServer.from(CLAIM_SUBMISSIONS_TABLE).upsert(
         {
           organization_id: orgId,
           [CLAIM_SUBMISSION_RETURN_ID_COLUMN]: returnId,
-          store_id: storeId,
-          report_url: "force-queue",
+          store_id: storeIdResolved,
+          report_url: null,
           status: "ready_to_send",
           submission_id: submissionId,
           claim_amount: claimAmount,
+          source_payload: sourcePayload,
           updated_at: now,
         },
         { onConflict: "return_id" },

@@ -167,12 +167,10 @@ export function SmartCameraUpload({
         </div>
         <div className="flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
-            <p className="text-sm font-semibold text-slate-900 dark:text-slate-50">{label}</p>
-            {required && (
-              <span className="shrink-0 rounded-full border border-rose-200 bg-rose-50 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-rose-700 dark:border-rose-800/60 dark:bg-rose-950/50 dark:text-rose-300">
-                Mandatory
-              </span>
-            )}
+            <p className="text-sm font-semibold text-slate-900 dark:text-slate-50">
+              {label}
+              {required && <span className="text-rose-500"> *</span>}
+            </p>
           </div>
           <p className="mt-0.5 text-[11px] leading-snug text-slate-500 dark:text-slate-400">{hint}</p>
         </div>
@@ -194,7 +192,7 @@ export function SmartCameraUpload({
                 className="relative aspect-square overflow-hidden rounded-xl border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800"
               >
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={url} alt={`Evidence ${i + 1}`} className="h-full w-full object-cover" />
+                <img src={url} alt={`Evidence ${i + 1}`} className="h-full w-full object-contain" />
                 {/* Always-visible delete button — visible on both touch and pointer devices */}
                 <button
                   type="button"

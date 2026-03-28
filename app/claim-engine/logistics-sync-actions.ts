@@ -1,6 +1,10 @@
 "use server";
 
 import { supabaseServer } from "../../lib/supabase-server";
+import {
+  shouldAutoEnqueueAmazonClaimSubmission,
+  storePlatformFromEmbed,
+} from "../returns/claim-queue-helpers";
 import { generateDailyClaimReports } from "./claim-submission-actions";
 import { CLAIM_SUBMISSION_RETURN_ID_COLUMN, CLAIM_SUBMISSIONS_TABLE } from "./claim-submissions-constants";
 
@@ -8,7 +12,7 @@ const DEFAULT_ORG = "00000000-0000-0000-0000-000000000001";
 
 /**
  * Returns counts for Settings "Logistics AI Agent" sync UI:
- * - `pendingSyncCount`: `ready_for_claim` returns not yet represented as `ready_to_send` in `claim_submissions`.
+ * - `pendingSyncCount`: Amazon `ready_for_claim` returns not yet represented as `ready_to_send` in `claim_submissions`.
  */
 export async function getClaimQueueSyncStatus(
   organizationId: string = DEFAULT_ORG,
@@ -22,13 +26,21 @@ export async function getClaimQueueSyncStatus(
   try {
     const { data: retRows, error: rErr } = await supabaseServer
       .from("returns")
-      .select("id")
+      .select("id, marketplace, conditions, stores(platform)")
       .eq("organization_id", organizationId)
       .eq("status", "ready_for_claim")
       .is("deleted_at", null)
       .limit(5000);
     if (rErr) throw new Error(rErr.message);
-    const readyIds = (retRows ?? []).map((r) => r.id as string);
+    const amazonReady = (retRows ?? []).filter((row) => {
+      const r = row as { marketplace?: string | null; conditions?: string[] | null; stores?: unknown };
+      return shouldAutoEnqueueAmazonClaimSubmission(
+        r.marketplace,
+        r.conditions ?? [],
+        storePlatformFromEmbed(r.stores),
+      );
+    });
+    const readyIds = amazonReady.map((r) => (r as { id: string }).id);
     const readyForClaimCount = readyIds.length;
     if (readyForClaimCount === 0) {
       return { ok: true, readyForClaimCount: 0, pendingSyncCount: 0, systemUpToDate: true };

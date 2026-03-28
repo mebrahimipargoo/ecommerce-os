@@ -3,7 +3,7 @@
  * Lives outside `actions.ts` because `"use server"` modules may only export async functions (Next.js 16+).
  */
 export const RETURN_SELECT =
-  "id,organization_id,lpn,marketplace,item_name,asin,fnsku,sku,conditions,status,notes,photo_evidence,expiration_date,batch_number,photo_item_url,photo_expiry_url,store_id,stores(name,platform),pallet_id,package_id,order_id,estimated_value,created_by,created_by_id,updated_by,updated_by_id,created_at,updated_at";
+  "id,organization_id,lpn,marketplace,item_name,asin,fnsku,sku,product_identifier,conditions,status,notes,photo_evidence,expiration_date,batch_number,photo_item_url,photo_expiry_url,photo_return_label_url,store_id,stores(name,platform),pallet_id,package_id,order_id,estimated_value,created_by,created_by_id,updated_by,updated_by_id,created_at,updated_at";
 
 /**
  * Columns embedded from `returns` on `claim_submissions` joins (Claim Engine / PDF).

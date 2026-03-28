@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePhysicalScanner } from "../../hooks/usePhysicalScanner";
 import { createPortal } from "react-dom";
 import Link from "next/link";
@@ -18,9 +18,9 @@ import {
   type OrgSettings,
   type ReturnRecord, type ReturnUpdatePayload,
   type PalletRecord, type PalletStatus,
-  type PackageRecord, type PackageStatus,
+  type PackageRecord, type PackageStatus, type ExpectedItem,
   insertReturn, updateReturn, deleteReturn,
-  createPallet, updatePalletStatus, deletePallet,
+  createPallet, updatePallet, updatePalletStatus, deletePallet,
   createPackage, updatePackage, closePackage, deletePackage,
   listReturnsByPackage,
 } from "./actions";
@@ -34,9 +34,32 @@ import { uploadToStorage } from "../../lib/supabase/storage";
 import { fetchProductFromAmazon } from "../../lib/api/amazon-mock";
 import { operatorDisplayLabel } from "../../lib/operator-display";
 import { listStores } from "../settings/adapters/actions";
+import { isUuidString, uuidFkInvalidMessage } from "../../lib/uuid";
 
 /** Seeded MVP org — use in client `stores` queries so RLS returns rows for local dev. */
 export const MVP_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001";
+
+/** Simulated org setting: show expiry-label upload when expiration is within this many days (FEFO). */
+export const CLAIM_EXPIRY_EVIDENCE_THRESHOLD_DAYS = 90;
+
+export function shouldShowExpiryLabelPhoto(state: { condition_keys: string[]; expiration_date: string }): boolean {
+  if (state.condition_keys.includes("expired")) return true;
+  const raw = state.expiration_date?.trim();
+  if (!raw) return false;
+  const d = new Date(`${raw}T12:00:00`);
+  if (Number.isNaN(d.getTime())) return false;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const exp = new Date(d);
+  exp.setHours(0, 0, 0, 0);
+  const diffDays = (exp.getTime() - today.getTime()) / 86400000;
+  return diffDays >= 0 && diffDays <= CLAIM_EXPIRY_EVIDENCE_THRESHOLD_DAYS;
+}
+
+/** When true, the expiry-label slot is shown and a photo is required (Expired tag or critical FEFO window). */
+export function isExpiryLabelPhotoMandatory(state: { condition_keys: string[]; expiration_date: string }): boolean {
+  return shouldShowExpiryLabelPhoto(state);
+}
 
 // ─── Contextual Scan Button ────────────────────────────────────────────────────
 //
@@ -228,6 +251,11 @@ export const INPUT      = "h-14 w-full rounded-2xl border border-slate-200 bg-wh
 export const LABEL      = "mb-2 block text-sm font-semibold text-slate-700 dark:text-slate-300";
 export const INPUT_SM   = "h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-900 placeholder:text-slate-400 focus:border-sky-400 focus:outline-none focus:ring-2 focus:ring-sky-400/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500";
 export const BTN_PRIMARY = "flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-sky-500 font-semibold text-white transition hover:bg-sky-600 active:scale-[0.98] disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500";
+/** Primary actions in drawer/modal footers — avoids `w-full` collapsing in flex layouts. */
+export const BTN_PRIMARY_INLINE = "inline-flex h-14 shrink-0 min-w-[12rem] items-center justify-center gap-2 rounded-2xl bg-sky-500 px-6 font-semibold text-white transition hover:bg-sky-600 active:scale-[0.98] disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500";
+/** Modal / drawer footers — balanced h-10 primary + secondary (use with `flex flex-wrap items-center justify-end gap-2`). */
+export const BTN_FOOTER_PRIMARY = "inline-flex h-10 min-w-[5.5rem] shrink-0 items-center justify-center gap-2 rounded-md bg-sky-500 px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-600 disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500";
+export const BTN_FOOTER_GHOST = "inline-flex h-10 min-w-[5.5rem] shrink-0 items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800";
 export const BTN_GHOST   = "flex h-10 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800";
 
 /** Checkbox column — fixed width + centered so TableHead matches TableCell */
@@ -324,19 +352,20 @@ export const FLAT_CONDITION_CARDS = CONDITION_CHIP_DEFS;
 
 export function getCategoriesForConditions(
   conditions: string[],
-  ctx?: { hasPackageLink?: boolean; orphanLpn?: boolean; packageInheritsBoxPhotos?: boolean },
+  ctx?: { hasPackageLink?: boolean; orphanLpn?: boolean; packageInheritsBoxPhotos?: boolean; looseItem?: boolean },
 ): PhotoCategoryDef[] {
+  if (ctx?.looseItem) return [];
   if (!conditions.length || conditions.includes("sellable")) return [];
   const ids = new Set<string>();
+  // Outer box / return label are inherited from Package only — never prompt for per-item box uploads.
   if (!ctx?.packageInheritsBoxPhotos) {
-    ids.add("outer_box");
     ids.add("fnsku_label");
   }
   for (const c of conditions) {
     if (c === "empty_box" || c === "missing_item") ids.add("empty_interior");
     if (c === "damaged_box" || c.startsWith("damaged_") || c === "scratched") ids.add("damage_closeup");
     if (c.startsWith("wrong_item_")) ids.add("incorrect_item");
-    if (c === "expired") ids.add("expiry_label");
+    // Expired: dedicated `photo_expiry_url` slot in consolidated Evidence UI — avoid duplicate SmartCamera category.
   }
   if (ctx?.orphanLpn && !ctx?.hasPackageLink) ids.add("orphan_label");
   return [...ids].map((id) => ALL_PHOTO_CATEGORIES[id]).filter(Boolean);
@@ -360,6 +389,15 @@ export async function mockPackageOcr(_f: File): Promise<{ ok: boolean; data?: Pa
   const carriers = ["UPS", "FedEx", "USPS", "DHL", "Amazon Logistics"];
   const tracking = `1Z${Math.random().toString(36).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 10)}`;
   return { ok: true, data: { expected_item_count: Math.floor(Math.random()*20+2), carrier_name: carriers[Math.floor(Math.random()*carriers.length)], tracking_number: tracking, confidence: 0.78 + Math.random()*0.2 } };
+}
+
+/** Mock line items for packing-slip reconciliation — shared by create package + package edit. */
+export async function mockManifestLineItems(_file: File): Promise<SlipExpectedItem[]> {
+  await new Promise((r) => setTimeout(r, 1400));
+  return [
+    { barcode: "111", name: "Item 111", expected_qty: 1 },
+    { barcode: "222", name: "Item 222", expected_qty: 2 },
+  ];
 }
 
 /** One line from an AI-read packing slip (barcode + display name + optional qty from Vision JSON). */
@@ -386,15 +424,55 @@ export async function simulatePackingSlipOcr(_file: File): Promise<{ ok: boolean
   return { ok: true, data: { items: shuffled, confidence: 0.88 + Math.random() * 0.1 } };
 }
 
-/** Whether a return row matches an expected slip line (by barcode or product name). */
+function normalizeManifestToken(s: string | null | undefined): string {
+  return String(s ?? "").trim().toLowerCase();
+}
+
+/** Normalized barcode / catalog fields only (no free-text item title) — for substring fallbacks. */
+function itemBarcodeFields(it: ReturnRecord): string[] {
+  const raw = [
+    it.asin,
+    it.fnsku,
+    it.sku,
+    it.lpn,
+    (it as { product_identifier?: string | null }).product_identifier,
+    (it as { scanned_barcode?: string | null }).scanned_barcode,
+  ];
+  return raw.map((x) => normalizeManifestToken(x)).filter(Boolean);
+}
+
+/** All tokens that may exactly match a manifest barcode or slip line (includes item title). */
+function itemManifestIdentifierSet(it: ReturnRecord): Set<string> {
+  const out = new Set<string>(itemBarcodeFields(it));
+  const t = normalizeManifestToken(it.item_name);
+  if (t) out.add(t);
+  return out;
+}
+
+/** Tokens from one manifest row (barcode + slip name). */
+function manifestLineTokens(exp: SlipExpectedItem): string[] {
+  const raw = [exp.barcode, exp.name];
+  const out = new Set<string>();
+  for (const x of raw) {
+    const t = normalizeManifestToken(x == null ? "" : String(x));
+    if (t) out.add(t);
+  }
+  return [...out];
+}
+
+/** Whether a scanned item matches an expected slip line — trimmed, case-insensitive; exact first, then light OCR fallbacks. */
 function physicalItemMatchesExpectedLine(it: ReturnRecord, exp: SlipExpectedItem): boolean {
-  const name = it.item_name.toLowerCase();
-  const pid  = (it.asin ?? it.fnsku ?? it.sku ?? "").toLowerCase();
-  const bc   = exp.barcode.trim().toLowerCase();
-  const nm   = exp.name.trim().toLowerCase();
-  const nameChunk = nm.split(/\s+/).slice(0, 3).join(" ");
+  const itemIds = itemManifestIdentifierSet(it);
+  const lineToks = manifestLineTokens(exp);
+  for (const lt of lineToks) {
+    if (itemIds.has(lt)) return true;
+  }
+  const name = (it.item_name ?? "").toLowerCase();
+  const bc = normalizeManifestToken(String(exp.barcode ?? ""));
+  const nameChunk = normalizeManifestToken(exp.name).split(/\s+/).slice(0, 3).join(" ");
+  const codes = itemBarcodeFields(it);
   return (
-    (bc.length >= 2 && (pid.includes(bc) || name.includes(bc))) ||
+    (bc.length >= 2 && (name.includes(bc) || codes.some((id) => id.includes(bc) || bc.includes(id)))) ||
     (nameChunk.length >= 3 && name.includes(nameChunk))
   );
 }
@@ -441,14 +519,20 @@ export type WizardState = {
   expiration_date: string; batch_number: string;
   /** Items link to Packages only. Pallet is inherited from the Package. */
   package_link_id: string;
+  /** When true, item has no parent package (loose/orphan flow). */
+  loose_item: boolean;
   notes: string; photos: Record<string, File[]>;
   /** Claim evidence photo URLs — uploaded to Supabase Storage during Step 2. */
   photo_item_url: string;
   photo_expiry_url: string;
+  /** Loose-item optional return label (no package to inherit from). */
+  photo_return_label_url: string;
   /** Connected store UUID — links this item to a specific store account. */
   store_id: string;
   /** Optional Amazon order ID — stored on `returns.order_id` and `claim_submissions.source_payload.amazon_order_id`. */
   amazon_order_id: string;
+  /** Product catalog lookup — when `unknown`, Step 1 allows Next without a resolved ASIN/UPC (manual item name). */
+  catalog_resolution: "idle" | "loading" | "local" | "amazon" | "unknown";
 };
 
 export const EMPTY_WIZARD: WizardState = {
@@ -456,10 +540,12 @@ export const EMPTY_WIZARD: WizardState = {
   asin: "", fnsku: "", sku: "",
   condition_keys: [],
   expiration_date: "", batch_number: "", package_link_id: "",
+  loose_item: false,
   notes: "", photos: {},
-  photo_item_url: "", photo_expiry_url: "",
+  photo_item_url: "", photo_expiry_url: "", photo_return_label_url: "",
   store_id: "",
   amazon_order_id: "",
+  catalog_resolution: "idle",
 };
 
 // ─── Toast ─────────────────────────────────────────────────────────────────────
@@ -783,7 +869,14 @@ function sortKeyPallet(p: PalletSortRow, field: string): string | number {
 
 // ─── ComboboxField ─────────────────────────────────────────────────────────────
 
-interface ComboboxOption { id: string; label: string; sublabel?: string }
+interface ComboboxOption {
+  id: string;
+  label: string;
+  sublabel?: string;
+  /** Scan / search keys (e.g. tracking #, RMA) — never used as `value`; only `id` is the DB UUID. */
+  tracking?: string | null;
+  rma?: string | null;
+}
 export function ComboboxField({ label, hint, icon: Icon, options, value, onChange, onClear, placeholder, onCreateNew, createLabel }: {
   label: string; hint?: string; icon?: React.ElementType;
   options: ComboboxOption[]; value: string;
@@ -794,11 +887,29 @@ export function ComboboxField({ label, hint, icon: Icon, options, value, onChang
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const selected = options.find((o) => o.id === value);
-  const filtered = useMemo(() => { const q = search.toLowerCase(); return q ? options.filter((o) => o.label.toLowerCase().includes(q) || (o.sublabel ?? "").toLowerCase().includes(q)) : options; }, [options, search]);
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return options;
+    return options.filter((o) => {
+      const labelOk = o.label.toLowerCase().includes(q);
+      const subOk = (o.sublabel ?? "").toLowerCase().includes(q);
+      const tr = (o.tracking ?? "").trim().toLowerCase();
+      const rma = (o.rma ?? "").trim().toLowerCase();
+      return labelOk || subOk || (tr && tr.includes(q)) || (rma && rma.includes(q));
+    });
+  }, [options, search]);
 
   useEffect(() => {
-    if (!search) return;
-    const exact = options.find((o) => o.label.toLowerCase() === search.toLowerCase() || o.sublabel?.toLowerCase() === search.toLowerCase());
+    const raw = search.trim();
+    if (!raw) return;
+    const key = raw.toLowerCase();
+    const exact = options.find((o) => {
+      const l = o.label.toLowerCase();
+      const sub = (o.sublabel ?? "").toLowerCase();
+      const tr = (o.tracking ?? "").trim().toLowerCase();
+      const rma = (o.rma ?? "").trim().toLowerCase();
+      return l === key || sub === key || (!!tr && tr === key) || (!!rma && rma === key);
+    });
     if (exact) { onChange(exact.id); setSearch(""); setOpen(false); }
   }, [search, options, onChange]);
 
@@ -851,35 +962,100 @@ export function ComboboxField({ label, hint, icon: Icon, options, value, onChang
 
 // ─── RowActionMenu ─────────────────────────────────────────────────────────────
 
+const ROW_ACTION_MENU_W = 176;
+
 export function RowActionMenu({ onView, onEdit, onDelete }: {
   onView?: () => void; onEdit?: () => void; onDelete?: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
-    document.addEventListener("mousedown", h);
-    return () => document.removeEventListener("mousedown", h);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [coords, setCoords] = useState<{ top: number; left: number } | null>(null);
+
+  const placeMenu = useCallback(() => {
+    const btn = btnRef.current;
+    const menu = menuRef.current;
+    if (!btn) return;
+    const rect = btn.getBoundingClientRect();
+    const menuH = menu?.offsetHeight ?? 148;
+    const gap = 8;
+    let top = rect.bottom + gap;
+    if (top + menuH > window.innerHeight - gap && rect.top - menuH - gap > gap) {
+      top = rect.top - menuH - gap;
+    }
+    let left = rect.right - ROW_ACTION_MENU_W;
+    left = Math.max(gap, Math.min(left, window.innerWidth - ROW_ACTION_MENU_W - gap));
+    setCoords({ top, left });
   }, []);
-  return (
-    <div ref={ref} className="relative" onClick={(e) => e.stopPropagation()}>
-      <button onClick={(e) => { e.stopPropagation(); setOpen(!open); }}
-        className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300">
-        <MoreHorizontal className="h-4 w-4" />
-      </button>
-      {open && (
-        <div className="absolute right-0 top-full z-30 mt-1 w-44 overflow-hidden rounded-2xl border border-slate-200 bg-white py-1 shadow-xl dark:border-slate-700 dark:bg-slate-900">
-          {onView && <button onClick={() => { onView(); setOpen(false); }} className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800"><Eye className="h-4 w-4 text-slate-400" />View Detail</button>}
-          {onEdit && <button onClick={() => { onEdit(); setOpen(false); }} className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800"><Pencil className="h-4 w-4 text-slate-400" />Edit</button>}
-          {onDelete && (
-            <>
-              <div className="my-1 border-t border-border" />
-              <button onClick={() => { onDelete(); setOpen(false); }} className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-rose-600 transition hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/30"><Trash2 className="h-4 w-4" />Delete</button>
-            </>
-          )}
-        </div>
+
+  useEffect(() => {
+    if (!open) setCoords(null);
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    placeMenu();
+    const id = requestAnimationFrame(() => placeMenu());
+    return () => cancelAnimationFrame(id);
+  }, [open, onView, onEdit, onDelete, placeMenu]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onScroll = () => setOpen(false);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", placeMenu);
+    return () => {
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", placeMenu);
+    };
+  }, [open, placeMenu]);
+
+  useEffect(() => {
+    const h = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (btnRef.current?.contains(t)) return;
+      if (menuRef.current?.contains(t)) return;
+      setOpen(false);
+    };
+    if (open) document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, [open]);
+
+  const menuPanel = (
+    <div
+      ref={menuRef}
+      role="menu"
+      className="fixed z-[220] w-44 overflow-hidden rounded-2xl border border-slate-200 bg-white py-1 shadow-xl dark:border-slate-700 dark:bg-slate-900"
+      style={coords ? { top: coords.top, left: coords.left } : { top: -9999, left: 0, visibility: "hidden" as const }}
+    >
+      {onView && <button type="button" onClick={() => { onView(); setOpen(false); }} className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800"><Eye className="h-4 w-4 text-slate-400" />View Detail</button>}
+      {onEdit && <button type="button" onClick={() => { onEdit(); setOpen(false); }} className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800"><Pencil className="h-4 w-4 text-slate-400" />Edit</button>}
+      {onDelete && (
+        <>
+          <div className="my-1 border-t border-border" />
+          <button type="button" onClick={() => { void onDelete(); setOpen(false); }} className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm font-medium text-rose-600 transition hover:bg-rose-50 dark:text-rose-400 dark:hover:bg-rose-950/30"><Trash2 className="h-4 w-4" />Delete</button>
+        </>
       )}
     </div>
+  );
+
+  return (
+    <>
+      <div className="relative" onClick={(e) => e.stopPropagation()}>
+        <button
+          ref={btnRef}
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setOpen((o) => !o);
+          }}
+          className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+        >
+          <MoreHorizontal className="h-4 w-4" />
+        </button>
+      </div>
+      {open && typeof document !== "undefined" && createPortal(menuPanel, document.body)}
+    </>
   );
 }
 
@@ -923,11 +1099,28 @@ export function BulkMoveModal({ selectedIds, packages: allPkgs, pallets: allPlts
   const [error,  setError]  = useState("");
   const openPkgs = allPkgs.filter((p) => p.status === "open");
   const openPlts = allPlts.filter((p) => p.status === "open");
-  const pkgOpts  = openPkgs.map((p) => ({ id: p.id, label: p.package_number, sublabel: `${p.actual_item_count} items` }));
-  const pltOpts  = openPlts.map((p) => ({ id: p.id, label: p.pallet_number,  sublabel: `${p.item_count} items` }));
+  const pkgOpts  = openPkgs.map((p) => ({
+    id: p.id,
+    label: p.package_number,
+    sublabel: `${p.actual_item_count} items`,
+    tracking: p.tracking_number ?? undefined,
+    rma: p.rma_number ?? undefined,
+  }));
+  const pltOpts  = openPlts.map((p) => ({
+    id: p.id,
+    label: p.pallet_number,
+    sublabel: `${p.item_count} items`,
+    tracking: p.tracking_number ?? undefined,
+  }));
 
   async function handleMove() {
     if (!targetPkgId && !targetPltId) { setError("Select at least a target package or pallet."); return; }
+    const pkgErr = uuidFkInvalidMessage(targetPkgId, "Package");
+    const pltErr = uuidFkInvalidMessage(targetPltId, "Pallet");
+    if (pkgErr || pltErr) {
+      setError(pkgErr ?? pltErr ?? "Invalid selection.");
+      return;
+    }
     setMoving(true); setError("");
     const results = await Promise.all(
       selectedIds.map((id) => updateReturn(id, { package_id: targetPkgId || undefined, pallet_id: targetPltId || undefined }, actor))
@@ -977,8 +1170,16 @@ export function BulkAssignPackagesModal({ selectedIds, pallets: allPlts, actor, 
   const openPlts = allPlts.filter((p) => p.status === "open");
 
   async function handleAssign() {
+    const raw = targetPalletId.trim();
+    if (raw) {
+      const msg = uuidFkInvalidMessage(raw, "Pallet");
+      if (msg) {
+        setError(msg);
+        return;
+      }
+    }
     setAssigning(true); setError("");
-    const palletId = targetPalletId.trim() || null;
+    const palletId = raw || null;
     const results = await Promise.all(
       selectedIds.map((id) => updatePackage(id, { pallet_id: palletId }, actor)),
     );
@@ -1126,12 +1327,79 @@ export function PhotoGallery({ photos, emptyText }: { photos: PhotoItem[]; empty
           <button key={i} type="button" onClick={() => setLightboxIdx(i)}
             className="group relative aspect-square overflow-hidden rounded-xl border border-slate-200 bg-slate-100 transition hover:border-sky-400 hover:shadow-md dark:border-slate-700 dark:bg-slate-800">
             {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src={p.src} alt={p.label} className="h-full w-full object-cover transition group-hover:scale-105" />
+            <img src={p.src} alt={p.label} className="h-full w-full object-contain transition group-hover:scale-[1.02]" />
             <div className="absolute inset-0 flex items-center justify-center bg-black/25 opacity-0 transition group-hover:opacity-100 rounded-xl">
               <ZoomIn className="h-5 w-5 text-white drop-shadow" />
             </div>
           </button>
         ))}
+      </div>
+      {lightboxIdx !== null && (
+        <PhotoLightbox photos={photos} startIdx={lightboxIdx} onClose={() => setLightboxIdx(null)} />
+      )}
+    </>
+  );
+}
+
+export interface ClaimEvidenceLineItem extends PhotoItem {
+  id: string;
+  kind: "pallet" | "package" | "item" | "category";
+}
+
+/** Optional grid with per-image Include toggles — intended for Claims Management admin (not the receiving wizard). */
+export function ClaimEvidencePhotoGrid({
+  lines,
+  selection,
+  onToggle,
+}: {
+  lines: ClaimEvidenceLineItem[];
+  selection: Record<string, boolean>;
+  onToggle: (id: string) => void;
+}) {
+  const [lightboxIdx, setLightboxIdx] = useState<number | null>(null);
+  const photos = useMemo(() => lines.map(({ src, label }) => ({ src, label })), [lines]);
+  if (!lines.length) {
+    return <p className="text-xs text-slate-400 italic">No photos to attach.</p>;
+  }
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+        {lines.map((line, i) => {
+          const included = selection[line.id] !== false;
+          return (
+            <div
+              key={line.id}
+              className="relative aspect-square overflow-hidden rounded-xl border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800"
+            >
+              <button
+                type="button"
+                onClick={() => setLightboxIdx(i)}
+                className="relative z-0 block h-full w-full"
+                aria-label={`Open ${line.label}`}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={line.src} alt={line.label} className="h-full w-full object-contain" />
+                <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/20 opacity-0 transition hover:opacity-100">
+                  <ZoomIn className="h-5 w-5 text-white drop-shadow" />
+                </div>
+              </button>
+              <div
+                className="absolute left-1.5 top-1.5 z-10 flex items-center gap-1 rounded-md bg-black/60 px-2 py-1 text-[10px] font-semibold text-white shadow backdrop-blur-sm"
+                onClick={(e) => e.stopPropagation()}
+                onKeyDown={(e) => e.stopPropagation()}
+              >
+                <input
+                  type="checkbox"
+                  checked={included}
+                  onChange={() => onToggle(line.id)}
+                  className="h-3.5 w-3.5 shrink-0 rounded border-white/40"
+                  aria-label={`Include ${line.label} in claim report`}
+                />
+                <span>Include</span>
+              </div>
+            </div>
+          );
+        })}
       </div>
       {lightboxIdx !== null && (
         <PhotoLightbox photos={photos} startIdx={lightboxIdx} onClose={() => setLightboxIdx(null)} />
@@ -1175,10 +1443,10 @@ function ItemsSubTable({ items, role, actor, onItemClick, onItemDeleted, showToa
       {filtered.length === 0
         ? <p className="py-4 text-center text-xs text-slate-400">No items{search || statusF ? " match your filters" : " scanned yet"}.</p>
         : (
-          <div className="overflow-hidden rounded-xl border border-border">
+          <div className="rounded-xl border border-border">
             <table className="w-full text-xs">
               <thead>
-                <tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900">
+                <tr className="rounded-t-xl border-b border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900">
                   <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-slate-400">LPN</th>
                   <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-slate-400">Item</th>
                   <th className="hidden px-3 py-2 text-left font-bold uppercase tracking-wide text-slate-400 sm:table-cell">Status</th>
@@ -1298,6 +1566,8 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   const [editExpiryDate,     setEditExpiryDate]     = useState(record.expiration_date ?? "");
   const [editPhotoItemUrl,   setEditPhotoItemUrl]   = useState(record.photo_item_url ?? "");
   const [editPhotoExpiryUrl, setEditPhotoExpiryUrl] = useState(record.photo_expiry_url ?? "");
+  const [expiryEditFiles, setExpiryEditFiles] = useState<File[]>([]);
+  const [itemEditFiles, setItemEditFiles] = useState<File[]>([]);
   const [itemPhotoUploading,   setItemPhotoUploading]   = useState(false);
   const [expiryPhotoUploading, setExpiryPhotoUploading] = useState(false);
 
@@ -1329,33 +1599,11 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     setEditExpiryDate(record.expiration_date ?? "");
     setEditPhotoItemUrl(record.photo_item_url ?? "");
     setEditPhotoExpiryUrl(record.photo_expiry_url ?? "");
+    setExpiryEditFiles([]);
+    setItemEditFiles([]);
     setEditCatalogStatus("idle");
     setEditCatalogPreview(null);
   }, [record.id, record.lpn, record.asin, record.fnsku, record.sku, record.store_id, record.item_name, record.notes, record.order_id, record.photo_evidence, record.expiration_date, record.photo_item_url, record.photo_expiry_url]);
-
-  async function handleItemEvidencePhoto(
-    e: React.ChangeEvent<HTMLInputElement>,
-    field: "photo_item_url" | "photo_expiry_url",
-  ) {
-    const f = e.target.files?.[0];
-    e.target.value = "";
-    if (!f) return;
-    const setUploading = field === "photo_item_url" ? setItemPhotoUploading : setExpiryPhotoUploading;
-    const setUrl       = field === "photo_item_url" ? setEditPhotoItemUrl   : setEditPhotoExpiryUrl;
-    setUploading(true);
-    try {
-      const ext  = f.name.split(".").pop() ?? "jpg";
-      const path = `evidence/${field}/${record.id}_${Date.now()}.${ext}`;
-      const { error: upErr } = await supabaseBrowser.storage.from("media").upload(path, f, { upsert: true });
-      if (upErr) throw new Error(upErr.message);
-      const { data: urlData } = supabaseBrowser.storage.from("media").getPublicUrl(path);
-      setUrl(urlData.publicUrl);
-    } catch {
-      setErr("Photo upload failed. Try again.");
-    } finally {
-      setUploading(false);
-    }
-  }
 
   async function handleEditBarcodeLookup(barcode: string) {
     if (!barcode.trim()) { setEditCatalogStatus("idle"); return; }
@@ -1419,6 +1667,8 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
 
   const linkedPkg    = packages.find((p) => p.id === record.package_id);
   const linkedPallet = pallets.find((p) => p.id === record.pallet_id);
+  /** Order ID is stored on the package when this item is in a package — not edited on the item row. */
+  const isLooseItem = !record.package_id;
   const showClaimLinkage =
     record.status === "ready_for_claim" || record.status === "pending_evidence";
   const editStorePlatform =
@@ -1426,6 +1676,11 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   const photoTotal   = record.photo_evidence ? Object.values(record.photo_evidence).reduce((a, b) => a + b, 0) : 0;
   const drawerEditIdBtn =
     "inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800";
+  const expiryLabelCtxForEdit = useMemo(
+    () => ({ condition_keys: record.conditions ?? [], expiration_date: editExpiryDate }),
+    [record.conditions, editExpiryDate],
+  );
+  const showExpiryLabelSlot = shouldShowExpiryLabelPhoto(expiryLabelCtxForEdit);
 
   async function copyEditCode(v: string, label: string) {
     if (!v.trim()) return;
@@ -1438,6 +1693,18 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   }
 
   async function handleSave() {
+    const storeMsg = uuidFkInvalidMessage(editStoreId, "Sales Channel");
+    if (storeMsg) {
+      setErr(storeMsg);
+      onToast?.(storeMsg, "error");
+      return;
+    }
+    if (showExpiryLabelSlot && !editPhotoExpiryUrl.trim()) {
+      const msg = "Expiry label photo is required when the item is expired or the expiry date is within the critical window.";
+      setErr(msg);
+      onToast?.(msg, "error");
+      return;
+    }
     setSaving(true); setErr("");
     // Merge new photos (counts only — actual files not yet uploaded to cloud storage)
     const newPhotoCount: Record<string, number> = {};
@@ -1453,7 +1720,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
       lpn: editLpn || undefined,
       item_name: editItem,
       notes: editNotes || undefined,
-      order_id: editOrderId.trim() || null,
+      order_id: isLooseItem ? (editOrderId.trim() || null) : null,
       expiration_date:  editExpiryDate  || undefined,
       photo_evidence:   Object.keys(mergedPhotoEvidence).length ? mergedPhotoEvidence : undefined,
       photo_item_url:   editPhotoItemUrl   || undefined,
@@ -1585,7 +1852,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
               </div>
             </div>
             <div>
-              <label className={LABEL}>Sales Channel</label>
+              <label className={LABEL}>Sales Channel <span className="text-rose-500">*</span></label>
               <select className={INPUT} value={editStoreId} onChange={(e) => setEditStoreId(e.target.value)}>
                 <option value="">— Select Sales Channel —</option>
                 {itemStoresList.map((s) => (
@@ -1600,13 +1867,12 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
           {!record.package_id && (
             <div><label className={LABEL}>LPN <span className="text-xs font-normal text-slate-400">(optional)</span></label><input className={INPUT} value={editLpn} onChange={(e) => setEditLpn(e.target.value)} placeholder="Orphan label scan…" /></div>
           )}
-          <div><label className={LABEL}>Item Name</label><input className={INPUT} value={editItem} onChange={(e) => setEditItem(e.target.value)} /></div>
+          <div><label className={LABEL}>Item Name <span className="text-rose-500">*</span></label><input className={INPUT} value={editItem} onChange={(e) => setEditItem(e.target.value)} /></div>
 
           {/* ── Expiry Date (FEFO) ──────────────────────────────────────────── */}
           <div className="rounded-2xl border border-orange-200 bg-orange-50 p-4 space-y-3 dark:border-orange-700/40 dark:bg-orange-950/30">
             <p className="flex items-center gap-2 text-sm font-bold text-orange-700 dark:text-orange-400">
               <CalendarX2 className="h-4 w-4" />Expiry Date
-              <span className="ml-auto rounded-full border border-orange-300 bg-orange-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-orange-600 dark:border-orange-700/60 dark:bg-orange-950/50 dark:text-orange-400">FEFO Tracking</span>
             </p>
             <input
               type="date"
@@ -1614,133 +1880,213 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
               value={editExpiryDate}
               onChange={(e) => setEditExpiryDate(e.target.value)}
             />
-            {editExpiryDate && (
+            {showExpiryLabelSlot && (
               <p className="text-xs text-orange-600 dark:text-orange-400 flex items-center gap-1">
                 <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                Expiry date set — upload a photo of the label below for claim evidence.
+                An expiry label photo is required for claim evidence (expired item or date in the critical window).
               </p>
             )}
           </div>
 
-          {/* ── Item Condition & Evidence ───────────────────────────────────── */}
-          <div className="rounded-2xl border-2 border-sky-200 bg-sky-50 p-4 space-y-3 dark:border-sky-700/50 dark:bg-sky-950/20">
-            <div className="flex items-center gap-2">
-              <Camera className="h-4 w-4 text-sky-600 dark:text-sky-400" />
-              <p className="text-sm font-bold text-sky-800 dark:text-sky-200">Item Condition &amp; Evidence</p>
+          {/* ── Inherited Package Evidence (intake / package-linked categories) ─────────── */}
+          {Object.keys(editPhotoEvidence).length > 0 && (
+            <div className="space-y-4 rounded-2xl border-2 border-violet-200 bg-violet-50/80 p-4 dark:border-violet-800/50 dark:bg-violet-950/25">
+              <div className="flex flex-col gap-1">
+                <div className="flex items-center gap-2">
+                  <Package2 className="h-4 w-4 text-violet-600 dark:text-violet-400" />
+                  <p className="text-sm font-bold text-violet-900 dark:text-violet-100">Inherited Package Evidence</p>
+                </div>
+                <p className="text-xs leading-relaxed text-violet-800/90 dark:text-violet-200/90">
+                  Photos tied to claim categories from the linked package flow. Manage existing slots or add more by category below.
+                </p>
+              </div>
+              <div className="space-y-3 rounded-xl border border-violet-200/90 bg-white/70 p-4 dark:border-violet-800/50 dark:bg-slate-900/50">
+                <p className="text-xs font-semibold text-violet-900 dark:text-violet-100">Registered slots</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Click <span className="font-semibold">✕</span> on a thumbnail to remove that photo slot before saving.</p>
+                {Object.entries(editPhotoEvidence).map(([cat, count]) => {
+                  const catDef = ALL_PHOTO_CATEGORIES[cat];
+                  return (
+                    <div key={cat}>
+                      <p className="mb-1.5 text-xs font-semibold text-slate-600 dark:text-slate-300">
+                        {catDef?.label ?? cat}
+                        <span className="ml-2 font-normal text-slate-400">{count} photo{count !== 1 ? "s" : ""}</span>
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {Array.from({ length: count }).map((_, i) => (
+                          <div key={i} className="relative flex h-16 w-16 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800">
+                            <Camera className="h-6 w-6 text-slate-300 dark:text-slate-600" />
+                            <span className="absolute bottom-1 right-1 text-[10px] font-bold text-slate-400">#{i + 1}</span>
+                            <button
+                              type="button"
+                              onClick={() => removeExistingPhotoSlot(cat)}
+                              aria-label={`Remove photo ${i + 1} of ${catDef?.label ?? cat}`}
+                              className="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded-full bg-rose-600 text-white shadow transition hover:bg-rose-700 active:scale-90"
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="space-y-3 rounded-xl border border-violet-200/90 bg-white/70 p-4 dark:border-violet-800/50 dark:bg-slate-900/50">
+                <p className="text-xs font-semibold text-violet-900 dark:text-violet-100">Add more by category</p>
+                {Object.keys(editPhotoEvidence).map((cat) => {
+                  const catDef = ALL_PHOTO_CATEGORIES[cat];
+                  if (!catDef) return null;
+                  return (
+                    <SmartCameraUpload
+                      key={cat}
+                      label={catDef.label}
+                      hint={`Add more ${catDef.label} photos`}
+                      icon={catDef.icon}
+                      iconColor={catDef.iconColor}
+                      accentClass={catDef.accentClass}
+                      files={editNewPhotos[cat] ?? []}
+                      onChange={(files) => setEditNewPhotos((p) => ({ ...p, [cat]: files }))}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* ── Item Condition Photos ─────────────────────────────────────── */}
+          <div className="rounded-2xl border-2 border-sky-200 bg-sky-50 p-4 space-y-4 dark:border-sky-700/50 dark:bg-sky-950/20">
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-2">
+                <Camera className="h-4 w-4 text-sky-600 dark:text-sky-400" />
+                <p className="text-sm font-bold text-sky-800 dark:text-sky-200">Item Condition Photos</p>
+              </div>
+              <p className="text-xs leading-relaxed text-sky-800/80 dark:text-sky-200/80">
+                Photos of this unit’s physical condition (overall item shot and expiry label when required).
+              </p>
             </div>
 
             {/* Item photo */}
             {editPhotoItemUrl ? (
-              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Item photo saved ✓</span>
-                <button type="button" onClick={() => setEditPhotoItemUrl("")} className="text-xs text-slate-400 underline">Remove</button>
-              </div>
+              <SavedUrlEvidenceCard
+                label="Item photo"
+                hint="Overall shot of the product (optional)."
+                imageUrl={editPhotoItemUrl}
+                onRemove={() => {
+                  setEditPhotoItemUrl("");
+                  setItemEditFiles([]);
+                }}
+                Icon={Camera}
+                iconColor="text-sky-600 dark:text-sky-400"
+              />
             ) : (
-              <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${itemPhotoUploading ? "border-sky-300 text-sky-500" : "border-sky-300 bg-sky-50 text-sky-700 hover:bg-sky-100 dark:border-sky-700/60 dark:bg-sky-950/30 dark:text-sky-300"}`}>
-                {itemPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                {itemPhotoUploading ? "Uploading…" : "📸 Upload Item Photo"}
-                <input type="file" accept="image/*" capture="environment" className="hidden" disabled={itemPhotoUploading} onChange={(e) => handleItemEvidencePhoto(e, "photo_item_url")} />
-              </label>
+              <SmartCameraUpload
+                label="Item photo"
+                hint="Overall shot of the product (optional)."
+                required={false}
+                maxPhotos={1}
+                files={itemEditFiles}
+                onChange={async (files) => {
+                  setItemEditFiles(files);
+                  if (files.length === 0) {
+                    setEditPhotoItemUrl("");
+                    return;
+                  }
+                  setItemPhotoUploading(true);
+                  try {
+                    const url = await uploadToStorage(files[files.length - 1], "evidence/wizard", record.organization_id);
+                    setEditPhotoItemUrl(url);
+                    setItemEditFiles([]);
+                  } catch {
+                    setErr("Photo upload failed. Try again.");
+                    setItemEditFiles([]);
+                  } finally {
+                    setItemPhotoUploading(false);
+                  }
+                }}
+                accentClass="border-sky-200 dark:border-sky-800/50"
+                icon={Camera}
+                iconColor="text-sky-600 dark:text-sky-400"
+              />
+            )}
+            {itemPhotoUploading && (
+              <p className="flex items-center gap-2 text-xs text-sky-700 dark:text-sky-300">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" /> Uploading…
+              </p>
             )}
 
-            {editExpiryDate.trim() && (
-              <>
-                <p className="text-xs font-semibold text-sky-700 dark:text-sky-300">Expiry label photo</p>
+            {showExpiryLabelSlot && (
+              <div className="rounded-2xl border border-orange-200 bg-orange-50/80 p-4 dark:border-orange-800/50 dark:bg-orange-950/25">
                 {editPhotoExpiryUrl ? (
-                  <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                    <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                    <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Expiry date photo saved ✓</span>
-                    <button type="button" onClick={() => setEditPhotoExpiryUrl("")} className="text-xs text-slate-400 underline">Remove</button>
-                  </div>
+                  <SavedUrlEvidenceCard
+                    label="Expiry label photo"
+                    hint={ALL_PHOTO_CATEGORIES.expiry_label.hint}
+                    imageUrl={editPhotoExpiryUrl}
+                    onRemove={() => {
+                      setEditPhotoExpiryUrl("");
+                      setExpiryEditFiles([]);
+                    }}
+                    Icon={Calendar}
+                    iconColor="text-orange-600 dark:text-orange-400"
+                    required
+                  />
                 ) : (
-                  <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-rose-300 bg-rose-50/80 py-3 text-sm font-semibold text-rose-800 transition hover:bg-rose-100 dark:border-rose-800/60 dark:bg-rose-950/40 dark:text-rose-200 ${expiryPhotoUploading ? "opacity-70" : ""}`}>
-                    {expiryPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                    {expiryPhotoUploading ? "Uploading…" : "Upload expiry label photo"}
-                    <input type="file" accept="image/*" capture="environment" className="hidden" disabled={expiryPhotoUploading} onChange={(e) => handleItemEvidencePhoto(e, "photo_expiry_url")} />
-                  </label>
+                  <SmartCameraUpload
+                    label="Expiry label photo"
+                    hint={ALL_PHOTO_CATEGORIES.expiry_label.hint}
+                    required
+                    maxPhotos={1}
+                    files={expiryEditFiles}
+                    onChange={async (files) => {
+                      setExpiryEditFiles(files);
+                      const last = files[files.length - 1];
+                      if (!last) return;
+                      setExpiryPhotoUploading(true);
+                      try {
+                        const url = await uploadToStorage(last, "evidence/wizard", record.organization_id);
+                        setEditPhotoExpiryUrl(url);
+                        setExpiryEditFiles([]);
+                      } catch {
+                        setErr("Photo upload failed. Try again.");
+                        setExpiryEditFiles([]);
+                      } finally {
+                        setExpiryPhotoUploading(false);
+                      }
+                    }}
+                    accentClass="border-orange-200 dark:border-orange-800/50"
+                    icon={Calendar}
+                    iconColor="text-orange-600 dark:text-orange-400"
+                  />
                 )}
-              </>
+                {expiryPhotoUploading && (
+                  <p className="mt-2 flex items-center gap-2 text-xs text-orange-700 dark:text-orange-300">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Uploading…
+                  </p>
+                )}
+              </div>
             )}
           </div>
 
-          <div>
-            <label className={LABEL}>Amazon order ID <span className="text-xs font-normal text-slate-400">(optional)</span></label>
-            <input
-              className={`${INPUT} font-mono`}
-              value={editOrderId}
-              onChange={(e) => setEditOrderId(e.target.value)}
-              placeholder="e.g. 111-1234567-8901234"
-              autoComplete="off"
-            />
-          </div>
+          {isLooseItem && (
+            <div>
+              <label className={LABEL}>Amazon order ID <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+              <input
+                className={`${INPUT} font-mono`}
+                value={editOrderId}
+                onChange={(e) => setEditOrderId(e.target.value)}
+                placeholder="e.g. 111-1234567-8901234"
+                autoComplete="off"
+              />
+            </div>
+          )}
           <p className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-300">
             Status is recalculated on save from defect reasons, photos, and linked package box/label shots (for claims).
           </p>
           <div><label className={LABEL}>Notes</label><textarea rows={3} className="w-full resize-none rounded-2xl border border-slate-200 bg-white p-4 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" value={editNotes} onChange={(e) => setEditNotes(e.target.value)} /></div>
 
-          {/* ── Photo Evidence Edit ───────────────────────────────────────────── */}
-          {Object.keys(editPhotoEvidence).length > 0 && (
-            <div className="space-y-3 rounded-2xl border border-slate-200 p-4 dark:border-slate-700">
-              <p className="text-xs font-bold uppercase tracking-wide text-slate-400">Photo Evidence</p>
-              <p className="text-xs text-slate-400">Click <span className="font-semibold">✕</span> on a thumbnail to remove that photo slot before saving.</p>
-              {Object.entries(editPhotoEvidence).map(([cat, count]) => {
-                const catDef = ALL_PHOTO_CATEGORIES[cat];
-                return (
-                  <div key={cat}>
-                    <p className="mb-1.5 text-xs font-semibold text-slate-600 dark:text-slate-300">
-                      {catDef?.label ?? cat}
-                      <span className="ml-2 font-normal text-slate-400">{count} photo{count !== 1 ? "s" : ""}</span>
-                    </p>
-                    <div className="flex flex-wrap gap-2">
-                      {Array.from({ length: count }).map((_, i) => (
-                        <div key={i} className="relative flex h-16 w-16 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800">
-                          <Camera className="h-6 w-6 text-slate-300 dark:text-slate-600" />
-                          <span className="absolute bottom-1 right-1 text-[10px] font-bold text-slate-400">#{i + 1}</span>
-                          {/* Always-visible X button */}
-                          <button
-                            type="button"
-                            onClick={() => removeExistingPhotoSlot(cat)}
-                            aria-label={`Remove photo ${i + 1} of ${catDef?.label ?? cat}`}
-                            className="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded-full bg-rose-600 text-white shadow transition hover:bg-rose-700 active:scale-90"
-                          >
-                            <X className="h-3 w-3" />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {/* ── Add new photos in edit mode ───────────────────────────────────── */}
-          {Object.keys(editPhotoEvidence).length > 0 && (
-            <div className="space-y-2 rounded-2xl border border-slate-200 p-4 dark:border-slate-700">
-              <p className="text-xs font-bold uppercase tracking-wide text-slate-400">Add New Photos</p>
-              {Object.keys(editPhotoEvidence).map((cat) => {
-                const catDef = ALL_PHOTO_CATEGORIES[cat];
-                if (!catDef) return null;
-                return (
-                  <SmartCameraUpload
-                    key={cat}
-                    label={catDef.label}
-                    hint={`Add more ${catDef.label} photos`}
-                    icon={catDef.icon}
-                    iconColor={catDef.iconColor}
-                    accentClass={catDef.accentClass}
-                    files={editNewPhotos[cat] ?? []}
-                    onChange={(files) => setEditNewPhotos((p) => ({ ...p, [cat]: files }))}
-                  />
-                );
-              })}
-            </div>
-          )}
-
           {err && <p className="rounded-xl bg-rose-50 px-4 py-2 text-sm text-rose-700 dark:bg-rose-950/40 dark:text-rose-400">{err}</p>}
-          <div className="flex gap-3">
+          <div className="flex flex-wrap items-center justify-end gap-2 border-t border-slate-200 pt-4 dark:border-slate-800">
             <button
+              type="button"
               onClick={() => {
                 setEditing(false);
                 setEditLpn(record.lpn ?? "");
@@ -1752,11 +2098,11 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                 setEditPhotoEvidence(record.photo_evidence ?? {});
                 setEditNewPhotos({});
               }}
-              className={`${BTN_GHOST} flex-1 h-12`}
+              className={BTN_FOOTER_GHOST}
             >
               <XCircle className="h-4 w-4" />Cancel
             </button>
-            <button onClick={handleSave} disabled={saving} className="flex h-12 flex-1 items-center justify-center gap-2 rounded-2xl bg-sky-500 font-semibold text-white hover:bg-sky-600 disabled:opacity-50">
+            <button type="button" onClick={handleSave} disabled={saving} className={BTN_FOOTER_PRIMARY}>
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}Save
             </button>
           </div>
@@ -1836,11 +2182,13 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
             )}
             {(record.photo_item_url || record.photo_expiry_url) && (
               <div className="col-span-2">
-                <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1.5">Evidence Photos</p>
-                <div className="flex flex-wrap gap-2">
-                  {record.photo_item_url && <span className="inline-flex items-center gap-1 rounded-full border border-sky-200 bg-sky-50 px-2.5 py-1 text-xs font-medium text-sky-700 dark:border-sky-700/60 dark:bg-sky-950/40 dark:text-sky-300"><Camera className="h-3 w-3" />Item Photo ✓</span>}
-                  {record.photo_expiry_url && <span className="inline-flex items-center gap-1 rounded-full border border-orange-200 bg-orange-50 px-2.5 py-1 text-xs font-medium text-orange-700 dark:border-orange-700/60 dark:bg-orange-950/30 dark:text-orange-300"><Camera className="h-3 w-3" />Expiry Photo ✓</span>}
-                </div>
+                <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1.5">Item Condition Photos</p>
+                <PhotoGallery
+                  photos={[
+                    ...(record.photo_item_url?.trim() ? [{ src: record.photo_item_url.trim(), label: "Item photo" }] : []),
+                    ...(record.photo_expiry_url?.trim() ? [{ src: record.photo_expiry_url.trim(), label: "Expiry label" }] : []),
+                  ]}
+                />
               </div>
             )}
             {(record.inherited_tracking_number || linkedPkg?.tracking_number) && (
@@ -1857,8 +2205,28 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                   />
                 </div>
                 {(record.inherited_carrier || linkedPkg?.carrier_name) && (
-                  <p className="text-xs text-muted-foreground">{record.inherited_carrier ?? linkedPkg?.carrier_name}</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Carrier (inherited from package):{" "}
+                    <span className="font-semibold text-foreground">{record.inherited_carrier ?? linkedPkg?.carrier_name}</span>
+                  </p>
                 )}
+              </div>
+            )}
+            {(linkedPkg?.order_id?.trim() || (isLooseItem && record.order_id?.trim())) && (
+              <div className="col-span-2">
+                <p className="text-xs text-slate-400">
+                  {linkedPkg?.order_id?.trim() ? "Amazon order ID (from package)" : "Amazon order ID"}
+                </p>
+                <div className="group flex flex-wrap items-center gap-2">
+                  <p className="font-mono text-sm text-foreground">
+                    {(linkedPkg?.order_id ?? record.order_id ?? "").trim() || "—"}
+                  </p>
+                  <InlineCopy
+                    value={(linkedPkg?.order_id ?? record.order_id ?? "").trim()}
+                    label="Amazon order ID"
+                    onToast={onToast}
+                  />
+                </div>
               </div>
             )}
           </div>
@@ -1875,7 +2243,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
           {photoTotal > 0 && record.photo_evidence && (
             <div>
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-3">
-                Photo Evidence ({photoTotal} photo{photoTotal !== 1 ? "s" : ""})
+                Inherited Package Evidence ({photoTotal} photo{photoTotal !== 1 ? "s" : ""})
               </p>
               {/* If we have live File objects from this session, show the gallery with zoom */}
               {sessionPhotos && Object.keys(sessionPhotos).length > 0 ? (
@@ -1907,19 +2275,19 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
             <div><p className="text-slate-400">By</p><p className="font-semibold capitalize text-slate-700 dark:text-slate-300">{operatorDisplayLabel(record)}</p></div>
             <div><p className="text-slate-400">Date</p><p className="font-semibold text-slate-700 dark:text-slate-300">{fmt(record.created_at)}</p></div>
           </div>
-          <div className="flex gap-3">
-            <button onClick={() => setEditing(true)} className={`${BTN_GHOST} flex-1 h-12`}><Pencil className="h-4 w-4" />Edit</button>
+          <div className="flex flex-wrap justify-end gap-3 border-t border-slate-200 pt-4 dark:border-slate-800">
+            <button onClick={() => setEditing(true)} className={`${BTN_GHOST} h-12 min-w-[7rem]`}><Pencil className="h-4 w-4" />Edit</button>
             {canDelete(role) && !confirmDel && (
-              <button onClick={() => setConfirmDel(true)} className="flex h-12 flex-1 items-center justify-center gap-2 rounded-2xl border border-rose-200 text-sm font-semibold text-rose-600 hover:bg-rose-50 dark:border-rose-700/60 dark:text-rose-400 dark:hover:bg-rose-950/30">
+              <button onClick={() => setConfirmDel(true)} className="flex h-12 min-w-[7rem] items-center justify-center gap-2 rounded-2xl border border-rose-200 px-4 text-sm font-semibold text-rose-600 hover:bg-rose-50 dark:border-rose-700/60 dark:text-rose-400 dark:hover:bg-rose-950/30">
                 <Trash2 className="h-4 w-4" />Delete
               </button>
             )}
             {confirmDel && (
-              <div className="flex flex-1 items-center gap-2">
-                <p className="flex-1 text-xs text-rose-600">Cannot be undone.</p>
+              <div className="flex w-full flex-wrap items-center justify-end gap-2">
+                <p className="mr-auto text-xs text-rose-600">Cannot be undone.</p>
                 <button onClick={() => setConfirmDel(false)} className={BTN_GHOST}>Cancel</button>
-                <button onClick={handleDelete} disabled={deleting} className="flex h-10 items-center gap-1.5 rounded-xl bg-rose-600 px-3 text-sm font-semibold text-white hover:bg-rose-700 disabled:opacity-60">
-                  {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}Yes
+                <button onClick={handleDelete} disabled={deleting} className="inline-flex h-10 items-center gap-1.5 rounded-xl bg-rose-600 px-4 text-sm font-semibold text-white hover:bg-rose-700 disabled:opacity-60">
+                  {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}Delete
                 </button>
               </div>
             )}
@@ -2034,7 +2402,8 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
   const [editRmaNumber, setEditRmaNumber] = useState(initPkg.rma_number ?? "");
   const [editExpected,  setEditExpected]  = useState(String(initPkg.expected_item_count));
   const [editPalletId,  setEditPalletId]  = useState(initPkg.pallet_id ?? "");
-  const slipCameraRef = useRef<HTMLInputElement>(null);
+  const [editOrderId,   setEditOrderId]   = useState(initPkg.order_id ?? "");
+  const editSlipCameraRef = useRef<HTMLInputElement>(null);
   const [saveErr,    setSaveErr]    = useState("");
   const [saving,     setSaving]     = useState(false);
 
@@ -2045,23 +2414,54 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
   const [editPhotoOpenedUploading,  setEditPhotoOpenedUploading]  = useState(false);
   const [editPhotoReturnLabelUploading, setEditPhotoReturnLabelUploading] = useState(false);
 
-  // ── Auto-fill carrier from pallet's existing packages (skip initial mount) ─
-  const pkgPalletMounted = useRef(false);
+  /** When a package is on a pallet, carrier is shared across that pallet's shipment — read from sibling packages. */
+  const [palletShipmentCarrier, setPalletShipmentCarrier] = useState<string | null>(null);
   useEffect(() => {
-    if (!pkgPalletMounted.current) { pkgPalletMounted.current = true; return; }
-    if (!editPalletId) return;
+    const raw = (editing ? editPalletId : pkg.pallet_id) ?? "";
+    const trimmed = raw.trim();
+    if (!trimmed || !isUuidString(trimmed)) {
+      setPalletShipmentCarrier(null);
+      return;
+    }
+    let cancelled = false;
     supabaseBrowser
       .from("packages")
       .select("carrier_name")
-      .eq("pallet_id", editPalletId)
+      .eq("pallet_id", trimmed)
       .not("carrier_name", "is", null)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle()
       .then(({ data }) => {
-        if (data?.carrier_name) setEditCarrier(data.carrier_name as string);
+        if (cancelled) return;
+        setPalletShipmentCarrier(data?.carrier_name ? String(data.carrier_name) : null);
       });
-  }, [editPalletId]);
+    return () => { cancelled = true; };
+  }, [editing, editPalletId, pkg.pallet_id, pkg.id]);
+
+  const packageLinkedToPallet = useMemo(() => {
+    const raw = (editing ? editPalletId : pkg.pallet_id) ?? "";
+    return Boolean(raw.trim() && isUuidString(raw.trim()));
+  }, [editing, editPalletId, pkg.pallet_id]);
+
+  const effectiveCarrierDisplay = useMemo(
+    () => (pkg.carrier_name?.trim() || palletShipmentCarrier || null),
+    [pkg.carrier_name, palletShipmentCarrier],
+  );
+
+  useEffect(() => {
+    if (editing) return;
+    setPkg(initPkg);
+    setEditCarrier(initPkg.carrier_name ?? "");
+    setEditTracking(initPkg.tracking_number ?? "");
+    setEditRmaNumber(initPkg.rma_number ?? "");
+    setEditExpected(String(initPkg.expected_item_count));
+    setEditPalletId(initPkg.pallet_id ?? "");
+    setEditOrderId(initPkg.order_id ?? "");
+    setEditPhotoClosedUrl(initPkg.photo_closed_url ?? "");
+    setEditPhotoOpenedUrl(initPkg.photo_opened_url ?? "");
+    setEditPhotoReturnLabelUrl(initPkg.photo_return_label_url ?? "");
+  }, [initPkg, editing]);
 
   // ── Physical scanner for the RMA field (edit mode only) ──────────────────
   const { onKeyDown: pkgRmaKeyDown } = usePhysicalScanner({
@@ -2082,26 +2482,40 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
     const setUrl       = field === "closed"        ? setEditPhotoClosedUrl
                        : field === "opened"        ? setEditPhotoOpenedUrl
                        : setEditPhotoReturnLabelUrl;
+    const folder =
+      field === "closed" ? "packages/claim_closed"
+        : field === "opened" ? "packages/claim_opened"
+          : "packages/claim_return_label";
     setUploading(true);
     try {
-      const ext  = f.name.split(".").pop() ?? "jpg";
-      const path = `packages/claim_${field}/${pkg.id}_${Date.now()}.${ext}`;
-      const { error: upErr } = await supabaseBrowser.storage.from("media").upload(path, f, { upsert: true });
-      if (upErr) throw new Error(upErr.message);
-      const { data: urlData } = supabaseBrowser.storage.from("media").getPublicUrl(path);
-      setUrl(urlData.publicUrl);
+      const publicUrl = await uploadToStorage(f, folder, pkg.organization_id);
+      setUrl(publicUrl);
     } catch {
       setSaveErr("Photo upload failed. Try again.");
     } finally {
       setUploading(false);
     }
   }
-  /** AI-read expected lines from a real camera/file upload — drives reconciliation. */
-  const [expectedItems, setExpectedItems]   = useState<SlipExpectedItem[] | null>(null);
-  const [ocrRunning,    setOcrRunning]      = useState(false);
-  const [ocrConfidence, setOcrConfidence]   = useState<number | null>(null);
-  const [ocrErr,        setOcrErr]          = useState("");
-  const [lastSlipName,  setLastSlipName]    = useState<string | null>(null);
+  /** Edit mode: manifest OCR in progress / errors (saved immediately on success). */
+  const [editManifestOcrRunning, setEditManifestOcrRunning] = useState(false);
+  const [editManifestErr, setEditManifestErr] = useState("");
+
+  const reconciliationLines = useMemo((): SlipExpectedItem[] | null => {
+    const md = pkg.manifest_data;
+    const ex = pkg.expected_items;
+    const raw =
+      md && Array.isArray(md) && md.length > 0
+        ? md
+        : ex && Array.isArray(ex) && ex.length > 0
+          ? ex
+          : null;
+    if (!raw) return null;
+    return raw.map((it) => ({
+      barcode: String(it.sku ?? "").trim(),
+      name: String(it.description ?? it.sku ?? "").trim(),
+      expected_qty: it.expected_qty ?? 1,
+    }));
+  }, [pkg.manifest_data, pkg.expected_items]);
 
   const mismatch   = pkg.expected_item_count > 0 && pkg.actual_item_count !== pkg.expected_item_count;
   const pct        = pkg.expected_item_count > 0 ? Math.min(100, (pkg.actual_item_count / pkg.expected_item_count) * 100) : null;
@@ -2110,43 +2524,49 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
 
   useEffect(() => { listReturnsByPackage(pkg.id).then((r) => { if (r.ok) setItems(r.data); setLoading(false); }); }, [pkg.id]);
 
-  /**
-   * Mock OCR: simulates reading a packing-slip photo without any real API call.
-   * Returns the two fixed test barcodes used for green/yellow/red reconciliation testing.
-   */
-  async function mockManifestOcr(_file: File): Promise<SlipExpectedItem[]> {
-    await new Promise((r) => setTimeout(r, 1400)); // realistic scanning delay
-    return [
-      { barcode: "111", name: "Item 111", expected_qty: 1 },
-      { barcode: "222", name: "Item 222", expected_qty: 2 },
-    ];
-  }
-
-  /** Native camera / gallery: `<input type="file" accept="image/*" capture="environment" />` */
-  async function handleImageUpload(e: React.ChangeEvent<HTMLInputElement>) {
+  /** Manifest upload from Edit mode — persists manifest_photo_url, manifest_data, and expected_items. */
+  async function handleEditManifestUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file || !file.type.startsWith("image/")) {
-      setOcrErr("Please choose an image file.");
+      setEditManifestErr("Please choose an image file.");
       return;
     }
-
-    setOcrRunning(true);
-    setOcrErr("");
-    setOcrConfidence(null);
-    setLastSlipName(file.name);
-
+    setEditManifestOcrRunning(true);
+    setEditManifestErr("");
     try {
-      const items = await mockManifestOcr(file);
-      setExpectedItems(items.length > 0 ? items : null);
-      setOcrConfidence(items.length > 0 ? 1 : 0);
+      const publicUrl = await uploadToStorage(file, "packages/manifest", pkg.organization_id);
+      const items = await mockManifestLineItems(file);
       if (items.length === 0) {
-        setOcrErr("No items detected on the packing slip — try a clearer photo.");
+        setEditManifestErr("No items detected on the packing slip — try a clearer photo.");
+        return;
+      }
+      const manifest_data: ExpectedItem[] = items.map((it) => ({
+        sku: it.barcode,
+        expected_qty: it.expected_qty ?? 1,
+        description: it.name,
+      }));
+      const expected_item_count = manifest_data.reduce((a, it) => a + (it.expected_qty ?? 1), 0);
+      const res = await updatePackage(
+        pkg.id,
+        {
+          manifest_photo_url: publicUrl,
+          manifest_data,
+          expected_item_count,
+        },
+        actor,
+      );
+      if (res.ok && res.data) {
+        setPkg(res.data);
+        onPackageUpdated(res.data);
+        setEditExpected(String(res.data.expected_item_count));
+      } else {
+        setEditManifestErr(res.error ?? "Could not save manifest to the package.");
       }
     } catch (err) {
-      setOcrErr(err instanceof Error ? err.message : "Upload or OCR failed. Try again.");
+      setEditManifestErr(err instanceof Error ? err.message : "Upload or OCR failed. Try again.");
     } finally {
-      setOcrRunning(false);
+      setEditManifestOcrRunning(false);
     }
   }
 
@@ -2155,11 +2575,18 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
 
   async function handleSaveEdits() {
     setSaving(true); setSaveErr("");
+    const rawPid = editPalletId.trim();
+    const linkedPlt = Boolean(rawPid && isUuidString(rawPid));
+    const carrierFromPalletFlow = (pkg.carrier_name?.trim() || palletShipmentCarrier || "").trim();
+    const carrierPayload = linkedPlt
+      ? (carrierFromPalletFlow || undefined)
+      : (editCarrier.trim() || undefined);
     const res = await updatePackage(pkg.id, {
-      carrier_name:         editCarrier    || undefined,
+      carrier_name:         carrierPayload,
       tracking_number:      editTracking   || undefined,
       rma_number:           editRmaNumber  || null,
       expected_item_count:  parseInt(editExpected, 10) || 0,
+      order_id:             editOrderId.trim() || null,
       ...(editPalletId           ? { pallet_id:              editPalletId           } : {}),
       ...(editPhotoClosedUrl      ? { photo_closed_url:       editPhotoClosedUrl      } : {}),
       ...(editPhotoOpenedUrl      ? { photo_opened_url:       editPhotoOpenedUrl      } : {}),
@@ -2182,7 +2609,12 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
     <div className="p-4 sm:p-6 space-y-5">
       <div className="flex flex-wrap gap-2">
         <PkgStatusBadge status={pkg.status} />
-        {pkg.carrier_name && <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"><Truck className="h-3 w-3" />{pkg.carrier_name}</span>}
+        {effectiveCarrierDisplay && (
+          <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300" title={pkg.pallet_id ? "Carrier (pallet shipment — from this or a sibling package on the pallet)" : undefined}>
+            <Truck className="h-3 w-3" />
+            {effectiveCarrierDisplay}
+          </span>
+        )}
         {pkg.tracking_number && (
           <span className="group inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 font-mono text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400">
             <QrCode className="h-3 w-3" />
@@ -2229,12 +2661,23 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
               {openPallets.map((p) => <option key={p.id} value={p.id}>{p.pallet_number} ({p.item_count} items)</option>)}
             </select>
           </div>
-          <div><label className={LABEL}>Carrier</label>
-            <select className={INPUT} value={editCarrier} onChange={(e) => setEditCarrier(e.target.value)}>
-              <option value="">Select carrier…</option>
-              {CARRIERS.map((c) => <option key={c} value={c}>{c}</option>)}
-            </select>
-          </div>
+          {packageLinkedToPallet ? (
+            <div className="rounded-2xl border border-slate-200 bg-slate-50/90 p-4 dark:border-slate-700 dark:bg-slate-900/50">
+              <p className={LABEL}>Carrier</p>
+              <p className="text-sm font-semibold text-foreground">{effectiveCarrierDisplay ?? "—"}</p>
+              <p className="mt-2 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+                This package is linked to a pallet. Carrier is inherited from the pallet shipment (first package on this pallet with a carrier). To set a different carrier, move the package off the pallet first.
+              </p>
+            </div>
+          ) : (
+            <div>
+              <label className={LABEL}>Carrier</label>
+              <select className={INPUT} value={editCarrier} onChange={(e) => setEditCarrier(e.target.value)}>
+                <option value="">Select carrier…</option>
+                {CARRIERS.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+          )}
           <div><label className={LABEL}>Tracking # <span className="text-xs font-normal text-slate-400">(unique)</span></label>
             <div className="relative"><QrCode className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
               <input className={`${INPUT} pl-11`} value={editTracking} onChange={(e) => setEditTracking(e.target.value)} placeholder="Scan or type tracking number…" />
@@ -2261,6 +2704,117 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
           <div><label className={LABEL}>Expected Item Count</label>
             <input type="number" min="0" className={INPUT} value={editExpected} onChange={(e) => setEditExpected(e.target.value)} placeholder="0" />
           </div>
+          <div>
+            <label className={LABEL}>Amazon order ID <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+            <input
+              className={`${INPUT} font-mono`}
+              value={editOrderId}
+              onChange={(e) => setEditOrderId(e.target.value)}
+              placeholder="e.g. 111-1234567-8901234"
+              autoComplete="off"
+            />
+          </div>
+
+          {/* ── Packing slip / manifest (upload here — not in read-only drawer) ── */}
+          <div className="rounded-2xl border-2 border-violet-200 bg-violet-50/80 p-4 space-y-3 dark:border-violet-800/50 dark:bg-violet-950/25">
+            <div className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-violet-600 dark:text-violet-400" />
+              <p className="text-sm font-bold text-violet-800 dark:text-violet-200">Packing slip / manifest</p>
+            </div>
+            <p className="text-xs text-violet-700 dark:text-violet-300">
+              Photo is stored on the package; line items drive Expected vs Scanned reconciliation in the drawer.
+            </p>
+            <input
+              ref={editSlipCameraRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="hidden"
+              onChange={handleEditManifestUpload}
+            />
+            {editManifestOcrRunning ? (
+              <div className="flex items-center gap-3 rounded-xl bg-violet-100/80 px-4 py-3 dark:bg-violet-950/40">
+                <Loader2 className="h-5 w-5 shrink-0 animate-spin text-violet-500" />
+                <span className="text-sm font-semibold text-violet-800 dark:text-violet-200">Analyzing manifest…</span>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  onClick={() => editSlipCameraRef.current?.click()}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-violet-600 py-3.5 text-sm font-semibold text-white shadow-sm transition hover:bg-violet-700"
+                >
+                  📸 Take photo of packing list
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void (async () => {
+                      const mockItems: SlipExpectedItem[] = [
+                        { barcode: "111", name: "Item 111", expected_qty: 1 },
+                        { barcode: "222", name: "Item 222", expected_qty: 2 },
+                      ];
+                      const manifest_data: ExpectedItem[] = mockItems.map((it) => ({
+                        sku: it.barcode,
+                        expected_qty: it.expected_qty ?? 1,
+                        description: it.name,
+                      }));
+                      const expected_item_count = manifest_data.reduce((a, it) => a + (it.expected_qty ?? 1), 0);
+                      const res = await updatePackage(
+                        pkg.id,
+                        { manifest_data, expected_item_count },
+                        actor,
+                      );
+                      if (res.ok && res.data) {
+                        setPkg(res.data);
+                        onPackageUpdated(res.data);
+                        setEditExpected(String(res.data.expected_item_count));
+                      } else {
+                        setEditManifestErr(res.error ?? "Could not save mock manifest.");
+                      }
+                    })();
+                  }}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl border border-violet-300 bg-white py-2.5 text-xs font-semibold text-violet-700 transition hover:bg-violet-100 dark:border-violet-700/50 dark:bg-slate-900 dark:text-violet-300"
+                >
+                  🧪 Load mock manifest (test reconciliation)
+                </button>
+              </div>
+            )}
+            {(pkg.manifest_photo_url || reconciliationLines) && (
+              <button
+                type="button"
+                onClick={() => {
+                  void (async () => {
+                    const res = await updatePackage(
+                      pkg.id,
+                      {
+                        manifest_data: null,
+                        manifest_photo_url: null,
+                        expected_item_count: 0,
+                      },
+                      actor,
+                    );
+                    if (res.ok && res.data) {
+                      setPkg(res.data);
+                      onPackageUpdated(res.data);
+                      setEditExpected("0");
+                    }
+                  })();
+                }}
+                className="text-[10px] font-semibold text-slate-500 underline hover:text-slate-700"
+              >
+                Clear manifest data
+              </button>
+            )}
+            {editManifestErr && (
+              <p className="text-xs text-rose-600 dark:text-rose-400">
+                {editManifestErr}{" "}
+                <button type="button" className="font-semibold underline" onClick={() => editSlipCameraRef.current?.click()}>
+                  Try again
+                </button>
+              </p>
+            )}
+          </div>
 
           {/* ── Claim Evidence Photos ──────────────────────────────────── */}
           <div className="rounded-2xl border-2 border-rose-200 bg-rose-50 p-4 space-y-3 dark:border-rose-700/50 dark:bg-rose-950/20">
@@ -2269,55 +2823,68 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
               <p className="text-sm font-bold text-rose-800 dark:text-rose-200">Claim Evidence Photos</p>
             </div>
             {editPhotoClosedUrl ? (
-              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Closed box photo saved ✓</span>
-                <button type="button" onClick={() => setEditPhotoClosedUrl("")} className="text-xs text-slate-400 underline">Remove</button>
-              </div>
+              <SavedUrlEvidenceCard
+                label="Closed box"
+                hint="Optional — claim evidence for the sealed package."
+                imageUrl={editPhotoClosedUrl}
+                onRemove={() => setEditPhotoClosedUrl("")}
+                Icon={Camera}
+                iconColor="text-rose-600 dark:text-rose-400"
+                footerNote="Stored on this package"
+              />
             ) : (
               <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${editPhotoClosedUploading ? "border-rose-300 text-rose-500" : "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100 dark:border-rose-700/60 dark:bg-rose-950/30 dark:text-rose-300"}`}>
                 {editPhotoClosedUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                {editPhotoClosedUploading ? "Uploading…" : "📸 Upload Closed Box Photo"}
+                {editPhotoClosedUploading ? "Uploading…" : "📸 Closed box (optional)"}
                 <input type="file" accept="image/*" capture="environment" className="hidden" disabled={editPhotoClosedUploading} onChange={(e) => handlePkgClaimPhoto(e, "closed")} />
               </label>
             )}
             {editPhotoOpenedUrl ? (
-              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Opened box photo saved ✓</span>
-                <button type="button" onClick={() => setEditPhotoOpenedUrl("")} className="text-xs text-slate-400 underline">Remove</button>
-              </div>
+              <SavedUrlEvidenceCard
+                label="Opened box"
+                hint="Shows contents — required for most claims."
+                imageUrl={editPhotoOpenedUrl}
+                onRemove={() => setEditPhotoOpenedUrl("")}
+                Icon={Camera}
+                iconColor="text-amber-600 dark:text-amber-400"
+                required
+                footerNote="Stored on this package"
+              />
             ) : (
               <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${editPhotoOpenedUploading ? "border-amber-300 text-amber-500" : "border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-300"}`}>
                 {editPhotoOpenedUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                {editPhotoOpenedUploading ? "Uploading…" : "📸 Upload Opened Box Photo"}
+                {editPhotoOpenedUploading ? "Uploading…" : "📸 Opened box"}
+                <span className="text-rose-500">*</span>
                 <input type="file" accept="image/*" capture="environment" className="hidden" disabled={editPhotoOpenedUploading} onChange={(e) => handlePkgClaimPhoto(e, "opened")} />
               </label>
             )}
 
             {/* Return shipping label */}
             {editPhotoReturnLabelUrl ? (
-              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Return label photo saved ✓</span>
-                <button type="button" onClick={() => setEditPhotoReturnLabelUrl("")} className="text-xs text-slate-400 underline">Remove</button>
-              </div>
+              <SavedUrlEvidenceCard
+                label="Return label"
+                hint="Carrier return label — required for most claims."
+                imageUrl={editPhotoReturnLabelUrl}
+                onRemove={() => setEditPhotoReturnLabelUrl("")}
+                Icon={Camera}
+                iconColor="text-violet-600 dark:text-violet-400"
+                required
+                footerNote="Stored on this package"
+              />
             ) : (
               <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${editPhotoReturnLabelUploading ? "border-violet-300 text-violet-500" : "border-violet-300 bg-violet-50 text-violet-700 hover:bg-violet-100 dark:border-violet-700/60 dark:bg-violet-950/30 dark:text-violet-300"}`}>
                 {editPhotoReturnLabelUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                {editPhotoReturnLabelUploading ? "Uploading…" : "📸 Upload Return Label Photo"}
+                {editPhotoReturnLabelUploading ? "Uploading…" : "📸 Return label"}
+                <span className="text-rose-500">*</span>
                 <input type="file" accept="image/*" capture="environment" className="hidden" disabled={editPhotoReturnLabelUploading} onChange={(e) => handlePkgClaimPhoto(e, "return_label")} />
               </label>
             )}
           </div>
 
-          <div className="rounded-xl border border-violet-200 bg-violet-50 px-3 py-2 text-xs text-violet-700 dark:border-violet-700/50 dark:bg-violet-950/20 dark:text-violet-300">
-            💡 Use the <strong>Scan Packing Slip</strong> button above (outside edit mode) to load the manifest and enable reconciliation.
-          </div>
           {saveErr && <p className="text-sm text-rose-600 dark:text-rose-400">{saveErr}</p>}
-          <div className="flex gap-3">
-            <button onClick={() => setEditing(false)} className={`${BTN_GHOST} flex-1 h-12`}><XCircle className="h-4 w-4" />Cancel</button>
-            <button onClick={handleSaveEdits} disabled={saving} className="flex h-12 flex-1 items-center justify-center gap-2 rounded-2xl bg-sky-500 font-semibold text-white disabled:opacity-50 hover:bg-sky-600">
+          <div className="flex w-full flex-wrap items-center justify-end gap-2 border-t border-slate-200 pt-4 dark:border-slate-800">
+            <button type="button" onClick={() => setEditing(false)} className={BTN_FOOTER_GHOST}><XCircle className="h-4 w-4" />Cancel</button>
+            <button type="button" onClick={handleSaveEdits} disabled={saving} className={BTN_FOOTER_PRIMARY}>
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}Save
             </button>
           </div>
@@ -2335,119 +2902,128 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
           )}
           <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{operatorDisplayLabel(pkg)}</p></div>
           <div><p className="text-xs text-slate-400">Created</p><p className="font-semibold text-foreground">{fmt(pkg.created_at)}</p></div>
-          {(pkg.photo_closed_url || pkg.photo_opened_url || pkg.photo_return_label_url) && (
-            <div className="col-span-2 flex flex-wrap gap-1.5 pt-1">
-              {pkg.photo_closed_url && <a href={pkg.photo_closed_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-full bg-rose-100 px-2.5 py-0.5 text-[10px] font-bold text-rose-700 hover:bg-rose-200 dark:bg-rose-900/40 dark:text-rose-300"><Camera className="h-3 w-3" />Closed Box ✓</a>}
-              {pkg.photo_opened_url && <a href={pkg.photo_opened_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2.5 py-0.5 text-[10px] font-bold text-amber-700 hover:bg-amber-200 dark:bg-amber-900/40 dark:text-amber-300"><Camera className="h-3 w-3" />Opened Box ✓</a>}
-              {pkg.photo_return_label_url && <a href={pkg.photo_return_label_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 rounded-full bg-violet-100 px-2.5 py-0.5 text-[10px] font-bold text-violet-700 hover:bg-violet-200 dark:bg-violet-900/40 dark:text-violet-300"><Camera className="h-3 w-3" />Return Label ✓</a>}
+          {pkg.order_id?.trim() && (
+            <div className="col-span-2">
+              <p className="text-xs text-slate-400">Amazon order ID</p>
+              <div className="group flex flex-wrap items-center gap-2">
+                <p className="font-mono font-semibold text-foreground">{pkg.order_id.trim()}</p>
+                <InlineCopy value={pkg.order_id.trim()} label="Amazon order ID" onToast={showToast} />
+              </div>
+            </div>
+          )}
+          {(pkg.photo_url || pkg.photo_closed_url || pkg.photo_opened_url || pkg.photo_return_label_url) && (
+            <div className="col-span-2 space-y-2 pt-1">
+              <p className="text-xs text-slate-400">Claim evidence</p>
+              <PhotoGallery
+                photos={[
+                  ...(pkg.photo_url?.trim() ? [{ src: pkg.photo_url.trim(), label: "Outer / reference" }] : []),
+                  ...(pkg.photo_closed_url?.trim() ? [{ src: pkg.photo_closed_url.trim(), label: "Closed box" }] : []),
+                  ...(pkg.photo_opened_url?.trim() ? [{ src: pkg.photo_opened_url.trim(), label: "Opened box" }] : []),
+                  ...(pkg.photo_return_label_url?.trim() ? [{ src: pkg.photo_return_label_url.trim(), label: "Return label" }] : []),
+                ]}
+              />
             </div>
           )}
         </div>
       )}
 
-      {/* Actions */}
+      {/* Actions — bottom bar (Item / Package / Pallet) */}
       {!editing && (
-        <div className="flex flex-wrap gap-2">
-          {pkg.status === "open" && <button onClick={() => setWizardOpen(true)} className="flex flex-1 h-12 items-center justify-center gap-2 rounded-2xl bg-sky-500 text-sm font-semibold text-white hover:bg-sky-600"><ScanLine className="h-4 w-4" />Scan New Item</button>}
-          {pkg.status === "open" && allReturns.length > 0 && <button onClick={() => setAssignOpen(true)} className="flex h-12 items-center justify-center gap-2 rounded-2xl border border-sky-300 bg-sky-50 px-4 text-sm font-semibold text-sky-700 hover:bg-sky-100 dark:border-sky-700/60 dark:bg-sky-950/30 dark:text-sky-300 dark:hover:bg-sky-950/50"><Plus className="h-4 w-4" />Assign Existing</button>}
-          <button onClick={() => setEditing(true)} className={`${BTN_GHOST} h-12 px-4`}><Pencil className="h-4 w-4" />Edit</button>
-          {pkg.status === "open" && <button onClick={() => mismatch ? setDiscOpen(true) : handleClose()} disabled={closing} className={`${BTN_GHOST} h-12 px-4`}>{closing ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckSquare className="h-4 w-4" />}Close</button>}
-          {canDelete(role) && <button onClick={async () => { const r = await deletePackage(pkg.id, actor); if (r.ok) { onPackageDeleted(pkg.id); onClose(); } else showToast(r.error ?? "Delete failed.", "error"); }} className="flex h-12 items-center gap-2 rounded-2xl border border-rose-200 px-4 text-sm font-semibold text-rose-600 hover:bg-rose-50 dark:border-rose-700/60 dark:text-rose-400 dark:hover:bg-rose-950/30"><Trash2 className="h-4 w-4" /></button>}
+        <div className="space-y-3 border-t border-slate-200 pt-4 dark:border-slate-800">
+          <div className="flex flex-wrap justify-end gap-3">
+            {pkg.status === "open" && (
+              <button
+                type="button"
+                onClick={() => setWizardOpen(true)}
+                className="inline-flex h-12 min-w-[11rem] shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-2xl bg-sky-500 px-4 text-sm font-semibold text-white transition hover:bg-sky-600"
+              >
+                <ScanLine className="h-4 w-4 shrink-0" />
+                Scan New Item
+              </button>
+            )}
+            {pkg.status === "open" && allReturns.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setAssignOpen(true)}
+                className="inline-flex h-12 min-w-[11rem] shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-2xl border border-sky-300 bg-sky-50 px-4 text-sm font-semibold text-sky-700 transition hover:bg-sky-100 dark:border-sky-700/60 dark:bg-sky-950/30 dark:text-sky-300 dark:hover:bg-sky-950/50"
+              >
+                <Plus className="h-4 w-4 shrink-0" />
+                Assign Existing
+              </button>
+            )}
+          </div>
+          <div className="flex flex-wrap justify-end gap-3">
+            <button type="button" onClick={() => setEditing(true)} className={`${BTN_GHOST} h-12 min-w-[9rem] justify-center px-4`}>
+              <Pencil className="h-4 w-4 shrink-0" />
+              Edit
+            </button>
+            {pkg.status === "open" && (
+              <button
+                type="button"
+                onClick={() => (mismatch ? setDiscOpen(true) : handleClose())}
+                disabled={closing}
+                className={`${BTN_GHOST} h-12 min-w-[9rem] justify-center px-4`}
+              >
+                {closing ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckSquare className="h-4 w-4 shrink-0" />}
+                Close
+              </button>
+            )}
+            {canDelete(role) && (
+              <button
+                type="button"
+                onClick={async () => {
+                  const r = await deletePackage(pkg.id, actor);
+                  if (r.ok) {
+                    onPackageDeleted(pkg.id);
+                    onClose();
+                  } else showToast(r.error ?? "Delete failed.", "error");
+                }}
+                className="inline-flex h-12 min-w-[9rem] items-center justify-center gap-2 whitespace-nowrap rounded-2xl border border-rose-200 px-4 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 dark:border-rose-700/60 dark:text-rose-400 dark:hover:bg-rose-950/30"
+              >
+                <Trash2 className="h-4 w-4 shrink-0" />
+                Delete
+              </button>
+            )}
+          </div>
         </div>
       )}
 
       {/* Assign Existing Item Modal */}
       {assignOpen && <AssignExistingItemModal pkg={pkg} allReturns={allReturns} currentItems={items} actor={actor} onAssigned={(updated) => { setItems((p) => [...p.filter((i) => i.id !== updated.id), updated]); showToast(`✓ Item assigned to ${pkg.package_number}`); setAssignOpen(false); }} onClose={() => setAssignOpen(false)} />}
 
-      {/* ── Packing Slip / Manifest ── */}
-      <div className="rounded-2xl border-2 border-dashed border-violet-200 p-4 space-y-3 dark:border-violet-800/50">
-        <p className="text-sm font-bold text-violet-700 dark:text-violet-300">Packing Slip / Manifest</p>
-        <div className="flex flex-wrap items-center justify-between gap-2">
+      {/* ── Read-only: reconciliation from saved manifest_data (upload lives in Edit) ── */}
+      <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-4 dark:border-slate-700 dark:bg-slate-900/40">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <span className="inline-flex items-center gap-1 rounded-full bg-violet-100 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-violet-700 dark:bg-violet-900/40 dark:text-violet-300"><Sparkles className="h-3 w-3" />Packing slip</span>
-            {ocrConfidence !== null && !ocrRunning && expectedItems && (
-              <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">{Math.round(ocrConfidence * 100)}% confidence</span>
-            )}
+            <p className="text-sm font-bold text-foreground">Packing slip / manifest</p>
+            <span className="inline-flex items-center gap-1 rounded-full bg-violet-100 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-violet-700 dark:bg-violet-900/40 dark:text-violet-300">
+              <Sparkles className="h-3 w-3" />
+              Read-only
+            </span>
           </div>
-          {expectedItems && (
-            <button type="button" onClick={() => { setExpectedItems(null); setOcrConfidence(null); setLastSlipName(null); }} className="text-[10px] text-slate-400 hover:text-slate-600 underline">
-              Clear expected list
-            </button>
+          {pkg.manifest_photo_url && (
+            <a
+              href={pkg.manifest_photo_url}
+              target="_blank"
+              rel="noreferrer"
+              className="text-[10px] font-semibold text-sky-600 underline hover:text-sky-700 dark:text-sky-400"
+            >
+              View manifest image
+            </a>
           )}
         </div>
-
-        <input
-          ref={slipCameraRef}
-          type="file"
-          accept="image/*"
-          capture="environment"
-          className="hidden"
-          onChange={handleImageUpload}
-        />
-
-        {ocrRunning ? (
-          <div className="flex items-center gap-3 rounded-xl bg-violet-50 px-4 py-3 dark:bg-violet-950/30">
-            <Loader2 className="h-5 w-5 shrink-0 animate-spin text-violet-500" />
-            <span className="text-sm font-semibold text-violet-800 dark:text-violet-200">AI analyzing…</span>
-          </div>
-        ) : expectedItems ? (
-          <p className="text-xs text-emerald-700 dark:text-emerald-400">
-            ✓ <strong>{expectedItems.length}</strong> expected line-items from{" "}
-            {lastSlipName ? <span className="font-mono">{lastSlipName}</span> : "your photo"}.
-            {" "}Reconciliation table shown below.
+        {!reconciliationLines && (
+          <p className="text-center text-[13px] text-muted-foreground">
+            No manifest line items on file. Use <strong>Edit</strong> to photograph or load a packing slip — reconciliation appears here once saved.
           </p>
-        ) : (
+        )}
+        {reconciliationLines && !loading && (
           <div className="space-y-2">
-            <button
-              type="button"
-              onClick={() => slipCameraRef.current?.click()}
-              className="flex w-full items-center justify-center gap-2 rounded-xl bg-violet-600 py-3.5 text-sm font-semibold text-white shadow-sm transition hover:bg-violet-700"
-            >
-              📸 Take Photo of List
-            </button>
-            {/* Mock data button — loads demo manifest to test the reconciliation table */}
-            <button
-              type="button"
-              onClick={() => {
-                const mockItems: SlipExpectedItem[] = [
-                  { barcode: "111", name: "Item 111", expected_qty: 1 },
-                  { barcode: "222", name: "Item 222", expected_qty: 2 },
-                ];
-                setExpectedItems(mockItems);
-                setOcrConfidence(1);
-                setLastSlipName("mock-manifest.json");
-                setOcrErr("");
-              }}
-              className="flex w-full items-center justify-center gap-2 rounded-xl border border-violet-300 bg-violet-50 py-2.5 text-xs font-semibold text-violet-700 transition hover:bg-violet-100 dark:border-violet-700/50 dark:bg-violet-950/30 dark:text-violet-300"
-            >
-              🧪 Load Mock Manifest (Test Green/Yellow/Red)
-            </button>
-          </div>
-        )}
-
-        {!ocrRunning && !expectedItems && (
-          <p className="text-center text-[11px] text-muted-foreground">
-            Upload or photograph a packing slip — mock OCR will return test barcodes{" "}
-            <span className="font-mono">111</span> &amp; <span className="font-mono">222</span> and render the reconciliation table below.
-          </p>
-        )}
-
-        {ocrErr && (
-          <p className="text-xs text-rose-600 dark:text-rose-400">
-            {ocrErr}{" "}
-            <button type="button" className="font-semibold underline" onClick={() => slipCameraRef.current?.click()}>
-              Try again
-            </button>
-          </p>
-        )}
-
-        {/* ── Reconciliation Table — rendered directly below the upload button ── */}
-        {expectedItems && !loading && (
-          <div className="mt-4 space-y-2">
             <div className="flex items-center gap-2">
               <p className="text-xs font-bold uppercase tracking-widest text-slate-400">Reconciliation</p>
               <span className="inline-flex items-center gap-1 rounded-full bg-violet-100 px-2 py-0.5 text-[10px] font-bold text-violet-700 dark:bg-violet-900/40 dark:text-violet-300">
-                <Sparkles className="h-2.5 w-2.5" />Manifest vs Scanned
+                <Sparkles className="h-2.5 w-2.5" />
+                Expected vs Scanned
               </span>
             </div>
             <div className="flex flex-wrap items-center gap-3 text-[10px] font-semibold uppercase tracking-wide">
@@ -2466,7 +3042,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {expectedItems.map((exp, slipIdx) => {
+                  {reconciliationLines.map((exp, slipIdx) => {
                     const need = exp.expected_qty ?? 1;
                     const matched = items.filter((it) => physicalItemMatchesExpectedLine(it, exp));
                     const isMatch = matched.length >= need;
@@ -2491,25 +3067,28 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
                     );
                   })}
                   {items
-                    .filter((it) => !expectedItems.some((exp) => physicalItemMatchesExpectedLine(it, exp)))
+                    .filter((it) => !reconciliationLines.some((exp) => physicalItemMatchesExpectedLine(it, exp)))
                     .map((it) => (
                       <tr key={it.id} className="bg-amber-50/70 dark:bg-amber-950/20">
                         <td className="px-3 py-2.5">
                           <p className="font-semibold text-slate-700 dark:text-slate-300">{it.item_name}</p>
-                          <p className="font-mono text-slate-400">{it.asin ?? it.fnsku ?? it.sku ?? "—"}</p>
+                          <p className="font-mono text-slate-400">
+                            {(it as { product_identifier?: string | null }).product_identifier?.trim()
+                              || (it.asin ?? it.fnsku ?? it.sku ?? it.lpn ?? "—")}
+                          </p>
                         </td>
                         <td className="px-3 py-2.5 text-center text-slate-400">—</td>
                         <td className="px-3 py-2.5 text-center font-bold text-amber-600">1</td>
                         <td className="px-3 py-2.5">
-                          <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">🟡 Unexpected</span>
+                          <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">🟡 Scanned, not on slip</span>
                         </td>
                       </tr>
                     ))}
                 </tbody>
               </table>
-              {items.length === 0 && expectedItems.length > 0 && (
+              {items.length === 0 && reconciliationLines.length > 0 && (
                 <p className="py-4 text-center text-xs text-slate-400">
-                  No items scanned yet — all {expectedItems.length} expected line-items are missing.
+                  No items scanned yet — all {reconciliationLines.length} expected line-items are missing.
                 </p>
               )}
             </div>
@@ -2528,21 +3107,28 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
       </div>
 
       {wizardOpen && (() => {
-        // Merge session-local expectedItems into the package so the wizard's
+        // Merge saved manifest lines into the package so the wizard's
         // itemMatchesPackageExpectation can check against the real manifest.
+        const rawManifest =
+          (pkg.manifest_data && pkg.manifest_data.length > 0
+            ? pkg.manifest_data
+            : pkg.expected_items) ?? [];
         const pkgWithExpected: PackageRecord = {
           ...pkg,
-          expected_items: (expectedItems ?? []).map((e) => ({
-            sku: e.barcode,
-            expected_qty: e.expected_qty ?? 1,
-            description: e.name,
-          })),
+          expected_items: rawManifest.length
+            ? rawManifest
+            : (reconciliationLines ?? []).map((e: SlipExpectedItem) => ({
+                sku: e.barcode,
+                expected_qty: e.expected_qty ?? 1,
+                description: e.name,
+              })),
         };
         return (
           <SingleItemWizardModal
             onClose={() => setWizardOpen(false)}
             onSuccess={(r) => { handleItemAdded(r); }}
             actor={actor}
+            organizationId={pkg.organization_id}
             openPackages={[pkgWithExpected]}
             openPallets={openPallets}
             onCreatePackage={() => {}}
@@ -2550,6 +3136,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
             inheritedContext={{ packageId: pkg.id, packageLabel: pkg.package_number, palletId: pkg.pallet_id ?? undefined, palletLabel: openPallets.find((p) => p.id === pkg.pallet_id)?.pallet_number }}
             onSoftPackageWarning={() => showToast("⚠ This item is not on the scanned packing slip.", "warning")}
             onToast={showToast}
+            onLinkedPackageUpdated={onPackageUpdated}
             onNavigateToPackage={(id) => { if (id === pkg.id) setWizardOpen(false); }}
             onNavigateToPallet={(palletId) => {
               const plt = openPallets.find((p) => p.id === palletId);
@@ -2568,15 +3155,33 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
 
 // ─── Pallet Drawer Content ─────────────────────────────────────────────────────
 
-export function PalletDrawerContent({ pallet, role, actor, packages, onClose, onPalletUpdated, onPalletDeleted, onOpenPackage, showToast }: {
-  pallet: PalletRecord; role: UserRole; actor: string; packages: PackageRecord[];
+export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_ORGANIZATION_ID, packages, onClose, onPalletUpdated, onPalletDeleted, onOpenPackage, showToast }: {
+  pallet: PalletRecord; role: UserRole; actor: string;
+  /** Workspace org for storage paths and `updatePallet` scoping. */
+  organizationId?: string;
+  packages: PackageRecord[];
   onClose: () => void;
   onPalletUpdated: (p: PalletRecord) => void;
   onPalletDeleted: (id: string) => void;
   onOpenPackage: (p: PackageRecord) => void;
   showToast: (msg: string, kind?: ToastKind) => void;
 }) {
+  const orgId = isUuidString((organizationId ?? "").trim()) ? (organizationId ?? "").trim() : MVP_ORGANIZATION_ID;
   const [plt, setPlt] = useState(pallet);
+  const [editOpen, setEditOpen] = useState(false);
+  const [editStatus, setEditStatus] = useState<PalletStatus>(pallet.status);
+  const [editTracking, setEditTracking] = useState(pallet.tracking_number ?? "");
+  const [editNotes, setEditNotes] = useState(pallet.notes ?? "");
+  const [editSaving, setEditSaving] = useState(false);
+  const [bolUploading, setBolUploading] = useState(false);
+  const [generalPhotoUploading, setGeneralPhotoUploading] = useState(false);
+
+  useEffect(() => {
+    setPlt(pallet);
+    setEditStatus(pallet.status);
+    setEditTracking(pallet.tracking_number ?? "");
+    setEditNotes(pallet.notes ?? "");
+  }, [pallet]);
 
   async function handleClose() {
     const res = await updatePalletStatus(plt.id, "closed", actor);
@@ -2584,18 +3189,120 @@ export function PalletDrawerContent({ pallet, role, actor, packages, onClose, on
     else showToast(res.error ?? "Failed.", "error");
   }
 
+  async function handleSaveEdit() {
+    setEditSaving(true);
+    const res = await updatePallet(
+      plt.id,
+      {
+        status: editStatus,
+        tracking_number: editTracking.trim() || null,
+        notes: editNotes.trim() || null,
+      },
+      actor,
+      orgId,
+    );
+    setEditSaving(false);
+    if (res.ok && res.data) {
+      setPlt(res.data);
+      onPalletUpdated(res.data);
+      setEditOpen(false);
+      showToast("Pallet updated.");
+    } else {
+      showToast(res.error ?? "Update failed.", "error");
+    }
+  }
+
+  async function handleBolUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    setBolUploading(true);
+    try {
+      const url = await uploadToStorage(f, "pallets/bol", orgId);
+      const res = await updatePallet(plt.id, { bol_photo_url: url }, actor, orgId);
+      if (res.ok && res.data) {
+        setPlt(res.data);
+        onPalletUpdated(res.data);
+        showToast("Bill of Lading saved.", "success");
+      } else {
+        showToast(res.error ?? "Could not save BOL.", "error");
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Upload failed.", "error");
+    } finally {
+      setBolUploading(false);
+    }
+  }
+
+  async function handleGeneralPalletPhotoUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    setGeneralPhotoUploading(true);
+    try {
+      const url = await uploadToStorage(f, "pallets", orgId);
+      const res = await updatePallet(plt.id, { photo_url: url }, actor, orgId);
+      if (res.ok && res.data) {
+        setPlt(res.data);
+        onPalletUpdated(res.data);
+        showToast("Pallet photo saved.", "success");
+      } else {
+        showToast(res.error ?? "Could not save pallet photo.", "error");
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Upload failed.", "error");
+    } finally {
+      setGeneralPhotoUploading(false);
+    }
+  }
+
   return (
     <div className="p-4 sm:p-6 space-y-5">
-      <PalletStatusBadge status={plt.status} />
+      <div className="flex flex-wrap items-center gap-2">
+        <PalletStatusBadge status={plt.status} />
+      </div>
       <div className="grid grid-cols-2 gap-3 text-sm">
         <div><p className="text-xs text-slate-400">Total Items</p><p className="text-3xl font-extrabold text-foreground">{plt.item_count}</p></div>
         <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{operatorDisplayLabel(plt)}</p></div>
         <div><p className="text-xs text-slate-400">Created</p><p className="font-semibold">{fmt(plt.created_at)}</p></div>
         <div><p className="text-xs text-slate-400">Updated</p><p className="font-semibold">{fmt(plt.updated_at)}</p></div>
       </div>
+      {plt.tracking_number?.trim() && (
+        <p className="text-sm">
+          <span className="text-xs font-semibold uppercase tracking-wide text-slate-400">Tracking </span>
+          <span className="font-mono font-semibold text-foreground">{plt.tracking_number}</span>
+        </p>
+      )}
       {plt.notes && <p className="rounded-xl bg-slate-50 p-3 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300">{plt.notes}</p>}
+      {plt.photo_url && (
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Pallet photo</p>
+          <a href={plt.photo_url} target="_blank" rel="noreferrer" className="block overflow-hidden rounded-xl border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900">
+            <div className="flex h-36 w-full items-center justify-center">
+              <img src={plt.photo_url} alt="Pallet" className="max-h-36 w-full object-contain" />
+            </div>
+          </a>
+        </div>
+      )}
       {plt.manifest_photo_url && (
-        <div><p className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Manifest</p><img src={plt.manifest_photo_url} alt="Manifest" className="h-36 w-full rounded-xl border border-slate-200 object-cover dark:border-slate-700" /></div>
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Manifest</p>
+          <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900">
+            <div className="flex h-36 w-full items-center justify-center">
+              <img src={plt.manifest_photo_url} alt="Manifest" className="max-h-36 w-full object-contain" />
+            </div>
+          </div>
+        </div>
+      )}
+      {plt.bol_photo_url && (
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Bill of Lading</p>
+          <a href={plt.bol_photo_url} target="_blank" rel="noreferrer" className="block overflow-hidden rounded-xl border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900">
+            <div className="flex h-36 w-full items-center justify-center">
+              <img src={plt.bol_photo_url} alt="BoL" className="max-h-36 w-full object-contain" />
+            </div>
+          </a>
+        </div>
       )}
 
       {/* Packages sub-table */}
@@ -2609,10 +3316,125 @@ export function PalletDrawerContent({ pallet, role, actor, packages, onClose, on
         💡 Tap a package above to open it and view or scan its items.
       </p>
 
-      <div className="flex flex-wrap gap-2">
-        {canEdit(role) && plt.status === "open" && <button onClick={handleClose} className={`${BTN_GHOST} h-12 flex-1 px-4`}><CheckSquare className="h-4 w-4" />Close Pallet</button>}
-        {canDelete(role) && <button onClick={async () => { const r = await deletePallet(plt.id, actor); if (r.ok) { onPalletDeleted(plt.id); onClose(); } else showToast(r.error ?? "Failed.", "error"); }} className="flex h-12 items-center gap-2 rounded-2xl border border-rose-200 px-4 text-sm font-semibold text-rose-600 hover:bg-rose-50 dark:border-rose-700/60 dark:text-rose-400 dark:hover:bg-rose-950/30"><Trash2 className="h-4 w-4" /></button>}
+      <div className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 pt-4 dark:border-slate-800">
+        {canEdit(role) && (
+          <button
+            type="button"
+            onClick={() => setEditOpen(true)}
+            className={`${BTN_GHOST} h-12 min-w-[9rem] justify-center px-4`}
+          >
+            <Pencil className="h-4 w-4 shrink-0" />
+            Edit Pallet
+          </button>
+        )}
+        {canEdit(role) && plt.status === "open" && (
+          <button type="button" onClick={handleClose} className={`${BTN_GHOST} h-12 min-w-[9rem] justify-center px-4`}>
+            <CheckSquare className="h-4 w-4 shrink-0" />
+            Close Pallet
+          </button>
+        )}
+        {canDelete(role) && (
+          <button
+            type="button"
+            onClick={async () => {
+              const r = await deletePallet(plt.id, actor);
+              if (r.ok) {
+                onPalletDeleted(plt.id);
+                onClose();
+              } else showToast(r.error ?? "Failed.", "error");
+            }}
+            className="inline-flex h-12 min-w-[9rem] items-center justify-center gap-2 whitespace-nowrap rounded-2xl border border-rose-200 px-4 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 dark:border-rose-700/60 dark:text-rose-400 dark:hover:bg-rose-950/30"
+          >
+            <Trash2 className="h-4 w-4 shrink-0" />
+            Delete
+          </button>
+        )}
       </div>
+
+      {editOpen && (
+        <div className="fixed inset-0 z-[400] flex items-center justify-center bg-black/50 p-3 backdrop-blur-sm" role="dialog" aria-modal="true">
+          <div className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 shadow-xl dark:border-slate-700 dark:bg-slate-950">
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-lg font-bold text-foreground">Edit Pallet</h3>
+              <button type="button" onClick={() => setEditOpen(false)} className="rounded-full p-2 text-slate-400 hover:bg-accent"><X className="h-5 w-5" /></button>
+            </div>
+            <div className="space-y-4">
+              <div>
+                <label className={LABEL}>Status</label>
+                <select className={INPUT} value={editStatus} onChange={(e) => setEditStatus(e.target.value as PalletStatus)}>
+                  {(Object.keys(PALLET_STATUS_CFG) as PalletStatus[]).map((s) => (
+                    <option key={s} value={s}>{PALLET_STATUS_CFG[s].label}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className={LABEL}>Tracking # <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+                <input className={INPUT} value={editTracking} onChange={(e) => setEditTracking(e.target.value)} placeholder="Carrier / inbound tracking…" />
+              </div>
+              <div>
+                <label className={LABEL}>Notes</label>
+                <textarea className="w-full resize-none rounded-2xl border border-slate-200 bg-white p-4 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" rows={3} value={editNotes} onChange={(e) => setEditNotes(e.target.value)} />
+              </div>
+              <div>
+                <label className={LABEL}>Pallet photo <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+                <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 py-3 text-sm font-semibold text-amber-800 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-200 ${generalPhotoUploading ? "opacity-60" : ""}`}>
+                  {generalPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
+                  {generalPhotoUploading ? "Uploading…" : plt.photo_url ? "Replace pallet photo" : "Upload pallet photo"}
+                  <input type="file" className="hidden" accept="image/*" capture="environment" onChange={handleGeneralPalletPhotoUpload} disabled={generalPhotoUploading} />
+                </label>
+                {plt.photo_url ? (
+                  <div className="mt-3 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800/50">
+                    <p className="border-b border-slate-200 px-3 py-2 text-xs font-semibold text-foreground dark:border-slate-700">Current pallet photo</p>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={plt.photo_url} alt="Pallet" className="max-h-48 w-full object-contain" />
+                  </div>
+                ) : null}
+              </div>
+              <div>
+                <label className={LABEL}>Bill of Lading (BoL) <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+                <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-border py-3 text-sm font-semibold ${bolUploading ? "opacity-60" : ""}`}>
+                  {bolUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+                  {bolUploading ? "Uploading…" : "Upload or replace BoL"}
+                  <input type="file" className="hidden" accept="image/*,application/pdf" onChange={handleBolUpload} disabled={bolUploading} />
+                </label>
+                {plt.bol_photo_url ? (
+                  <div className="mt-3 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800/50">
+                    <p className="border-b border-slate-200 px-3 py-2 text-xs font-semibold text-foreground dark:border-slate-700">Current BoL</p>
+                    {plt.bol_photo_url.toLowerCase().includes(".pdf") ? (
+                      <a
+                        href={plt.bol_photo_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="flex items-center gap-2 px-3 py-4 text-sm font-semibold text-sky-600 underline hover:text-sky-700 dark:text-sky-400"
+                      >
+                        <FileText className="h-5 w-5 shrink-0" /> Open PDF in new tab
+                      </a>
+                    ) : (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={plt.bol_photo_url} alt="Bill of lading" className="max-h-48 w-full object-contain" />
+                    )}
+                  </div>
+                ) : null}
+                <p className="mt-1 text-[10px] text-muted-foreground">Images or PDF — stored per organization.</p>
+              </div>
+            </div>
+            <div className="mt-6 flex w-full flex-row-reverse flex-wrap items-center justify-start gap-2 border-t border-slate-200 pt-4 sm:justify-end dark:border-slate-800">
+              <button
+                type="button"
+                onClick={() => void handleSaveEdit()}
+                disabled={editSaving}
+                className="inline-flex h-10 min-w-[7rem] shrink-0 items-center justify-center gap-2 rounded-md bg-sky-500 px-4 text-sm font-semibold text-white shadow transition hover:bg-sky-600 disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500"
+              >
+                {editSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                {editSaving ? "Saving…" : "Save"}
+              </button>
+              <button type="button" onClick={() => setEditOpen(false)} className={`${BTN_GHOST} h-10 min-w-[7rem] justify-center px-4`}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2661,9 +3483,15 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   onNavigateToPallet?: (palletId: string) => void;
 }) {
   const up = (k: keyof WizardState, v: unknown) => setState((p) => ({ ...p, [k]: v }));
-  const pkgOpts = openPackages.map((p) => ({ id: p.id, label: p.package_number, sublabel: `${p.actual_item_count}/${p.expected_item_count > 0 ? p.expected_item_count : "?"} items` }));
-  const pltOpts = openPallets.map((p) => ({ id: p.id, label: p.pallet_number, sublabel: `${p.item_count} items` }));
-  const hasPackageLink = !!(inherited?.packageId ?? state.package_link_id);
+  const pkgOpts = openPackages.map((p) => ({
+    id: p.id,
+    label: p.package_number,
+    sublabel: `${p.actual_item_count}/${p.expected_item_count > 0 ? p.expected_item_count : "?"} items`,
+    tracking: p.tracking_number ?? undefined,
+    rma: p.rma_number ?? undefined,
+  }));
+  const isLooseFlow = !!state.loose_item && !inherited?.packageId;
+  const hasPackageLink = !isLooseFlow && !!(inherited?.packageId ?? state.package_link_id);
   const [ocrLoad, setOcrLoad] = useState(false);
   const [ocrBanner, setOcrBanner] = useState<{ ok: boolean; msg: string } | null>(null);
   const ocrFileRef = useRef<HTMLInputElement>(null);
@@ -2693,7 +3521,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   // ── Auto-fill store_id from linked package (Package → Item inheritance) ───
   useEffect(() => {
     const pkgId = state.package_link_id || inherited?.packageId;
-    if (!pkgId) {
+    if (!pkgId?.trim() || !isUuidString(pkgId.trim())) {
       setStoreInherited(false);
       return;
     }
@@ -2725,15 +3553,26 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.package_link_id, inherited?.packageId, openPackages]);
 
-  // ── Catalog lookup state ──────────────────────────────────────────────────
-  const [catalogStatus, setCatalogStatus] = useState<"idle" | "loading" | "local" | "amazon" | "unknown">("idle");
+  // Keep `returns.marketplace` aligned with the selected Sales Channel (fixes Next disabled when only store is set).
+  useEffect(() => {
+    if (!state.store_id || connectedStores.length === 0) return;
+    const store = connectedStores.find((s) => s.id === state.store_id);
+    if (!store) return;
+    const m = platformToMarketplace(store.platform);
+    setState((p) => (p.marketplace === m ? p : { ...p, marketplace: m }));
+  }, [state.store_id, connectedStores, setState]);
+
+  const setCatalogResolution = (s: WizardState["catalog_resolution"]) =>
+    setState((p) => ({ ...p, catalog_resolution: s }));
+
+  // ── Catalog lookup preview (display only; resolution lives on WizardState) ─
   const [catalogPreview, setCatalogPreview] = useState<{ name: string; price?: number; image_url?: string } | null>(null);
   // ── SP-API mock auto-fill state ───────────────────────────────────────────
   const [spApiStatus, setSpApiStatus] = useState<"idle" | "loading" | "done">("idle");
 
   async function handleBarcodeLookup(barcode: string) {
-    if (!barcode.trim()) { setCatalogStatus("idle"); return; }
-    setCatalogStatus("loading");
+    if (!barcode.trim()) { setCatalogResolution("idle"); return; }
+    setCatalogResolution("loading");
     setCatalogPreview(null);
 
     const classified = classifyProductBarcode(barcode.trim());
@@ -2744,6 +3583,8 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
       up("asin", classified.normalized);
       up("product_identifier", classified.normalized);
     } else if (classified.kind === "upc_ean") {
+      up("product_identifier", classified.normalized);
+    } else {
       up("product_identifier", classified.normalized);
     }
 
@@ -2762,10 +3603,13 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
         const amazonStore = connectedStores.find(
           (s) => s.platform.toLowerCase() === "amazon",
         );
-        up("store_id", amazonStore?.id ?? getDefaultStoreIdFromStorage());
+        const defRaw = getDefaultStoreIdFromStorage().trim();
+        const defStore = isUuidString(defRaw) ? defRaw : "";
+        up("store_id", amazonStore?.id ?? defStore);
       } else if (!state.store_id) {
         // No known prefix → fallback to operator's saved default store
-        const fallback = getDefaultStoreIdFromStorage();
+        const fallbackRaw = getDefaultStoreIdFromStorage().trim();
+        const fallback = isUuidString(fallbackRaw) ? fallbackRaw : "";
         if (fallback) up("store_id", fallback);
       }
     }
@@ -2780,7 +3624,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
     if (local) {
       up("item_name", local.name);
       setCatalogPreview({ name: local.name, price: local.price, image_url: local.image_url });
-      setCatalogStatus("local");
+      setCatalogResolution("local");
       return;
     }
 
@@ -2789,7 +3633,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
     if (amazon) {
       up("item_name", amazon.name);
       setCatalogPreview({ name: amazon.name, price: amazon.price, image_url: amazon.image_url });
-      setCatalogStatus("amazon");
+      setCatalogResolution("amazon");
       // Cache the result locally so the next scan is instant
       try {
         await supabaseBrowser
@@ -2801,7 +3645,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
       return;
     }
 
-    setCatalogStatus("unknown");
+    setCatalogResolution("unknown");
   }
 
   // ── SP-API Phase B mock: auto-fill ASIN / FNSKU / Item Name ──────────────
@@ -2861,14 +3705,45 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
 
   return (
     <div className="space-y-5">
-      {/* ── HIERARCHY: Package link at the very top (Items → Package → Pallet) ── */}
+      {/* ── HIERARCHY: Package link (optional) vs explicit loose item ── */}
       {!inherited?.packageId && (
-        <div className="rounded-2xl border-2 border-sky-200 bg-sky-50 p-3 dark:border-sky-700/50 dark:bg-sky-950/30">
-          <p className="mb-2 flex items-center gap-2 text-xs font-bold text-sky-700 dark:text-sky-300">
-            <Package2 className="h-3.5 w-3.5" />Step 1 — Assign to Package <span className="font-normal text-sky-500">(recommended)</span>
-          </p>
-          <ComboboxField label="" hint="" icon={Tag} options={pkgOpts} value={state.package_link_id} onChange={(id) => up("package_link_id", id)} onClear={() => up("package_link_id", "")} placeholder="Scan tracking # or search package…" onCreateNew={onCreatePackage} createLabel="Create new package…" />
-          {!state.package_link_id && <p className="mt-1.5 text-[10px] text-sky-500">⚠ Without a package this item will be marked <strong>Orphaned / Loose</strong></p>}
+        <div className="space-y-3">
+          <label className="flex cursor-pointer items-start gap-3 rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900">
+            <input
+              type="checkbox"
+              className="mt-1 h-4 w-4 shrink-0 rounded border-slate-300"
+              checked={state.loose_item}
+              onChange={(e) => {
+                const v = e.target.checked;
+                setState((p) => ({
+                  ...p,
+                  loose_item: v,
+                  package_link_id: v ? "" : p.package_link_id,
+                  photo_return_label_url: v ? p.photo_return_label_url : "",
+                }));
+              }}
+            />
+            <div>
+              <p className="text-sm font-semibold text-foreground">Loose Item (No Box)</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Skip package assignment. In Step 2 you can add an optional return-label photo for this item only.
+              </p>
+            </div>
+          </label>
+          {!state.loose_item && (
+            <div className="rounded-2xl border-2 border-sky-200 bg-sky-50 p-3 dark:border-sky-700/50 dark:bg-sky-950/30">
+              <p className="mb-2 flex items-center gap-2 text-xs font-bold text-sky-700 dark:text-sky-300">
+                <Package2 className="h-3.5 w-3.5" />Step 1 — Assign to Package <span className="font-normal text-sky-500">(recommended)</span>
+              </p>
+              <ComboboxField label="" hint="" icon={Tag} options={pkgOpts} value={state.package_link_id} onChange={(id) => up("package_link_id", id)} onClear={() => up("package_link_id", "")} placeholder="Scan tracking # or search package…" onCreateNew={onCreatePackage} createLabel="Create new package…" />
+              {!state.package_link_id && <p className="mt-1.5 text-[10px] text-sky-500">⚠ Without a package this item will be marked <strong>Orphaned / Loose</strong></p>}
+            </div>
+          )}
+          {state.loose_item && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50/90 px-3 py-2 text-xs font-medium text-amber-900 dark:border-amber-800/50 dark:bg-amber-950/35 dark:text-amber-200">
+              Loose item — no package link. Tracking and carrier are captured at the item / notes level.
+            </div>
+          )}
         </div>
       )}
       {inherited && (
@@ -2961,10 +3836,12 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
             <QrCode className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
             <input
               type="text"
-              className={`${INPUT} pl-11 transition-all ${catalogStatus === "unknown" ? "border-yellow-400 ring-2 ring-yellow-300 focus:border-yellow-400 focus:ring-yellow-300" : ""}`}
+              className={`${INPUT} pl-11 transition-all ${state.catalog_resolution === "unknown" ? "border-yellow-400 ring-2 ring-yellow-300 focus:border-yellow-400 focus:ring-yellow-300" : ""}`}
               placeholder="Scan or type product identifier…"
               value={state.product_identifier}
-              onChange={(e) => { up("product_identifier", e.target.value); setCatalogStatus("idle"); }}
+              onChange={(e) => {
+                setState((p) => ({ ...p, product_identifier: e.target.value, catalog_resolution: "idle" }));
+              }}
               autoFocus
               onKeyDown={(e) => {
                 barcodeKeyDown(e);
@@ -3006,26 +3883,26 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
           </div>
         )}
         {/* Catalog lookup feedback */}
-        {catalogStatus === "loading" && spApiStatus === "idle" && (
+        {state.catalog_resolution === "loading" && spApiStatus === "idle" && (
           <div className="mt-1.5 flex items-center gap-2 text-xs text-slate-400">
             <Loader2 className="h-3.5 w-3.5 animate-spin" />Looking up barcode…
           </div>
         )}
-        {catalogStatus === "local" && catalogPreview && (
+        {state.catalog_resolution === "local" && catalogPreview && (
           <div className="mt-1.5 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-xs font-semibold text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-300">
             <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
             Found in Catalog — {catalogPreview.name}
           </div>
         )}
-        {catalogStatus === "amazon" && catalogPreview && (
+        {state.catalog_resolution === "amazon" && catalogPreview && (
           <div className="mt-1.5 flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-700 dark:border-sky-700/50 dark:bg-sky-950/30 dark:text-sky-300">
             <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
             Found on Amazon — {catalogPreview.name}{catalogPreview.price != null ? ` · $${catalogPreview.price.toFixed(2)}` : ""}
           </div>
         )}
-        {catalogStatus === "unknown" && (
+        {state.catalog_resolution === "unknown" && (
           <div className="mt-1.5 rounded-xl border-2 border-yellow-400 bg-yellow-50 px-3 py-2 text-xs font-bold text-yellow-800 dark:border-yellow-500/60 dark:bg-yellow-950/20 dark:text-yellow-300">
-            ⚠️ Unknown Item — Not found locally or on Amazon.
+            ⚠️ Unknown Item — Not found locally or on Amazon. Enter the item name below — you can continue without a catalog match.
           </div>
         )}
         <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">
@@ -3055,7 +3932,16 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
         <select
           className={INPUT}
           value={state.store_id}
-          onChange={(e) => { up("store_id", e.target.value); setStoreInherited(false); }}
+          onChange={(e) => {
+            const id = e.target.value;
+            const store = connectedStores.find((s) => s.id === id);
+            setState((p) => ({
+              ...p,
+              store_id: id,
+              marketplace: store ? platformToMarketplace(store.platform) : "",
+            }));
+            setStoreInherited(false);
+          }}
           disabled={storeInherited}
         >
           <option value="">— Select Sales Channel —</option>
@@ -3080,7 +3966,15 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
         <label className={LABEL}>Item Name <span className="text-rose-500">*</span></label>
         <input
           ref={itemNameRef} type="text" className={INPUT} placeholder="Product name…"
-          value={state.item_name} onChange={(e) => up("item_name", e.target.value)}
+          value={state.item_name}
+          onChange={(e) => {
+            const v = e.target.value;
+            setState((p) => ({
+              ...p,
+              item_name: v,
+              ...(p.catalog_resolution === "unknown" ? { catalog_resolution: "idle" as const } : {}),
+            }));
+          }}
           onKeyDown={(e) => { if (e.key === "Enter" && onAdvance) { e.preventDefault(); onAdvance(); } }}
         />
       </div>
@@ -3179,14 +4073,9 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
         </div>
       </div>
       <div className="rounded-2xl border border-orange-200 bg-orange-50 p-4 dark:border-orange-700/40 dark:bg-orange-950/30 space-y-3">
-        <div className="flex items-start justify-between gap-2">
-          <p className="flex items-center gap-2 text-sm font-bold text-orange-700 dark:text-orange-400">
-            <CalendarX2 className="h-4 w-4" />Expiry &amp; Batch
-          </p>
-          <span className="rounded-full border border-orange-300 bg-orange-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-orange-600 dark:border-orange-700/60 dark:bg-orange-950/50 dark:text-orange-400">
-            FEFO Tracking
-          </span>
-        </div>
+        <p className="flex items-center gap-2 text-sm font-bold text-orange-700 dark:text-orange-400">
+          <CalendarX2 className="h-4 w-4" />Expiry &amp; Batch
+        </p>
         <p className="text-xs text-orange-600 dark:text-orange-400">
           Enter the expiry date for all perishable items to enable First-Expired, First-Out (FEFO) compliance. Required if the item has an expiry label.
         </p>
@@ -3219,46 +4108,232 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   );
 }
 
-export function WizardStep2({ state, setState, conditions, photoCtx, inheritedPackagePhotos, packageInheritsBoxPhotos }: {
-  state: WizardState; setState: React.Dispatch<React.SetStateAction<WizardState>>;
+/** Saved URL preview — same chrome as SmartCameraUpload “complete” (header + 1/1 + thumb + remove). */
+function SavedUrlEvidenceCard({
+  label,
+  hint,
+  imageUrl,
+  onRemove,
+  Icon,
+  iconColor,
+  required,
+  footerNote = "Stored on this return item",
+}: {
+  label: string;
+  hint: string;
+  imageUrl: string;
+  onRemove: () => void;
+  Icon: React.ElementType;
+  iconColor: string;
+  required?: boolean;
+  footerNote?: string;
+}) {
+  return (
+    <div className={["overflow-hidden rounded-2xl border-2 border-emerald-400 bg-white transition dark:border-emerald-600/60 dark:bg-slate-900"].join(" ")}>
+      <div className="flex items-start gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-emerald-100 dark:bg-emerald-950/40">
+          <CheckCircle2 className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-semibold text-slate-900 dark:text-slate-50">
+            {label}
+            {required ? <span className="text-rose-500"> *</span> : null}
+          </p>
+          <p className="mt-0.5 text-[11px] leading-snug text-slate-500 dark:text-slate-400">{hint}</p>
+        </div>
+        <span className="shrink-0 text-xs font-bold text-emerald-600 dark:text-emerald-400">1/1</span>
+      </div>
+      <div className="grid grid-cols-4 gap-2 px-4 pt-3">
+        <div className="relative col-span-2 aspect-square overflow-hidden rounded-xl border border-slate-200 bg-slate-100 sm:col-span-1 dark:border-slate-700 dark:bg-slate-800">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={imageUrl} alt={label} className="h-full w-full object-contain" />
+          <button
+            type="button"
+            onClick={onRemove}
+            className="absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded-full bg-black/70 text-white shadow-md transition hover:bg-rose-600"
+            aria-label="Remove photo"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+      <div className="px-4 pb-3 pt-2">
+        <p className="text-[10px] text-slate-400 dark:text-slate-500">
+          <Icon className={`mr-1 inline h-3 w-3 align-text-bottom ${iconColor}`} />
+          {footerNote}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+export function WizardStep2({
+  state,
+  setState,
+  conditions,
+  photoCtx,
+  inheritedPackagePhotos,
+  packageInheritsBoxPhotos,
+  isLooseItem = false,
+  actor,
+  linkedPackageId,
+  linkedPackage,
+  onPackageUpdated,
+  onToast,
+  organizationId = MVP_ORGANIZATION_ID,
+}: {
+  state: WizardState;
+  setState: React.Dispatch<React.SetStateAction<WizardState>>;
   conditions: string[];
   photoCtx?: { hasPackageLink?: boolean; orphanLpn?: boolean; packageInheritsBoxPhotos?: boolean };
   inheritedPackagePhotos: {
     photo_opened_url: string | null;
     photo_closed_url: string | null;
     photo_return_label_url: string | null;
+    photo_url?: string | null;
   } | null;
   packageInheritsBoxPhotos: boolean;
+  /** No parent box — hide package photo backfill; optional item-level return label only. */
+  isLooseItem?: boolean;
+  actor: string;
+  linkedPackageId?: string;
+  linkedPackage?: PackageRecord | null;
+  onPackageUpdated?: (p: PackageRecord) => void;
+  onToast?: (msg: string, kind?: ToastKind) => void;
+  organizationId?: string;
 }) {
-  const categories = getCategoriesForConditions(conditions, { ...photoCtx, packageInheritsBoxPhotos });
-  const outerUrl = inheritedPackagePhotos?.photo_opened_url || inheritedPackagePhotos?.photo_closed_url || null;
+  const orgId = isUuidString((organizationId ?? "").trim()) ? (organizationId ?? "").trim() : MVP_ORGANIZATION_ID;
+  const categories = getCategoriesForConditions(conditions, { ...photoCtx, packageInheritsBoxPhotos, looseItem: isLooseItem });
+  const outerBoxUrl = inheritedPackagePhotos?.photo_url?.trim() || null;
+  const openedBoxUrl = inheritedPackagePhotos?.photo_opened_url?.trim() || null;
+  const closedBoxUrl = inheritedPackagePhotos?.photo_closed_url?.trim() || null;
   const labelUrl = inheritedPackagePhotos?.photo_return_label_url ?? null;
-  const showExpiryPhotoSlot = !!state.expiration_date?.trim();
+  const showExpiryPhotoSlot = shouldShowExpiryLabelPhoto(state);
 
-  const [itemPhotoUploading, setItemPhotoUploading] = useState(false);
-  const [expiryPhotoUploading, setExpiryPhotoUploading] = useState(false);
-  const itemPhotoRef = useRef<HTMLInputElement>(null);
-  const expiryPhotoRef = useRef<HTMLInputElement>(null);
+  const [itemPhotoFiles, setItemPhotoFiles] = useState<File[]>([]);
+  const [expiryPhotoFiles, setExpiryPhotoFiles] = useState<File[]>([]);
+  const [pkgOpenedFiles, setPkgOpenedFiles] = useState<File[]>([]);
+  const [pkgOuterBoxFiles, setPkgOuterBoxFiles] = useState<File[]>([]);
+  const [pkgLabelFiles, setPkgLabelFiles] = useState<File[]>([]);
+  const [looseReturnLabelFiles, setLooseReturnLabelFiles] = useState<File[]>([]);
 
-  async function uploadEvidencePhoto(
-    file: File,
-    field: "photo_item_url" | "photo_expiry_url",
-    setUploading: (v: boolean) => void,
-  ) {
-    setUploading(true);
+  const hasPkgOpenedOnly = !!linkedPackage?.photo_opened_url?.trim();
+  const hasPkgOuterPhoto = !!linkedPackage?.photo_url?.trim();
+  const hasPkgReturnLabel = !!linkedPackage?.photo_return_label_url?.trim();
+  const packageMissingMandatoryPhotos = !hasPkgOpenedOnly || !hasPkgReturnLabel;
+  const showPackageBackfill =
+    !!photoCtx?.hasPackageLink && !!linkedPackageId && packageMissingMandatoryPhotos;
+  const showOptionalOuterUpload =
+    !!photoCtx?.hasPackageLink && !!linkedPackageId && !hasPkgOuterPhoto;
+
+  async function onItemFilesChange(files: File[]) {
+    setItemPhotoFiles(files);
+    if (files.length === 0) {
+      setState((p) => ({ ...p, photo_item_url: "" }));
+      return;
+    }
     try {
-      const ext  = file.name.split(".").pop() ?? "jpg";
-      const path = `evidence/${field}/${Date.now()}.${ext}`;
-      const { error: upErr } = await supabaseBrowser.storage
-        .from("media")
-        .upload(path, file, { upsert: true });
-      if (upErr) throw new Error(upErr.message);
-      const { data: urlData } = supabaseBrowser.storage.from("media").getPublicUrl(path);
-      setState((p) => ({ ...p, [field]: urlData.publicUrl }));
-    } catch {
-      // silently ignore — operator can retry
-    } finally {
-      setUploading(false);
+      const url = await uploadToStorage(files[files.length - 1], "evidence/wizard", orgId);
+      setState((p) => ({ ...p, photo_item_url: url }));
+      setItemPhotoFiles([]);
+      onToast?.("Item photo saved.", "success");
+    } catch (e) {
+      onToast?.(e instanceof Error ? e.message : "Upload failed", "error");
+      setItemPhotoFiles([]);
+    }
+  }
+
+  async function onExpiryFilesChange(files: File[]) {
+    setExpiryPhotoFiles(files);
+    if (files.length === 0) {
+      setState((p) => ({ ...p, photo_expiry_url: "" }));
+      return;
+    }
+    try {
+      const url = await uploadToStorage(files[files.length - 1], "evidence/wizard", orgId);
+      setState((p) => ({ ...p, photo_expiry_url: url }));
+      setExpiryPhotoFiles([]);
+      onToast?.("Expiry label photo saved.", "success");
+    } catch (e) {
+      onToast?.(e instanceof Error ? e.message : "Upload failed", "error");
+      setExpiryPhotoFiles([]);
+    }
+  }
+
+  async function onPkgOuterBoxFilesChange(files: File[]) {
+    setPkgOuterBoxFiles(files);
+    if (files.length === 0 || !linkedPackageId) return;
+    try {
+      const url = await uploadToStorage(files[files.length - 1], "packages", orgId);
+      const res = await updatePackage(linkedPackageId, { photo_url: url }, actor);
+      if (res.ok && res.data) {
+        onPackageUpdated?.(res.data);
+        setPkgOuterBoxFiles([]);
+        onToast?.("Outer box photo saved on package.", "success");
+      } else {
+        onToast?.(res.error ?? "Could not update package", "error");
+        setPkgOuterBoxFiles([]);
+      }
+    } catch (e) {
+      onToast?.(e instanceof Error ? e.message : "Upload failed", "error");
+      setPkgOuterBoxFiles([]);
+    }
+  }
+
+  async function onPkgOpenedFilesChange(files: File[]) {
+    setPkgOpenedFiles(files);
+    if (files.length === 0 || !linkedPackageId) return;
+    try {
+      const url = await uploadToStorage(files[files.length - 1], "packages/claim_opened", orgId);
+      const res = await updatePackage(linkedPackageId, { photo_opened_url: url }, actor);
+      if (res.ok && res.data) {
+        onPackageUpdated?.(res.data);
+        setPkgOpenedFiles([]);
+        onToast?.("Opened box photo saved on package.", "success");
+      } else {
+        onToast?.(res.error ?? "Could not update package", "error");
+        setPkgOpenedFiles([]);
+      }
+    } catch (e) {
+      onToast?.(e instanceof Error ? e.message : "Upload failed", "error");
+      setPkgOpenedFiles([]);
+    }
+  }
+
+  async function onPkgLabelFilesChange(files: File[]) {
+    setPkgLabelFiles(files);
+    if (files.length === 0 || !linkedPackageId) return;
+    try {
+      const url = await uploadToStorage(files[files.length - 1], "packages/claim_return_label", orgId);
+      const res = await updatePackage(linkedPackageId, { photo_return_label_url: url }, actor);
+      if (res.ok && res.data) {
+        onPackageUpdated?.(res.data);
+        setPkgLabelFiles([]);
+        onToast?.("Return label photo saved on package.", "success");
+      } else {
+        onToast?.(res.error ?? "Could not update package", "error");
+        setPkgLabelFiles([]);
+      }
+    } catch (e) {
+      onToast?.(e instanceof Error ? e.message : "Upload failed", "error");
+      setPkgLabelFiles([]);
+    }
+  }
+
+  async function onLooseReturnLabelFilesChange(files: File[]) {
+    setLooseReturnLabelFiles(files);
+    if (files.length === 0) {
+      setState((p) => ({ ...p, photo_return_label_url: "" }));
+      return;
+    }
+    try {
+      const url = await uploadToStorage(files[files.length - 1], "evidence/wizard", orgId);
+      setState((p) => ({ ...p, photo_return_label_url: url }));
+      setLooseReturnLabelFiles([]);
+      onToast?.("Return label photo saved on this return.", "success");
+    } catch (e) {
+      onToast?.(e instanceof Error ? e.message : "Upload failed", "error");
+      setLooseReturnLabelFiles([]);
     }
   }
 
@@ -3270,128 +4345,235 @@ export function WizardStep2({ state, setState, conditions, photoCtx, inheritedPa
           <p className="text-sm font-bold uppercase tracking-wide text-slate-600 dark:text-slate-300">Evidence</p>
         </div>
         <p className="mb-4 text-xs text-slate-500 dark:text-slate-400">
-          Outer Box Photo and Box Label are pulled from the linked package when available. Add item-specific shots below.
+          {isLooseItem ? (
+            <>
+              <span className="font-semibold">Loose item</span> — no linked package. Add optional return-label and item photos below; condition photos follow.
+            </>
+          ) : (
+            <>
+              Carton and return-label reference shots on the <span className="font-semibold">Package</span> are inherited here. Item-level shots and condition photos are grouped below.
+            </>
+          )}
         </p>
 
-        {packageInheritsBoxPhotos && (outerUrl || labelUrl) && (
-          <div className="mb-4 grid gap-3 sm:grid-cols-2">
-            {outerUrl && (
-              <a href={outerUrl} target="_blank" rel="noreferrer" className="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-600 dark:bg-slate-950">
-                <img src={outerUrl} alt="Outer box from package" className="h-28 w-full object-cover" />
-                <p className="border-t border-slate-100 px-2 py-1.5 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
-                  Outer Box Photo (package)
-                </p>
-              </a>
-            )}
-            {labelUrl && (
-              <a href={labelUrl} target="_blank" rel="noreferrer" className="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-600 dark:bg-slate-950">
-                <img src={labelUrl} alt="Return label from package" className="h-28 w-full object-cover" />
-                <p className="border-t border-slate-100 px-2 py-1.5 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
-                  Box Label (package)
-                </p>
-              </a>
-            )}
-          </div>
-        )}
-        {!packageInheritsBoxPhotos && photoCtx?.hasPackageLink && (
-          <p className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-200">
-            Add <strong>outer box</strong> and <strong>return label</strong> photos on the package record to inherit them here and speed up claims.
-          </p>
-        )}
-
         <div className="space-y-4 border-t border-slate-200 pt-4 dark:border-slate-600">
-          <div>
-            <p className="mb-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
-              Item photo <span className="font-normal text-slate-400">(optional)</span>
-            </p>
-            {state.photo_item_url ? (
-              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Saved ✓</span>
-                <button type="button" onClick={() => setState((p) => ({ ...p, photo_item_url: "" }))} className="text-xs text-slate-400 underline hover:text-slate-600">
-                  Remove
-                </button>
-              </div>
-            ) : (
-              <label
-                className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-300 py-3 text-sm font-semibold transition hover:bg-white dark:border-slate-600 dark:hover:bg-slate-800 ${itemPhotoUploading ? "text-slate-400" : "text-slate-700 dark:text-slate-200"}`}
-              >
-                {itemPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                {itemPhotoUploading ? "Uploading…" : "Upload item photo"}
-                <input
-                  ref={itemPhotoRef}
-                  type="file"
-                  accept="image/*"
-                  capture="environment"
-                  className="hidden"
-                  disabled={itemPhotoUploading}
-                  onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    e.target.value = "";
-                    if (f) void uploadEvidencePhoto(f, "photo_item_url", setItemPhotoUploading);
-                  }}
-                />
-              </label>
-            )}
-          </div>
-
-          {showExpiryPhotoSlot && (
+          {photoCtx?.hasPackageLink && (outerBoxUrl || openedBoxUrl || closedBoxUrl || labelUrl) && (
             <div>
-              <p className="mb-1.5 text-xs font-semibold text-slate-700 dark:text-slate-200">
-                Expiry label photo <span className="text-rose-500">*</span>
-              </p>
-              {state.photo_expiry_url ? (
-                <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                  <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Saved ✓</span>
-                  <button type="button" onClick={() => setState((p) => ({ ...p, photo_expiry_url: "" }))} className="text-xs text-slate-400 underline hover:text-slate-600">
-                    Remove
-                  </button>
-                </div>
-              ) : (
-                <label
-                  className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed border-rose-300 bg-rose-50/80 py-3 text-sm font-semibold text-rose-800 hover:bg-rose-100 dark:border-rose-800/60 dark:bg-rose-950/40 dark:text-rose-200 ${expiryPhotoUploading ? "opacity-70" : ""}`}
-                >
-                  {expiryPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                  {expiryPhotoUploading ? "Uploading…" : "Upload expiry label photo"}
-                  <input
-                    ref={expiryPhotoRef}
-                    type="file"
-                    accept="image/*"
-                    capture="environment"
-                    className="hidden"
-                    disabled={expiryPhotoUploading}
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      e.target.value = "";
-                      if (f) void uploadEvidencePhoto(f, "photo_expiry_url", setExpiryPhotoUploading);
-                    }}
-                  />
-                </label>
-              )}
+              <p className="mb-2 text-[10px] font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">Inherited from linked package</p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {outerBoxUrl && (
+                  <a href={outerBoxUrl} target="_blank" rel="noreferrer" className="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-600 dark:bg-slate-950">
+                    <div className="flex h-28 w-full items-center justify-center bg-slate-100 dark:bg-slate-900">
+                      <img src={outerBoxUrl} alt="Outer box" className="max-h-28 w-full object-contain" />
+                    </div>
+                    <p className="border-t border-slate-100 px-2 py-1.5 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
+                      Package — outer box (optional)
+                    </p>
+                  </a>
+                )}
+                {openedBoxUrl && (
+                  <a href={openedBoxUrl} target="_blank" rel="noreferrer" className="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-600 dark:bg-slate-950">
+                    <div className="flex h-28 w-full items-center justify-center bg-slate-100 dark:bg-slate-900">
+                      <img src={openedBoxUrl} alt="Opened box" className="max-h-28 w-full object-contain" />
+                    </div>
+                    <p className="border-t border-slate-100 px-2 py-1.5 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
+                      Package — opened box
+                    </p>
+                  </a>
+                )}
+                {closedBoxUrl && (
+                  <a href={closedBoxUrl} target="_blank" rel="noreferrer" className="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-600 dark:bg-slate-950">
+                    <div className="flex h-28 w-full items-center justify-center bg-slate-100 dark:bg-slate-900">
+                      <img src={closedBoxUrl} alt="Closed box" className="max-h-28 w-full object-contain" />
+                    </div>
+                    <p className="border-t border-slate-100 px-2 py-1.5 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
+                      Package — closed box
+                    </p>
+                  </a>
+                )}
+                {labelUrl && (
+                  <a href={labelUrl} target="_blank" rel="noreferrer" className="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-600 dark:bg-slate-950">
+                    <div className="flex h-28 w-full items-center justify-center bg-slate-100 dark:bg-slate-900">
+                      <img src={labelUrl} alt="Package return label" className="max-h-28 w-full object-contain" />
+                    </div>
+                    <p className="border-t border-slate-100 px-2 py-1.5 text-[10px] font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300">
+                      Package — return label
+                    </p>
+                  </a>
+                )}
+              </div>
             </div>
           )}
+
+          {showOptionalOuterUpload && (
+            <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-950">
+              <p className="mb-2 text-[10px] font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">Optional — outer box</p>
+              <SmartCameraUpload
+                label="Outer box (optional)"
+                hint="Exterior carton — stored on the linked package as photo_url."
+                required={false}
+                maxPhotos={1}
+                files={pkgOuterBoxFiles}
+                onChange={onPkgOuterBoxFilesChange}
+                accentClass="border-slate-300 dark:border-slate-700"
+                icon={Package2}
+                iconColor="text-slate-600 dark:text-slate-400"
+              />
+            </div>
+          )}
+
+          {showPackageBackfill && (
+            <div className="rounded-2xl border-2 border-dashed border-amber-300/90 bg-amber-50/90 p-4 ring-1 ring-amber-200/60 dark:border-amber-700/70 dark:bg-amber-950/35 dark:ring-amber-900/40">
+              <p className="mb-1 text-xs font-bold uppercase tracking-wide text-amber-900 dark:text-amber-200">
+                Quick add for package
+              </p>
+              <p className="mb-3 text-[11px] leading-snug text-amber-950/90 dark:text-amber-100/90">
+                This linked package is missing mandatory claim photos (opened box and/or return label). Capture them here — they are saved on the <span className="font-semibold">package record</span> only (not on this return item).
+              </p>
+              <div className="space-y-4">
+                {!hasPkgOpenedOnly && (
+                  <SmartCameraUpload
+                    label="Opened box"
+                    hint="Interior / opened carton — stored on the linked package (photo_opened_url)."
+                    required
+                    maxPhotos={1}
+                    files={pkgOpenedFiles}
+                    onChange={onPkgOpenedFilesChange}
+                    accentClass="border-amber-200 dark:border-amber-800/50"
+                    icon={Package2}
+                    iconColor="text-amber-700 dark:text-amber-400"
+                  />
+                )}
+                {!hasPkgReturnLabel && (
+                  <SmartCameraUpload
+                    label="Return label"
+                    hint="Return / RMA label on the carton — stored on the linked package."
+                    required
+                    maxPhotos={1}
+                    files={pkgLabelFiles}
+                    onChange={onPkgLabelFilesChange}
+                    accentClass="border-sky-200 dark:border-sky-800/50"
+                    icon={Barcode}
+                    iconColor="text-sky-600 dark:text-sky-400"
+                  />
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="space-y-4">
+            <p className="text-[10px] font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">Item-specific photos</p>
+
+            {!isLooseItem &&
+              (state.photo_item_url ? (
+                <SavedUrlEvidenceCard
+                  label="Item photo"
+                  hint="Overall shot of the unit (optional)."
+                  imageUrl={state.photo_item_url}
+                  onRemove={() => {
+                    setState((p) => ({ ...p, photo_item_url: "" }));
+                    setItemPhotoFiles([]);
+                  }}
+                  Icon={Camera}
+                  iconColor="text-slate-500"
+                />
+              ) : (
+                <SmartCameraUpload
+                  label="Item photo"
+                  hint="Overall shot of the product (optional)."
+                  required={false}
+                  maxPhotos={1}
+                  files={itemPhotoFiles}
+                  onChange={onItemFilesChange}
+                  accentClass="border-slate-300 dark:border-slate-700"
+                  icon={Camera}
+                  iconColor="text-slate-600 dark:text-slate-400"
+                />
+              ))}
+
+            {showExpiryPhotoSlot &&
+              (state.photo_expiry_url ? (
+                <SavedUrlEvidenceCard
+                  label="Expiry label photo"
+                  hint={ALL_PHOTO_CATEGORIES.expiry_label.hint}
+                  imageUrl={state.photo_expiry_url}
+                  onRemove={() => {
+                    setState((p) => ({ ...p, photo_expiry_url: "" }));
+                    setExpiryPhotoFiles([]);
+                  }}
+                  Icon={Calendar}
+                  iconColor="text-orange-600 dark:text-orange-400"
+                />
+              ) : (
+                <SmartCameraUpload
+                  label="Expiry label photo"
+                  hint={ALL_PHOTO_CATEGORIES.expiry_label.hint}
+                  required={showExpiryPhotoSlot}
+                  maxPhotos={1}
+                  files={expiryPhotoFiles}
+                  onChange={onExpiryFilesChange}
+                  accentClass="border-slate-300 dark:border-slate-700"
+                  icon={Calendar}
+                  iconColor="text-orange-600 dark:text-orange-400"
+                />
+              ))}
+
+            {isLooseItem &&
+              (state.photo_return_label_url ? (
+                <SavedUrlEvidenceCard
+                  label="Return label (optional)"
+                  hint="Standalone — stored on this return only (no package)."
+                  imageUrl={state.photo_return_label_url}
+                  onRemove={() => {
+                    setState((p) => ({ ...p, photo_return_label_url: "" }));
+                    setLooseReturnLabelFiles([]);
+                  }}
+                  Icon={Barcode}
+                  iconColor="text-sky-600 dark:text-sky-400"
+                />
+              ) : (
+                <SmartCameraUpload
+                  label="Return label (optional)"
+                  hint="RMA / return label for this item — stored on this return only."
+                  required={false}
+                  maxPhotos={1}
+                  files={looseReturnLabelFiles}
+                  onChange={onLooseReturnLabelFilesChange}
+                  accentClass="border-sky-200 dark:border-sky-800/50"
+                  icon={Barcode}
+                  iconColor="text-sky-600 dark:text-sky-400"
+                />
+              ))}
+          </div>
+
+          {categories.length > 0 &&
+            categories.map((cat) => (
+              <div key={cat.id} className={`rounded-2xl border p-4 ${cat.accentClass}`}>
+                <div className="mb-3 flex items-center gap-2">
+                  <cat.icon className={`h-5 w-5 ${cat.iconColor}`} />
+                  <div>
+                    <p className="text-sm font-bold text-foreground">
+                      {cat.label}
+                      {!cat.optional ? <span className="text-rose-500"> *</span> : null}
+                    </p>
+                    <p className="text-xs text-slate-400">{cat.hint}</p>
+                  </div>
+                </div>
+                <SmartCameraUpload
+                  label={cat.label}
+                  hint={cat.hint}
+                  required={!cat.optional}
+                  icon={cat.icon}
+                  iconColor={cat.iconColor}
+                  accentClass={cat.accentClass}
+                  files={state.photos[cat.id] ?? []}
+                  onChange={(files) => setState((p) => ({ ...p, photos: { ...p.photos, [cat.id]: files } }))}
+                />
+              </div>
+            ))}
         </div>
       </div>
 
-      {/* ── Condition-based photo categories ─────────────────────── */}
-      {categories.length > 0 && (
-        <>
-          <p className="text-xs text-muted-foreground">Packing slip / manifest scans belong to <span className="font-semibold">Package</span> setup only — not here.</p>
-          {categories.map((cat) => (
-            <div key={cat.id} className={`rounded-2xl border p-4 ${cat.accentClass}`}>
-              <div className="mb-3 flex items-center gap-2">
-                <cat.icon className={`h-5 w-5 ${cat.iconColor}`} />
-                <div><p className="text-sm font-bold text-foreground">{cat.label}<span className={`ml-2 text-[10px] font-semibold uppercase tracking-wide ${cat.optional ? "text-slate-400" : "text-rose-500"}`}>{cat.optional ? "Optional" : "Required"}</span></p><p className="text-xs text-slate-400">{cat.hint}</p></div>
-              </div>
-              <SmartCameraUpload label={cat.label} hint={cat.hint} required={!cat.optional} icon={cat.icon} iconColor={cat.iconColor} accentClass={cat.accentClass}
-                files={state.photos[cat.id] ?? []}
-                onChange={(files) => setState((p) => ({ ...p, photos: { ...p.photos, [cat.id]: files } }))}
-              />
-            </div>
-          ))}
-        </>
-      )}
       {categories.length === 0 && (
         <div className="flex flex-col items-center gap-2 py-6 text-center">
           <CheckCircle2 className="h-8 w-8 text-emerald-500" />
@@ -3399,11 +4581,15 @@ export function WizardStep2({ state, setState, conditions, photoCtx, inheritedPa
           <p className="text-xs text-slate-400">Use the item photo above if the issue is visible on the unit.</p>
         </div>
       )}
+
+      <p className="text-center text-[11px] leading-relaxed text-muted-foreground">
+        Packing slip / manifest scans belong to <span className="font-semibold text-foreground">Package</span> setup only — not here.
+      </p>
     </div>
   );
 }
 
-export function WizardStep3({ state, conditions, packages, pallets, inherited, onNotesChange, onAmazonOrderIdChange, packageExpectationMismatch, onToast, onNavigateToPackage, onNavigateToPallet }: {
+export function WizardStep3({ state, conditions, packages, pallets, inherited, onNotesChange, onAmazonOrderIdChange, packageExpectationMismatch, onToast, onNavigateToPackage, onNavigateToPallet, palletEvidenceFromDb, packageEvidenceFromDb }: {
   state: WizardState; conditions: string[]; packages: PackageRecord[]; pallets: PalletRecord[];
   inherited?: WizardInheritedContext; onNotesChange: (v: string) => void;
   onAmazonOrderIdChange: (v: string) => void;
@@ -3412,10 +4598,160 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
   onToast?: (msg: string, kind?: ToastKind) => void;
   onNavigateToPackage?: (packageId: string) => void;
   onNavigateToPallet?: (palletId: string) => void;
+  /** Pallet-level URLs when the linked pallet is not fully loaded in `pallets` (DB fetch in wizard). */
+  palletEvidenceFromDb?: { manifest_photo_url?: string | null; bol_photo_url?: string | null; photo_url?: string | null } | null;
+  /** Fresh package photos + pallet_id from DB when `openPackages` is stale or incomplete. */
+  packageEvidenceFromDb?: {
+    photo_opened_url?: string | null;
+    photo_closed_url?: string | null;
+    photo_return_label_url?: string | null;
+    photo_url?: string | null;
+    pallet_id?: string | null;
+    order_id?: string | null;
+  } | null;
 }) {
   const photoTotal = Object.values(state.photos).reduce((a, files) => a + files.length, 0);
-  const linkedPkg  = packages.find((p) => p.id === ((inherited?.packageId) ?? state.package_link_id));
-  const linkedPlt  = linkedPkg ? pallets.find((p) => p.id === linkedPkg.pallet_id) : undefined;
+  const pkgKey = ((inherited?.packageId) ?? state.package_link_id)?.trim() ?? "";
+  const pkgFromList = pkgKey ? packages.find((p) => p.id === pkgKey) : undefined;
+  const linkedPkg = useMemo((): PackageRecord | undefined => {
+    if (!pkgKey) return undefined;
+    const fromDb = packageEvidenceFromDb;
+    if (pkgFromList && fromDb) {
+      return {
+        ...pkgFromList,
+        photo_opened_url: fromDb.photo_opened_url ?? pkgFromList.photo_opened_url,
+        photo_closed_url: fromDb.photo_closed_url ?? pkgFromList.photo_closed_url,
+        photo_return_label_url: fromDb.photo_return_label_url ?? pkgFromList.photo_return_label_url,
+        photo_url: fromDb.photo_url ?? pkgFromList.photo_url,
+        pallet_id: fromDb.pallet_id ?? pkgFromList.pallet_id,
+        order_id: fromDb.order_id ?? pkgFromList.order_id,
+      };
+    }
+    if (pkgFromList) return pkgFromList;
+    if (fromDb) {
+      return {
+        id: pkgKey,
+        organization_id: "",
+        package_number: "",
+        tracking_number: null,
+        carrier_name: null,
+        expected_item_count: 0,
+        actual_item_count: 0,
+        pallet_id: fromDb.pallet_id ?? null,
+        order_id: fromDb.order_id ?? null,
+        status: "open",
+        discrepancy_note: null,
+        photo_opened_url: fromDb.photo_opened_url ?? null,
+        photo_closed_url: fromDb.photo_closed_url ?? null,
+        photo_return_label_url: fromDb.photo_return_label_url ?? null,
+        photo_url: fromDb.photo_url ?? null,
+        created_at: "",
+        updated_at: "",
+      } as PackageRecord;
+    }
+    return undefined;
+  }, [pkgKey, pkgFromList, packageEvidenceFromDb]);
+  const palletIdForGallery = (linkedPkg?.pallet_id ?? "").trim();
+  const linkedPlt = palletIdForGallery ? pallets.find((p) => p.id === palletIdForGallery) : undefined;
+
+  const [blobMap, setBlobMap] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const next: Record<string, string> = {};
+    for (const [cat, files] of Object.entries(state.photos)) {
+      files.forEach((f, i) => {
+        const id = `cat:${cat}:${i}`;
+        next[id] = URL.createObjectURL(f);
+      });
+    }
+    setBlobMap(next);
+    return () => {
+      Object.values(next).forEach((u) => URL.revokeObjectURL(u));
+    };
+  }, [state.photos]);
+
+  /** Read-only thumbnails for scan confirmation — warehouse does not filter claim evidence here. */
+  const summaryPhotos = useMemo((): PhotoItem[] => {
+    const lines: PhotoItem[] = [];
+    const pltManifest = (linkedPlt?.manifest_photo_url ?? palletEvidenceFromDb?.manifest_photo_url ?? "").trim();
+    const pltBol = (linkedPlt?.bol_photo_url ?? palletEvidenceFromDb?.bol_photo_url ?? "").trim();
+    const pltPhoto = (linkedPlt?.photo_url ?? palletEvidenceFromDb?.photo_url ?? "").trim();
+    if (pltManifest) {
+      lines.push({
+        label: "Pallet — manifest",
+        src: pltManifest,
+      });
+    }
+    if (pltBol) {
+      lines.push({
+        label: "Pallet — BOL",
+        src: pltBol,
+      });
+    }
+    if (pltPhoto) {
+      lines.push({
+        label: "Pallet — photo",
+        src: pltPhoto,
+      });
+    }
+    if (linkedPkg?.photo_closed_url?.trim()) {
+      lines.push({
+        label: "Package — closed box",
+        src: linkedPkg.photo_closed_url.trim(),
+      });
+    }
+    if (linkedPkg?.photo_opened_url?.trim()) {
+      lines.push({
+        label: "Package — opened box",
+        src: linkedPkg.photo_opened_url.trim(),
+      });
+    }
+    if (linkedPkg?.photo_return_label_url?.trim()) {
+      lines.push({
+        label: "Package — return label",
+        src: linkedPkg.photo_return_label_url.trim(),
+      });
+    }
+    if (linkedPkg?.photo_url?.trim()) {
+      lines.push({
+        label: "Package — reference",
+        src: linkedPkg.photo_url.trim(),
+      });
+    }
+    if (state.photo_item_url?.trim()) {
+      lines.push({
+        label: "Item photo",
+        src: state.photo_item_url.trim(),
+      });
+    }
+    if (state.photo_expiry_url?.trim()) {
+      lines.push({
+        label: "Expiry label",
+        src: state.photo_expiry_url.trim(),
+      });
+    }
+    if (state.loose_item && state.photo_return_label_url?.trim()) {
+      lines.push({
+        label: "Return label (item)",
+        src: state.photo_return_label_url.trim(),
+      });
+    }
+    for (const [cat, files] of Object.entries(state.photos)) {
+      files.forEach((f, i) => {
+        const id = `cat:${cat}:${i}`;
+        const src = blobMap[id];
+        if (!src) return;
+        lines.push({
+          label: `${ALL_PHOTO_CATEGORIES[cat]?.label ?? cat} ${i + 1}`,
+          src,
+        });
+      });
+    }
+    return lines;
+  }, [linkedPlt, linkedPkg, palletEvidenceFromDb, packageEvidenceFromDb, state.loose_item, state.photo_item_url, state.photo_expiry_url, state.photo_return_label_url, state.photos, blobMap]);
+
+  const summaryPhotoCount = summaryPhotos.length;
+  const pkgOrder = linkedPkg?.order_id?.trim() ?? "";
+
   return (
     <div className="space-y-5">
       {packageExpectationMismatch && (
@@ -3519,31 +4855,40 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
         )}
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <Camera className="h-4 w-4" />
-          {photoTotal > 0 ? `${photoTotal} photo${photoTotal > 1 ? "s" : ""} attached` : <span className="text-amber-600 dark:text-amber-400">No photos attached</span>}
+          {summaryPhotoCount > 0
+            ? `${summaryPhotoCount} photo${summaryPhotoCount > 1 ? "s" : ""} in summary below`
+            : photoTotal > 0
+              ? `${photoTotal} condition photo${photoTotal > 1 ? "s" : ""} attached`
+              : <span className="text-amber-600 dark:text-amber-400">No photos attached</span>}
         </div>
-        {photoTotal > 0 && (
-          <div className="mt-2">
-            <PhotoGallery
-              photos={Object.entries(state.photos).flatMap(([cat, files]) =>
-                files.map((f, i) => ({
-                  src: URL.createObjectURL(f),
-                  label: `${ALL_PHOTO_CATEGORIES[cat]?.label ?? cat} ${i + 1}`,
-                }))
-              )}
-            />
-          </div>
-        )}
       </div>
+
+      <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-950">
+        <p className="mb-1 text-xs font-bold uppercase tracking-widest text-slate-400">Photo summary</p>
+        <p className="mb-3 text-xs text-slate-500 dark:text-slate-400">
+          Inherited pallet/package shots, item evidence, and condition photos captured in this session — read-only for scan confirmation.
+        </p>
+        <PhotoGallery photos={summaryPhotos} emptyText="No photos to show." />
+      </div>
+
       <div>
-        <label className={LABEL}>Amazon order ID <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+        <label className={LABEL}>
+          Amazon order ID
+          {pkgOrder ? (
+            <span className="text-xs font-normal text-slate-400"> (from package)</span>
+          ) : (
+            <span className="text-xs font-normal text-slate-400"> (optional)</span>
+          )}
+        </label>
         <input
           type="text"
           inputMode="text"
           autoComplete="off"
           placeholder="e.g. 111-1234567-8901234"
-          value={state.amazon_order_id}
+          value={pkgOrder ? pkgOrder : state.amazon_order_id}
+          readOnly={!!pkgOrder}
           onChange={(e) => onAmazonOrderIdChange(e.target.value)}
-          className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-mono placeholder:text-slate-400 focus:border-sky-400 focus:outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          className={`w-full rounded-2xl border border-slate-200 px-4 py-3 text-sm font-mono placeholder:text-slate-400 focus:border-sky-400 focus:outline-none dark:border-slate-700 dark:text-slate-100 ${pkgOrder ? "bg-slate-100 dark:bg-slate-800" : "bg-white dark:bg-slate-900"}`}
         />
       </div>
       <div>
@@ -3558,7 +4903,7 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
 
 // ─── Single Item Wizard Modal ──────────────────────────────────────────────────
 
-export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast, onNavigateToPackage, onNavigateToPallet }: {
+export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast, onNavigateToPackage, onNavigateToPallet, onLinkedPackageUpdated, organizationId = MVP_ORGANIZATION_ID }: {
   onClose: () => void;
   /** Called with the saved record AND the in-session photo files for gallery display. */
   onSuccess: (r: ReturnRecord, photos: Record<string, File[]>) => void;
@@ -3571,7 +4916,16 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
   onToast?: (msg: string, kind?: ToastKind) => void;
   onNavigateToPackage?: (packageId: string) => void;
   onNavigateToPallet?: (palletId: string) => void;
+  /** After Step 2 uploads box/label photos to the linked package row. */
+  onLinkedPackageUpdated?: (p: PackageRecord) => void;
+  /** Workspace org for `returns.organization_id` / claim_submissions (defaults to MVP seed). */
+  organizationId?: string;
 }) {
+  const workspaceOrgId = useMemo(() => {
+    const raw = (organizationId ?? "").trim();
+    return isUuidString(raw) ? raw : MVP_ORGANIZATION_ID;
+  }, [organizationId]);
+
   const [step, setStep] = useState(1);
   const [state, setState] = useState<WizardState>({ ...EMPTY_WIZARD, package_link_id: inheritedContext?.packageId ?? "" });
   const [submitting, setSubmitting] = useState(false);
@@ -3581,100 +4935,250 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
     photo_opened_url: string | null;
     photo_closed_url: string | null;
     photo_return_label_url: string | null;
+    photo_url?: string | null;
+    /** From DB — may be missing on stale `openPackages` rows; used for pallet gallery + inheritance. */
+    pallet_id?: string | null;
+    order_id?: string | null;
   } | null>(null);
+  /** Pallet BOL / manifest when package → pallet chain is resolved (matches claim payload family tree). */
+  const [fetchedPalletEvidence, setFetchedPalletEvidence] = useState<{
+    manifest_photo_url: string | null;
+    bol_photo_url: string | null;
+    photo_url: string | null;
+  } | null>(null);
+  /** Resolves `marketplace` on submit when Step 1 synced only `store_id` (same source as listStores in WizardStep1). */
+  const [wizardStoresForSubmit, setWizardStoresForSubmit] = useState<{ id: string; platform: string }[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void listStores().then((res) => {
+      if (cancelled || !res.ok || !res.data) return;
+      setWizardStoresForSubmit(
+        res.data.filter((s) => s.is_active !== false).map((s) => ({ id: s.id, platform: s.platform })),
+      );
+    });
+    return () => { cancelled = true; };
+  }, []);
 
-  const resolvedPkgId = inheritedContext?.packageId ?? state.package_link_id ?? "";
+  const isLooseItem = !!state.loose_item && !inheritedContext?.packageId;
+  const resolvedPkgId = isLooseItem ? "" : (inheritedContext?.packageId ?? state.package_link_id ?? "");
 
   useEffect(() => {
-    if (!resolvedPkgId) {
+    if (!resolvedPkgId?.trim() || !isUuidString(resolvedPkgId.trim())) {
       setFetchedPkgPhotos(null);
+      setFetchedPalletEvidence(null);
       return;
     }
-    const local = openPackages.find((p) => p.id === resolvedPkgId);
-    if (local) {
-      setFetchedPkgPhotos({
-        photo_opened_url: local.photo_opened_url ?? null,
-        photo_closed_url: local.photo_closed_url ?? null,
-        photo_return_label_url: local.photo_return_label_url ?? null,
-      });
-      return;
-    }
+    const pkgKey = resolvedPkgId.trim();
     let cancelled = false;
+
+    function applyPalletEvidence(palletId: string | null | undefined) {
+      const pid = palletId?.trim() ?? "";
+      if (!pid || !isUuidString(pid)) {
+        if (!cancelled) setFetchedPalletEvidence(null);
+        return;
+      }
+      const localPlt = openPallets.find((p) => p.id === pid);
+      if (localPlt) {
+        if (!cancelled) {
+          setFetchedPalletEvidence({
+            manifest_photo_url: localPlt.manifest_photo_url ?? null,
+            bol_photo_url: localPlt.bol_photo_url ?? null,
+            photo_url: localPlt.photo_url ?? null,
+          });
+        }
+        return;
+      }
+      void supabaseBrowser
+        .from("pallets")
+        .select("manifest_photo_url, bol_photo_url, photo_url")
+        .eq("id", pid)
+        .eq("organization_id", workspaceOrgId)
+        .maybeSingle()
+        .then(({ data }) => {
+          if (cancelled) return;
+          if (!data) {
+            setFetchedPalletEvidence(null);
+            return;
+          }
+          setFetchedPalletEvidence({
+            manifest_photo_url: (data as { manifest_photo_url?: string | null }).manifest_photo_url ?? null,
+            bol_photo_url: (data as { bol_photo_url?: string | null }).bol_photo_url ?? null,
+            photo_url: (data as { photo_url?: string | null }).photo_url ?? null,
+          });
+        });
+    }
+
+    /** Always load from DB so pallet_id + photos are not stale vs. cached `openPackages`. */
     void supabaseBrowser
       .from("packages")
-      .select("photo_opened_url, photo_closed_url, photo_return_label_url")
-      .eq("id", resolvedPkgId)
-      .eq("organization_id", MVP_ORGANIZATION_ID)
+      .select("photo_opened_url, photo_closed_url, photo_return_label_url, photo_url, order_id, pallet_id")
+      .eq("id", pkgKey)
+      .eq("organization_id", workspaceOrgId)
       .maybeSingle()
       .then(({ data }) => {
         if (cancelled) return;
         if (!data) {
           setFetchedPkgPhotos(null);
+          setFetchedPalletEvidence(null);
           return;
         }
         setFetchedPkgPhotos({
           photo_opened_url: (data.photo_opened_url as string) ?? null,
           photo_closed_url: (data.photo_closed_url as string) ?? null,
           photo_return_label_url: (data.photo_return_label_url as string) ?? null,
+          photo_url: (data.photo_url as string) ?? null,
+          pallet_id: (data as { pallet_id?: string | null }).pallet_id ?? null,
+          order_id: (data as { order_id?: string | null }).order_id ?? null,
         });
+        const oid = (data.order_id as string | null | undefined)?.trim();
+        if (oid) setState((p) => (p.amazon_order_id.trim() ? p : { ...p, amazon_order_id: oid }));
+        applyPalletEvidence((data as { pallet_id?: string | null }).pallet_id ?? null);
       });
     return () => { cancelled = true; };
-  }, [resolvedPkgId, openPackages]);
+  }, [resolvedPkgId, openPallets, workspaceOrgId]);
 
   const inheritedPackagePhotos = fetchedPkgPhotos;
   const packageInheritsBoxPhotos = !!(
     inheritedPackagePhotos &&
-    (inheritedPackagePhotos.photo_opened_url || inheritedPackagePhotos.photo_closed_url) &&
+    inheritedPackagePhotos.photo_opened_url &&
     inheritedPackagePhotos.photo_return_label_url
   );
 
   const conditions = conditionsFromKeys(state.condition_keys);
-  const pkgIdForWarn = (inheritedContext?.packageId ?? state.package_link_id) || undefined;
+  const pkgIdForWarn = isLooseItem ? undefined : (inheritedContext?.packageId ?? state.package_link_id) || undefined;
   const pkgForWarn = pkgIdForWarn ? openPackages.find((p) => p.id === pkgIdForWarn) : undefined;
   const packageExpectationMismatch = !!(pkgForWarn && !itemMatchesPackageExpectation(state.item_name, pkgForWarn));
 
+  const hasManualProductIds =
+    !!state.asin.trim() ||
+    !!state.fnsku.trim() ||
+    !!state.sku.trim() ||
+    !!state.product_identifier.trim();
+  const productIdOk =
+    hasManualProductIds ||
+    state.catalog_resolution === "unknown" ||
+    state.catalog_resolution === "local" ||
+    state.catalog_resolution === "amazon";
+
+  const rawPkgLink = (inheritedContext?.packageId ?? state.package_link_id)?.trim() ?? "";
+  const packageLinkUuidOk =
+    isLooseItem ||
+    !rawPkgLink ||
+    isUuidString(rawPkgLink);
   const step1Valid =
-    !!state.marketplace &&
+    packageLinkUuidOk &&
+    !!state.store_id &&
+    isUuidString(state.store_id.trim()) &&
     !!state.item_name.trim() &&
-    !!state.product_identifier.trim() &&
+    productIdOk &&
     state.condition_keys.length > 0 &&
     (!state.condition_keys.includes("expired") || !!state.expiration_date.trim());
 
+  const photoCtxForStep2 = useMemo(
+    () => ({
+      hasPackageLink: !isLooseItem && !!(inheritedContext?.packageId ?? state.package_link_id),
+      orphanLpn: !!state.lpn.trim(),
+      packageInheritsBoxPhotos,
+    }),
+    [isLooseItem, inheritedContext?.packageId, state.package_link_id, state.lpn, packageInheritsBoxPhotos],
+  );
+
+  const step2Valid = useMemo(() => {
+    const expiryBlocking =
+      isExpiryLabelPhotoMandatory(state) && !state.photo_expiry_url.trim();
+    if (isLooseItem) {
+      return !expiryBlocking;
+    }
+    const cats = getCategoriesForConditions(conditions, photoCtxForStep2);
+    const catsOk = cats.every((c) => c.optional || (state.photos[c.id]?.length ?? 0) > 0);
+    return !expiryBlocking && catsOk;
+  }, [state.condition_keys, state.expiration_date, state.photo_expiry_url, state.photos, conditions, photoCtxForStep2, isLooseItem]);
+
   async function handleSubmit() {
     setSubmitting(true); setSubmitErr("");
-    const pkgId = (inheritedContext?.packageId ?? state.package_link_id) || undefined;
+    const rawLink = (inheritedContext?.packageId ?? state.package_link_id)?.trim() ?? "";
+    if (!isLooseItem && rawLink && !isUuidString(rawLink)) {
+      setSubmitErr(
+        "Package link is invalid. Open Step 1 and pick the package again (search by tracking # — the saved value must be the package record id, not a tracking code).",
+      );
+      setSubmitting(false);
+      return;
+    }
+    const storeFkMsg = uuidFkInvalidMessage(state.store_id, "Sales Channel");
+    if (storeFkMsg) {
+      setSubmitErr(storeFkMsg);
+      onToast?.(storeFkMsg, "error");
+      setSubmitting(false);
+      return;
+    }
+    const pkgId = isLooseItem ? undefined : (inheritedContext?.packageId ?? state.package_link_id) || undefined;
+    const linkedPkg = pkgId ? openPackages.find((p) => p.id === pkgId) : undefined;
     if (pkgId && onSoftPackageWarning) {
-      const pkg = openPackages.find((p) => p.id === pkgId);
-      if (pkg && !itemMatchesPackageExpectation(state.item_name, pkg)) onSoftPackageWarning();
+      if (linkedPkg && !itemMatchesPackageExpectation(state.item_name, linkedPkg)) onSoftPackageWarning();
     }
     const photoEvidence = Object.fromEntries(Object.entries(state.photos).map(([k, v]) => [k, v.length]));
-    const orderId = state.amazon_order_id.trim() || undefined;
+    const orderId =
+      linkedPkg?.order_id?.trim() ||
+      state.amazon_order_id.trim() ||
+      undefined;
+
     try {
+      /** Condition-category files (local) — uploaded here so URLs exist for storage; claim payload merges package/pallet from DB. */
+      const conditionCategoryUrls: string[] = [];
+      for (const [, files] of Object.entries(state.photos)) {
+        for (let i = 0; i < files.length; i++) {
+          const url = await uploadToStorage(files[i], "evidence/wizard", workspaceOrgId);
+          conditionCategoryUrls.push(url);
+        }
+      }
+
+      const storeRow = wizardStoresForSubmit.find((s) => s.id === state.store_id);
+      const marketplaceResolved =
+        String(state.marketplace ?? "").trim() ||
+        (storeRow ? platformToMarketplace(storeRow.platform) : "amazon");
+
       const res = await insertReturn({
+        organization_id: workspaceOrgId,
         lpn: state.lpn || undefined,
-        marketplace: state.marketplace as string, item_name: state.item_name, conditions,
+        marketplace: marketplaceResolved,
+        item_name: state.item_name,
+        conditions,
         asin: state.asin.trim() || state.product_identifier.trim() || undefined,
         fnsku: state.fnsku.trim() || undefined,
         sku: state.sku.trim() || undefined,
-        order_id: orderId,
+        amazon_order_id: orderId,
         notes: state.notes, photo_evidence: photoEvidence,
         expiration_date: state.expiration_date || undefined,
         batch_number: state.batch_number || undefined,
         photo_item_url:   state.photo_item_url   || undefined,
         photo_expiry_url: state.photo_expiry_url || undefined,
+        photo_return_label_url: state.photo_return_label_url || undefined,
         package_id: pkgId,
         store_id:   state.store_id || undefined,
         created_by: actor,
+        claim_evidence_selected_urls: conditionCategoryUrls.length > 0 ? conditionCategoryUrls : undefined,
       });
       if (res.ok && res.data) {
         onSuccess(res.data, state.photos);
-        if (res.data.status === "ready_for_claim") {
+        if (res.data.status === "ready_for_claim" && res.data.marketplace?.toLowerCase() === "amazon") {
           onToast?.("Success: return saved and claim queued (ready_to_send) for the agent.", "success");
+        } else if (res.data.status === "ready_for_claim") {
+          onToast?.("Success: return saved — ready for claim.", "success");
         } else {
           onToast?.("Success: return saved.", "success");
         }
         setFlash(true);
-        setTimeout(() => { setFlash(false); setStep(1); setState({ ...EMPTY_WIZARD, package_link_id: inheritedContext?.packageId ?? "" }); setSubmitErr(""); }, 700);
+        setTimeout(() => {
+          setFlash(false);
+          setStep(1);
+          setState({
+            ...EMPTY_WIZARD,
+            package_link_id: inheritedContext?.packageId ?? "",
+            loose_item: false,
+            catalog_resolution: "idle",
+          });
+          setSubmitErr("");
+        }, 700);
       } else {
         const msg = res.error ?? "Submission failed.";
         setSubmitErr(msg);
@@ -3728,11 +5232,18 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
               conditions={conditions}
               inheritedPackagePhotos={inheritedPackagePhotos}
               packageInheritsBoxPhotos={packageInheritsBoxPhotos}
+              isLooseItem={isLooseItem}
               photoCtx={{
-                hasPackageLink: !!(inheritedContext?.packageId ?? state.package_link_id),
+                hasPackageLink: !isLooseItem && !!(inheritedContext?.packageId ?? state.package_link_id),
                 orphanLpn: !!state.lpn.trim(),
                 packageInheritsBoxPhotos,
               }}
+              actor={actor}
+              organizationId={workspaceOrgId}
+              linkedPackageId={resolvedPkgId || undefined}
+              linkedPackage={resolvedPkgId ? openPackages.find((p) => p.id === resolvedPkgId) : undefined}
+              onPackageUpdated={onLinkedPackageUpdated}
+              onToast={onToast}
             />
           )}
           {step === 3 && (
@@ -3748,14 +5259,28 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
               onToast={onToast}
               onNavigateToPackage={onNavigateToPackage}
               onNavigateToPallet={onNavigateToPallet}
+              palletEvidenceFromDb={fetchedPalletEvidence}
+              packageEvidenceFromDb={fetchedPkgPhotos}
             />
           )}
         </div>
         {submitErr && <p className="shrink-0 px-4 sm:px-6 pb-2 text-sm font-semibold text-rose-600 dark:text-rose-400">{submitErr}</p>}
-        <div className="flex shrink-0 items-center gap-3 border-t border-slate-200 px-4 py-3 sm:px-6 sm:py-4 dark:border-slate-700">
-          {step > 1 && <button onClick={() => setStep((s) => s-1)} className={`${BTN_GHOST} h-14 px-4`}><ArrowLeft className="h-5 w-5" /></button>}
-          {step < 3 ? <button onClick={() => setStep((s) => s+1)} disabled={step === 1 && !step1Valid} className={BTN_PRIMARY}>Next <ArrowRight className="h-5 w-5" /></button>
-            : <button onClick={handleSubmit} disabled={submitting} className={BTN_PRIMARY}>{submitting ? <Loader2 className="h-5 w-5 animate-spin" /> : <CheckCircle2 className="h-5 w-5" />}{submitting ? "Saving…" : "Submit to Claims"}</button>}
+        <div className="flex shrink-0 items-center justify-between gap-2 border-t border-slate-200 px-4 py-3 sm:px-6 sm:py-4 dark:border-slate-700">
+          <div className="flex min-w-0 items-center gap-2">
+            {step > 1 && <button type="button" onClick={() => setStep((s) => s - 1)} className={`${BTN_FOOTER_GHOST} px-3`}><ArrowLeft className="h-4 w-4" /></button>}
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            {step < 3 ? (
+              <button type="button" onClick={() => setStep((s) => s + 1)} disabled={(step === 1 && !step1Valid) || (step === 2 && !step2Valid)} className={BTN_FOOTER_PRIMARY}>
+                Next <ArrowRight className="h-4 w-4" />
+              </button>
+            ) : (
+              <button type="button" onClick={handleSubmit} disabled={submitting} className={BTN_FOOTER_PRIMARY}>
+                {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                {submitting ? "Submitting…" : "Submit return"}
+              </button>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -3764,13 +5289,15 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
 
 // ─── Create Package Modal ──────────────────────────────────────────────────────
 
-export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiPackingSlipEnabled = false }: {
+export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiPackingSlipEnabled = false, organizationId = MVP_ORGANIZATION_ID }: {
   onClose: () => void; onCreated: (p: PackageRecord) => void; actor: string; openPallets: PalletRecord[];
   aiPackingSlipEnabled?: boolean;
+  organizationId?: string;
 }) {
   const [pkgNum, setPkgNum] = useState(generatePackageNumber());
   const [tracking, setTracking] = useState(""); const [carrier, setCarrier] = useState(""); const [expected, setExpected] = useState(""); const [palletId, setPalletId] = useState("");
   const [rmaNumber, setRmaNumber] = useState("");
+  const [amazonOrderId, setAmazonOrderId] = useState("");
   const [ocrFile, setOcrFile] = useState<File | null>(null); const [ocrLoad, setOcrLoad] = useState(false); const [ocrDone, setOcrDone] = useState(false);
   const [saving, setSaving] = useState(false); const [error, setError] = useState("");
   const [photoClosedUrl, setPhotoClosedUrl] = useState<string | null>(null);
@@ -3779,12 +5306,25 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
   const [photoOpenedUploading, setPhotoOpenedUploading] = useState(false);
   const [photoReturnLabelUrl, setPhotoReturnLabelUrl] = useState<string | null>(null);
   const [photoReturnLabelUploading, setPhotoReturnLabelUploading] = useState(false);
+  /** Persisted packing-slip image URL (saved with the package row). */
+  const [manifestPhotoUrl, setManifestPhotoUrl] = useState<string | null>(null);
+  /** Parsed manifest lines — saved as manifest_data JSONB; count rolls up to expected_item_count. */
+  const [manifestParsedLines, setManifestParsedLines] = useState<ExpectedItem[] | null>(null);
+  const [manifestOcrLoad, setManifestOcrLoad] = useState(false);
+  /** Poly / loose shipment — skip mandatory opened-box + return-label photos. */
+  const [noBoxMode, setNoBoxMode] = useState(false);
+  const manifestFileRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const palletOptions = openPallets.map((p) => ({ id: p.id, label: p.pallet_number, sublabel: `${p.item_count} items` }));
+  const palletOptions = openPallets.map((p) => ({
+    id: p.id,
+    label: p.pallet_number,
+    sublabel: `${p.item_count} items`,
+    tracking: p.tracking_number ?? undefined,
+  }));
 
   // ── Auto-fill carrier from the pallet's existing packages ─────────────────
   useEffect(() => {
-    if (!palletId) return;
+    if (!palletId?.trim() || !isUuidString(palletId.trim())) return;
     supabaseBrowser
       .from("packages")
       .select("carrier_name")
@@ -3818,7 +5358,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
 
   // ── Inherit store_id from pallet (Pallet → Package) — local list or DB fetch ─
   useEffect(() => {
-    if (!palletId) {
+    if (!palletId?.trim() || !isUuidString(palletId.trim())) {
       setPkgStoreInherited(false);
       return;
     }
@@ -3859,11 +5399,71 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
     onScan: (code) => setRmaNumber(code),
   });
 
-  async function handleOcr(file: File) { setOcrFile(file); setOcrLoad(true); setOcrDone(false); const res = await mockPackageOcr(file); setOcrLoad(false); if (res.ok && res.data) { setExpected(String(res.data.expected_item_count)); setCarrier(res.data.carrier_name); setTracking(res.data.tracking_number); setOcrDone(true); } else setError(res.error ?? "OCR failed."); }
+  async function handleOcr(file: File) {
+    setOcrFile(file);
+    setOcrLoad(true);
+    setOcrDone(false);
+    setError("");
+    let manifestLines: ExpectedItem[] = [];
+    try {
+      const url = await uploadToStorage(file, "packages/manifest", organizationId);
+      setManifestPhotoUrl(url);
+      const slipItems = await mockManifestLineItems(file);
+      manifestLines = slipItems.map((it) => ({
+        sku: it.barcode,
+        expected_qty: it.expected_qty ?? 1,
+        description: it.name,
+      }));
+      setManifestParsedLines(manifestLines);
+      const fromLines = manifestLines.reduce((a, it) => a + (it.expected_qty ?? 1), 0);
+      if (fromLines > 0) setExpected(String(fromLines));
+    } catch (e) {
+      setOcrLoad(false);
+      setError(e instanceof Error ? e.message : "Manifest image upload failed.");
+      return;
+    }
+    const res = await mockPackageOcr(file);
+    setOcrLoad(false);
+    if (res.ok && res.data) {
+      const lineCount = manifestLines.reduce((a, it) => a + (it.expected_qty ?? 1), 0);
+      setExpected(String(lineCount > 0 ? lineCount : res.data.expected_item_count));
+      setCarrier(res.data.carrier_name);
+      setTracking(res.data.tracking_number);
+      setOcrDone(true);
+    } else {
+      setError(res.error ?? "OCR failed.");
+    }
+  }
   async function handleManifestUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0];
     if (f) handleOcr(f);
     e.target.value = "";
+  }
+
+  /** Standalone manifest capture (when AI packing slip block is off) — still saves photo + manifest_data. */
+  async function handleStandaloneManifestUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file || !file.type.startsWith("image/")) return;
+    setManifestOcrLoad(true);
+    setError("");
+    try {
+      const url = await uploadToStorage(file, "packages/manifest", organizationId);
+      setManifestPhotoUrl(url);
+      const slipItems = await mockManifestLineItems(file);
+      const lines: ExpectedItem[] = slipItems.map((it) => ({
+        sku: it.barcode,
+        expected_qty: it.expected_qty ?? 1,
+        description: it.name,
+      }));
+      setManifestParsedLines(lines);
+      const fromLines = lines.reduce((a, it) => a + (it.expected_qty ?? 1), 0);
+      if (fromLines > 0) setExpected(String(fromLines));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Manifest upload failed.");
+    } finally {
+      setManifestOcrLoad(false);
+    }
   }
   async function handleClaimPhotoCapture(
     e: React.ChangeEvent<HTMLInputElement>,
@@ -3884,7 +5484,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
         field === "closed"       ? "packages/claim_closed"       :
         field === "opened"       ? "packages/claim_opened"       :
                                    "packages/claim_return_label";
-      const publicUrl = await uploadToStorage(f, folder);
+      const publicUrl = await uploadToStorage(f, folder, organizationId);
       setUrl(publicUrl);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Photo upload failed.");
@@ -3894,16 +5494,50 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
   }
 
   async function handleCreate() {
-    if (!pkgNum.trim()) return; setSaving(true); setError("");
+    if (!pkgNum.trim()) return;
+    if (!pkgStoreId.trim()) {
+      setError("Select a sales channel.");
+      return;
+    }
+    const storeMsg = uuidFkInvalidMessage(pkgStoreId, "Sales Channel");
+    if (storeMsg) {
+      setError(storeMsg);
+      return;
+    }
+    const pltMsg = uuidFkInvalidMessage(palletId, "Pallet");
+    if (pltMsg) {
+      setError(pltMsg);
+      return;
+    }
+    if (!noBoxMode) {
+      if (!photoReturnLabelUrl?.trim()) {
+        setError("Upload a return label photo (required for boxed packages), or turn on “No box / poly mailer”.");
+        return;
+      }
+      if (!photoOpenedUrl?.trim()) {
+        setError("Upload an opened-box photo (required for boxed packages), or turn on “No box / poly mailer”.");
+        return;
+      }
+    }
+    setSaving(true); setError("");
     const res = await createPackage({
+      organization_id: organizationId,
       package_number: pkgNum.trim(),
       tracking_number: tracking.trim() || undefined,
       carrier_name: carrier || undefined,
       rma_number: rmaNumber.trim() || undefined,
-      expected_item_count: expected ? parseInt(expected, 10) : 0,
+      order_id: amazonOrderId.trim() || undefined,
+      expected_item_count:
+        manifestParsedLines && manifestParsedLines.length > 0
+          ? manifestParsedLines.reduce((a, it) => a + (it.expected_qty ?? 1), 0)
+          : expected
+            ? parseInt(expected, 10) || 0
+            : 0,
       pallet_id: palletId || undefined,
       store_id: pkgStoreId || undefined,
       created_by: actor,
+      manifest_photo_url: manifestPhotoUrl ?? undefined,
+      ...(manifestParsedLines && manifestParsedLines.length > 0 ? { manifest_data: manifestParsedLines } : {}),
       photo_closed_url:        photoClosedUrl         ?? undefined,
       photo_opened_url:        photoOpenedUrl         ?? undefined,
       photo_return_label_url:  photoReturnLabelUrl    ?? undefined,
@@ -3934,7 +5568,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
               </div>
               {!ocrFile ? <button type="button" onClick={() => fileRef.current?.click()} className="flex w-full flex-col items-center gap-3 rounded-2xl border-2 border-dashed border-violet-300 bg-violet-50 p-5 transition hover:border-violet-400 hover:bg-violet-100 dark:border-violet-700/60 dark:bg-violet-950/30"><FileImage className="h-10 w-10 text-violet-400" /><p className="text-sm font-semibold text-violet-700 dark:text-violet-300">Photo Packing Slip for AI Scan</p><p className="text-xs text-slate-400">Extracts carrier, tracking, expected count</p></button>
                 : ocrLoad ? <div className="flex items-center gap-3 rounded-2xl border border-sky-200 bg-sky-50 p-4 dark:border-sky-700/60 dark:bg-sky-950/30"><Loader2 className="h-5 w-5 animate-spin text-sky-500" /><p className="text-sm font-semibold text-sky-700 dark:text-sky-300">Scanning with AI…</p></div>
-                : ocrDone ? <div className="flex items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-700/60 dark:bg-emerald-950/30"><Sparkles className="h-5 w-5 text-emerald-500" /><div className="flex-1"><p className="text-sm font-bold text-emerald-700 dark:text-emerald-300">AI Scan Complete</p><p className="text-xs text-slate-400">Fields pre-filled — override if needed.</p></div><button onClick={() => { setOcrFile(null); setOcrDone(false); }} className="text-xs text-slate-400 underline">Rescan</button></div>
+                : ocrDone ? <div className="flex items-center gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-700/60 dark:bg-emerald-950/30"><Sparkles className="h-5 w-5 text-emerald-500" /><div className="flex-1"><p className="text-sm font-bold text-emerald-700 dark:text-emerald-300">AI Scan Complete</p><p className="text-xs text-slate-400">Fields pre-filled — override if needed.</p></div><button onClick={() => { setOcrFile(null); setOcrDone(false); setManifestPhotoUrl(null); setManifestParsedLines(null); }} className="text-xs text-slate-400 underline">Rescan</button></div>
                 : null}
               <input ref={fileRef} type="file" className="hidden" accept="image/*" capture="environment" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleOcr(f); e.target.value = ""; }} />
             </>
@@ -3979,6 +5613,19 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
               />
             </div>
           </div>
+          <div>
+            <label className={LABEL}>Amazon order ID <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+            <input
+              type="text"
+              inputMode="text"
+              autoComplete="off"
+              className={`${INPUT} font-mono`}
+              placeholder="e.g. 111-1234567-8901234"
+              value={amazonOrderId}
+              onChange={(e) => setAmazonOrderId(e.target.value)}
+            />
+            <p className="mt-1 text-[11px] text-slate-400">Linked return items inherit this for claims.</p>
+          </div>
           <div><label className={LABEL}>Expected Items</label><input type="number" min="0" className={INPUT} placeholder="0" value={expected} onChange={(e) => setExpected(e.target.value)} /></div>
           <ComboboxField label="Link to Pallet" hint="(optional)" icon={Boxes} options={palletOptions} value={palletId} onChange={setPalletId} onClear={() => setPalletId("")} placeholder="Search pallets…" />
 
@@ -4014,25 +5661,99 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
             )}
           </div>
 
+          {/* ── Packing slip / manifest (when AI packing-slip block above is disabled) ── */}
+          {!aiPackingSlipEnabled && (
+            <div className="rounded-2xl border-2 border-violet-200 bg-violet-50/80 p-4 space-y-3 dark:border-violet-800/50 dark:bg-violet-950/25">
+              <div className="flex items-center gap-2">
+                <Sparkles className="h-4 w-4 text-violet-600 dark:text-violet-400" />
+                <p className="text-sm font-bold text-violet-800 dark:text-violet-200">Packing slip / manifest</p>
+              </div>
+              <p className="text-xs text-violet-700 dark:text-violet-300">
+                Optional — photo and parsed lines are saved on the package for reconciliation.
+              </p>
+              <input
+                ref={manifestFileRef}
+                type="file"
+                accept="image/*"
+                capture="environment"
+                className="hidden"
+                onChange={handleStandaloneManifestUpload}
+              />
+              {manifestOcrLoad ? (
+                <div className="flex items-center gap-2 rounded-xl bg-violet-100/80 px-3 py-2 dark:bg-violet-950/40">
+                  <Loader2 className="h-4 w-4 animate-spin text-violet-500" />
+                  <span className="text-sm font-semibold text-violet-800 dark:text-violet-200">Processing manifest…</span>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => manifestFileRef.current?.click()}
+                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-violet-600 py-3 text-sm font-semibold text-white hover:bg-violet-700"
+                  >
+                    📸 Scan packing slip / manifest
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const lines: ExpectedItem[] = [
+                        { sku: "111", expected_qty: 1, description: "Item 111" },
+                        { sku: "222", expected_qty: 2, description: "Item 222" },
+                      ];
+                      setManifestParsedLines(lines);
+                      setExpected(String(lines.reduce((a, it) => a + (it.expected_qty ?? 1), 0)));
+                    }}
+                    className="flex w-full items-center justify-center gap-2 rounded-xl border border-violet-300 bg-white py-2.5 text-xs font-semibold text-violet-700 dark:border-violet-700/50 dark:bg-slate-900 dark:text-violet-300"
+                  >
+                    🧪 Load mock manifest (test)
+                  </button>
+                </div>
+              )}
+              {manifestParsedLines && manifestParsedLines.length > 0 && (
+                <p className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
+                  ✓ {manifestParsedLines.length} manifest line(s) — will save with the package.
+                </p>
+              )}
+            </div>
+          )}
+
           {/* ── Claim Evidence Photos ──────────────────────────────────────── */}
           <div className="rounded-2xl border-2 border-rose-200 bg-rose-50 p-4 space-y-3 dark:border-rose-700/50 dark:bg-rose-950/20">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Camera className="h-4 w-4 text-rose-600 dark:text-rose-400" />
               <p className="text-sm font-bold text-rose-800 dark:text-rose-200">Claim Evidence Photos</p>
               <span className="ml-auto rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-rose-600 dark:bg-rose-900/40 dark:text-rose-300">Box Level</span>
             </div>
+            <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-rose-200 bg-white/80 p-3 dark:border-rose-800/50 dark:bg-slate-900/40">
+              <input
+                type="checkbox"
+                className="mt-1 h-4 w-4 shrink-0 rounded border-slate-300"
+                checked={noBoxMode}
+                onChange={(e) => setNoBoxMode(e.target.checked)}
+              />
+              <div>
+                <p className="text-sm font-semibold text-rose-900 dark:text-rose-100">No box / poly mailer</p>
+                <p className="mt-0.5 text-[11px] text-rose-700/90 dark:text-rose-300/90">
+                  Skip required opened-box and return-label photos (e.g. loose or non-carton shipments).
+                </p>
+              </div>
+            </label>
 
             {/* Closed box */}
             {photoClosedUrl ? (
-              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Closed box photo saved ✓</span>
-                <button type="button" onClick={() => setPhotoClosedUrl(null)} className="text-xs text-slate-400 underline">Remove</button>
-              </div>
+              <SavedUrlEvidenceCard
+                label="Closed box"
+                hint="Optional — claim evidence for the sealed package."
+                imageUrl={photoClosedUrl}
+                onRemove={() => setPhotoClosedUrl(null)}
+                Icon={Camera}
+                iconColor="text-rose-600 dark:text-rose-400"
+                footerNote="Stored on this package"
+              />
             ) : (
               <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${photoClosedUploading ? "border-rose-300 bg-rose-50/80 text-rose-500" : "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100 dark:border-rose-700/60 dark:bg-rose-950/30 dark:text-rose-300"}`}>
                 {photoClosedUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                {photoClosedUploading ? "Uploading…" : "📸 Upload Closed Box Photo"}
+                {photoClosedUploading ? "Uploading…" : "📸 Closed box (optional)"}
                 <input type="file" accept="image/*" capture="environment" className="hidden" disabled={photoClosedUploading}
                   onChange={(e) => handleClaimPhotoCapture(e, "closed")} />
               </label>
@@ -4040,15 +5761,21 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
 
             {/* Opened box */}
             {photoOpenedUrl ? (
-              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Opened box photo saved ✓</span>
-                <button type="button" onClick={() => setPhotoOpenedUrl(null)} className="text-xs text-slate-400 underline">Remove</button>
-              </div>
+              <SavedUrlEvidenceCard
+                label="Opened box"
+                hint="Shows contents — required unless “No box” is checked."
+                imageUrl={photoOpenedUrl}
+                onRemove={() => setPhotoOpenedUrl(null)}
+                Icon={Camera}
+                iconColor="text-amber-600 dark:text-amber-400"
+                required={!noBoxMode}
+                footerNote="Stored on this package"
+              />
             ) : (
               <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${photoOpenedUploading ? "border-amber-300 bg-amber-50/80 text-amber-500" : "border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-300"}`}>
                 {photoOpenedUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                {photoOpenedUploading ? "Uploading…" : "📸 Upload Opened Box Photo"}
+                {photoOpenedUploading ? "Uploading…" : "📸 Opened box"}
+                {!noBoxMode ? <span className="text-rose-500">*</span> : null}
                 <input type="file" accept="image/*" capture="environment" className="hidden" disabled={photoOpenedUploading}
                   onChange={(e) => handleClaimPhotoCapture(e, "opened")} />
               </label>
@@ -4056,15 +5783,21 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
 
             {/* Return shipping label */}
             {photoReturnLabelUrl ? (
-              <div className="flex items-center gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 dark:border-emerald-700/50 dark:bg-emerald-950/30">
-                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
-                <span className="flex-1 truncate text-xs font-semibold text-emerald-700 dark:text-emerald-300">Return label photo saved ✓</span>
-                <button type="button" onClick={() => setPhotoReturnLabelUrl(null)} className="text-xs text-slate-400 underline">Remove</button>
-              </div>
+              <SavedUrlEvidenceCard
+                label="Return label"
+                hint="Carrier return label — required unless “No box” is checked."
+                imageUrl={photoReturnLabelUrl}
+                onRemove={() => setPhotoReturnLabelUrl(null)}
+                Icon={Camera}
+                iconColor="text-violet-600 dark:text-violet-400"
+                required={!noBoxMode}
+                footerNote="Stored on this package"
+              />
             ) : (
               <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${photoReturnLabelUploading ? "border-violet-300 bg-violet-50/80 text-violet-500" : "border-violet-300 bg-violet-50 text-violet-700 hover:bg-violet-100 dark:border-violet-700/60 dark:bg-violet-950/30 dark:text-violet-300"}`}>
                 {photoReturnLabelUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                {photoReturnLabelUploading ? "Uploading…" : "📸 Upload Return Label Photo"}
+                {photoReturnLabelUploading ? "Uploading…" : "📸 Return label"}
+                {!noBoxMode ? <span className="text-rose-500">*</span> : null}
                 <input type="file" accept="image/*" capture="environment" className="hidden" disabled={photoReturnLabelUploading}
                   onChange={(e) => handleClaimPhotoCapture(e, "return_label")} />
               </label>
@@ -4073,12 +5806,24 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
 
           {error && <p className="rounded-xl bg-rose-50 px-4 py-2 text-sm text-rose-700 dark:bg-rose-950/40 dark:text-rose-400">{error}</p>}
         </div>
-        <div className="border-t border-slate-200 p-4 dark:border-slate-700 flex flex-col gap-3">
-          <label className="flex w-full cursor-pointer items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-slate-300 bg-slate-50 py-3 text-sm font-semibold text-slate-600 transition hover:border-slate-400 hover:bg-slate-100 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-300">
-            📸 Scan Packing Slip / Manifest
-            <input type="file" accept="image/*" capture="environment" className="hidden" onChange={handleManifestUpload} />
-          </label>
-          <button onClick={handleCreate} disabled={saving || !pkgNum.trim()} className={BTN_PRIMARY}>{saving ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}{saving ? "Creating…" : "Create Package"}</button>
+        <div className="flex flex-col gap-3 border-t border-slate-200 p-4 dark:border-slate-700">
+          <div className="flex w-full justify-end">
+            <button
+              type="button"
+              onClick={handleCreate}
+              disabled={
+                saving ||
+                !pkgNum.trim() ||
+                !pkgStoreId.trim() ||
+                !isUuidString(pkgStoreId.trim()) ||
+                (!noBoxMode && (!photoReturnLabelUrl?.trim() || !photoOpenedUrl?.trim()))
+              }
+              className={BTN_PRIMARY}
+            >
+              {saving ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}
+              {saving ? "Creating…" : "Create Package"}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -4087,9 +5832,10 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
 
 // ─── Create Pallet Modal ───────────────────────────────────────────────────────
 
-export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled = false }: {
+export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled = false, organizationId = MVP_ORGANIZATION_ID }: {
   onClose: () => void; onCreated: (p: PalletRecord) => void; actor: string;
   aiManifestEnabled?: boolean;
+  organizationId?: string;
 }) {
   const [palletNum, setPalletNum] = useState(generatePalletNumber()); const [notes, setNotes] = useState(""); const [file, setFile] = useState<File | null>(null);
   const [bolFile, setBolFile] = useState<File | null>(null);
@@ -4125,12 +5871,8 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
     if (!f) return;
     setPhotoUploading(true);
     try {
-      const ext = f.name.split(".").pop() ?? "jpg";
-      const path = `pallets/${Date.now()}.${ext}`;
-      const { error: upErr } = await supabaseBrowser.storage.from("media").upload(path, f, { upsert: true });
-      if (upErr) throw new Error(upErr.message);
-      const { data: urlData } = supabaseBrowser.storage.from("media").getPublicUrl(path);
-      setPhotoUrl(urlData.publicUrl);
+      const url = await uploadToStorage(f, "pallets", organizationId);
+      setPhotoUrl(url);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Photo upload failed.");
     } finally {
@@ -4138,12 +5880,33 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
     }
   }
   async function handleCreate() {
-    if (!palletNum.trim()) return; setSaving(true); setError("");
-    const manifest_photo_url = file ? URL.createObjectURL(file) : undefined;
-    const bol_photo_url = bolFile ? URL.createObjectURL(bolFile) : undefined;
-    const res = await createPallet({ pallet_number: palletNum.trim(), manifest_photo_url, bol_photo_url, photo_url: photoUrl ?? undefined, store_id: palletStoreId || undefined, notes, created_by: actor });
-    setSaving(false);
-    if (res.ok && res.data) onCreated(res.data); else setError(res.error ?? "Failed.");
+    if (!palletNum.trim()) return;
+    if (!palletStoreId.trim() || !isUuidString(palletStoreId.trim())) {
+      setError("Select a valid Sales Channel from the dropdown.");
+      return;
+    }
+    setSaving(true); setError("");
+    try {
+      let manifest_photo_url: string | undefined;
+      let bol_photo_url: string | undefined;
+      if (file) manifest_photo_url = await uploadToStorage(file, "pallets/manifest", organizationId);
+      if (bolFile) bol_photo_url = await uploadToStorage(bolFile, "pallets/bol", organizationId);
+      const res = await createPallet({
+        organization_id: organizationId,
+        pallet_number: palletNum.trim(),
+        manifest_photo_url,
+        bol_photo_url,
+        photo_url: photoUrl ?? undefined,
+        store_id: palletStoreId,
+        notes,
+        created_by: actor,
+      });
+      setSaving(false);
+      if (res.ok && res.data) onCreated(res.data); else setError(res.error ?? "Failed.");
+    } catch (e) {
+      setSaving(false);
+      setError(e instanceof Error ? e.message : "Upload failed.");
+    }
   }
 
   return (
@@ -4223,7 +5986,16 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
           {photoUrl && <p className="truncate text-center text-[10px] text-muted-foreground">{photoUrl}</p>}
           {error && <p className="rounded-xl bg-rose-50 px-4 py-2 text-sm text-rose-700 dark:bg-rose-950/40 dark:text-rose-400">{error}</p>}
         </div>
-        <div className="border-t border-slate-200 p-4 dark:border-slate-700"><button onClick={handleCreate} disabled={saving || !palletNum.trim()} className={BTN_PRIMARY}>{saving ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}{saving ? "Creating…" : "Create Pallet"}</button></div>
+        <div className="border-t border-slate-200 p-4 dark:border-slate-700">
+          <button
+            onClick={handleCreate}
+            disabled={saving || !palletNum.trim() || !palletStoreId.trim() || !isUuidString(palletStoreId.trim())}
+            className={BTN_PRIMARY}
+          >
+            {saving ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}
+            {saving ? "Creating…" : "Create Pallet"}
+          </button>
+        </div>
       </div>
     </div>
   );

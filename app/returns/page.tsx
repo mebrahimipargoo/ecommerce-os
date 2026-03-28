@@ -14,6 +14,7 @@ import {
   DEFAULT_FEFO,
   type InventoryModuleConfig,
 } from "../settings/workspace-settings-types";
+import { resolveOrganizationId } from "../../lib/organization";
 import {
   DEFAULT_ORG_SETTINGS,
   type DrawerContent, type WizardInheritedContext,
@@ -314,6 +315,7 @@ export default function ReturnsPage() {
             pallet={activeDrawer.record}
             role={role}
             actor={actor}
+            organizationId={resolveOrganizationId()}
             packages={packages}
             onClose={closeDrawer}
             onPalletUpdated={updatePallet_}
@@ -330,6 +332,7 @@ export default function ReturnsPage() {
           onClose={() => { setWizardOpen(false); setWizardInherited(undefined); }}
           onSuccess={(r, photos) => { addReturn(r, photos); }}
           actor={actor}
+          organizationId={resolveOrganizationId()}
           openPackages={openPackages}
           openPallets={openPallets}
           onCreatePackage={() => { setWizardOpen(false); setCreatePackageOpen(true); }}
@@ -338,6 +341,7 @@ export default function ReturnsPage() {
           aiLabelEnabled={orgSettings.is_ai_label_ocr_enabled}
           onSoftPackageWarning={() => showToast("Warning: This item is not on the package's expected list.", "warning")}
           onToast={showToast}
+          onLinkedPackageUpdated={updatePackage_}
           onNavigateToPackage={(id) => {
             const p = packages.find((x) => x.id === id);
             if (p) {
@@ -364,6 +368,7 @@ export default function ReturnsPage() {
           onClose={() => setCreatePackageOpen(false)}
           onCreated={(p) => { addPackage(p); setCreatePackageOpen(false); showToast(`Package ${p.package_number} created.`); }}
           actor={actor}
+          organizationId={resolveOrganizationId()}
           openPallets={openPallets}
           aiPackingSlipEnabled={orgSettings.is_ai_packing_slip_ocr_enabled}
         />
@@ -374,6 +379,7 @@ export default function ReturnsPage() {
           onClose={() => setCreatePalletOpen(false)}
           onCreated={(p) => { addPallet(p); setCreatePalletOpen(false); showToast(`Pallet ${p.pallet_number} created.`); }}
           actor={actor}
+          organizationId={resolveOrganizationId()}
           aiManifestEnabled={orgSettings.is_ai_packing_slip_ocr_enabled}
         />
       )}
