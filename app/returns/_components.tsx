@@ -35,6 +35,7 @@ import { fetchProductFromAmazon } from "../../lib/api/amazon-mock";
 import { operatorDisplayLabel } from "../../lib/operator-display";
 import { listStores } from "../settings/adapters/actions";
 import { isUuidString, uuidFkInvalidMessage } from "../../lib/uuid";
+import { isAdminRole, type UserRole } from "../../components/UserRoleContext";
 
 /** Seeded MVP org — use in client `stores` queries so RLS returns rows for local dev. */
 export const MVP_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001";
@@ -146,11 +147,11 @@ function ContextualScanButton({ onDetected, modalTitle = "Scan Barcode", classNa
 
 // ─── RBAC ──────────────────────────────────────────────────────────────────────
 
-export type UserRole = "admin" | "operator";
+export type { UserRole };
 export interface MockUser { name: string; role: UserRole }
 export const DEFAULT_USER: MockUser = { name: "Warehouse Op", role: "operator" };
-export const canEdit   = (r: UserRole) => r === "admin";
-export const canDelete = (r: UserRole) => r === "admin";
+export const canEdit   = (r: UserRole) => isAdminRole(r);
+export const canDelete = (r: UserRole) => isAdminRole(r);
 
 // ─── Marketplace & Carriers ────────────────────────────────────────────────────
 
@@ -606,10 +607,11 @@ export function PalletStatusBadge({ status }: { status: PalletStatus }) {
   return <span className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${cfg.cls}`}>{cfg.label}</span>;
 }
 export function RoleBadge({ user, onToggle }: { user: MockUser; onToggle: () => void }) {
+  const adminish = isAdminRole(user.role);
   return (
     <button onClick={onToggle} title="Toggle role (demo)"
-      className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold transition ${user.role === "admin" ? "border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-700/60 dark:bg-violet-950/50 dark:text-violet-300" : "border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-700/60 dark:bg-sky-950/50 dark:text-sky-300"}`}>
-      {user.role === "admin" ? <ShieldCheck className="h-3 w-3" /> : <User className="h-3 w-3" />}
+      className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-bold transition ${adminish ? "border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-700/60 dark:bg-violet-950/50 dark:text-violet-300" : "border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-700/60 dark:bg-sky-950/50 dark:text-sky-300"}`}>
+      {user.role === "super_admin" ? <Sparkles className="h-3 w-3" /> : adminish ? <ShieldCheck className="h-3 w-3" /> : <User className="h-3 w-3" />}
       {user.role.toUpperCase()}
     </button>
   );
@@ -1693,7 +1695,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   }
 
   async function handleSave() {
-    const storeMsg = uuidFkInvalidMessage(editStoreId, "Sales Channel");
+    const storeMsg = uuidFkInvalidMessage(editStoreId, "Store");
     if (storeMsg) {
       setErr(storeMsg);
       onToast?.(storeMsg, "error");
@@ -1852,9 +1854,9 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
               </div>
             </div>
             <div>
-              <label className={LABEL}>Sales Channel <span className="text-rose-500">*</span></label>
+              <label className={LABEL}>Store <span className="text-rose-500">*</span></label>
               <select className={INPUT} value={editStoreId} onChange={(e) => setEditStoreId(e.target.value)}>
-                <option value="">— Select Sales Channel —</option>
+                <option value="">— Select Store —</option>
                 {itemStoresList.map((s) => (
                   <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
                 ))}
@@ -3553,7 +3555,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.package_link_id, inherited?.packageId, openPackages]);
 
-  // Keep `returns.marketplace` aligned with the selected Sales Channel (fixes Next disabled when only store is set).
+  // Keep `returns.marketplace` aligned with the selected Store (fixes Next disabled when only store is set).
   useEffect(() => {
     if (!state.store_id || connectedStores.length === 0) return;
     const store = connectedStores.find((s) => s.id === state.store_id);
@@ -3922,7 +3924,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
       )}
       <div>
         <label className={LABEL}>
-          Sales Channel <span className="text-rose-500">*</span>
+          Store <span className="text-rose-500">*</span>
           {storeInherited && (
             <span className="ml-2 text-xs font-normal text-emerald-600 dark:text-emerald-400">
               · Inherited from Package
@@ -3944,7 +3946,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
           }}
           disabled={storeInherited}
         >
-          <option value="">— Select Sales Channel —</option>
+          <option value="">— Select Store —</option>
           {connectedStores.map((s) => (
             <option key={s.id} value={s.id}>
               {s.name} ({s.platform})
@@ -3953,7 +3955,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
         </select>
         {storeInherited && (
           <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
-            🔒 Locked — Sales Channel is inherited from the linked package.
+            🔒 Locked — store is inherited from the linked package.
           </p>
         )}
         {connectedStores.length === 0 && (
@@ -3980,7 +3982,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
       </div>
       <div className="space-y-4">
         <p className="text-[11px] leading-relaxed text-slate-500 dark:text-slate-400">
-          ASIN = catalog ID · FNSKU = your FBA label · SKU = Seller / warehouse (MSKU). Each is copyable; search uses the Sales Channel store (Amazon / Walmart).
+          ASIN = catalog ID · FNSKU = your FBA label · SKU = Seller / warehouse (MSKU). Each is copyable; search uses the selected store (Amazon / Walmart).
         </p>
         <div>
           <label className={LABEL}>ASIN <span className="text-xs font-normal text-slate-400">(optional)</span></label>
@@ -4790,7 +4792,7 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
             </div>
           )}
           <div>
-            <p className="text-xs text-slate-400">Sales Channel</p>
+            <p className="text-xs text-slate-400">Store</p>
             <p className="font-bold">
               {linkedPkg?.stores?.name
                 ? linkedPkg.stores.name
@@ -5104,7 +5106,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
       setSubmitting(false);
       return;
     }
-    const storeFkMsg = uuidFkInvalidMessage(state.store_id, "Sales Channel");
+    const storeFkMsg = uuidFkInvalidMessage(state.store_id, "Store");
     if (storeFkMsg) {
       setSubmitErr(storeFkMsg);
       onToast?.(storeFkMsg, "error");
@@ -5496,10 +5498,10 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
   async function handleCreate() {
     if (!pkgNum.trim()) return;
     if (!pkgStoreId.trim()) {
-      setError("Select a sales channel.");
+      setError("Select a store.");
       return;
     }
-    const storeMsg = uuidFkInvalidMessage(pkgStoreId, "Sales Channel");
+    const storeMsg = uuidFkInvalidMessage(pkgStoreId, "Store");
     if (storeMsg) {
       setError(storeMsg);
       return;
@@ -5631,7 +5633,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
 
           <div>
             <label className={LABEL}>
-              Sales Channel <span className="text-rose-500">*</span>
+              Store <span className="text-rose-500">*</span>
               {pkgStoreInherited && (
                 <span className="ml-2 text-xs font-normal text-emerald-600 dark:text-emerald-400">
                   · Inherited from Pallet
@@ -5644,14 +5646,14 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
               onChange={(e) => { setPkgStoreId(e.target.value); setPkgStoreInherited(false); }}
               disabled={pkgStoreInherited}
             >
-              <option value="">— Select Sales Channel —</option>
+              <option value="">— Select Store —</option>
               {pkgStoresList.map((s) => (
                 <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
               ))}
             </select>
             {pkgStoreInherited && (
               <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
-                🔒 Locked — Sales Channel is inherited from the selected pallet.
+                🔒 Locked — store is inherited from the selected pallet.
               </p>
             )}
             {pkgStoresList.length === 0 && (
@@ -5882,7 +5884,7 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
   async function handleCreate() {
     if (!palletNum.trim()) return;
     if (!palletStoreId.trim() || !isUuidString(palletStoreId.trim())) {
-      setError("Select a valid Sales Channel from the dropdown.");
+      setError("Select a valid Store from the dropdown.");
       return;
     }
     setSaving(true); setError("");
@@ -5955,13 +5957,13 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
             <input ref={bolRef} type="file" className="hidden" accept="image/*,application/pdf" capture="environment" onChange={(e) => { const f = e.target.files?.[0]; if (f) setBolFile(f); e.target.value = ""; }} />
           </div>
           <div>
-            <label className={LABEL}>Sales Channel <span className="text-rose-500">*</span></label>
+            <label className={LABEL}>Store <span className="text-rose-500">*</span></label>
             <select
               className={INPUT}
               value={palletStoreId}
               onChange={(e) => setPalletStoreId(e.target.value)}
             >
-              <option value="">— Select Sales Channel —</option>
+              <option value="">— Select Store —</option>
               {palletStoresList.map((s) => (
                 <option key={s.id} value={s.id}>{s.name} ({s.platform})</option>
               ))}
@@ -5972,7 +5974,7 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
               </p>
             ) : (
               <p className="mt-1 text-[11px] text-muted-foreground">
-                Packages created inside this pallet will inherit this Sales Channel automatically.
+                Packages created inside this pallet will inherit this store automatically.
               </p>
             )}
           </div>
@@ -6085,7 +6087,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative min-w-[180px] flex-1"><Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" /><input placeholder="Filter: ID, ASIN, tracking, RMA…" value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }} className={`${INPUT_SM_DARK} pl-9`} /></div>
         <select value={statusF} onChange={(e) => { setStatusF(e.target.value); setPage(1); }} className={`${INPUT_SM_DARK} w-auto`}><option value="">All Statuses</option>{Object.entries(STATUS_CFG).map(([k,v]) => <option key={k} value={k}>{v.label}</option>)}</select>
-        <select value={marketF} onChange={(e) => { setMarketF(e.target.value); setPage(1); }} className={`${INPUT_SM_DARK} w-auto`} title="Filter by sales channel / store"><option value="">All Stores</option>{MARKETPLACES.map((m) => <option key={m} value={m}>{MP_LABELS[m]}</option>)}</select>
+        <select value={marketF} onChange={(e) => { setMarketF(e.target.value); setPage(1); }} className={`${INPUT_SM_DARK} w-auto`} title="Filter by store"><option value="">All Stores</option>{MARKETPLACES.map((m) => <option key={m} value={m}>{MP_LABELS[m]}</option>)}</select>
         <div className="flex items-center gap-1.5">
           <Calendar className="h-4 w-4 shrink-0 text-slate-400" />
           <input type="date" value={dateFrom} onChange={(e) => { setDateFrom(e.target.value); setPage(1); }} className={`${INPUT_SM_DARK} w-36`} title="From date" />
@@ -6109,7 +6111,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                 <th className="px-4 py-3 text-left"><SortButton field="item_name" label="Identifiers" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="tracking_effective" label="Tracking" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="lpn" label="LPN" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
-                <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="store_name" label="Sales Channel" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
+                <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="store_name" label="Store" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left lg:table-cell"><SortButton field="item_conditions" label="Conditions" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="px-4 py-3 text-left"><SortButton field="status" label="Status" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 {/* ── NEW: Expiry Date column ── */}
@@ -6312,7 +6314,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                   </div>
                 </th>
                 <th className="px-4 py-3 text-left"><SortButton field="package_number" label="Package #" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
-                <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="store_name" label="Sales Channel" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
+                <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="store_name" label="Store" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="carrier_tracking" label="Carrier / Tracking" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="px-4 py-3 text-left"><SortButton field="pkg_items_sort" label="Items" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="px-4 py-3 text-left"><SortButton field="status" label="Status" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
@@ -6389,7 +6391,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                                 <table className="w-full text-xs">
                                   <thead><tr className="border-b border-violet-200 bg-violet-100/60 dark:border-violet-800/50 dark:bg-violet-950/40">
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Item</th>
-                                    <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Sales Channel</th>
+                                    <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Store</th>
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Condition</th>
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Status</th>
                                     <th className="px-3 py-2 text-left font-bold uppercase tracking-wide text-violet-500">Operator</th>
@@ -6543,7 +6545,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                   </div>
                 </th>
                 <th className="px-4 py-3 text-left"><SortButton field="pallet_number" label="Pallet #" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
-                <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="store_name" label="Sales Channel" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
+                <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="store_name" label="Store" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="px-4 py-3 text-left">
                   <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
                     <SortButton field="rollup_pkgs" label="Pkgs" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} />

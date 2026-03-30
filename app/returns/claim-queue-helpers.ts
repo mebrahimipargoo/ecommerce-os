@@ -16,7 +16,7 @@ export const CLAIM_CONDITIONS = new Set([
   "expired",
 ]);
 
-export function isAmazonSalesChannel(
+export function isAmazonStore(
   marketplace: string | null | undefined,
   storePlatform?: string | null,
 ): boolean {
@@ -32,7 +32,7 @@ export function shouldAutoEnqueueAmazonClaimSubmission(
   conditions: string[] | null | undefined,
   storePlatform?: string | null,
 ): boolean {
-  if (!isAmazonSalesChannel(marketplace, storePlatform)) return false;
+  if (!isAmazonStore(marketplace, storePlatform)) return false;
   const list = conditions ?? [];
   return list.some((c) => CLAIM_CONDITIONS.has(c));
 }

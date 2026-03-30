@@ -2,6 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import { Boxes, Package2, ScanLine } from "lucide-react";
+import { DatabaseTag } from "../../components/DatabaseTag";
 import { useGlobalSearch } from "../../components/GlobalSearchContext";
 import { useUserRole } from "../../components/UserRoleContext";
 import {
@@ -218,54 +219,63 @@ export default function ReturnsPage() {
         ) : (
           <>
             {activeTab === "items" && (
-              <ItemsDataTable
-                items={visibleReturns}
-                packages={packages}
-                pallets={pallets}
-                role={role}
-                actor={actor}
-                fefoSettings={fefoSettings}
-                externalSearch={globalSearchQuery}
-                onToast={showToast}
-                onRowClick={(r) => openDrawer({ type: "item", record: r })}
-                onRowEdit={(r)  => openDrawer({ type: "item", record: r })}
-                onBulkDeleted={bulkRemoveReturns}
-                onBulkMoved={bulkUpdateReturns}
-                onNewItem={() => openWizard()}
-              />
+              <div className="relative min-h-0">
+                <DatabaseTag table="items" />
+                <ItemsDataTable
+                  items={visibleReturns}
+                  packages={packages}
+                  pallets={pallets}
+                  role={role}
+                  actor={actor}
+                  fefoSettings={fefoSettings}
+                  externalSearch={globalSearchQuery}
+                  onToast={showToast}
+                  onRowClick={(r) => openDrawer({ type: "item", record: r })}
+                  onRowEdit={(r)  => openDrawer({ type: "item", record: r })}
+                  onBulkDeleted={bulkRemoveReturns}
+                  onBulkMoved={bulkUpdateReturns}
+                  onNewItem={() => openWizard()}
+                />
+              </div>
             )}
 
             {activeTab === "packages" && (
-              <PackagesDataTable
-                packages={packages}
-                returns={visibleReturns}
-                pallets={pallets}
-                role={role}
-                actor={actor}
-                externalSearch={globalSearchQuery}
-                onToast={showToast}
-                onRowClick={(p) => openDrawer({ type: "package", record: p })}
-                onRowEdit={(p)  => openDrawer({ type: "package", record: p })}
-                onBulkDeleted={bulkRemovePackages}
-                onBulkPackagesUpdated={bulkUpdatePackages}
-                onNewPackage={() => setCreatePackageOpen(true)}
-              />
+              <div className="relative min-h-0">
+                <DatabaseTag table="packages" />
+                <PackagesDataTable
+                  packages={packages}
+                  returns={visibleReturns}
+                  pallets={pallets}
+                  role={role}
+                  actor={actor}
+                  externalSearch={globalSearchQuery}
+                  onToast={showToast}
+                  onRowClick={(p) => openDrawer({ type: "package", record: p })}
+                  onRowEdit={(p)  => openDrawer({ type: "package", record: p })}
+                  onBulkDeleted={bulkRemovePackages}
+                  onBulkPackagesUpdated={bulkUpdatePackages}
+                  onNewPackage={() => setCreatePackageOpen(true)}
+                />
+              </div>
             )}
 
             {activeTab === "pallets" && (
-              <PalletsDataTable
-                pallets={pallets}
-                packages={packages}
-                returns={visibleReturns}
-                role={role}
-                actor={actor}
-                externalSearch={globalSearchQuery}
-                onToast={showToast}
-                onRowClick={(p) => openDrawer({ type: "pallet", record: p })}
-                onRowEdit={(p)  => openDrawer({ type: "pallet", record: p })}
-                onBulkDeleted={bulkRemovePallets}
-                onNewPallet={() => setCreatePalletOpen(true)}
-              />
+              <div className="relative min-h-0">
+                <DatabaseTag table="pallets" />
+                <PalletsDataTable
+                  pallets={pallets}
+                  packages={packages}
+                  returns={visibleReturns}
+                  role={role}
+                  actor={actor}
+                  externalSearch={globalSearchQuery}
+                  onToast={showToast}
+                  onRowClick={(p) => openDrawer({ type: "pallet", record: p })}
+                  onRowEdit={(p)  => openDrawer({ type: "pallet", record: p })}
+                  onBulkDeleted={bulkRemovePallets}
+                  onNewPallet={() => setCreatePalletOpen(true)}
+                />
+              </div>
             )}
           </>
         )}

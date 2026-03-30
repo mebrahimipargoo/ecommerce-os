@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Inter, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "../components/providers/ThemeProvider";
+import { DebugModeProvider } from "../components/DebugModeContext";
 import { AppShell } from "../components/AppShell";
 
 const inter = Inter({
@@ -41,12 +42,14 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange
         >
-          {/*
-           * AppShell renders the persistent collapsible sidebar on desktop
-           * and a hamburger-triggered drawer on mobile.
-           * Every page route is wrapped here — the sidebar NEVER disappears.
-           */}
-          <AppShell>{children}</AppShell>
+          <DebugModeProvider>
+            {/*
+             * AppShell renders the persistent collapsible sidebar on desktop
+             * and a hamburger-triggered drawer on mobile.
+             * Every page route is wrapped here — the sidebar NEVER disappears.
+             */}
+            <AppShell>{children}</AppShell>
+          </DebugModeProvider>
         </ThemeProvider>
       </body>
     </html>

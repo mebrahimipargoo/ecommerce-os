@@ -17,6 +17,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   ChevronDown, ChevronRight,
+  Database,
   LayoutDashboard, Menu,
   PanelLeftClose, PanelLeftOpen,
   RotateCcw, Settings, ShieldAlert, Users, X,
@@ -25,7 +26,8 @@ import { TopHeader } from "./TopHeader";
 import { BrandingProvider, useBranding } from "./BrandingContext";
 import { BrandLogoImage } from "./BrandLogoImage";
 import { GlobalSearchProvider } from "./GlobalSearchContext";
-import { UserRoleProvider, useUserRole } from "./UserRoleContext";
+import { isAdminRole, UserRoleProvider, useUserRole } from "./UserRoleContext";
+import { SidebarDebugToggle } from "./SidebarDebugToggle";
 
 // ─── Nav Definition ────────────────────────────────────────────────────────────
 
@@ -103,6 +105,10 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   function isActive(href?: string) {
     if (!href || href === "#") return false;
     if (href === "/") return pathname === "/";
+    // Settings hub is only active on the exact /settings page, not deeper routes like /settings/imports
+    if (href === "/settings") {
+      return pathname === "/settings" || pathname === "/settings/";
+    }
     return pathname.startsWith(href);
   }
 
@@ -229,10 +235,17 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     );
   }
 
-  function SidebarBody({ alwaysFull = false }: { alwaysFull?: boolean }) {
+  function SidebarBody({
+    alwaysFull = false,
+    collapsed: sidebarCollapsed,
+  }: {
+    alwaysFull?: boolean;
+    /** Narrow sidebar mode (desktop collapsed). Mobile drawer should pass false. */
+    collapsed: boolean;
+  }) {
     const { role } = useUserRole();
-    const showSection = alwaysFull || !collapsed;
-    const visibleNav = NAV.filter((sec) => sec.id !== "sys" || role === "admin");
+    const showSection = alwaysFull || !sidebarCollapsed;
+    const visibleNav = NAV.filter((sec) => sec.id !== "sys" || isAdminRole(role));
     return (
       <>
         {visibleNav.map((sec) => (
@@ -250,6 +263,22 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             </div>
           </div>
         ))}
+
+        {isAdminRole(role) && (
+          <div className="mb-4">
+            {showSection
+              ? <p className={CLS.section}>System Admin</p>
+              : <div className="mb-2 mx-3 h-px bg-border" />
+            }
+            <div className="space-y-0.5">
+              <NavLink
+                item={{ label: "Imports", icon: Database, href: "/settings/imports" }}
+                alwaysFull={alwaysFull}
+              />
+              <SidebarDebugToggle collapsed={sidebarCollapsed} />
+            </div>
+          </div>
+        )}
       </>
     );
   }
@@ -287,7 +316,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         </div>
 
         <nav className="flex-1 overflow-y-auto px-2 py-4">
-          <SidebarBody alwaysFull />
+          <SidebarBody alwaysFull collapsed={false} />
         </nav>
       </div>
     </>
@@ -324,7 +353,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
           </div>
 
           <nav className="flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
-            <SidebarBody />
+            <SidebarBody collapsed={collapsed} />
           </nav>
 
           <div className="shrink-0 border-t border-sidebar-border p-2">

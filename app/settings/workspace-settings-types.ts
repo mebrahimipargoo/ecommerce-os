@@ -40,8 +40,6 @@ export interface ClaimAgentConfig {
   autonomous_claim_submission_0_50_usd?: boolean;
   /** Default ON — bulk marketplace submission requires explicit approval in UI. */
   require_manual_approval_bulk_submission?: boolean;
-  /** Preferred store for adapter routing (FK to `stores.id`). */
-  default_marketplace_adapter_store_id?: string | null;
 
   /** Logistics: periodic sync of `ready_for_claim` returns → `claim_submissions` (UI/cron hint). */
   logistics_background_sync_enabled?: boolean;
@@ -78,7 +76,6 @@ export const DEFAULT_CLAIM_AGENT_CONFIG: ClaimAgentConfig = {
   max_auto_submit_amount_usd: 500,
   autonomous_claim_submission_0_50_usd: false,
   require_manual_approval_bulk_submission: true,
-  default_marketplace_adapter_store_id: null,
   logistics_background_sync_enabled: false,
   logistics_sync_interval_hours: 2,
 };

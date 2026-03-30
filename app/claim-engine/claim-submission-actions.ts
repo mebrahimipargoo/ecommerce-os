@@ -62,7 +62,7 @@ async function signedUrlForPath(path: string | null): Promise<string | null> {
 
 /**
  * Force-build submission queue: every Amazon `ready_for_claim` return gets a `claim_submissions` row
- * (`ready_to_send`). Existing rows are upserted. Non-Amazon channels are skipped.
+ * (`ready_to_send`). Existing rows are upserted. Non-Amazon stores are skipped.
  */
 export async function approveClaimSubmission(
   submissionId: string,

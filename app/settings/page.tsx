@@ -51,10 +51,14 @@ import {
   type LabelPrinter,
 } from "../../lib/openai-settings";
 import { useBranding } from "../../components/BrandingContext";
-import { useUserRole } from "../../components/UserRoleContext";
+import { isAdminRole, useUserRole } from "../../components/UserRoleContext";
+import { DatabaseTag } from "../../components/DatabaseTag";
+import type { AdapterProviderKey } from "../../lib/adapters";
 import {
   listMarketplaces, listStores, insertStore, insertMarketplace,
   updateMarketplace, testConnection, deleteStore, updateStore,
+  getMarketplaceCredentialsForEdit,
+  testMarketplaceCredentials,
   type StorePublicRow,
 } from "./adapters/actions";
 import { getClaimQueueSyncStatus, syncClaimQueueNow } from "../claim-engine/logistics-sync-actions";
@@ -68,6 +72,10 @@ import {
   getOrganizationClaimEvidenceDefaults,
   saveOrganizationClaimEvidenceDefaults,
 } from "./organization-claim-evidence-actions";
+import {
+  getOrganizationDefaultStoreId,
+  saveOrganizationDefaultStoreId,
+} from "./organization-default-store-actions";
 
 // ─── Types & Constants ────────────────────────────────────────────────────────
 
@@ -114,12 +122,8 @@ type CredField = {
 };
 
 const PLATFORM_CRED_FIELDS: Record<string, CredField[]> = {
-  amazon: [
-    { key: "sellerId",        label: "Seller ID",         type: "text",     placeholder: "e.g. A1BCDEFGHIJKL",             credKey: "seller_id"         },
-    { key: "lwaClientId",     label: "Client ID",         type: "text",     placeholder: "amzn1.application-oa2-client…",  credKey: "lwa_client_id"     },
-    { key: "lwaClientSecret", label: "Client Secret",     type: "password", placeholder: "Paste client secret",            credKey: "lwa_client_secret" },
-    { key: "refreshToken",    label: "Refresh Token",     type: "password", placeholder: "Atzr|…",                         credKey: "refresh_token"     },
-  ],
+  /** Amazon SP-API uses the dedicated form block below (all keys live in `marketplaces.credentials`). */
+  amazon: [],
   walmart: [
     { key: "clientId",     label: "Client ID",     type: "text",     placeholder: "Walmart API Client ID", credKey: "client_id"    },
     { key: "clientSecret", label: "Client Secret", type: "password", placeholder: "Paste client secret",   credKey: "client_secret" },
@@ -138,6 +142,28 @@ const PLATFORM_CRED_FIELDS: Record<string, CredField[]> = {
     { key: "apiKey", label: "API Key", type: "password", placeholder: "Your API key",            credKey: "api_key" },
   ],
 };
+
+const AMAZON_SP_API_DEFAULTS = {
+  region: "us-east-1",
+  endpoint: "https://sellingpartnerapi-na.amazon.com",
+} as const;
+
+const AMAZON_CREDENTIAL_ROWS: {
+  key: string;
+  label: string;
+  type: "text" | "password";
+  placeholder: string;
+}[] = [
+  { key: "seller_id", label: "Seller ID (Merchant Token)", type: "text", placeholder: "e.g. A1BCDEFGHIJKL" },
+  { key: "marketplace_id", label: "Marketplace ID", type: "text", placeholder: "e.g. ATVPDKIKX0DER" },
+  { key: "lwa_client_id", label: "LWA Client ID", type: "text", placeholder: "amzn1.application-oa2-client…" },
+  { key: "lwa_client_secret", label: "LWA Client Secret", type: "password", placeholder: "Paste client secret" },
+  { key: "aws_access_key", label: "AWS Access Key", type: "text", placeholder: "AKIA…" },
+  { key: "aws_secret_key", label: "AWS Secret Key", type: "password", placeholder: "••••••••" },
+  { key: "refresh_token", label: "Refresh Token", type: "password", placeholder: "Atzr|…" },
+  { key: "region", label: "Region", type: "text", placeholder: "us-east-1" },
+  { key: "endpoint", label: "SP-API Endpoint", type: "text", placeholder: "https://sellingpartnerapi-na.amazon.com" },
+];
 
 const PLATFORM_TO_PROVIDER: Record<string, string | null> = {
   amazon:  "amazon_sp_api",
@@ -367,6 +393,8 @@ export default function SettingsPage() {
   const [newStoreRegion,      setNewStoreRegion]      = useState("US");
   const [newStoreCredentials, setNewStoreCredentials] = useState<Record<string, string>>({});
   const [addStoreSaving,      setAddStoreSaving]      = useState(false);
+  const [storeModalCredLoading, setStoreModalCredLoading] = useState(false);
+  const [storeModalTestLoading, setStoreModalTestLoading] = useState(false);
   const [storeTestStatus, setStoreTestStatus] = useState<Record<string, "idle" | "testing" | "ok" | "error">>({});
   const [deletingStoreId, setDeletingStoreId] = useState<string | null>(null);
 
@@ -425,7 +453,6 @@ export default function SettingsPage() {
   // ── Hydrate from localStorage ──────────────────────────────────────────────
   useEffect(() => {
     setMounted(true);
-    setDefaultStoreId(getDefaultStoreIdFromStorage());
     setConfigs(getAIConfigsFromStorage());
     setAssignments(getAIRoleAssignmentsFromStorage());
     setBarcodeMode(getBarcodeModeFromStorage());
@@ -433,6 +460,24 @@ export default function SettingsPage() {
     const saved = localStorage.getItem("mock_saas_plan") as SaasPlan | null;
     if (saved && (PLANS as readonly string[]).includes(saved)) setMockPlan(saved as SaasPlan);
   }, []);
+
+  // ── Default store: organization_settings.default_store_id is canonical; localStorage is fallback ─
+  useEffect(() => {
+    if (!mounted) return;
+    let cancelled = false;
+    void getOrganizationDefaultStoreId().then((serverId) => {
+      if (cancelled) return;
+      if (serverId) {
+        setDefaultStoreId(serverId);
+        setDefaultStoreIdInStorage(serverId);
+      } else {
+        setDefaultStoreId(getDefaultStoreIdFromStorage());
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [mounted]);
 
   // ── Load core_settings (white-label) from DB ──────────────────────────────
   useEffect(() => {
@@ -473,9 +518,8 @@ export default function SettingsPage() {
       setClaimAgentLoading(true);
       try {
         const cfg = await getClaimAgentConfig();
-        const normalized = { ...cfg, default_marketplace_adapter_store_id: null as string | null };
-        setClaimAgentSaved(normalized);
-        setClaimAgentLocal(normalized);
+        setClaimAgentSaved(cfg);
+        setClaimAgentLocal(cfg);
       } finally {
         setClaimAgentLoading(false);
       }
@@ -563,8 +607,13 @@ export default function SettingsPage() {
   const canAddStore = planLimits.stores === Infinity || storesList.length < planLimits.stores;
 
   // ── General save ───────────────────────────────────────────────────────────
-  function handleSaveGeneral(e: React.FormEvent) {
+  async function handleSaveGeneral(e: React.FormEvent) {
     e.preventDefault();
+    const res = await saveOrganizationDefaultStoreId(defaultStoreId.trim() || null);
+    if (!res.ok) {
+      showToast(res.error ?? "Failed to save default store.", false);
+      return;
+    }
     setDefaultStoreIdInStorage(defaultStoreId);
     void refreshBranding();
     showToast("General preferences saved.", true);
@@ -822,7 +871,6 @@ export default function SettingsPage() {
       max_auto_submit_amount_usd: maxUsd,
       autonomous_claim_submission_0_50_usd: claimAgentLocal.autonomous_claim_submission_0_50_usd ?? false,
       require_manual_approval_bulk_submission: claimAgentLocal.require_manual_approval_bulk_submission ?? true,
-      default_marketplace_adapter_store_id: null,
       logistics_background_sync_enabled: claimAgentLocal.logistics_background_sync_enabled ?? false,
       logistics_sync_interval_hours: intervalH,
     });
@@ -836,7 +884,6 @@ export default function SettingsPage() {
       ...claimAgentLocal,
       max_auto_submit_amount_usd: maxUsd,
       logistics_sync_interval_hours: intervalH,
-      default_marketplace_adapter_store_id: null,
     };
     setClaimAgentSaved(merged);
     setClaimAgentLocal(merged);
@@ -873,20 +920,126 @@ export default function SettingsPage() {
     showToast("Hardware settings saved.", true);
   }
 
+  function closeAddStoreModal() {
+    setShowAddStoreModal(false);
+    setEditingStoreId(null);
+    setStoreModalCredLoading(false);
+    setStoreModalTestLoading(false);
+  }
+
+  function buildStoreCredentialsForSave(): Record<string, string> {
+    if (newStorePlatform === "amazon") {
+      const keys = [
+        "seller_id",
+        "marketplace_id",
+        "lwa_client_id",
+        "lwa_client_secret",
+        "aws_access_key",
+        "aws_secret_key",
+        "refresh_token",
+        "region",
+        "endpoint",
+      ];
+      const out: Record<string, string> = {};
+      for (const k of keys) {
+        const v = newStoreCredentials[k]?.trim();
+        if (v) out[k] = v;
+      }
+      return out;
+    }
+    const credFields = PLATFORM_CRED_FIELDS[newStorePlatform] ?? [];
+    const out: Record<string, string> = {};
+    for (const f of credFields) {
+      const v = newStoreCredentials[f.key]?.trim();
+      if (v) out[f.credKey] = v;
+    }
+    return out;
+  }
+
+  async function handleTestModalConnection() {
+    const provider = PLATFORM_TO_PROVIDER[newStorePlatform];
+    if (!provider) {
+      showToast("Connection test is not available for this platform.", false);
+      return;
+    }
+    const creds = buildStoreCredentialsForSave();
+    if (newStorePlatform === "amazon") {
+      if (!creds.lwa_client_id?.trim() || !creds.lwa_client_secret?.trim()) {
+        showToast("Enter LWA Client ID and LWA Client Secret to test.", false);
+        return;
+      }
+    } else if (newStorePlatform === "walmart") {
+      if (!creds.client_id?.trim() || !creds.client_secret?.trim()) {
+        showToast("Enter Client ID and Client Secret to test.", false);
+        return;
+      }
+    } else if (Object.keys(creds).length === 0) {
+      showToast("Enter API credentials in the form to test.", false);
+      return;
+    }
+    setStoreModalTestLoading(true);
+    const res = await testMarketplaceCredentials(provider as AdapterProviderKey, creds);
+    setStoreModalTestLoading(false);
+    showToast(
+      res.ok ? "Connection verified successfully ✓" : (res.error ?? "Connection test failed."),
+      res.ok,
+    );
+  }
+
   function openAddStoreModal() {
     setEditingStoreId(null);
-    setNewStoreName(""); setNewStorePlatform("amazon"); setNewStoreRegion("US");
-    setNewStoreCredentials({});
+    setNewStoreName("");
+    setNewStorePlatform("amazon");
+    setNewStoreRegion("US");
+    setNewStoreCredentials({
+      region: AMAZON_SP_API_DEFAULTS.region,
+      endpoint: AMAZON_SP_API_DEFAULTS.endpoint,
+    });
     setShowAddStoreModal(true);
   }
 
-  function openEditStoreModal(store: StorePublicRow) {
+  async function openEditStoreModal(store: StorePublicRow) {
     setEditingStoreId(store.id);
     setNewStoreName(store.name);
     setNewStorePlatform(store.platform);
     setNewStoreRegion("US");
     setNewStoreCredentials({});
     setShowAddStoreModal(true);
+    if (store.marketplace_id) {
+      setStoreModalCredLoading(true);
+      try {
+        const res = await getMarketplaceCredentialsForEdit(store.marketplace_id);
+        if (res.ok && res.data) {
+          if (store.platform === "amazon") {
+            setNewStoreCredentials({
+              region: AMAZON_SP_API_DEFAULTS.region,
+              endpoint: AMAZON_SP_API_DEFAULTS.endpoint,
+              ...res.data,
+            });
+          } else {
+            const mapped: Record<string, string> = {};
+            const fields = PLATFORM_CRED_FIELDS[store.platform] ?? [];
+            for (const f of fields) {
+              const v = res.data[f.credKey];
+              if (v) mapped[f.key] = v;
+            }
+            setNewStoreCredentials(mapped);
+          }
+        } else if (store.platform === "amazon") {
+          setNewStoreCredentials({
+            region: AMAZON_SP_API_DEFAULTS.region,
+            endpoint: AMAZON_SP_API_DEFAULTS.endpoint,
+          });
+        }
+      } finally {
+        setStoreModalCredLoading(false);
+      }
+    } else if (store.platform === "amazon") {
+      setNewStoreCredentials({
+        region: AMAZON_SP_API_DEFAULTS.region,
+        endpoint: AMAZON_SP_API_DEFAULTS.endpoint,
+      });
+    }
   }
 
   async function handleAddStore(e: React.FormEvent) {
@@ -894,33 +1047,42 @@ export default function SettingsPage() {
     if (!newStoreName.trim()) { showToast("Store name is required.", false); return; }
     setAddStoreSaving(true);
 
-    if (editingStoreId) {
-      // ── Edit mode ────────────────────────────────────────────────────────────
-      const res = await updateStore(editingStoreId, { name: newStoreName });
-      if (!res.ok) { setAddStoreSaving(false); showToast(res.error ?? "Failed to update store.", false); return; }
+    const creds = buildStoreCredentialsForSave();
+    const provider = PLATFORM_TO_PROVIDER[newStorePlatform];
 
-      // Update credentials if any were filled in
-      const credFields = PLATFORM_CRED_FIELDS[newStorePlatform] ?? [];
-      const creds: Record<string, string> = {};
-      for (const f of credFields) {
-        const v = newStoreCredentials[f.key]?.trim();
-        if (v) creds[f.credKey] = v;
+    if (editingStoreId) {
+      const res = await updateStore(editingStoreId, { name: newStoreName });
+      if (!res.ok) {
+        setAddStoreSaving(false);
+        showToast(res.error ?? "Failed to update store.", false);
+        return;
       }
-      if (Object.keys(creds).length > 0) {
+
+      if (Object.keys(creds).length > 0 && provider) {
         const existingStore = storesList.find((s) => s.id === editingStoreId);
         if (existingStore?.marketplace_id) {
-          await updateMarketplace(existingStore.marketplace_id, { credentials: creds });
+          const mpRes = await updateMarketplace(existingStore.marketplace_id, { credentials: creds });
+          if (!mpRes.ok) {
+            setAddStoreSaving(false);
+            showToast(mpRes.error ?? "Failed to update API credentials.", false);
+            return;
+          }
         } else {
-          const provider = PLATFORM_TO_PROVIDER[newStorePlatform];
-          if (provider) {
-            const mpRes = await insertMarketplace({
-              provider: provider as Parameters<typeof insertMarketplace>[0]["provider"],
-              nickname: newStoreName,
-              credentials: creds,
-            });
-            if (mpRes.ok && mpRes.data) {
-              // link the marketplace to the store if possible (best-effort)
-            }
+          const mpRes = await insertMarketplace({
+            provider: provider as Parameters<typeof insertMarketplace>[0]["provider"],
+            nickname: newStoreName.trim(),
+            credentials: creds,
+          });
+          if (!mpRes.ok || !mpRes.data?.id) {
+            setAddStoreSaving(false);
+            showToast(mpRes.error ?? "Failed to save API credentials.", false);
+            return;
+          }
+          const linkRes = await updateStore(editingStoreId, { marketplace_id: mpRes.data.id });
+          if (!linkRes.ok) {
+            setAddStoreSaving(false);
+            showToast(linkRes.error ?? "Failed to link credentials to store.", false);
+            return;
           }
         }
       }
@@ -928,25 +1090,15 @@ export default function SettingsPage() {
       const refreshed = await listStores();
       if (refreshed.ok && refreshed.data) setStoresList(refreshed.data);
       setAddStoreSaving(false);
-      setShowAddStoreModal(false);
-      setEditingStoreId(null);
-      showToast(`Store "${newStoreName}" updated.`, true);
+      closeAddStoreModal();
+      showToast(`Store "${newStoreName.trim()}" updated.`, true);
     } else {
-      // ── Add mode ─────────────────────────────────────────────────────────────
-      const provider = PLATFORM_TO_PROVIDER[newStorePlatform];
-      const credFields = PLATFORM_CRED_FIELDS[newStorePlatform] ?? [];
-      const credentials: Record<string, string> = {};
-      for (const f of credFields) {
-        const v = newStoreCredentials[f.key]?.trim();
-        if (v) credentials[f.credKey] = v;
-      }
-
       let marketplace_id: string | undefined;
-      if (provider && Object.keys(credentials).length > 0) {
+      if (provider && Object.keys(creds).length > 0) {
         const mpRes = await insertMarketplace({
           provider: provider as Parameters<typeof insertMarketplace>[0]["provider"],
-          nickname: newStoreName,
-          credentials,
+          nickname: newStoreName.trim(),
+          credentials: creds,
         });
         if (!mpRes.ok) {
           setAddStoreSaving(false);
@@ -957,17 +1109,24 @@ export default function SettingsPage() {
       }
 
       const res = await insertStore({
-        name: newStoreName, platform: newStorePlatform,
-        region: newStoreRegion, marketplace_id,
+        name: newStoreName,
+        platform: newStorePlatform,
+        region: newStoreRegion,
+        marketplace_id,
       });
       setAddStoreSaving(false);
       if (!res.ok) { showToast(res.error ?? "Failed to create store.", false); return; }
 
       const refreshed = await listStores();
       if (refreshed.ok && refreshed.data) setStoresList(refreshed.data);
-      setNewStoreName(""); setNewStorePlatform("amazon"); setNewStoreRegion("US");
-      setNewStoreCredentials({});
-      setShowAddStoreModal(false);
+      setNewStoreName("");
+      setNewStorePlatform("amazon");
+      setNewStoreRegion("US");
+      setNewStoreCredentials({
+        region: AMAZON_SP_API_DEFAULTS.region,
+        endpoint: AMAZON_SP_API_DEFAULTS.endpoint,
+      });
+      closeAddStoreModal();
       showToast(`Store "${res.data?.name}" created successfully.`, true);
     }
   }
@@ -979,6 +1138,11 @@ export default function SettingsPage() {
     setDeletingStoreId(null);
     if (!res.ok) { showToast(res.error ?? "Failed to delete store.", false); return; }
     setStoresList((prev) => prev.filter((s) => s.id !== store.id));
+    if (defaultStoreId === store.id) {
+      setDefaultStoreId("");
+      setDefaultStoreIdInStorage("");
+      void saveOrganizationDefaultStoreId(null);
+    }
     showToast(`Store "${store.name}" deleted.`, true);
   }
 
@@ -1004,7 +1168,7 @@ export default function SettingsPage() {
     );
   }
 
-  if (role !== "admin") return null;
+  if (!isAdminRole(role)) return null;
 
   const globalProvider = configs.find((c) => c.isGlobalOverride) ?? null;
   const isOverridden   = globalProvider !== null;
@@ -1225,7 +1389,8 @@ export default function SettingsPage() {
                       <label className={LABEL_CLS}>Default Store</label>
                     </div>
                     <p className={HINT_CLS}>
-                      Fallback store when a scanned barcode can&apos;t be matched to a parent package.
+                      Saved to <code className="rounded bg-muted px-1 font-mono text-[11px]">organization_settings.default_store_id</code>.
+                      Fallback when a scanned barcode can&apos;t be matched to a parent package.
                       Amazon FNSKUs (starting with{" "}
                       <code className="rounded bg-muted px-1 font-mono text-[11px]">X00</code> or{" "}
                       <code className="rounded bg-muted px-1 font-mono text-[11px]">B00</code>) are
@@ -1334,7 +1499,7 @@ export default function SettingsPage() {
                     <p className="text-xs font-medium text-amber-800 dark:text-amber-300">
                       You&apos;ve reached the <strong>{mockPlan}</strong> limit of{" "}
                       {planLimits.stores} store{planLimits.stores !== 1 ? "s" : ""}. Upgrade to Pro
-                      or Enterprise to connect additional channels.
+                      or Enterprise to connect additional stores.
                     </p>
                   </div>
                 )}
@@ -1350,7 +1515,7 @@ export default function SettingsPage() {
                     <Store className="mx-auto mb-3 h-9 w-9 text-muted-foreground/30" />
                     <p className="text-sm font-semibold text-muted-foreground">No stores yet.</p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      Click <strong>Add New Store</strong> above to connect your first channel.
+                      Click <strong>Add New Store</strong> above to connect your first marketplace store.
                     </p>
                   </div>
                 ) : (
@@ -1365,17 +1530,6 @@ export default function SettingsPage() {
                       const statusInvalid = testSt === "error";
                       const statusActive  = testSt === "ok" || (s.is_active && testSt === "idle");
 
-                      // Per-platform accent colors
-                      const platformColor: Record<string, string> = {
-                        amazon:  "bg-amber-50 border-amber-200 text-amber-700 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-300",
-                        walmart: "bg-sky-50 border-sky-200 text-sky-700 dark:border-sky-700/50 dark:bg-sky-950/30 dark:text-sky-300",
-                        ebay:    "bg-red-50 border-red-200 text-red-700 dark:border-red-700/50 dark:bg-red-950/30 dark:text-red-300",
-                        shopify: "bg-emerald-50 border-emerald-200 text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-300",
-                        target:  "bg-rose-50 border-rose-200 text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-300",
-                        custom:  "bg-slate-50 border-slate-200 text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300",
-                      };
-                      const platCls = platformColor[s.platform] ?? platformColor.custom;
-
                       return (
                         <div
                           key={s.id}
@@ -1386,46 +1540,40 @@ export default function SettingsPage() {
                               : "border-border bg-background hover:border-sky-200 hover:shadow-sm",
                           ].join(" ")}
                         >
-                          {/* Top row: name + badges */}
-                          <div className="flex items-start justify-between gap-2 min-w-0">
-                            <div className="flex items-center gap-2 min-w-0">
-                              <div className={`h-2.5 w-2.5 shrink-0 rounded-full ${statusInvalid ? "bg-rose-400" : statusActive ? "bg-emerald-400" : "bg-slate-300 dark:bg-slate-600"}`} />
-                              <p className="text-sm font-bold truncate">{s.name}</p>
+                          <div className="flex items-start justify-between gap-3 min-w-0">
+                            <div className="min-w-0 flex-1 space-y-0.5">
+                              <p className="text-sm font-bold leading-tight truncate">{s.name}</p>
+                              <p className="text-xs font-medium text-muted-foreground">
+                                Marketplace · {PLATFORM_LABELS[s.platform] ?? s.platform}
+                              </p>
                             </div>
-                            <div className="flex shrink-0 items-center gap-1.5">
+                            <div className="flex shrink-0 flex-col items-end gap-1.5">
                               {isDefault && (
                                 <span className="inline-flex items-center gap-1 rounded-full border border-violet-300 bg-violet-100 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-violet-700 dark:border-violet-700/50 dark:bg-violet-950/40 dark:text-violet-300">
                                   ★ Default
                                 </span>
                               )}
+                              <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${
+                                statusInvalid
+                                  ? "border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
+                                  : statusActive
+                                  ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/40 dark:text-emerald-300"
+                                  : "border-slate-200 bg-slate-50 text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400"
+                              }`}>
+                                {statusInvalid ? (
+                                  <><TriangleAlert className="h-2.5 w-2.5" />Invalid</>
+                                ) : statusActive ? (
+                                  <><BadgeCheck className="h-2.5 w-2.5" />Active</>
+                                ) : (
+                                  "Inactive"
+                                )}
+                              </span>
                               {s.marketplace_id && (
                                 <span className="inline-flex items-center rounded-full border border-violet-200 bg-violet-50 px-1.5 py-0.5 text-[9px] font-bold text-violet-600 dark:border-violet-700/50 dark:bg-violet-950/40 dark:text-violet-300">
                                   API
                                 </span>
                               )}
                             </div>
-                          </div>
-
-                          {/* Platform + Status row */}
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <span className={`inline-flex rounded-full border px-2.5 py-0.5 text-[11px] font-bold capitalize ${platCls}`}>
-                              {PLATFORM_LABELS[s.platform] ?? s.platform}
-                            </span>
-                            <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold ${
-                              statusInvalid
-                                ? "border-rose-200 bg-rose-50 text-rose-600 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
-                                : statusActive
-                                ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/40 dark:text-emerald-300"
-                                : "border-slate-200 bg-slate-50 text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-400"
-                            }`}>
-                              {statusInvalid ? (
-                                <><TriangleAlert className="h-2.5 w-2.5" />Invalid</>
-                              ) : statusActive ? (
-                                <><BadgeCheck className="h-2.5 w-2.5" />Active</>
-                              ) : (
-                                "Inactive"
-                              )}
-                            </span>
                           </div>
 
                           {/* Store ID */}
@@ -1465,7 +1613,7 @@ export default function SettingsPage() {
                             {/* Edit */}
                             <button
                               type="button"
-                              onClick={() => openEditStoreModal(s)}
+                              onClick={() => void openEditStoreModal(s)}
                               className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground transition hover:border-sky-300 hover:text-sky-600"
                             >
                               <Pencil className="h-3 w-3" />
@@ -1505,9 +1653,9 @@ export default function SettingsPage() {
                 </p>
               </div>
 
-              {/* ── Available channels overview ──────────────────────────── */}
+              {/* ── Supported marketplace integrations overview ─────────── */}
               <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-4">
-                <h3 className="text-sm font-bold">Supported Channels</h3>
+                <h3 className="text-sm font-bold">Supported Marketplaces</h3>
                 <div className="grid gap-3 sm:grid-cols-2">
                   {[
                     { name: "Amazon SP-API",  desc: "FBA/FBM returns, A-to-Z claims automation",    active: true  },
@@ -1540,7 +1688,8 @@ export default function SettingsPage() {
 
           {/* ══════════════ AI & OCR QUOTAS ══════════════ */}
           {activeTab === "ai_quotas" && (
-            <div className="space-y-4">
+            <div className="relative space-y-4">
+              <DatabaseTag table="organization_settings" />
 
               {isOverridden && (
                 <div className="flex items-center gap-3 rounded-2xl border-2 border-violet-300 bg-violet-50 px-4 py-3 dark:border-violet-600/50 dark:bg-violet-950/30">
@@ -2699,7 +2848,7 @@ export default function SettingsPage() {
                   used={storesList.length}
                   limit={planLimits.stores}
                   color="sky"
-                  hint="Active marketplace channel integrations"
+                  hint="Active marketplace integrations"
                 />
 
                 <UsageMeter
@@ -2953,13 +3102,10 @@ export default function SettingsPage() {
         <div
           className="fixed inset-0 z-[400] flex items-end justify-center sm:items-center bg-black/60 backdrop-blur-sm p-0 sm:p-4"
           onClick={(e) => {
-            if (e.target === e.currentTarget) {
-              setShowAddStoreModal(false);
-              setEditingStoreId(null);
-            }
+            if (e.target === e.currentTarget) closeAddStoreModal();
           }}
         >
-          <div className="w-full sm:w-[95vw] sm:max-w-lg overflow-y-auto max-h-[92dvh] sm:max-h-[88vh] rounded-t-3xl sm:rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950 animate-in slide-in-from-bottom-4 duration-200">
+          <div className="w-full sm:w-[95vw] sm:max-w-xl overflow-y-auto max-h-[92dvh] sm:max-h-[88vh] rounded-t-3xl sm:rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950 animate-in slide-in-from-bottom-4 duration-200">
 
             {/* Modal header */}
             <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200 bg-white px-5 py-4 dark:border-slate-700 dark:bg-slate-950">
@@ -2971,7 +3117,7 @@ export default function SettingsPage() {
               </div>
               <button
                 type="button"
-                onClick={() => { setShowAddStoreModal(false); setEditingStoreId(null); }}
+                onClick={closeAddStoreModal}
                 className="rounded-full p-2 text-slate-400 hover:bg-accent hover:text-accent-foreground transition"
               >
                 <X className="h-5 w-5" />
@@ -2979,15 +3125,23 @@ export default function SettingsPage() {
             </div>
 
             {/* Modal form */}
-            <form onSubmit={handleAddStore} className="p-5 space-y-5">
+            <form onSubmit={handleAddStore} className="relative space-y-5 p-5">
+              {storeModalCredLoading && (
+                <div
+                  className="absolute inset-0 z-20 flex items-center justify-center rounded-b-2xl bg-white/75 backdrop-blur-[1px] dark:bg-slate-950/75"
+                  aria-busy
+                >
+                  <Loader2 className="h-8 w-8 animate-spin text-sky-600 dark:text-sky-400" />
+                </div>
+              )}
 
               {/* ── Basic Info ───────────────────────────────────────────── */}
               <div className="space-y-4">
-                <div>
+                <div className="min-h-[6.5rem] space-y-1.5">
                   <label className={LABEL_CLS}>
                     Store Name <span className="text-rose-500">*</span>
                   </label>
-                  <p className={HINT_CLS}>A friendly label (e.g. &quot;My US Amazon Store&quot;).</p>
+                  <p className={`${HINT_CLS} min-h-[2.5rem]`}>A friendly label (e.g. &quot;My US Amazon Store&quot;).</p>
                   <input
                     type="text"
                     autoFocus
@@ -2995,11 +3149,11 @@ export default function SettingsPage() {
                     value={newStoreName}
                     onChange={(e) => setNewStoreName(e.target.value)}
                     placeholder="My Amazon Store…"
-                    className={INPUT_CLS}
+                    className={`${INPUT_CLS} h-10`}
                   />
                 </div>
 
-                <div>
+                <div className="min-h-[4.5rem] space-y-1.5">
                   <label className={LABEL_CLS}>
                     Platform <span className="text-rose-500">*</span>
                   </label>
@@ -3008,11 +3162,19 @@ export default function SettingsPage() {
                     value={newStorePlatform}
                     disabled={!!editingStoreId}
                     onChange={(e) => {
-                      setNewStorePlatform(e.target.value);
+                      const p = e.target.value;
+                      setNewStorePlatform(p);
                       setNewStoreRegion("US");
-                      setNewStoreCredentials({});
+                      if (p === "amazon") {
+                        setNewStoreCredentials({
+                          region: AMAZON_SP_API_DEFAULTS.region,
+                          endpoint: AMAZON_SP_API_DEFAULTS.endpoint,
+                        });
+                      } else {
+                        setNewStoreCredentials({});
+                      }
                     }}
-                    className={`${SELECT_CLS} ${editingStoreId ? "opacity-60 cursor-not-allowed" : ""}`}
+                    className={`${SELECT_CLS} h-10 ${editingStoreId ? "opacity-60 cursor-not-allowed" : ""}`}
                   >
                     <option value="amazon">Amazon</option>
                     <option value="walmart">Walmart</option>
@@ -3021,19 +3183,21 @@ export default function SettingsPage() {
                     <option value="shopify">Shopify</option>
                     <option value="custom">Custom / Other</option>
                   </select>
-                  {editingStoreId && (
-                    <p className="mt-1 text-[11px] text-muted-foreground">Platform cannot be changed after creation.</p>
-                  )}
+                  <div className="min-h-[1.25rem]">
+                    {editingStoreId && (
+                      <p className="text-[11px] text-muted-foreground">Platform cannot be changed after creation.</p>
+                    )}
+                  </div>
                 </div>
 
                 {!editingStoreId && (
-                  <div>
+                  <div className="min-h-[6.5rem] space-y-1.5">
                     <label className={LABEL_CLS}>Marketplace Region</label>
-                    <p className={HINT_CLS}>The geographic marketplace where this store operates.</p>
+                    <p className={`${HINT_CLS} min-h-[2.5rem]`}>The geographic marketplace where this store operates.</p>
                     <select
                       value={newStoreRegion}
                       onChange={(e) => setNewStoreRegion(e.target.value)}
-                      className={SELECT_CLS}
+                      className={`${SELECT_CLS} h-10`}
                     >
                       {newStorePlatform === "amazon" ? (
                         <>
@@ -3076,8 +3240,41 @@ export default function SettingsPage() {
                 )}
               </div>
 
-              {/* ── API Credentials ──────────────────────────────────────── */}
-              {(PLATFORM_CRED_FIELDS[newStorePlatform] ?? []).length > 0 && (
+              {/* ── Amazon SP-API (credentials JSONB) ───────────────────── */}
+              {newStorePlatform === "amazon" && (
+                <div className="rounded-xl border border-sky-200 bg-sky-50/50 p-4 dark:border-sky-700/50 dark:bg-sky-950/20">
+                  <div className="mb-4 flex items-start gap-2">
+                    <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-sky-600 dark:text-sky-400" />
+                    <div>
+                      <p className="text-sm font-bold text-sky-800 dark:text-sky-200">Amazon SP-API</p>
+                      <p className="text-[11px] text-sky-600 dark:text-sky-400">
+                        All fields are stored in <code className="rounded bg-sky-100 px-1 font-mono text-[10px] dark:bg-sky-900/50">marketplaces.credentials</code>.
+                        {editingStoreId ? " Leave a secret blank to keep the saved value." : ""}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    {AMAZON_CREDENTIAL_ROWS.map((row) => (
+                      <div key={row.key} className="flex min-h-[5.25rem] flex-col gap-1.5">
+                        <label className="text-sm font-medium leading-none">{row.label}</label>
+                        <input
+                          type={row.type}
+                          autoComplete="off"
+                          value={newStoreCredentials[row.key] ?? ""}
+                          onChange={(e) =>
+                            setNewStoreCredentials((prev) => ({ ...prev, [row.key]: e.target.value }))
+                          }
+                          placeholder={row.placeholder}
+                          className={`${INPUT_CLS} h-10 min-h-[2.5rem] font-mono text-sm`}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* ── Other platforms: API Credentials ─────────────────────── */}
+              {newStorePlatform !== "amazon" && (PLATFORM_CRED_FIELDS[newStorePlatform] ?? []).length > 0 && (
                 <div className="rounded-xl border border-sky-200 bg-sky-50/50 p-4 space-y-4 dark:border-sky-700/50 dark:bg-sky-950/20">
                   <div className="flex items-center gap-2">
                     <KeyRound className="h-4 w-4 text-sky-600 dark:text-sky-400 shrink-0" />
@@ -3092,7 +3289,7 @@ export default function SettingsPage() {
                   </div>
 
                   {(PLATFORM_CRED_FIELDS[newStorePlatform] ?? []).map((f) => (
-                    <div key={f.key}>
+                    <div key={f.key} className="min-h-[5.25rem] space-y-1.5">
                       <label className={LABEL_CLS}>{f.label}</label>
                       <input
                         type={f.type}
@@ -3102,10 +3299,32 @@ export default function SettingsPage() {
                           setNewStoreCredentials((prev) => ({ ...prev, [f.key]: e.target.value }))
                         }
                         placeholder={f.placeholder}
-                        className={`${INPUT_CLS} font-mono`}
+                        className={`${INPUT_CLS} h-10 font-mono`}
                       />
                     </div>
                   ))}
+                </div>
+              )}
+
+              {/* Test connection */}
+              {PLATFORM_TO_PROVIDER[newStorePlatform] && (
+                <div className="flex flex-wrap items-center gap-2 border-t border-border pt-4">
+                  <button
+                    type="button"
+                    onClick={() => void handleTestModalConnection()}
+                    disabled={storeModalTestLoading || storeModalCredLoading}
+                    className="inline-flex h-10 min-w-[160px] items-center justify-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-4 text-sm font-semibold text-sky-800 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-200 dark:hover:bg-sky-950/60"
+                  >
+                    {storeModalTestLoading ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Wifi className="h-4 w-4" />
+                    )}
+                    {storeModalTestLoading ? "Testing…" : "Test Connection"}
+                  </button>
+                  <p className="text-[11px] text-muted-foreground">
+                    Uses the credentials above without saving.
+                  </p>
                 </div>
               )}
 
@@ -3113,15 +3332,15 @@ export default function SettingsPage() {
               <div className="flex gap-3 pt-1">
                 <button
                   type="button"
-                  onClick={() => { setShowAddStoreModal(false); setEditingStoreId(null); }}
-                  className="flex-1 rounded-xl border border-border bg-muted/50 py-3 text-sm font-semibold text-muted-foreground transition hover:bg-accent"
+                  onClick={closeAddStoreModal}
+                  className="flex h-11 flex-1 items-center justify-center rounded-xl border border-border bg-muted/50 text-sm font-semibold text-muted-foreground transition hover:bg-accent"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  disabled={addStoreSaving || !newStoreName.trim()}
-                  className="flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-700 disabled:opacity-50"
+                  disabled={addStoreSaving || !newStoreName.trim() || storeModalCredLoading}
+                  className="flex h-11 flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-700 disabled:opacity-50"
                 >
                   {addStoreSaving ? (
                     <><Loader2 className="h-4 w-4 animate-spin" />Saving…</>

@@ -13,7 +13,7 @@ export type IdentifierStackProps = {
   asin?: string | null;
   fnsku?: string | null;
   sku?: string | null;
-  /** Sales channel platform (e.g. amazon, walmart) — drives search URL. */
+  /** Store platform / marketplace (e.g. amazon, walmart) — drives search URL. */
   storePlatform?: string | null;
   compact?: boolean;
   onToast?: IdentifierToastFn;

@@ -55,11 +55,21 @@ export function generateMockAmazonClaims(): MockClaim[] {
   }));
 }
 
-function toCredentials(form: Record<string, string>): Record<string, string> {
+function normalizeLwa(
+  credentials: Record<string, string>,
+): { lwa_client_id: string; lwa_client_secret: string; refresh_token?: string } {
+  const lwa_client_id =
+    credentials.lwa_client_id ?? (credentials as { lwaClientId?: string }).lwaClientId ?? "";
+  const lwa_client_secret =
+    credentials.lwa_client_secret ??
+    (credentials as { lwaClientSecret?: string }).lwaClientSecret ??
+    "";
+  const refresh_token =
+    credentials.refresh_token ?? (credentials as { refreshToken?: string }).refreshToken ?? "";
   return {
-    seller_id: form.sellerId ?? form.seller_id ?? "",
-    lwa_client_id: form.lwaClientId ?? form.lwa_client_id ?? "",
-    lwa_client_secret: form.lwaClientSecret ?? form.lwa_client_secret ?? "",
+    lwa_client_id,
+    lwa_client_secret,
+    refresh_token: refresh_token.trim() || undefined,
   };
 }
 
@@ -73,12 +83,14 @@ export const amazonAdapter: BaseMarketplaceAdapter = {
 
   async testConnection(credentials: Record<string, string>): Promise<TestResult> {
     try {
-      const c = credentials.lwa_client_id && credentials.lwa_client_secret
-        ? credentials
-        : toCredentials(credentials as unknown as Record<string, string>);
+      const c = normalizeLwa(credentials);
+      if (!c.lwa_client_id.trim() || !c.lwa_client_secret.trim()) {
+        return { ok: false, error: "LWA Client ID and Client Secret are required." };
+      }
       const token = await getAmazonAccessToken({
-        lwaClientId: c.lwa_client_id,
-        lwaClientSecret: c.lwa_client_secret,
+        lwaClientId: c.lwa_client_id.trim(),
+        lwaClientSecret: c.lwa_client_secret.trim(),
+        refreshToken: c.refresh_token,
       });
       return { ok: true, expiresIn: token.expiresIn };
     } catch (error) {

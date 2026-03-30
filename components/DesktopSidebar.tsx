@@ -10,7 +10,7 @@ import {
   Store,
   Settings,
 } from "lucide-react";
-import { useUserRole } from "./UserRoleContext";
+import { isAdminRole, useUserRole } from "./UserRoleContext";
 
 const NAV_SECTIONS = [
   {
@@ -95,7 +95,7 @@ export function DesktopSidebar() {
       </nav>
 
       {/* Footer — Settings link only rendered for admins */}
-      {role === "admin" && (
+      {isAdminRole(role) && (
         <div className="shrink-0 border-t border-slate-200 px-3 py-3 dark:border-slate-800">
           <Link
             href="/settings"

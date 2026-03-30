@@ -12,7 +12,7 @@ import {
   Menu,
   X,
 } from "lucide-react";
-import { useUserRole } from "./UserRoleContext";
+import { isAdminRole, useUserRole } from "./UserRoleContext";
 
 const navLinks = [
   {
@@ -112,7 +112,7 @@ export function MobileNav() {
         </nav>
 
         {/* Footer */}
-        {role === "admin" && (
+        {isAdminRole(role) && (
           <div className="shrink-0 border-t border-slate-800 px-3 py-3">
             <Link
               href="/settings"

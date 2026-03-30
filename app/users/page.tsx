@@ -5,7 +5,7 @@ import Link from "next/link";
 import {
   ArrowLeft, ImageIcon, Loader2, Pencil, Plus, Save, Trash2, UserRound, X,
 } from "lucide-react";
-import { useUserRole } from "../../components/UserRoleContext";
+import { isAdminRole, useUserRole } from "../../components/UserRoleContext";
 import { UserProfileAvatar } from "./UserProfileAvatar";
 import {
   createUserProfile,
@@ -57,7 +57,7 @@ export default function UsersPage() {
   }, [showToast]);
 
   useEffect(() => {
-    if (role === "admin") void load();
+    if (isAdminRole(role)) void load();
   }, [role, load]);
 
   function openCreate() {
@@ -152,13 +152,13 @@ export default function UsersPage() {
     await load();
   }
 
-  if (role !== "admin") {
+  if (!isAdminRole(role)) {
     return (
       <div className="mx-auto max-w-lg px-4 py-16 text-center">
         <UserRound className="mx-auto mb-4 h-12 w-12 text-muted-foreground" />
         <h1 className="text-lg font-bold">Users</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          Switch to <strong>Admin</strong> in the header to manage users.
+          Switch to <strong>Admin</strong> or <strong>Super Admin</strong> in the header to manage users.
         </p>
         <Link href="/" className="mt-6 inline-block text-sm font-medium text-primary underline">
           Back to dashboard

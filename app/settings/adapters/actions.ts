@@ -68,6 +68,59 @@ function canAccess(roleRequired: string, userRole: string): boolean {
   return userIdx >= 0 && userIdx >= requiredIdx;
 }
 
+/** Load raw credentials JSON for the store editor (admin settings only). */
+export async function getMarketplaceCredentialsForEdit(
+  marketplaceId: string,
+  ctx?: RbacContext | null
+): Promise<{ ok: boolean; data?: Record<string, string>; error?: string }> {
+  const rbac = getRbacContext(ctx);
+  try {
+    const { data, error } = await supabaseServer
+      .from("marketplaces")
+      .select("organization_id, role_required, credentials")
+      .eq("id", marketplaceId)
+      .eq("organization_id", rbac.organization_id)
+      .single();
+
+    if (error || !data) throw new Error("Connection not found.");
+    const row = data as { role_required: string; credentials?: Record<string, string> };
+    if (!canAccess(row.role_required, rbac.user_role)) {
+      throw new Error("Insufficient role to view this connection.");
+    }
+    const raw = (row.credentials ?? {}) as Record<string, unknown>;
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (v != null && String(v).trim() !== "") out[k] = String(v).trim();
+    }
+    return { ok: true, data: out };
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to load credentials.";
+    return { ok: false, error: message };
+  }
+}
+
+/** Test adapter connectivity without persisting (uses credentials from the form). */
+export async function testMarketplaceCredentials(
+  provider: AdapterProviderKey,
+  credentials: Record<string, string>,
+  ctx?: RbacContext | null
+): Promise<{ ok: boolean; expiresIn?: number; error?: string }> {
+  const rbac = getRbacContext(ctx);
+  if (!canAccess(DEFAULT_ROLE_REQUIRED, rbac.user_role)) {
+    return { ok: false, error: "Insufficient role to test connections." };
+  }
+  try {
+    const adapter = MarketplaceFactory.getAdapter(provider);
+    if (!adapter) throw new Error(`Unknown provider: ${provider}`);
+    return await adapter.testConnection(credentials ?? {});
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Connection test failed.";
+    return { ok: false, error: message };
+  }
+}
+
 export async function testConnection(
   connectionId: string,
   ctx?: RbacContext | null
@@ -417,7 +470,7 @@ export async function deleteStore(
 
 export async function updateStore(
   id: string,
-  payload: { name?: string; is_active?: boolean },
+  payload: { name?: string; is_active?: boolean; marketplace_id?: string | null },
   ctx?: RbacContext | null
 ): Promise<{ ok: boolean; data?: StorePublicRow; error?: string }> {
   const rbac = getRbacContext(ctx);
@@ -425,6 +478,9 @@ export async function updateStore(
     const update: Record<string, unknown> = {};
     if (payload.name !== undefined) update.name = payload.name.trim();
     if (payload.is_active !== undefined) update.is_active = payload.is_active;
+    if (payload.marketplace_id !== undefined) {
+      update.marketplace_id = payload.marketplace_id;
+    }
     if (Object.keys(update).length === 0) throw new Error("No fields to update.");
 
     const { data, error } = await supabaseServer

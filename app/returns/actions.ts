@@ -1017,7 +1017,7 @@ export async function insertReturn(
     const rawStore = payload.store_id?.trim();
     if (rawStore && !isUuidString(rawStore)) {
       throw new Error(
-        `Invalid store_id: "${rawStore}" is not a valid UUID. Pick a Sales Channel from the dropdown.`,
+        `Invalid store_id: "${rawStore}" is not a valid UUID. Pick a Store from the dropdown.`,
       );
     }
     const resolvedStoreId = await resolveClaimSubmissionStoreId(orgId, rawStore, {

@@ -4,6 +4,7 @@ import React, {
   createContext, useCallback, useContext, useEffect, useMemo, useState,
 } from "react";
 import { getCoreSettings } from "../app/settings/workspace-settings-actions";
+import { normalizeTenantLogoUrl } from "../lib/tenant-logo-url";
 
 export type BrandingContextValue = {
   companyName: string;
@@ -28,12 +29,12 @@ export function BrandingProvider({ children }: { children: React.ReactNode }) {
         (typeof cfg.company_name === "string" && cfg.company_name.trim()) ||
         (typeof cfg.workspace_name === "string" && String(cfg.workspace_name).trim()) ||
         "";
-      const logo =
+      const raw =
         (typeof cfg.company_logo_url === "string" && cfg.company_logo_url.trim()) ||
         (typeof cfg.logo_url === "string" && cfg.logo_url.trim()) ||
         "";
       setCompanyName(name);
-      setLogoUrl(logo);
+      setLogoUrl(normalizeTenantLogoUrl(raw));
     } catch {
       setCompanyName("");
       setLogoUrl("");

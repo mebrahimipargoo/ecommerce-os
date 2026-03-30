@@ -2,8 +2,13 @@ export type AmazonSpApiCredentials = {
   lwaClientId: string;
   lwaClientSecret: string;
   /**
+   * When set, uses LWA refresh_token grant (seller-authorized SP-API flow).
+   * Otherwise uses client_credentials with `scope` (app-only).
+   */
+  refreshToken?: string;
+  /**
    * LWA scopes vary by use-case. For initial connectivity tests, a minimal SP-API scope
-   * can be used. You can override this per call if needed.
+   * can be used. You can override this per call if needed. Ignored when `refreshToken` is set.
    */
   scope?: string;
 };
@@ -31,14 +36,20 @@ const AMAZON_OAUTH_TOKEN_URL = "https://api.amazon.com/auth/o2/token";
 export async function getAmazonAccessToken(
   credentials: AmazonSpApiCredentials
 ): Promise<AmazonAccessTokenResponse> {
-  const scope = credentials.scope?.trim() || DEFAULT_LWA_SCOPE;
-
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: credentials.lwaClientId,
-    client_secret: credentials.lwaClientSecret,
-    scope,
-  });
+  const refresh = credentials.refreshToken?.trim();
+  const body = refresh
+    ? new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refresh,
+        client_id: credentials.lwaClientId,
+        client_secret: credentials.lwaClientSecret,
+      })
+    : new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: credentials.lwaClientId,
+        client_secret: credentials.lwaClientSecret,
+        scope: credentials.scope?.trim() || DEFAULT_LWA_SCOPE,
+      });
 
   const response = await fetch(AMAZON_OAUTH_TOKEN_URL, {
     method: "POST",

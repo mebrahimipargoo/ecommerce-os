@@ -42,6 +42,7 @@ import { useTableSortFilter, useSortFilterState, type SortDir } from "../../hook
 import type { CoreSettings } from "../settings/workspace-settings-types";
 import type { ClaimEvidenceKey } from "./claim-evidence-settings";
 import type { PalletRecord, PackageRecord } from "../returns/actions";
+import { DatabaseTag } from "../../components/DatabaseTag";
 import { ReturnIdentifiersColumn } from "../../components/ReturnIdentifiersColumn";
 import { InlineCopy, StatusBadge } from "../returns/_components";
 import type { ClaimRecord } from "./claim-actions";
@@ -262,7 +263,7 @@ export function ClaimEngineClient({
           [c.item_name, c.asin, c.fnsku, c.sku].filter(Boolean).join(" "),
       },
       {
-        key: "channel",
+        key: "store",
         pickText: (c: ClaimRecord) =>
           resolveStore(c, stores)?.platform ?? c.marketplace_provider ?? "",
       },
@@ -804,7 +805,8 @@ export function ClaimEngineClient({
             </div>
           )}
 
-          <section className="w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
+          <section className="relative w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
+            <DatabaseTag table="claims" />
             <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
               <div>
                 <p className="text-xs font-semibold tracking-tight text-slate-900 dark:text-slate-50">Marketplace investigations</p>
@@ -868,8 +870,8 @@ export function ClaimEngineClient({
                           onToggle={claimsSf.toggleSort}
                         />
                         <DataTableSortHeader
-                          label="Sales Channel"
-                          colKey="channel"
+                          label="Store"
+                          colKey="store"
                           sortKey={claimsSf.sortKey}
                           sortDir={claimsSf.sortDir}
                           onToggle={claimsSf.toggleSort}

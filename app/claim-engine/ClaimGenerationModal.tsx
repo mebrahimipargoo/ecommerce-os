@@ -93,7 +93,7 @@ export function ClaimGenerationModal({
     setBusy(true);
     try {
       const st = resolveStoreFromDetail(detail, stores);
-      const storeName = st?.name ?? "Sales channel";
+      const storeName = st?.name ?? "Store";
       const storePlatform = st?.platform ?? "amazon";
       await downloadEnterpriseClaimPdf({
         tenant: coreSettings,

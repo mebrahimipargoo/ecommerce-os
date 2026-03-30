@@ -4,6 +4,7 @@ import {
   getOrganizationLogoUrlFromDb,
   upsertOrganizationLogoUrl,
 } from "../../lib/organization-logo";
+import { normalizeTenantLogoUrl } from "../../lib/tenant-logo-url";
 import { supabaseServer } from "../../lib/supabase-server";
 import {
   DEFAULT_CLAIM_AGENT_CONFIG,
@@ -53,11 +54,12 @@ export async function getCoreSettings(): Promise<CoreSettings> {
     ...(ws.core_settings as CoreSettings),
   };
   const orgLogo = await getOrganizationLogoUrlFromDb();
-  const logo =
+  const rawLogo =
     orgLogo ||
     (typeof merged.company_logo_url === "string" && merged.company_logo_url) ||
     (typeof merged.logo_url === "string" && merged.logo_url) ||
     "";
+  const logo = normalizeTenantLogoUrl(rawLogo);
   return {
     ...merged,
     company_logo_url: logo,

@@ -1,25 +1,20 @@
 "use client";
 
 /**
- * Global top bar — single place for Theme toggle and User profile.
- * Mobile LTR: [Hamburger] → [Tenant logo / Title] → [Theme + Profile]
- * Desktop: tenant line + search … [Theme + Profile]
+ * Global top bar — search, notifications, theme, profile only (no tenant logo or title).
+ * Branding lives exclusively in the sidebar on all breakpoints.
  */
 
 import React from "react";
-import { Bell, ChevronDown, Menu, Search, ShieldCheck, User } from "lucide-react";
+import { Bell, ChevronDown, Menu, Search, ShieldCheck, Sparkles, User } from "lucide-react";
 import { ThemeToggle } from "./ThemeToggle";
-import { BrandLogoImage } from "./BrandLogoImage";
-import { useBranding } from "./BrandingContext";
 import { useGlobalSearch } from "./GlobalSearchContext";
 import { useUserRole } from "./UserRoleContext";
 
 export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
   const { query, setQuery } = useGlobalSearch();
   const { role, toggleRole, actorName } = useUserRole();
-  const { companyName } = useBranding();
   const profileInitial = actorName.trim().charAt(0).toUpperCase() || "M";
-  const title = companyName.trim() || "E-commerce OS";
 
   return (
     <header
@@ -34,25 +29,6 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
       >
         <Menu className="h-5 w-5" />
       </button>
-
-      <div className="flex min-w-0 shrink-0 items-center gap-2.5 md:min-w-0 md:flex-1">
-        <div className="flex max-w-[55%] min-w-0 items-center gap-2 sm:max-w-none md:hidden">
-          <BrandLogoImage />
-          <div className="min-w-0">
-            <p className="truncate text-sm font-bold text-foreground">{title}</p>
-            <p className="truncate text-[10px] text-muted-foreground">Returns ERP</p>
-          </div>
-        </div>
-        <div className="hidden min-w-0 items-center gap-2.5 md:flex">
-          <BrandLogoImage />
-          <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-foreground">{title}</p>
-            <p className="truncate text-[10px] text-muted-foreground">
-              {companyName.trim() ? "Enterprise workspace" : "Enterprise control"}
-            </p>
-          </div>
-        </div>
-      </div>
 
       <div className="mx-2 hidden min-w-0 max-w-md flex-1 md:flex">
         <label className="relative flex w-full items-center">
@@ -85,15 +61,19 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
         <button
           type="button"
           onClick={toggleRole}
-          title={`Currently viewing as ${role === "admin" ? "Admin" : "Operator"} — click to switch`}
+          title={`Viewing as ${role === "super_admin" ? "Super Admin" : role === "admin" ? "Admin" : "Operator"} — click to rotate`}
           className={[
             "hidden h-9 items-center gap-1.5 rounded-full border px-3 text-xs font-semibold transition sm:flex",
-            role === "admin"
-              ? "border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:border-emerald-700/60 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:bg-emerald-950/50"
-              : "border-slate-300 bg-slate-50 text-slate-600 hover:bg-slate-100 dark:border-slate-600 dark:bg-slate-800/50 dark:text-slate-300 dark:hover:bg-slate-800",
+            role === "super_admin"
+              ? "border-violet-300 bg-violet-50 text-violet-800 hover:bg-violet-100 dark:border-violet-700/60 dark:bg-violet-950/40 dark:text-violet-200 dark:hover:bg-violet-950/60"
+              : role === "admin"
+                ? "border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:border-emerald-700/60 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:bg-emerald-950/50"
+                : "border-slate-300 bg-slate-50 text-slate-600 hover:bg-slate-100 dark:border-slate-600 dark:bg-slate-800/50 dark:text-slate-300 dark:hover:bg-slate-800",
           ].join(" ")}
         >
-          {role === "admin" ? (
+          {role === "super_admin" ? (
+            <><Sparkles className="h-3.5 w-3.5" />Super Admin</>
+          ) : role === "admin" ? (
             <><ShieldCheck className="h-3.5 w-3.5" />Admin</>
           ) : (
             <><User className="h-3.5 w-3.5" />Operator</>
