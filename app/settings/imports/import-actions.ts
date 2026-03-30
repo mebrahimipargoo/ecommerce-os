@@ -9,6 +9,13 @@ import { isUuidString } from "../../../lib/uuid";
 
 /** Import `RawReportType` from `lib/raw-report-types` in client code — not re-exported here (avoids bundler/runtime issues with `"use server"`). */
 
+/**
+ * Inserts use **only** snake_case keys that match PostgREST / Postgres.
+ * If you see "Could not find column in schema cache", reload PostgREST:
+ *   SQL: `NOTIFY pgrst, 'reload schema';`
+ * (or restart the Supabase API / project.)
+ */
+
 function serializeColumnMappingJson(
   m: Record<string, string> | null | undefined,
 ): Record<string, string> | null {
@@ -139,28 +146,30 @@ export async function createRawReportUploadSession(input: {
   const storagePrefix = `${orgId}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
   /** Plain JSON object for `column_mapping` JSONB (PostgREST). */
-  const columnMappingPayload =
+  const column_mapping =
     input.columnMapping && Object.keys(input.columnMapping).length > 0
       ? (JSON.parse(JSON.stringify(input.columnMapping)) as Record<string, string>)
       : null;
 
+  /**
+   * Strict payload: keys are DB column names (snake_case). JS `totalBytes` → `total_bytes`.
+   * Only columns verified in Supabase + required row identity fields.
+   */
+  const insertRow = {
+    organization_id: orgId,
+    file_name: input.fileName,
+    report_type: input.reportType,
+    storage_prefix: storagePrefix,
+    status: "pending" as const,
+    total_bytes: input.totalBytes,
+    upload_progress: 0,
+    column_mapping,
+  };
+
   try {
     const { data, error } = await supabaseServer
       .from("raw_report_uploads")
-      .insert({
-        organization_id: orgId,
-        file_name: input.fileName,
-        report_type: input.reportType,
-        storage_prefix: storagePrefix,
-        status: "pending",
-        total_bytes: input.totalBytes,
-        uploaded_bytes: 0,
-        uploaded_by: userId,
-        upload_progress: 0,
-        process_progress: 0,
-        column_mapping: columnMappingPayload,
-        error_log: null,
-      })
+      .insert(insertRow)
       .select("id")
       .single();
 
@@ -176,7 +185,7 @@ export async function createRawReportUploadSession(input: {
     await audit(userId, "import.session_created", data.id as string, {
       fileName: input.fileName,
       totalBytes: input.totalBytes,
-      hasMapping: !!columnMappingPayload,
+      hasMapping: !!column_mapping,
     });
 
     return { ok: true, id: data.id as string, storagePrefix };
@@ -197,7 +206,7 @@ export async function finalizeRawReportUpload(input: {
   const orgId = resolveOrganizationId();
   const { data: row, error: fetchErr } = await supabaseServer
     .from("raw_report_uploads")
-    .select("id, uploaded_by, total_bytes")
+    .select("id")
     .eq("id", input.uploadId)
     .eq("organization_id", orgId)
     .maybeSingle();
@@ -209,7 +218,6 @@ export async function finalizeRawReportUpload(input: {
     .update({
       status: "complete",
       upload_progress: 100,
-      process_progress: 100,
       column_mapping: serializeColumnMappingJson(input.columnMapping ?? null),
       updated_at: new Date().toISOString(),
     })
@@ -237,7 +245,6 @@ export async function failRawReportUpload(input: {
     .from("raw_report_uploads")
     .update({
       status: "failed",
-      error_log: input.message.slice(0, 2000),
       updated_at: new Date().toISOString(),
     })
     .eq("id", input.uploadId)
