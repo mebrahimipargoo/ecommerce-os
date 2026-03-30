@@ -3,7 +3,7 @@
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
 import {
-  ArrowLeft, BadgeCheck, BarChart3, Building2, CheckCircle2, ChevronUp, CreditCard, Cpu, Crown,
+  ArrowLeft, BadgeCheck, BarChart3, Building2, CheckCircle2, CreditCard, Cpu, Crown,
   Globe, HardDrive, ImageIcon, KeyRound, Loader2, Package, PackageX, Pencil, Plus, Printer,
   RefreshCw, RotateCcw, Save, ScanLine, Settings, ShieldAlert, ShieldCheck, Store, Tag, Trash2,
   Truck, TriangleAlert, UserCog, Users, Wifi, X, Zap,
@@ -16,6 +16,10 @@ import {
   saveInventoryFefoSettings,
   saveCoreSettings,
 } from "./workspace-settings-actions";
+import { BRAND_LOGO_IMG_CLASSNAME } from "../../lib/brand-logo-classes";
+import { uploadOrganizationLogoAction } from "./upload-organization-logo-action";
+import { AgentApiKeysSection } from "./AgentApiKeysSection";
+import { RoleTagCombobox } from "./RoleTagCombobox";
 import {
   DEFAULT_CLAIM_AGENT_CONFIG,
   DEFAULT_FEFO,
@@ -38,14 +42,15 @@ import {
   setLabelPrinterInStorage,
   getDefaultStoreIdFromStorage,
   setDefaultStoreIdInStorage,
+  normalizeAIRoleTag,
   type AIConfig,
   type AIConfigStatus,
   type AIProvider,
-  type AIRole,
   type AIRoleAssignments,
   type BarcodeMode,
   type LabelPrinter,
 } from "../../lib/openai-settings";
+import { useBranding } from "../../components/BrandingContext";
 import { useUserRole } from "../../components/UserRoleContext";
 import {
   listMarketplaces, listStores, insertStore, insertMarketplace,
@@ -156,11 +161,32 @@ const MOCK_AI_CALLS      = 450;
 const MOCK_SCANNED_ITEMS = 1_247;
 
 const SELECT_CLS =
-  "h-12 w-full rounded-xl border border-border bg-background px-4 text-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20";
+  "flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50";
 const INPUT_CLS =
-  "h-12 w-full rounded-xl border border-border bg-background px-4 text-sm focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/20";
-const LABEL_CLS = "mb-1.5 block text-sm font-semibold";
+  "flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50";
+const LABEL_CLS = "mb-2 block text-sm font-medium leading-none";
 const HINT_CLS  = "mb-2 text-xs text-muted-foreground";
+
+/** Reserves hint height so inputs do not shift when helper copy or warnings appear. */
+function StableField({
+  label,
+  hint,
+  children,
+}: {
+  label: React.ReactNode;
+  hint?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-0">
+      <div className="mb-2 block text-sm font-medium leading-none">{label}</div>
+      <div className="min-h-[2.5rem] text-xs text-muted-foreground">
+        {hint ?? <span className="invisible select-none">.</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
 
 const PROVIDER_LABELS: Record<AIProvider, string> = {
   openai: "OpenAI",
@@ -294,6 +320,7 @@ function UsageMeter({
 
 export default function SettingsPage() {
   const { role } = useUserRole();
+  const { refresh: refreshBranding } = useBranding();
 
   const [activeTab, setActiveTab] = useState<TabId>("general");
   const [mounted,   setMounted]   = useState(false);
@@ -302,7 +329,6 @@ export default function SettingsPage() {
   const [defaultStoreId,  setDefaultStoreId]  = useState<string>("");
   const [storesList,      setStoresList]      = useState<StorePublicRow[]>([]);
   const [storesListLoading, setStoresListLoading] = useState(false);
-  const [generalSaved,    setGeneralSaved]    = useState(false);
 
   // ── White-label / Tenant Customization (core_settings JSONB) ───────────────
   const [companyName,         setCompanyName]         = useState<string>("");
@@ -374,6 +400,28 @@ export default function SettingsPage() {
 
   const [toast, setToast] = useState<ToastState>(null);
 
+  function closeAddConnectionModal() {
+    setShowForm(false);
+    setFormData(newBlankConfig());
+  }
+
+  useEffect(() => {
+    if (!showForm) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setShowForm(false);
+        setFormData(newBlankConfig());
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [showForm]);
+
   // ── Hydrate from localStorage ──────────────────────────────────────────────
   useEffect(() => {
     setMounted(true);
@@ -425,8 +473,9 @@ export default function SettingsPage() {
       setClaimAgentLoading(true);
       try {
         const cfg = await getClaimAgentConfig();
-        setClaimAgentSaved(cfg);
-        setClaimAgentLocal(cfg);
+        const normalized = { ...cfg, default_marketplace_adapter_store_id: null as string | null };
+        setClaimAgentSaved(normalized);
+        setClaimAgentLocal(normalized);
       } finally {
         setClaimAgentLoading(false);
       }
@@ -517,32 +566,25 @@ export default function SettingsPage() {
   function handleSaveGeneral(e: React.FormEvent) {
     e.preventDefault();
     setDefaultStoreIdInStorage(defaultStoreId);
-    setGeneralSaved(true);
-    setTimeout(() => setGeneralSaved(false), 2500);
+    void refreshBranding();
     showToast("General preferences saved.", true);
   }
 
-  // ── Logo file upload → Supabase Storage → saves URL ──────────────────────
+  // ── Logo file upload → server action (logos bucket + organization_settings) ─
   async function handleLogoFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
     setLogoUploading(true);
     try {
-      const { supabase: sb } = await import("../../src/lib/supabase");
-      const ext = file.name.split(".").pop() ?? "png";
-      const path = `logos/${Date.now()}.${ext}`;
-      const { error: upErr } = await sb.storage
-        .from("workspace_logos")
-        .upload(path, file, { upsert: true, contentType: file.type });
-      if (upErr) throw new Error(upErr.message);
-      const { data: urlData } = sb.storage.from("workspace_logos").getPublicUrl(path);
-      setCompanyLogoUrl(urlData.publicUrl);
-      const res = await saveCoreSettings({
-        company_name:     companyName.trim(),
-        company_logo_url: urlData.publicUrl,
-      });
-      if (!res.ok) throw new Error(res.error ?? "Failed to save logo URL.");
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await uploadOrganizationLogoAction(fd);
+      if (!res.ok) throw new Error(res.error ?? "Logo upload failed.");
+      setCompanyLogoUrl(res.publicUrl);
+      const nameRes = await saveCoreSettings({ company_name: companyName.trim() });
+      if (!nameRes.ok) throw new Error(nameRes.error ?? "Failed to save workspace name.");
+      void refreshBranding();
       showToast("Logo uploaded and saved.", true);
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Logo upload failed.", false);
@@ -555,15 +597,18 @@ export default function SettingsPage() {
   async function handleSaveWhitelabel(e: React.FormEvent) {
     e.preventDefault();
     setCoreSettingsSaving(true);
+    const url = companyLogoUrl.trim();
     const res = await saveCoreSettings({
       company_name:     companyName.trim(),
-      company_logo_url: companyLogoUrl.trim(),
+      company_logo_url: url,
+      logo_url:         url,
     });
     setCoreSettingsSaving(false);
     if (!res.ok) {
       showToast(res.error ?? "Failed to save white-label settings.", false);
       return;
     }
+    void refreshBranding();
     showToast("White-label settings saved.", true);
   }
 
@@ -647,6 +692,7 @@ export default function SettingsPage() {
       providerName: formData.providerName.trim() || PROVIDER_LABELS[formData.provider],
       apiKey:       formData.apiKey.trim(),
       baseURL:      formData.baseURL.trim(),
+      role:         normalizeAIRoleTag(formData.role),
       status:       "untested",
     };
     const updated = [...base, newCfg];
@@ -676,8 +722,9 @@ export default function SettingsPage() {
     );
   }
 
-  function handleRoleChange(id: string, newRole: AIRole) {
-    const updated = configs.map((c) => (c.id === id ? { ...c, role: newRole } : c));
+  function handleRoleChange(id: string, newRole: string) {
+    const tag = normalizeAIRoleTag(newRole);
+    const updated = configs.map((c) => (c.id === id ? { ...c, role: tag } : c));
     setConfigs(updated);
     setAIConfigsInStorage(updated);
   }
@@ -775,8 +822,7 @@ export default function SettingsPage() {
       max_auto_submit_amount_usd: maxUsd,
       autonomous_claim_submission_0_50_usd: claimAgentLocal.autonomous_claim_submission_0_50_usd ?? false,
       require_manual_approval_bulk_submission: claimAgentLocal.require_manual_approval_bulk_submission ?? true,
-      default_marketplace_adapter_store_id:
-        claimAgentLocal.default_marketplace_adapter_store_id?.trim() || null,
+      default_marketplace_adapter_store_id: null,
       logistics_background_sync_enabled: claimAgentLocal.logistics_background_sync_enabled ?? false,
       logistics_sync_interval_hours: intervalH,
     });
@@ -790,6 +836,7 @@ export default function SettingsPage() {
       ...claimAgentLocal,
       max_auto_submit_amount_usd: maxUsd,
       logistics_sync_interval_hours: intervalH,
+      default_marketplace_adapter_store_id: null,
     };
     setClaimAgentSaved(merged);
     setClaimAgentLocal(merged);
@@ -986,18 +1033,20 @@ export default function SettingsPage() {
         </div>
       </div>
 
-      {/* Toast notification */}
+      {/* Success / error toast — fixed so it stays visible while scrolling long settings */}
       {toast && (
         <div
+          role="status"
+          aria-live="polite"
           className={[
-            "mb-6 flex items-center gap-3 rounded-2xl border px-4 py-3 text-sm font-medium",
+            "fixed bottom-6 right-6 z-[80] flex max-w-md items-center gap-3 rounded-lg border px-4 py-3 text-sm font-medium shadow-lg",
             toast.ok
-              ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-700/50 dark:bg-emerald-950/30 dark:text-emerald-300"
-              : "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400",
+              ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-700/50 dark:bg-emerald-950/90 dark:text-emerald-200"
+              : "border-rose-200 bg-rose-50 text-rose-800 dark:border-rose-700/50 dark:bg-rose-950/90 dark:text-rose-200",
           ].join(" ")}
         >
           {toast.ok
-            ? <CheckCircle2 className="h-4 w-4 shrink-0" />
+            ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
             : <ShieldAlert   className="h-4 w-4 shrink-0" />}
           {toast.msg}
         </div>
@@ -1113,9 +1162,11 @@ export default function SettingsPage() {
                           <label className={LABEL_CLS}>Company Logo</label>
                         </div>
                         <p className={HINT_CLS}>
-                          Upload your logo (PNG/SVG/WEBP recommended, min 200 px wide). Displayed on the sidebar and reports.
+                          PNG, SVG, or WebP. Stored in the public <code className="rounded bg-muted px-1 font-mono text-[10px]">logos</code> bucket
+                          and <code className="rounded bg-muted px-1 font-mono text-[10px]">organization_settings.logo_url</code>. Shown in the sidebar,
+                          settings preview, and claim PDF header (max 180×50 display).
                         </p>
-                        <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 text-sm font-semibold transition ${logoUploading ? "border-violet-300 bg-violet-50/80 text-violet-500 dark:bg-violet-950/20" : companyLogoUrl ? "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700/60 dark:bg-emerald-950/20 dark:text-emerald-300" : "border-violet-300 bg-violet-50 text-violet-700 hover:border-violet-400 hover:bg-violet-100 dark:border-violet-700/60 dark:bg-violet-950/30 dark:text-violet-300"}`}>
+                        <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-md border-2 border-dashed border-input bg-muted/30 py-3 text-sm font-medium transition hover:bg-muted/50 ${logoUploading ? "text-muted-foreground" : companyLogoUrl ? "border-emerald-500/50 text-emerald-800 dark:text-emerald-200" : "text-foreground"}`}>
                           {logoUploading
                             ? <><Loader2 className="h-4 w-4 animate-spin" />Uploading…</>
                             : companyLogoUrl
@@ -1128,14 +1179,16 @@ export default function SettingsPage() {
                   )}
 
                   {companyLogoUrl && (
-                    <div className="flex items-center gap-3 rounded-xl border border-border bg-muted/30 px-4 py-3">
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img
-                        src={companyLogoUrl}
-                        alt="Company logo preview"
-                        className="h-10 max-w-[120px] rounded object-contain"
-                        onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
-                      />
+                    <div className="flex items-center gap-3 rounded-lg border border-border bg-muted/30 px-4 py-3">
+                      <div className="flex h-[45px] w-full max-w-[160px] shrink-0 items-center justify-start overflow-hidden">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={companyLogoUrl}
+                          alt="Company logo preview"
+                          className={BRAND_LOGO_IMG_CLASSNAME}
+                          onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
+                        />
+                      </div>
                       <div className="flex-1 min-w-0">
                         <p className="text-xs font-semibold">Logo Preview</p>
                         <p className="text-[11px] text-muted-foreground truncate">Displayed on sidebar &amp; reports.</p>
@@ -1148,7 +1201,7 @@ export default function SettingsPage() {
                 <button
                   type="submit"
                   disabled={coreSettingsSaving || coreSettingsLoading}
-                  className="inline-flex min-w-[220px] items-center justify-center gap-2 rounded-xl bg-violet-600 py-3 text-sm font-semibold text-white transition hover:bg-violet-700 disabled:opacity-50"
+                  className="inline-flex min-w-[220px] items-center justify-center gap-2 rounded-md bg-violet-600 px-4 py-2 text-sm font-semibold text-white shadow transition hover:bg-violet-700 disabled:opacity-50"
                 >
                   {coreSettingsSaving
                     ? <><Loader2 className="h-4 w-4 animate-spin" />Saving…</>
@@ -1167,9 +1220,9 @@ export default function SettingsPage() {
                   </div>
 
                   <div>
-                    <div className="mb-2 flex items-center gap-2">
+                    <div className="mb-1.5 flex items-center gap-2">
                       <Tag className="h-4 w-4 text-sky-600 dark:text-sky-400" />
-                      <label className="text-sm font-semibold">Default Store</label>
+                      <label className={LABEL_CLS}>Default Store</label>
                     </div>
                     <p className={HINT_CLS}>
                       Fallback store when a scanned barcode can&apos;t be matched to a parent package.
@@ -1220,15 +1273,12 @@ export default function SettingsPage() {
                 <div className="flex flex-wrap gap-2">
                   <button
                     type="submit"
-                    className="inline-flex min-w-[180px] flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white transition hover:bg-sky-700"
+                    className="inline-flex min-w-[180px] flex-1 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground shadow transition hover:bg-primary/90"
                   >
                     <Save className="h-4 w-4" />
                     Save General Preferences
                   </button>
                 </div>
-                {generalSaved && (
-                  <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">Saved.</p>
-                )}
               </form>
             </div>
           )}
@@ -1512,20 +1562,21 @@ export default function SettingsPage() {
                   <div>
                     <h2 className="text-base font-bold">API Connections</h2>
                     <p className="text-xs text-muted-foreground">
-                      Add multiple providers — assign roles below or use global override.
+                      Internal LLM routing (browser-stored keys). Add providers here, then assign roles — separate from{" "}
+                      <span className="font-medium text-foreground/80">Workspace API keys</span> at the bottom.
                     </p>
                   </div>
                   <button
                     type="button"
-                    onClick={() => setShowForm((v) => !v)}
+                    onClick={() => setShowForm(true)}
                     className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
                   >
-                    {showForm ? <ChevronUp className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
-                    {showForm ? "Cancel" : "Add Connection"}
+                    <Plus className="h-3.5 w-3.5" />
+                    Add Connection
                   </button>
                 </div>
 
-                {configs.length === 0 && !showForm && (
+                {configs.length === 0 && (
                   <div className="flex flex-col items-center gap-2 rounded-2xl border border-dashed border-border bg-muted/30 py-10 text-center">
                     <KeyRound className="h-8 w-8 text-muted-foreground/40" />
                     <p className="text-sm font-medium text-muted-foreground">No API connections saved yet.</p>
@@ -1576,15 +1627,14 @@ export default function SettingsPage() {
                               : "••••••••"}
                           </p>
                           <div className="mt-3 flex flex-wrap items-center gap-2">
-                            <select
+                            <RoleTagCombobox
+                              id={`role-tag-${cfg.id}`}
                               value={cfg.role}
-                              onChange={(e) => handleRoleChange(cfg.id, e.target.value as AIRole)}
-                              className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-[11px] font-semibold text-slate-600 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+                              onChange={(v) => handleRoleChange(cfg.id, v)}
+                              className="min-w-[120px] max-w-[220px] rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-semibold text-slate-600 focus:outline-none focus:ring-2 focus:ring-sky-500/30 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
                               aria-label="Role tag"
-                            >
-                              <option value="default">Tag: Default</option>
-                              <option value="ocr_vision">Tag: OCR / Vision</option>
-                            </select>
+                              placeholder="Tag…"
+                            />
                             <label className="flex cursor-pointer items-center gap-1.5">
                               <input
                                 type="checkbox"
@@ -1624,143 +1674,191 @@ export default function SettingsPage() {
                 )}
               </div>
 
-              {/* Add connection form */}
+              {/* New connection — modal (keeps LLM setup separate from Workspace keys below) */}
               {showForm && (
-                <form
-                  onSubmit={handleAddConfig}
-                  className="space-y-5 rounded-2xl border border-sky-200 bg-sky-50/40 p-6 shadow-sm dark:border-sky-700/50 dark:bg-sky-950/20"
+                <div
+                  className="fixed inset-0 z-[100] flex items-center justify-center p-4"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="new-ai-connection-title"
                 >
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-bold text-sky-800 dark:text-sky-200">New API Connection</h3>
-                    <button
-                      type="button"
-                      onClick={() => { setShowForm(false); setFormData(newBlankConfig()); }}
-                      className="rounded-full p-1 text-muted-foreground hover:bg-accent"
-                    >
-                      <X className="h-4 w-4" />
-                    </button>
-                  </div>
-
-                  <div>
-                    <label className={LABEL_CLS}>Connection Name</label>
-                    <p className={HINT_CLS}>A label to identify this connection (e.g. &quot;Gemini Flash — Chat&quot;).</p>
-                    <input
-                      type="text"
-                      value={formData.providerName}
-                      onChange={(e) => setFormData((p) => ({ ...p, providerName: e.target.value }))}
-                      placeholder="e.g. GPT-4o Vision"
-                      className={INPUT_CLS}
-                    />
-                  </div>
-
-                  <div>
-                    <label className={LABEL_CLS}>Provider Type</label>
-                    <select
-                      value={formData.provider}
-                      onChange={(e) => handleFormProviderChange(e.target.value as AIProvider)}
-                      className={SELECT_CLS}
-                    >
-                      <option value="openai">OpenAI  (GPT-4o, o3, o4-mini…)</option>
-                      <option value="gemini">Google Gemini</option>
-                      <option value="custom">Custom / Other  (Ollama, Groq, Azure OpenAI…)</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className={LABEL_CLS}>
-                      <Tag className="mr-1 inline h-3.5 w-3.5" />
-                      Role Tag
-                    </label>
-                    <p className={HINT_CLS}>Tag this connection for the Role Assignment section below.</p>
-                    <select
-                      value={formData.role}
-                      onChange={(e) => setFormData((p) => ({ ...p, role: e.target.value as AIRole }))}
-                      className={SELECT_CLS}
-                    >
-                      <option value="default">Default — general AI tasks</option>
-                      <option value="ocr_vision">OCR / Vision — image analysis &amp; packing-slip scanning</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className={LABEL_CLS}>Base URL</label>
-                    <p className={HINT_CLS}>Auto-filled for known providers; edit freely for custom deployments.</p>
-                    <input
-                      type="text"
-                      autoComplete="off"
-                      spellCheck={false}
-                      value={formData.baseURL}
-                      onChange={(e) => setFormData((p) => ({ ...p, baseURL: e.target.value }))}
-                      placeholder="https://api.openai.com/v1"
-                      className={`${INPUT_CLS} font-mono`}
-                    />
-                    {formData.provider === "custom" && (
-                      <p className="mt-1.5 text-xs text-amber-600 dark:text-amber-400">
-                        Custom providers: ensure CORS allows requests from this origin, or proxy via your backend.
-                      </p>
-                    )}
-                  </div>
-
-                  <div>
-                    <label className={LABEL_CLS}>API Key</label>
-                    <p className={HINT_CLS}>Stored only in this browser&apos;s localStorage — never sent to our servers.</p>
-                    <div className="flex gap-2">
-                      <input
-                        type="password"
-                        autoComplete="off"
-                        value={formData.apiKey}
-                        onChange={(e) => setFormData((p) => ({ ...p, apiKey: e.target.value }))}
-                        placeholder={
-                          formData.provider === "openai" ? "sk-…"
-                          : formData.provider === "gemini" ? "AIza…"
-                          : "Your API key…"
-                        }
-                        className={`${INPUT_CLS} min-w-0 flex-1 font-mono`}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => runTest(formData, null)}
-                        disabled={testingId === "__form__"}
-                        className="inline-flex h-12 shrink-0 items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-4 text-sm font-semibold text-sky-700 transition hover:bg-sky-100 disabled:opacity-50 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
-                      >
-                        {testingId === "__form__"
-                          ? <Loader2 className="h-4 w-4 animate-spin" />
-                          : <Wifi    className="h-4 w-4" />}
-                        {testingId === "__form__" ? "Testing…" : "Test"}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="rounded-xl border border-violet-200 bg-violet-50/60 p-4 dark:border-violet-700/40 dark:bg-violet-950/20">
-                    <label className="flex cursor-pointer items-start gap-3">
-                      <input
-                        type="checkbox"
-                        checked={!!formData.isGlobalOverride}
-                        onChange={(e) => setFormData((p) => ({ ...p, isGlobalOverride: e.target.checked }))}
-                        className="mt-0.5 h-4 w-4 rounded accent-violet-600"
-                      />
-                      <div>
-                        <p className="text-sm font-bold text-violet-800 dark:text-violet-200">
-                          Use this configuration for all roles
-                        </p>
-                        <p className="mt-0.5 text-xs text-violet-700 dark:text-violet-400">
-                          When checked, this API becomes the sole provider for every task.
-                        </p>
+                  <button
+                    type="button"
+                    className="absolute inset-0 bg-black/50 backdrop-blur-[1px]"
+                    aria-label="Close dialog"
+                    onClick={closeAddConnectionModal}
+                  />
+                  <div className="relative z-10 max-h-[min(90vh,720px)] w-full max-w-lg overflow-y-auto rounded-2xl border border-border bg-card p-6 shadow-xl">
+                    <form onSubmit={handleAddConfig} className="space-y-5">
+                      <div className="flex items-start justify-between gap-3 border-b border-border pb-4">
+                        <div>
+                          <h3 id="new-ai-connection-title" className="text-base font-bold text-foreground">
+                            New API Connection
+                          </h3>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            Browser-stored LLM credentials for routing and OCR. Separate from workspace API keys for external bots.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={closeAddConnectionModal}
+                          className="rounded-full p-1.5 text-muted-foreground transition hover:bg-muted"
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
                       </div>
-                    </label>
-                  </div>
 
-                  <div className="flex gap-2 pt-1">
-                    <button
-                      type="submit"
-                      disabled={savingForm}
-                      className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:opacity-50"
-                    >
-                      <Save className="h-4 w-4" />
-                      Save Connection
-                    </button>
+                      <StableField
+                        label="Connection name"
+                        hint={
+                          <>
+                            A label to identify this connection (e.g. &quot;Gemini Flash — Chat&quot;).
+                          </>
+                        }
+                      >
+                        <input
+                          type="text"
+                          value={formData.providerName}
+                          onChange={(e) => setFormData((p) => ({ ...p, providerName: e.target.value }))}
+                          placeholder="e.g. GPT-4o Vision"
+                          className={INPUT_CLS}
+                        />
+                      </StableField>
+
+                      <StableField
+                        label="Provider type"
+                        hint="Grouped by vendor. Custom covers self-hosted and compatible proxies."
+                      >
+                        <select
+                          value={formData.provider}
+                          onChange={(e) => handleFormProviderChange(e.target.value as AIProvider)}
+                          className={SELECT_CLS}
+                        >
+                          <optgroup label="OpenAI">
+                            <option value="openai">OpenAI  (GPT-4o, o3, o4-mini…)</option>
+                          </optgroup>
+                          <optgroup label="Google">
+                            <option value="gemini">Google Gemini</option>
+                          </optgroup>
+                          <optgroup label="Custom & self-hosted">
+                            <option value="custom">Custom / local  (Ollama, Groq, Azure OpenAI…)</option>
+                          </optgroup>
+                        </select>
+                      </StableField>
+
+                      <StableField
+                        label={
+                          <span className="inline-flex items-center gap-1.5">
+                            <Tag className="h-3.5 w-3.5" />
+                            Role tag
+                          </span>
+                        }
+                        hint="Used for routing presets below — choose a category or enter a custom tag."
+                      >
+                        <RoleTagCombobox
+                          id="new-connection-role-tag"
+                          value={formData.role}
+                          onChange={(v) => setFormData((p) => ({ ...p, role: v }))}
+                          className={INPUT_CLS}
+                          placeholder="default"
+                          aria-label="Role tag for new connection"
+                        />
+                      </StableField>
+
+                      <StableField
+                        label="Base URL"
+                        hint="Auto-filled for known providers; edit freely for custom deployments."
+                      >
+                        <input
+                          type="text"
+                          autoComplete="off"
+                          spellCheck={false}
+                          value={formData.baseURL}
+                          onChange={(e) => setFormData((p) => ({ ...p, baseURL: e.target.value }))}
+                          placeholder="https://api.openai.com/v1"
+                          className={`${INPUT_CLS} font-mono`}
+                        />
+                        <div className="mt-1.5 min-h-[2.75rem]">
+                          {formData.provider === "custom" ? (
+                            <p className="text-xs text-amber-600 dark:text-amber-400">
+                              Custom providers: ensure CORS allows requests from this origin, or proxy via your backend.
+                            </p>
+                          ) : (
+                            <span className="invisible select-none">.</span>
+                          )}
+                        </div>
+                      </StableField>
+
+                      <StableField
+                        label="API key"
+                        hint="Stored only in this browser&apos;s localStorage — never sent to our servers."
+                      >
+                        <div className="flex items-stretch gap-2">
+                          <input
+                            type="password"
+                            autoComplete="off"
+                            value={formData.apiKey}
+                            onChange={(e) => setFormData((p) => ({ ...p, apiKey: e.target.value }))}
+                            placeholder={
+                              formData.provider === "openai" ? "sk-…"
+                              : formData.provider === "gemini" ? "AIza…"
+                              : "Your API key…"
+                            }
+                            className={`${INPUT_CLS} min-w-0 flex-1 font-mono`}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => runTest(formData, null)}
+                            disabled={testingId === "__form__"}
+                            className="inline-flex h-10 shrink-0 items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-4 text-sm font-semibold text-sky-700 transition hover:bg-sky-100 disabled:opacity-50 dark:border-sky-700/50 dark:bg-sky-950/40 dark:text-sky-300"
+                          >
+                            {testingId === "__form__"
+                              ? <Loader2 className="h-4 w-4 animate-spin" />
+                              : <Wifi    className="h-4 w-4" />}
+                            {testingId === "__form__" ? "Testing…" : "Test"}
+                          </button>
+                        </div>
+                      </StableField>
+
+                      <div className="rounded-xl border border-violet-200 bg-violet-50/60 p-4 dark:border-violet-700/40 dark:bg-violet-950/20">
+                        <label className="flex cursor-pointer items-start gap-3">
+                          <input
+                            type="checkbox"
+                            checked={!!formData.isGlobalOverride}
+                            onChange={(e) => setFormData((p) => ({ ...p, isGlobalOverride: e.target.checked }))}
+                            className="mt-0.5 h-4 w-4 rounded accent-violet-600"
+                          />
+                          <div>
+                            <p className="text-sm font-bold text-violet-800 dark:text-violet-200">
+                              Use this configuration for all roles
+                            </p>
+                            <p className="mt-0.5 text-xs text-violet-700 dark:text-violet-400">
+                              When checked, this API becomes the sole provider for every task.
+                            </p>
+                          </div>
+                        </label>
+                      </div>
+
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={closeAddConnectionModal}
+                          className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl border border-border py-3 text-sm font-semibold transition hover:bg-muted"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={savingForm}
+                          className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-sky-600 py-3 text-sm font-semibold text-white transition hover:bg-sky-700 disabled:opacity-50"
+                        >
+                          <Save className="h-4 w-4" />
+                          Save connection
+                        </button>
+                      </div>
+                    </form>
                   </div>
-                </form>
+                </div>
               )}
 
               {/* Role Assignment */}
@@ -1855,6 +1953,13 @@ export default function SettingsPage() {
                   </button>
                 </div>
               )}
+
+              <div className="border-t border-border pt-8">
+                <p className="mb-4 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  Workspace &amp; external integrations
+                </p>
+                <AgentApiKeysSection showToast={showToast} />
+              </div>
             </div>
           )}
 
@@ -2422,32 +2527,6 @@ export default function SettingsPage() {
                           </span>
                         </span>
                       </label>
-                    </div>
-
-                    <div>
-                      <label className={LABEL_CLS}>Default Marketplace Adapter</label>
-                      <p className={HINT_CLS}>
-                        Store used as the default routing context for claim automation (from your connected stores).
-                      </p>
-                      <select
-                        className={`${INPUT_CLS} mt-2 max-w-md`}
-                        value={claimAgentLocal.default_marketplace_adapter_store_id ?? ""}
-                        onChange={(e) =>
-                          setClaimAgentLocal((p) => ({
-                            ...p,
-                            default_marketplace_adapter_store_id: e.target.value || null,
-                          }))
-                        }
-                        disabled={storesListLoading}
-                      >
-                        <option value="">— Select store —</option>
-                        {storesList.map((s) => (
-                          <option key={s.id} value={s.id}>
-                            {s.name}
-                            {s.platform ? ` (${s.platform})` : ""}
-                          </option>
-                        ))}
-                      </select>
                     </div>
 
                     <div>

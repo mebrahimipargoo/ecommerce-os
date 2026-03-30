@@ -2,27 +2,30 @@
 
 /**
  * Global top bar — single place for Theme toggle and User profile.
- * Mobile LTR: [Hamburger] → [Logo / Title] → [Theme + Profile]
- * Desktop:     [optional left slot] … [Theme + Profile] on the right
+ * Mobile LTR: [Hamburger] → [Tenant logo / Title] → [Theme + Profile]
+ * Desktop: tenant line + search … [Theme + Profile]
  */
 
 import React from "react";
 import { Bell, ChevronDown, Menu, Search, ShieldCheck, User } from "lucide-react";
 import { ThemeToggle } from "./ThemeToggle";
-import { LogoMark } from "./LogoMark";
+import { BrandLogoImage } from "./BrandLogoImage";
+import { useBranding } from "./BrandingContext";
 import { useGlobalSearch } from "./GlobalSearchContext";
 import { useUserRole } from "./UserRoleContext";
 
 export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
   const { query, setQuery } = useGlobalSearch();
   const { role, toggleRole, actorName } = useUserRole();
+  const { companyName } = useBranding();
   const profileInitial = actorName.trim().charAt(0).toUpperCase() || "M";
+  const title = companyName.trim() || "E-commerce OS";
+
   return (
     <header
       className="sticky top-0 z-40 flex h-14 w-full min-w-0 shrink-0 items-center justify-between gap-3 border-b border-border bg-card px-3 md:px-4"
       role="banner"
     >
-      {/* ── Mobile: hamburger (left) ── */}
       <button
         type="button"
         onClick={onMenuClick}
@@ -32,22 +35,25 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
         <Menu className="h-5 w-5" />
       </button>
 
-      {/* ── Logo + title: compact on mobile so global search can grow ── */}
       <div className="flex min-w-0 shrink-0 items-center gap-2.5 md:min-w-0 md:flex-1">
-        <div className="flex max-w-[40%] min-w-0 items-center gap-2 sm:max-w-none md:hidden">
-          <LogoMark />
+        <div className="flex max-w-[55%] min-w-0 items-center gap-2 sm:max-w-none md:hidden">
+          <BrandLogoImage />
           <div className="min-w-0">
-            <p className="truncate text-sm font-bold text-foreground">E-commerce OS</p>
+            <p className="truncate text-sm font-bold text-foreground">{title}</p>
             <p className="truncate text-[10px] text-muted-foreground">Returns ERP</p>
           </div>
         </div>
-        <div className="hidden min-w-0 md:block">
-          <p className="truncate text-sm font-semibold text-foreground">Workspace</p>
-          <p className="truncate text-[10px] text-muted-foreground">Enterprise control</p>
+        <div className="hidden min-w-0 items-center gap-2.5 md:flex">
+          <BrandLogoImage />
+          <div className="min-w-0">
+            <p className="truncate text-sm font-semibold text-foreground">{title}</p>
+            <p className="truncate text-[10px] text-muted-foreground">
+              {companyName.trim() ? "Enterprise workspace" : "Enterprise control"}
+            </p>
+          </div>
         </div>
       </div>
 
-      {/* Global search — filters the active Returns tab (Items / Packages / Pallets) */}
       <div className="mx-2 hidden min-w-0 max-w-md flex-1 md:flex">
         <label className="relative flex w-full items-center">
           <Search className="pointer-events-none absolute left-3 h-4 w-4 text-muted-foreground" aria-hidden />
@@ -75,9 +81,7 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
         </label>
       </div>
 
-      {/* ── Right cluster: pinned to far right ── */}
       <div className="ml-auto flex shrink-0 items-center gap-1.5 sm:gap-2">
-        {/* Role switcher — toggles RBAC across the entire app */}
         <button
           type="button"
           onClick={toggleRole}

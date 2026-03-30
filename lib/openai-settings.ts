@@ -133,8 +133,67 @@ export const AI_CONFIGS_STORAGE_KEY        = "ecommerce_os_ai_configs";
 export const AI_GLOBAL_PROVIDER_STORAGE_KEY = "ecommerce_os_ai_global_provider_id";
 export const AI_ROLE_ASSIGNMENTS_STORAGE_KEY = "ecommerce_os_ai_role_assignments";
 
-/** Role assigned to each saved API connection. */
-export type AIRole = "default" | "ocr_vision";
+/**
+ * Free-form role / tag for each saved API connection (e.g. default, ocr_vision, Agent, Bot).
+ * Stored as plain string in localStorage — not a database ENUM.
+ */
+export type AIRole = string;
+
+/** Flat list of suggested tags (creatable comboboxes may use grouped metadata below). */
+export const SUGGESTED_AI_ROLE_TAGS: readonly string[] = [
+  "default",
+  "ocr_vision",
+  "agent",
+  "bot",
+  "integration",
+  "system",
+  "api",
+] as const;
+
+export type AIRoleTagSuggestion = {
+  value: string;
+  label: string;
+  description: string;
+};
+
+/** Grouped presets for enterprise role/tag pickers (custom values still allowed). */
+export const AI_ROLE_TAG_GROUPS: readonly {
+  group: string;
+  description: string;
+  tags: readonly AIRoleTagSuggestion[];
+}[] = [
+  {
+    group: "General chat & tasks",
+    description: "Default routing for summaries, decisions, and in-app chat.",
+    tags: [
+      { value: "default", label: "default", description: "General chat & default routing" },
+      { value: "system", label: "system", description: "Internal automation & system tasks" },
+    ],
+  },
+  {
+    group: "Hardware & imaging",
+    description: "Scanners, packing slips, and camera / OCR flows.",
+    tags: [
+      { value: "ocr_vision", label: "ocr_vision", description: "Vision, packing slips, label OCR" },
+    ],
+  },
+  {
+    group: "External & automation",
+    description: "Bots, agents, and integrations calling your workspace.",
+    tags: [
+      { value: "agent", label: "agent", description: "External agents & copilots" },
+      { value: "bot", label: "bot", description: "Chatbots & messaging integrations" },
+      { value: "integration", label: "integration", description: "Sync jobs & third-party APIs" },
+      { value: "api", label: "api", description: "Programmatic / headless access" },
+    ],
+  },
+] as const;
+
+/** Normalize tag: trim, max length, empty → "default". */
+export function normalizeAIRoleTag(raw: string): string {
+  const t = raw.trim().slice(0, 80);
+  return t || "default";
+}
 
 /** Connection health / test status. */
 export type AIConfigStatus = "untested" | "active" | "testing" | "error";

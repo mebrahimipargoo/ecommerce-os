@@ -105,9 +105,6 @@ ALTER TABLE public.packages
   ADD COLUMN IF NOT EXISTS tracking_number TEXT DEFAULT NULL,
   ADD COLUMN IF NOT EXISTS package_number  TEXT DEFAULT NULL;
 
-ALTER TABLE public.stores
-  ADD COLUMN IF NOT EXISTS api_keys JSONB NOT NULL DEFAULT '{}';
-
 ALTER TABLE public.products ADD COLUMN IF NOT EXISTS organization_id TEXT;
 UPDATE public.products SET organization_id = '00000000-0000-0000-0000-000000000001' WHERE organization_id::text !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' OR organization_id IS NULL;
 ALTER TABLE public.products ALTER COLUMN organization_id TYPE UUID USING organization_id::uuid;
@@ -181,9 +178,6 @@ CREATE INDEX IF NOT EXISTS idx_packages_tracking
 
 CREATE INDEX IF NOT EXISTS idx_packages_number
   ON public.packages (organization_id, package_number);
-
-CREATE INDEX IF NOT EXISTS idx_stores_api_keys_gin
-  ON public.stores USING GIN (api_keys);
 
 CREATE INDEX IF NOT EXISTS idx_workspace_settings_core_gin
   ON public.workspace_settings USING GIN (core_settings);

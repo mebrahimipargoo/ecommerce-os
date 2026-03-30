@@ -108,7 +108,13 @@ const styles = StyleSheet.create({
     marginTop: 4,
     textAlign: "right" as const,
   },
-  globalLogo: { width: 56, height: 30, objectFit: "contain", marginRight: 8 },
+  /** Max bounding box (pt) — matches app shell logo constraints (contain, no stretch). */
+  globalLogo: {
+    width: 160,
+    height: 45,
+    objectFit: "contain" as const,
+    marginRight: 8,
+  },
   headerRow: {
     flexDirection: "row",
     justifyContent: "space-between",
