@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import type { ReturnRecord } from "../returns/actions";
+import type { ReturnRecord } from "../returns/returns-action-types";
 
 function num(v: unknown): number {
   const n = Number(v);

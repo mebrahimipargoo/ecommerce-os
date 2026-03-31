@@ -1,7 +1,7 @@
 "use server";
 
 import { supabaseServer } from "../../lib/supabase-server";
-import type { PackageRecord, PalletRecord, ReturnRecord } from "../returns/actions";
+import type { PackageRecord, PalletRecord, ReturnRecord } from "../returns/returns-action-types";
 import { listPackages, listPallets } from "../returns/actions";
 import { RETURN_SELECT } from "../returns/returns-constants";
 import { fetchClaimWorkspaceRows, mapSubmissionToClaimRecord } from "./claim-repository";

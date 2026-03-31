@@ -1,4 +1,4 @@
-import type { PackageRecord, PalletRecord, ReturnRecord } from "../returns/actions";
+import type { PackageRecord, PalletRecord, ReturnRecord } from "../returns/returns-action-types";
 import { resolveClaimAmountFromReturnSync } from "./claim-amount-utils";
 import type { ClaimRecord } from "./claim-types";
 

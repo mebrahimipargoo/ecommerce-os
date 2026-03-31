@@ -5,11 +5,8 @@ import { Boxes, Package2, ScanLine } from "lucide-react";
 import { DatabaseTag } from "../../components/DatabaseTag";
 import { useGlobalSearch } from "../../components/GlobalSearchContext";
 import { useUserRole } from "../../components/UserRoleContext";
-import {
-  type PackageRecord, type PalletRecord, type ReturnRecord,
-  type OrgSettings,
-  listReturns, listPackages, listPallets, getOrgSettings,
-} from "./actions";
+import { listReturns, listPackages, listPallets, getOrgSettings } from "./actions";
+import type { OrgSettings, PackageRecord, PalletRecord, ReturnRecord } from "./returns-action-types";
 import { getFefoSettings } from "../settings/workspace-settings-actions";
 import {
   DEFAULT_FEFO,
@@ -69,25 +66,35 @@ export default function ReturnsPage() {
 
   // ── Data Loading ─────────────────────────────────────────────────────────────
   useEffect(() => {
+    let cancelled = false;
     async function load() {
       setLoading(true);
       setFetchErrors([]);
-      const [r, p, pl, settings, fefo] = await Promise.all([
-        listReturns(), listPackages(), listPallets(), getOrgSettings(), getFefoSettings(),
-      ]);
-      const errs: string[] = [];
-      if (r.ok)  setReturns(r.data   ?? []);
-      else       errs.push(`Items: ${r.error ?? "unknown error"}`);
-      if (p.ok)  setPackages(p.data  ?? []);
-      else       errs.push(`Packages: ${p.error ?? "unknown error"}`);
-      if (pl.ok) setPallets(pl.data  ?? []);
-      else       errs.push(`Pallets: ${pl.error ?? "unknown error"}`);
-      if (errs.length) setFetchErrors(errs);
-      setOrgSettings(settings);
-      setFefoSettings(fefo);
-      setLoading(false);
+      try {
+        const [r, p, pl, settings, fefo] = await Promise.all([
+          listReturns(), listPackages(), listPallets(), getOrgSettings(), getFefoSettings(),
+        ]);
+        if (cancelled) return;
+        const errs: string[] = [];
+        if (r.ok)  setReturns(r.data   ?? []);
+        else       errs.push(`Items: ${r.error ?? "unknown error"}`);
+        if (p.ok)  setPackages(p.data  ?? []);
+        else       errs.push(`Packages: ${p.error ?? "unknown error"}`);
+        if (pl.ok) setPallets(pl.data  ?? []);
+        else       errs.push(`Pallets: ${pl.error ?? "unknown error"}`);
+        if (errs.length) setFetchErrors(errs);
+        setOrgSettings(settings);
+        setFefoSettings(fefo);
+      } catch (e) {
+        if (!cancelled) {
+          setFetchErrors([`Failed to load: ${e instanceof Error ? e.message : String(e)}`]);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
     }
-    load();
+    void load();
+    return () => { cancelled = true; };
   }, []);
 
   // ── Derived helpers ──────────────────────────────────────────────────────────

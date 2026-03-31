@@ -7,6 +7,7 @@ import {
   getReturnPhotoEvidenceUrls,
   type ReturnPhotoEvidenceRow,
 } from "../../lib/return-photo-evidence";
+import { normalizeEntityPhotoEvidenceUrls } from "../../lib/entity-photo-evidence";
 
 export type ClaimEvidenceKey =
   | "outer_box"
@@ -73,16 +74,10 @@ export function buildClaimEvidenceSlots(detail: {
     photo_evidence?: ReturnPhotoEvidenceRow;
   } | null;
   packageRow: {
-    photo_url?: string | null;
-    photo_closed_url?: string | null;
-    photo_opened_url?: string | null;
-    photo_return_label_url?: string | null;
-    manifest_photo_url?: string | null;
+    photo_evidence?: unknown;
   } | null;
   pallet: {
-    manifest_photo_url?: string | null;
-    bol_photo_url?: string | null;
-    photo_url?: string | null;
+    photo_evidence?: unknown;
   } | null;
 }): ClaimEvidenceSlot[] {
   const slots: ClaimEvidenceSlot[] = [];
@@ -111,34 +106,27 @@ export function buildClaimEvidenceSlots(detail: {
   const pkg = detail.packageRow;
   const ret = detail.returnRow;
 
-  const pkgHasManifest = !!(pkg?.manifest_photo_url && String(pkg.manifest_photo_url).trim());
+  const pltUrls = plt ? normalizeEntityPhotoEvidenceUrls(plt.photo_evidence) : [];
+  const pkgUrls = pkg ? normalizeEntityPhotoEvidenceUrls(pkg.photo_evidence) : [];
 
-  if (plt) {
-    if (!pkgHasManifest) {
-      add(
-        plt.manifest_photo_url,
-        "Packing Slip / Manifest (pallet)",
-        "pallet",
-        "packing_slip_manifest",
-        "manifest",
-      );
-    }
-    add(plt.bol_photo_url, "Bill of Lading (pallet)", "pallet", "pallet_bol", "bol");
-    add(plt.photo_url, "Pallet Overview", "pallet", "pallet_overview", "overview");
+  if (pltUrls.length > 0) {
+    add(pltUrls[0], "Packing Slip / Manifest (pallet)", "pallet", "packing_slip_manifest", "manifest");
+    add(pltUrls[1], "Bill of Lading (pallet)", "pallet", "pallet_bol", "bol");
+    add(pltUrls[2], "Pallet Overview", "pallet", "pallet_overview", "overview");
+    pltUrls.forEach((u, i) => {
+      if (i <= 2) return;
+      add(u, "Pallet evidence", "pallet", "pallet_overview", `pe-${i}`);
+    });
   }
 
-  if (pkg) {
-    add(pkg.photo_closed_url, "Damaged Outer Box (closed)", "package", "outer_box", "closed");
-    const closed = (pkg.photo_closed_url ?? "").trim();
-    const generic = (pkg.photo_url ?? "").trim();
-    if (generic && generic !== closed) {
-      add(pkg.photo_url, "Outer Box", "package", "outer_box", "outer");
-    } else if (!closed) {
-      add(pkg.photo_url, "Outer Box", "package", "outer_box", "outer");
-    }
-    add(pkg.photo_opened_url, "Opened Box", "package", "opened_box", "opened");
-    add(pkg.photo_return_label_url, "Box Label", "package", "box_label", "label");
-    add(pkg.manifest_photo_url, "Packing Slip / Manifest (package)", "package", "packing_slip_manifest", "manifest");
+  if (pkgUrls.length > 0) {
+    add(pkgUrls[0], "Opened Box", "package", "opened_box", "opened");
+    add(pkgUrls[1], "Box Label", "package", "box_label", "label");
+    add(pkgUrls[2], "Damaged Outer Box (closed)", "package", "outer_box", "closed");
+    pkgUrls.forEach((u, i) => {
+      if (i <= 2) return;
+      add(u, "Package evidence", "package", "outer_box", `pe-${i}`);
+    });
   }
 
   if (ret) {
@@ -146,7 +134,7 @@ export function buildClaimEvidenceSlots(detail: {
     add(ev.item_url, "Defective Item Condition", "item", "defective_item", "item");
     add(ev.expiry_url, "Expiry Label", "item", "expiry", "expiry");
     const rl = ev.return_label_url.trim();
-    const pkgLabel = (pkg?.photo_return_label_url ?? "").trim();
+    const pkgLabel = (pkgUrls[1] ?? "").trim();
     if (rl && rl !== pkgLabel) {
       add(ev.return_label_url, "Return Label (item)", "item", "box_label", "ret-label");
     }

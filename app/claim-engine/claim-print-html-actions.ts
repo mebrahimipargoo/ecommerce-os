@@ -5,7 +5,7 @@ import {
   CLAIM_SUBMISSION_RETURN_ID_COLUMN,
   CLAIM_SUBMISSIONS_TABLE,
 } from "./claim-submissions-constants";
-import { RETURNS_CLAIM_EMBED } from "../returns/returns-constants";
+import { RETURN_SELECT } from "../returns/returns-constants";
 import {
   getReturnPhotoEvidenceUrls,
   type ReturnPhotoEvidenceRow,
@@ -121,7 +121,7 @@ export async function fetchReadyToSendSubmissionsForHtmlPrint(
     if (returnIds.length > 0) {
       const { data: rets, error: rErr } = await supabaseServer
         .from("returns")
-        .select(RETURNS_CLAIM_EMBED)
+        .select(RETURN_SELECT)
         .in("id", returnIds);
       if (rErr) throw new Error(rErr.message);
       retMap = new Map((rets ?? []).map((row) => [row.id as string, row as Record<string, unknown>]));

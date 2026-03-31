@@ -15,7 +15,7 @@ import {
   CartesianGrid,
 } from "recharts";
 import { Boxes, Clock, RotateCcw, User } from "lucide-react";
-import type { ReturnsAnalyticsPayload } from "../app/returns/actions";
+import type { ReturnsAnalyticsPayload } from "../app/returns/returns-action-types";
 
 const PIE_COLORS = [
   "#0ea5e9", "#8b5cf6", "#f59e0b", "#10b981", "#f43f5e", "#64748b",

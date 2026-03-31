@@ -2,20 +2,13 @@
 
 import { supabaseServer } from "./supabase-server";
 import { isUuidString } from "./uuid";
+import {
+  STORAGE_BUCKETS,
+  type MediaUploadFolder,
+  type StorageBucketName,
+} from "./media-upload-types";
 
-const BUCKET = "media";
-
-/** Storage prefixes under the `media` bucket (service-role upload bypasses Storage RLS). */
-export type MediaUploadFolder =
-  | "packages"
-  | "packages/claim_closed"
-  | "packages/claim_opened"
-  | "packages/claim_return_label"
-  | "packages/manifest"
-  | "pallets"
-  | "pallets/manifest"
-  | "pallets/bol"
-  | "evidence/wizard";
+const DEFAULT_BUCKET = "media";
 
 /**
  * Upload a file from the browser via FormData using the Supabase service role.
@@ -34,6 +27,12 @@ export async function uploadMediaFileAction(
       ? (folderRaw as MediaUploadFolder)
       : "packages";
 
+  const bucketRaw = formData.get("bucket");
+  const bucket: StorageBucketName =
+    typeof bucketRaw === "string" && (STORAGE_BUCKETS as readonly string[]).includes(bucketRaw)
+      ? (bucketRaw as StorageBucketName)
+      : DEFAULT_BUCKET;
+
   const orgRaw = formData.get("organization_id");
   const organizationId =
     typeof orgRaw === "string" && orgRaw.trim().length > 0 && isUuidString(orgRaw.trim())
@@ -49,7 +48,7 @@ export async function uploadMediaFileAction(
 
   const buf = Buffer.from(await file.arrayBuffer());
   const { error } = await supabaseServer.storage
-    .from(BUCKET)
+    .from(bucket)
     .upload(path, buf, {
       upsert: true,
       contentType: file.type || undefined,
@@ -57,6 +56,6 @@ export async function uploadMediaFileAction(
 
   if (error) return { ok: false, error: error.message };
 
-  const { data } = supabaseServer.storage.from(BUCKET).getPublicUrl(path);
+  const { data } = supabaseServer.storage.from(bucket).getPublicUrl(path);
   return { ok: true, publicUrl: data.publicUrl };
 }

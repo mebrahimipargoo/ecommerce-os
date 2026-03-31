@@ -13,12 +13,38 @@ import {
   shouldAutoEnqueueAmazonClaimSubmission,
   storePlatformFromEmbed,
 } from "./claim-queue-helpers";
-import { RETURN_SELECT } from "./returns-constants";
+import {
+  PACKAGE_LIST_SELECT,
+  PALLET_LIST_SELECT,
+  RETURN_SELECT,
+} from "./returns-constants";
 import {
   hasReturnPhotoEvidenceCounts,
   hasReturnPhotoEvidenceUrlSlots,
   type ReturnPhotoEvidenceRow,
 } from "../../lib/return-photo-evidence";
+import {
+  normalizeEntityPhotoEvidenceUrls,
+  resolvePackageClaimPhotoUrls,
+} from "../../lib/entity-photo-evidence";
+import type {
+  AuditLogRecord,
+  DashboardSnapshot,
+  ExpectedItem,
+  OrgSettings,
+  PackageInsertPayload,
+  PackageRecord,
+  PackageStatus,
+  PackageUpdatePayload,
+  PalletInsertPayload,
+  PalletRecord,
+  PalletStatus,
+  PalletUpdatePayload,
+  ReturnInsertPayload,
+  ReturnRecord,
+  ReturnsAnalyticsPayload,
+  ReturnUpdatePayload,
+} from "./returns-action-types";
 
 const DEFAULT_ORG = resolveOrganizationId();
 
@@ -75,11 +101,6 @@ function resolveActorUserId(actor?: string | null): string {
 
 // ─── Organisation Settings ────────────────────────────────────────────────────
 
-export interface OrgSettings {
-  is_ai_label_ocr_enabled: boolean;
-  is_ai_packing_slip_ocr_enabled: boolean;
-}
-
 const FALLBACK_ORG_SETTINGS: OrgSettings = {
   is_ai_label_ocr_enabled: false,
   is_ai_packing_slip_ocr_enabled: false,
@@ -124,13 +145,13 @@ async function fetchPackageInheritedClaimPhotosReady(packageId: string | null | 
   if (!id) return false;
   const { data } = await supabaseServer
     .from("packages")
-    .select("photo_opened_url, photo_closed_url, photo_return_label_url, photo_url")
+    .select("photo_evidence")
     .eq("id", id)
     .maybeSingle();
   if (!data) return false;
-  /** Opened-box evidence must be on `photo_opened_url` — `photo_url` is optional outer-only. */
-  const opened = !!String(data.photo_opened_url ?? "").trim();
-  const label = !!String(data.photo_return_label_url ?? "").trim();
+  const resolved = resolvePackageClaimPhotoUrls(data as { photo_evidence?: unknown });
+  const opened = !!String(resolved.opened ?? "").trim();
+  const label = !!String(resolved.label ?? "").trim();
   return opened && label;
 }
 
@@ -209,14 +230,15 @@ async function mergePackageBoxEvidenceIntoPayload(
   if (!id) return payload;
   const { data } = await supabaseServer
     .from("packages")
-    .select("photo_opened_url, photo_closed_url, photo_return_label_url, photo_url")
+    .select("photo_evidence")
     .eq("id", id)
     .maybeSingle();
   if (!data) return payload;
-  const closed = data.photo_closed_url ?? null;
-  const opened = data.photo_opened_url ?? null;
-  const label = data.photo_return_label_url ?? null;
-  const outer = opened || closed || data.photo_url || null;
+  const urls = normalizeEntityPhotoEvidenceUrls((data as { photo_evidence?: unknown }).photo_evidence);
+  const opened = urls[0] ?? null;
+  const label = urls[1] ?? null;
+  const closed = urls[2] ?? null;
+  const outer = opened || closed || urls[0] || null;
   return {
     ...payload,
     package_box_evidence: {
@@ -245,16 +267,18 @@ async function mergePalletEvidenceIntoPayload(
   if (!palletId || !isUuidString(palletId)) return payload;
   const { data: plt } = await supabaseServer
     .from("pallets")
-    .select("manifest_photo_url, bol_photo_url, photo_url")
+    .select("photo_evidence")
     .eq("id", palletId)
     .maybeSingle();
   if (!plt) return payload;
+  const urls = normalizeEntityPhotoEvidenceUrls((plt as { photo_evidence?: unknown }).photo_evidence);
   return {
     ...payload,
     pallet_evidence: {
-      manifest_photo_url: (plt as { manifest_photo_url?: string | null }).manifest_photo_url ?? null,
-      bol_photo_url: (plt as { bol_photo_url?: string | null }).bol_photo_url ?? null,
-      photo_url: (plt as { photo_url?: string | null }).photo_url ?? null,
+      incident_photo_urls: urls,
+      manifest_photo_url: urls[0] ?? null,
+      bol_photo_url: urls[1] ?? null,
+      photo_url: urls[2] ?? null,
     },
   };
 }
@@ -394,218 +418,12 @@ async function logPackageAudit(opts: {
   }).then(() => null);
 }
 
-// ─── Pallet Types ─────────────────────────────────────────────────────────────
-
-export type PalletStatus = "open" | "closed" | "submitted";
-
-export type PalletRecord = {
-  id: string; organization_id: string;
-  pallet_number: string;
-  /** Inbound shipment / pro tracking — optional text (not a UUID). */
-  tracking_number?: string | null;
-  manifest_photo_url: string | null;
-  bol_photo_url?: string | null; // post-migration field
-  photo_url?: string | null; // box/pallet general photo — added in 20260324_media_photo_urls.sql
-  status: PalletStatus; notes: string | null; item_count: number;
-  /** Actor user id (UUID). */
-  created_by?: string | null;
-  /** Last actor who updated this row */
-  updated_by?: string | null;
-  created_at: string; updated_at: string;
-  /** UUID of the connected store — added in 20260325_pallets_store_id.sql */
-  store_id?: string | null;
-  /** Joined store row — present when fetched with stores(name,platform) select */
-  stores?: { name: string; platform: string } | null;
-  /** Live counts from `listPallets` relation embeds (optional). */
-  child_packages_count?: number;
-  child_returns_count?: number;
-};
-
-export type PalletInsertPayload = {
-  pallet_number: string; manifest_photo_url?: string;
-  bol_photo_url?: string;
-  photo_url?: string;
-  store_id?: string;
-  notes?: string; organization_id?: string; created_by?: string;
-};
-
-// ─── Package Types ────────────────────────────────────────────────────────────
-
-export type PackageStatus = "open" | "closed" | "suspicious" | "submitted";
-
-/** A single line-item extracted from a packing slip by AI OCR. */
-export type ExpectedItem = { sku: string; expected_qty: number; description?: string };
-
-export type PackageRecord = {
-  id: string; organization_id: string;
-  package_number: string; tracking_number: string | null;
-  carrier_name: string | null;
-  /** RMA number at the package level — added in 20260325_packages_rma_number.sql */
-  rma_number?: string | null;
-  expected_item_count: number; actual_item_count: number;
-  pallet_id: string | null; status: PackageStatus;
-  discrepancy_note: string | null;
-  // Post-migration field — only present after 20250325_packages_expected_items.sql is applied
-  expected_items?: ExpectedItem[] | null;
-  /** URL of the uploaded packing-slip photo in the manifests storage bucket */
-  manifest_url?: string | null;
-  /** Packing slip / manifest image in the media bucket — migration 20260327_packages_manifest_photo_url.sql */
-  manifest_photo_url?: string | null;
-  /** Parsed manifest lines (JSONB) — migration 20260337_packages_manifest_data.sql */
-  manifest_data?: ExpectedItem[] | null;
-  /** General box/package photo — added in 20260324_media_photo_urls.sql */
-  photo_url?: string | null;
-  /** Claim evidence: closed-box photo — added in 20260325_claims_evidence_expiry.sql */
-  photo_closed_url?: string | null;
-  /** Claim evidence: opened-box photo — added in 20260325_claims_evidence_expiry.sql */
-  photo_opened_url?: string | null;
-  /** Claim evidence: return-label photo — added in 20260325_packages_return_label_photo.sql */
-  photo_return_label_url?: string | null;
-  /** UUID of the connected store — added in 20260325_saas_stores_usage.sql */
-  store_id?: string | null;
-  /** Joined store row — present when fetched with stores(name,platform) select */
-  stores?: { name: string; platform: string } | null;
-  created_by?: string | null;
-  updated_by?: string | null;
-  created_at: string; updated_at: string;
-  /** External order id — migration 20260327_packages_amazon_order_id.sql */
-  order_id?: string | null;
-};
-
 function sumManifestLineQty(lines: ExpectedItem[] | null | undefined): number {
   if (!lines?.length) return 0;
   return lines.reduce((a, it) => a + (Number(it.expected_qty) > 0 ? Number(it.expected_qty) : 1), 0);
 }
 
-export type PackageInsertPayload = {
-  package_number: string; tracking_number?: string;
-  carrier_name?: string; rma_number?: string; expected_item_count?: number;
-  pallet_id?: string; store_id?: string; organization_id?: string; created_by?: string;
-  manifest_url?: string;
-  manifest_photo_url?: string;
-  /** JSONB manifest lines — do not send arrays to `expected_item_count` (integer). */
-  manifest_data?: ExpectedItem[] | null;
-  photo_url?: string;
-  photo_closed_url?: string;
-  photo_opened_url?: string;
-  photo_return_label_url?: string;
-  order_id?: string | null;
-};
-
-export type PackageUpdatePayload = Partial<Pick<
-  PackageRecord,
-  | "carrier_name" | "tracking_number" | "rma_number" | "expected_item_count" | "status" | "discrepancy_note" | "pallet_id" | "manifest_url" | "manifest_photo_url" | "manifest_data" | "photo_url" | "photo_closed_url" | "photo_opened_url" | "photo_return_label_url"
-  | "order_id"
-  | "expected_items"
->>;
-
-// ─── Return Types ─────────────────────────────────────────────────────────────
-
-export type ReturnInsertPayload = {
-  /** Optional orphan label / LPN when item is not tied to a package (tracking lives on package). */
-  lpn?: string;
-  marketplace: string; item_name: string;
-  /** Amazon Standard Identification Number */
-  asin?: string;
-  /** Fulfillment Network SKU (FBA label / network ID) */
-  fnsku?: string;
-  /** Stock Keeping Unit (Seller / warehouse MSKU) — column `sku` in DB V16.4+ */
-  sku?: string;
-  conditions: string[];
-  notes?: string;
-  /** Category counts + optional `item_url` / `expiry_url` / `return_label_url` in the same JSONB object. */
-  photo_evidence?: Record<string, string | number> | null;
-  expiration_date?: string; batch_number?: string;
-  pallet_id?: string; package_id?: string;
-  /** UUID of the connected store — added in 20260325_saas_stores_usage.sql */
-  store_id?: string;
-  /**
-   * Amazon / marketplace order id — stored ONLY in `returns.order_id` (TEXT) and in
-   * `claim_submissions.source_payload.amazon_order_id` (JSONB). Never use for UUID FK columns.
-   */
-  amazon_order_id?: string | null;
-  /** @deprecated Prefer `amazon_order_id` — same TEXT column `returns.order_id`. */
-  order_id?: string | null;
-  customer_id?: string | null;
-  /**
-   * Condition-category evidence URLs uploaded during receiving (local files → storage).
-   * Not used for operator-side claim filtering; `buildClaimSubmissionSourcePayloadForReturn` still merges
-   * package/pallet evidence from the DB. Claims Management may refine attachments later.
-   */
-  claim_evidence_selected_urls?: string[] | null;
-  organization_id?: string; created_by?: string;
-};
-
-export type ReturnRecord = {
-  id: string; organization_id: string;
-  lpn: string | null;
-  inherited_tracking_number?: string | null;
-  inherited_carrier?: string | null;
-  marketplace: string; item_name: string;
-  /** Amazon Standard Identification Number — added in 20260326_returns_asin_fnsku_name.sql */
-  asin?: string | null;
-  /** Fulfillment Network SKU — added in 20260326_returns_asin_fnsku_name.sql */
-  fnsku?: string | null;
-  /** Stock Keeping Unit — unified with DB column `sku` (replaces legacy seller_sku). */
-  sku?: string | null;
-  /** Raw scanned product / barcode from intake — migration 20250325_returns_product_inherited_tracking.sql `product_identifier`. */
-  product_identifier?: string | null;
-  conditions: string[]; status: string;
-  notes: string | null;
-  photo_evidence: ReturnPhotoEvidenceRow;
-  expiration_date: string | null; batch_number: string | null;
-  /** UUID of the connected store — added in 20260325_saas_stores_usage.sql */
-  store_id?: string | null;
-  /** Joined store row — present when fetched with stores(name,platform) select */
-  stores?: { name: string; platform: string } | null;
-  pallet_id: string | null; package_id: string | null;
-  // Post-migration fields — null/undefined until 20250324_returns_order_customer_ids.sql is applied
-  order_id?: string | null;
-  customer_id?: string | null;
-  created_by?: string | null;
-  updated_by?: string | null;
-  created_at: string; updated_at: string;
-  /** Expected item value for claims — migration 20260331_returns_estimated_value_reimbursement.sql */
-  estimated_value?: number | null;
-};
-
-export type ReturnUpdatePayload = Partial<Pick<
-  ReturnRecord,
-  | "lpn" | "item_name" | "notes" | "status"
-  | "conditions" | "expiration_date" | "batch_number"
-  | "package_id" | "pallet_id"
-  | "photo_evidence"
-  | "asin" | "fnsku" | "sku" | "product_identifier" | "store_id" | "marketplace"
-  | "order_id"
->>;
-
-// ─── Audit Log Types ──────────────────────────────────────────────────────────
-
-export type AuditLogRecord = {
-  id: string; organization_id: string;
-  return_id: string | null; pallet_id: string | null;
-  action: string; field: string | null;
-  old_value: string | null; new_value: string | null;
-  actor: string; created_at: string;
-};
-
 // ─── SELECT strings ───────────────────────────────────────────────────────────
-
-// NOTE: The following columns are only available AFTER their respective migrations are applied.
-// They are omitted from SELECT to prevent PostgREST 400 errors that silently blank all data.
-//   • inherited_tracking_number / inherited_carrier / bol_photo_url
-//       → migration: 20250325_returns_product_inherited_tracking.sql
-//   • order_id / customer_id
-//       → migration: 20250324_returns_order_customer_ids.sql
-//   • asin / fnsku (included in RETURN_SELECT in returns-constants.ts)
-//       → migration: 20260326_returns_asin_fnsku_name.sql  (run this before deploying)
-// NOTE: store_id in PALLET_SELECT requires migration 20260325_pallets_store_id.sql to be applied first.
-const PALLET_SELECT = "id,organization_id,pallet_number,tracking_number,manifest_photo_url,bol_photo_url,photo_url,store_id,status,notes,item_count,created_by,updated_by,created_at,updated_at";
-const PKG_SELECT    = "id,organization_id,package_number,tracking_number,carrier_name,rma_number,expected_item_count,actual_item_count,pallet_id,store_id,status,discrepancy_note,manifest_url,manifest_photo_url,manifest_data,photo_url,photo_closed_url,photo_opened_url,photo_return_label_url,order_id,expected_items,created_by,updated_by,created_at,updated_at";
-
-/** Supabase relation embeds: live child counts + joined store name/platform. */
-const PKG_LIST_SELECT = `${PKG_SELECT},stores(name,platform),returns(count)`;
-const PALLET_LIST_SELECT = `${PALLET_SELECT},stores(name,platform),packages(count),returns(count)`;
 
 function parseManifestData(raw: unknown): ExpectedItem[] | null | undefined {
   if (raw == null) return raw as null | undefined;
@@ -659,14 +477,11 @@ export async function createPallet(
     const insertRow: Record<string, unknown> = {
       organization_id: orgId,
       pallet_number: payload.pallet_number.trim(),
-      manifest_photo_url: payload.manifest_photo_url ?? null,
       notes: payload.notes?.trim() || null,
       status: "open",
       created_by: resolveActorUserId(payload.created_by),
     };
-    // bol_photo_url / photo_url / store_id only inserted if migration has been applied
-    if (payload.bol_photo_url) insertRow.bol_photo_url = payload.bol_photo_url;
-    if (payload.photo_url)     insertRow.photo_url     = payload.photo_url;
+    if (payload.photo_evidence != null) insertRow.photo_evidence = payload.photo_evidence;
     const sid = uuidFkOrNull(payload.store_id ?? null, "store_id");
     if (sid) insertRow.store_id = sid;
     const { data, error } = await supabaseServer.from("pallets")
@@ -729,11 +544,6 @@ export async function updatePalletStatus(
     return { ok: false, error: err instanceof Error ? err.message : "Failed to update pallet." };
   }
 }
-
-export type PalletUpdatePayload = Partial<Pick<
-  PalletRecord,
-  | "status" | "notes" | "tracking_number" | "bol_photo_url" | "manifest_photo_url" | "photo_url"
->>;
 
 export async function updatePallet(
   palletId: string,
@@ -817,20 +627,16 @@ export async function createPackage(
       created_by:       resolveActorUserId(payload.created_by),
     };
     if (storeIdFk) insertRow.store_id = storeIdFk;
-    if (payload.manifest_photo_url) insertRow.manifest_photo_url = payload.manifest_photo_url;
     if (lines) {
       insertRow.manifest_data = lines;
       insertRow.expected_items = lines;
     }
-    if (payload.photo_url) insertRow.photo_url = payload.photo_url;
-    if (payload.photo_closed_url) insertRow.photo_closed_url = payload.photo_closed_url;
-    if (payload.photo_opened_url) insertRow.photo_opened_url = payload.photo_opened_url;
-    if (payload.photo_return_label_url) insertRow.photo_return_label_url = payload.photo_return_label_url;
+    if (payload.photo_evidence != null) insertRow.photo_evidence = payload.photo_evidence;
     if (payload.order_id?.trim()) insertRow.order_id = payload.order_id.trim();
 
     const { data, error } = await supabaseServer.from("packages")
       .insert(insertRow)
-      .select(PKG_LIST_SELECT).single();
+      .select(PACKAGE_LIST_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
     void logPackageAudit({ organizationId: orgId, packageId: (data as { id: string }).id, action: "created", actor });
     return { ok: true, data: normalizePackageRow(data as Record<string, unknown>) };
@@ -869,7 +675,7 @@ export async function updatePackage(
     }
     const { data, error } = await supabaseServer.from("packages")
       .update(payload)
-      .eq("id", pkgId).select(PKG_LIST_SELECT).single();
+      .eq("id", pkgId).select(PACKAGE_LIST_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
     const row = normalizePackageRow(data as Record<string, unknown>);
     // Keep denormalized returns.pallet_id in sync when package moves between pallets
@@ -893,7 +699,7 @@ export async function updatePackage(
 
 export async function listPackages(organizationId?: string): Promise<{ ok: boolean; data: PackageRecord[]; error?: string }> {
   try {
-    const { data, error } = await supabaseServer.from("packages").select(PKG_LIST_SELECT)
+    const { data, error } = await supabaseServer.from("packages").select(PACKAGE_LIST_SELECT)
       .eq("organization_id", organizationId ?? DEFAULT_ORG)
       .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(200);
@@ -912,7 +718,7 @@ export async function listPackages(organizationId?: string): Promise<{ ok: boole
 
 export async function listOpenPackages(organizationId?: string): Promise<{ ok: boolean; data: PackageRecord[]; error?: string }> {
   try {
-    const { data, error } = await supabaseServer.from("packages").select(PKG_LIST_SELECT)
+    const { data, error } = await supabaseServer.from("packages").select(PACKAGE_LIST_SELECT)
       .eq("organization_id", organizationId ?? DEFAULT_ORG).eq("status", "open")
       .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(50);
@@ -1299,16 +1105,6 @@ export async function listAuditLog(organizationId?: string, limit = 50): Promise
 
 // ─── Dashboard high-level snapshot (UTC “today”) ───────────────────────────────
 
-export type DashboardSnapshot = {
-  returnsToday: number;
-  palletCount: number;
-  packageCount: number;
-  /** `claim_submissions` rows awaiting marketplace filing (Agent / ops). */
-  claimsReadyToSend: number;
-  /** Sum of `returns.estimated_value` (null treated as 0) for ROI-style dashboard. */
-  returnsEstimatedValueUsd: number;
-};
-
 export async function getDashboardSnapshot(
   organizationId?: string,
 ): Promise<{ ok: boolean; data?: DashboardSnapshot; error?: string }> {
@@ -1366,16 +1162,6 @@ export async function getDashboardSnapshot(
 }
 
 // ─── Dashboard analytics (serialized for recharts) ─────────────────────────────
-
-export type ReturnsAnalyticsPayload = {
-  totalReturns: number;
-  totalPallets: number;
-  avgProcessingHours: number;
-  conditionSlices: { name: string; value: number }[];
-  carrierBars: { name: string; count: number }[];
-  /** Items processed grouped by operator (created_by). */
-  operatorStats: { operator: string; count: number }[];
-};
 
 export async function getReturnsAnalyticsData(
   organizationId?: string,

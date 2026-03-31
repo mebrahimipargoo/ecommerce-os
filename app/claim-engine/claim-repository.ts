@@ -3,7 +3,7 @@
  * Joins `returns` for ASIN/FNSKU/SKU whenever `return_id` is set.
  */
 import { supabaseServer } from "../../lib/supabase-server";
-import type { ReturnRecord } from "../returns/actions";
+import type { ReturnRecord } from "../returns/returns-action-types";
 import {
   CLAIM_SUBMISSION_RETURN_ID_COLUMN,
   CLAIM_SUBMISSIONS_TABLE,

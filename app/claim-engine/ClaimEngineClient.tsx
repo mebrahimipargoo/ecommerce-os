@@ -41,7 +41,7 @@ import {
 import { useTableSortFilter, useSortFilterState, type SortDir } from "../../hooks/use-table-sort-filter";
 import type { CoreSettings } from "../settings/workspace-settings-types";
 import type { ClaimEvidenceKey } from "./claim-evidence-settings";
-import type { PalletRecord, PackageRecord } from "../returns/actions";
+import type { PalletRecord, PackageRecord } from "../returns/returns-action-types";
 import { DatabaseTag } from "../../components/DatabaseTag";
 import { ReturnIdentifiersColumn } from "../../components/ReturnIdentifiersColumn";
 import { InlineCopy, StatusBadge } from "../returns/_components";
