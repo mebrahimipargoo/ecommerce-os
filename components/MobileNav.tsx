@@ -4,6 +4,7 @@ import React, { useState, useEffect } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
 import {
+  FileText,
   LayoutDashboard,
   RotateCcw,
   ShieldAlert,
@@ -21,6 +22,7 @@ const navLinks = [
       { label: "Dashboard", icon: LayoutDashboard, href: "/" },
       { label: "Returns Processing", icon: RotateCcw, href: "/returns" },
       { label: "Claim Engine", icon: ShieldAlert, href: "/claim-engine" },
+      { label: "Report history", icon: FileText, href: "/claim-engine/report-history" },
     ],
   },
   {

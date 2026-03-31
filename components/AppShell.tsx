@@ -18,6 +18,7 @@ import { usePathname } from "next/navigation";
 import {
   ChevronDown, ChevronRight,
   Database,
+  FileText,
   LayoutDashboard, Menu,
   PanelLeftClose, PanelLeftOpen,
   RotateCcw, Settings, ShieldAlert, Users, X,
@@ -47,6 +48,7 @@ const NAV: NavSection[] = [
       { label: "Dashboard",          icon: LayoutDashboard, href: "/" },
       { label: "Returns Processing", icon: RotateCcw,       href: "/returns" },
       { label: "Claim Engine",       icon: ShieldAlert,     href: "/claim-engine" },
+      { label: "Report history",     icon: FileText,        href: "/claim-engine/report-history" },
     ],
   },
   {
@@ -104,12 +106,20 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
 
   function isActive(href?: string) {
     if (!href || href === "#") return false;
-    if (href === "/") return pathname === "/";
+    const path = pathname.endsWith("/") && pathname.length > 1 ? pathname.slice(0, -1) : pathname;
+    if (href === "/") return path === "/";
     // Settings hub is only active on the exact /settings page, not deeper routes like /settings/imports
     if (href === "/settings") {
-      return pathname === "/settings" || pathname === "/settings/";
+      return path === "/settings";
     }
-    return pathname.startsWith(href);
+    // Claim Engine vs Report history share a prefix — use exact match for the parent, not startsWith("/claim-engine").
+    if (href === "/claim-engine") {
+      return path === "/claim-engine" || path.startsWith("/claim-engine/investigation");
+    }
+    if (href === "/claim-engine/report-history") {
+      return path === "/claim-engine/report-history" || path.startsWith("/claim-engine/report-history/");
+    }
+    return path === href || path.startsWith(`${href}/`);
   }
 
   useEffect(() => {

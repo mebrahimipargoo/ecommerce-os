@@ -33,6 +33,12 @@ import { supabase as supabaseBrowser } from "../../src/lib/supabase";
 import { uploadToStorage } from "../../lib/supabase/storage";
 import { fetchProductFromAmazon } from "../../lib/api/amazon-mock";
 import { operatorDisplayLabel } from "../../lib/operator-display";
+import {
+  getReturnPhotoEvidenceUrls,
+  mergeReturnPhotoEvidence,
+  photoEvidenceCategoryCounts,
+  photoEvidenceNumericTotal,
+} from "../../lib/return-photo-evidence";
 import { listStores } from "../settings/adapters/actions";
 import { isUuidString, uuidFkInvalidMessage } from "../../lib/uuid";
 import { isAdminRole, type UserRole } from "../../components/UserRoleContext";
@@ -366,7 +372,7 @@ export function getCategoriesForConditions(
     if (c === "empty_box" || c === "missing_item") ids.add("empty_interior");
     if (c === "damaged_box" || c.startsWith("damaged_") || c === "scratched") ids.add("damage_closeup");
     if (c.startsWith("wrong_item_")) ids.add("incorrect_item");
-    // Expired: dedicated `photo_expiry_url` slot in consolidated Evidence UI — avoid duplicate SmartCamera category.
+    // Expired: dedicated expiry URL slot in `photo_evidence.expiry_url` — avoid duplicate SmartCamera category.
   }
   if (ctx?.orphanLpn && !ctx?.hasPackageLink) ids.add("orphan_label");
   return [...ids].map((id) => ALL_PHOTO_CATEGORIES[id]).filter(Boolean);
@@ -830,7 +836,7 @@ function sortKeyItem(
       return `${linkedPkg.package_number}\0${pltPart}`.toLowerCase();
     }
     case "expiration_date": return r.expiration_date ? r.expiration_date : "\uffff";
-    case "created_by": return (r.created_by ?? r.created_by_id ?? "").toLowerCase();
+    case "created_by": return operatorDisplayLabel(r).toLowerCase();
     case "created_at": return new Date(r.created_at).getTime();
     default:
       return String((r as unknown as Record<string, unknown>)[field] ?? "").toLowerCase();
@@ -848,7 +854,7 @@ function sortKeyPackage(p: PackageRecord, field: string): string | number {
     case "pkg_items_sort": return p.actual_item_count * 1_000_000 + p.expected_item_count;
     case "status": return p.status.toLowerCase();
     case "store_name": return (p.stores?.name ?? "").toLowerCase();
-    case "created_by": return (p.created_by ?? p.created_by_id ?? "").toLowerCase();
+    case "created_by": return operatorDisplayLabel(p).toLowerCase();
     case "created_at": return new Date(p.created_at).getTime();
     default: return String((p as unknown as Record<string, unknown>)[field] ?? "").toLowerCase();
   }
@@ -863,7 +869,7 @@ function sortKeyPallet(p: PalletSortRow, field: string): string | number {
     case "rollup_items": return p._rollupItems;
     case "status": return p.status.toLowerCase();
     case "store_name": return (p.stores?.name ?? "").toLowerCase();
-    case "created_by": return (p.created_by ?? p.created_by_id ?? "").toLowerCase();
+    case "created_by": return operatorDisplayLabel(p).toLowerCase();
     case "created_at": return new Date(p.created_at).getTime();
     default: return String((p as unknown as Record<string, unknown>)[field] ?? "").toLowerCase();
   }
@@ -1560,14 +1566,18 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
    * New photos captured in edit mode are appended to `editNewPhotos`.
    */
   const [editPhotoEvidence, setEditPhotoEvidence] = useState<Record<string, number>>(
-    record.photo_evidence ?? {},
+    () => photoEvidenceCategoryCounts(record.photo_evidence),
   );
   const [editNewPhotos, setEditNewPhotos] = useState<Record<string, File[]>>({});
   const [editCatalogStatus, setEditCatalogStatus] = useState<"idle" | "loading" | "local" | "amazon" | "unknown">("idle");
   const [editCatalogPreview, setEditCatalogPreview] = useState<{ name: string; price?: number; image_url?: string } | null>(null);
   const [editExpiryDate,     setEditExpiryDate]     = useState(record.expiration_date ?? "");
-  const [editPhotoItemUrl,   setEditPhotoItemUrl]   = useState(record.photo_item_url ?? "");
-  const [editPhotoExpiryUrl, setEditPhotoExpiryUrl] = useState(record.photo_expiry_url ?? "");
+  const [editPhotoItemUrl,   setEditPhotoItemUrl]   = useState(
+    () => getReturnPhotoEvidenceUrls(record.photo_evidence).item_url,
+  );
+  const [editPhotoExpiryUrl, setEditPhotoExpiryUrl] = useState(
+    () => getReturnPhotoEvidenceUrls(record.photo_evidence).expiry_url,
+  );
   const [expiryEditFiles, setExpiryEditFiles] = useState<File[]>([]);
   const [itemEditFiles, setItemEditFiles] = useState<File[]>([]);
   const [itemPhotoUploading,   setItemPhotoUploading]   = useState(false);
@@ -1597,15 +1607,15 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     setEditItem(record.item_name);
     setEditNotes(record.notes ?? "");
     setEditOrderId(record.order_id ?? "");
-    setEditPhotoEvidence(record.photo_evidence ?? {});
+    setEditPhotoEvidence(photoEvidenceCategoryCounts(record.photo_evidence));
     setEditExpiryDate(record.expiration_date ?? "");
-    setEditPhotoItemUrl(record.photo_item_url ?? "");
-    setEditPhotoExpiryUrl(record.photo_expiry_url ?? "");
+    setEditPhotoItemUrl(getReturnPhotoEvidenceUrls(record.photo_evidence).item_url);
+    setEditPhotoExpiryUrl(getReturnPhotoEvidenceUrls(record.photo_evidence).expiry_url);
     setExpiryEditFiles([]);
     setItemEditFiles([]);
     setEditCatalogStatus("idle");
     setEditCatalogPreview(null);
-  }, [record.id, record.lpn, record.asin, record.fnsku, record.sku, record.store_id, record.item_name, record.notes, record.order_id, record.photo_evidence, record.expiration_date, record.photo_item_url, record.photo_expiry_url]);
+  }, [record.id, record.lpn, record.asin, record.fnsku, record.sku, record.store_id, record.item_name, record.notes, record.order_id, record.photo_evidence, record.expiration_date]);
 
   async function handleEditBarcodeLookup(barcode: string) {
     if (!barcode.trim()) { setEditCatalogStatus("idle"); return; }
@@ -1675,7 +1685,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     record.status === "ready_for_claim" || record.status === "pending_evidence";
   const editStorePlatform =
     itemStoresList.find((s) => s.id === editStoreId)?.platform ?? record.stores?.platform ?? null;
-  const photoTotal   = record.photo_evidence ? Object.values(record.photo_evidence).reduce((a, b) => a + b, 0) : 0;
+  const photoTotal   = photoEvidenceNumericTotal(record.photo_evidence);
   const drawerEditIdBtn =
     "inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-500 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800";
   const expiryLabelCtxForEdit = useMemo(
@@ -1713,9 +1723,13 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     Object.entries(editNewPhotos).forEach(([cat, files]) => {
       if (files.length) newPhotoCount[cat] = (newPhotoCount[cat] ?? 0) + files.length;
     });
-    const mergedPhotoEvidence: Record<string, number> = { ...editPhotoEvidence };
+    const mergedCounts: Record<string, number> = { ...editPhotoEvidence };
     Object.entries(newPhotoCount).forEach(([cat, n]) => {
-      mergedPhotoEvidence[cat] = (mergedPhotoEvidence[cat] ?? 0) + n;
+      mergedCounts[cat] = (mergedCounts[cat] ?? 0) + n;
+    });
+    const mergedPhotoEvidence = mergeReturnPhotoEvidence(mergedCounts, {
+      item_url: editPhotoItemUrl,
+      expiry_url: editPhotoExpiryUrl,
     });
     const pickedStore = itemStoresList.find((s) => s.id === editStoreId);
     const res = await updateReturn(record.id, {
@@ -1724,9 +1738,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
       notes: editNotes || undefined,
       order_id: isLooseItem ? (editOrderId.trim() || null) : null,
       expiration_date:  editExpiryDate  || undefined,
-      photo_evidence:   Object.keys(mergedPhotoEvidence).length ? mergedPhotoEvidence : undefined,
-      photo_item_url:   editPhotoItemUrl   || undefined,
-      photo_expiry_url: editPhotoExpiryUrl || undefined,
+      photo_evidence:   mergedPhotoEvidence ?? undefined,
       asin: editAsin.trim() || editProductId.trim() || null,
       fnsku: editFnsku.trim() || null,
       sku: editSku.trim() || null,
@@ -2097,7 +2109,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                 setEditFnsku(record.fnsku ?? "");
                 setEditSku(record.sku ?? "");
                 setEditStoreId(record.store_id ?? "");
-                setEditPhotoEvidence(record.photo_evidence ?? {});
+                setEditPhotoEvidence(photoEvidenceCategoryCounts(record.photo_evidence));
                 setEditNewPhotos({});
               }}
               className={BTN_FOOTER_GHOST}
@@ -2182,17 +2194,20 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                 <p className="font-mono font-bold text-orange-700 dark:text-orange-300">{record.expiration_date}</p>
               </div>
             )}
-            {(record.photo_item_url || record.photo_expiry_url) && (
+            {(() => {
+              const peUrls = getReturnPhotoEvidenceUrls(record.photo_evidence);
+              return (peUrls.item_url || peUrls.expiry_url) ? (
               <div className="col-span-2">
                 <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-1.5">Item Condition Photos</p>
                 <PhotoGallery
                   photos={[
-                    ...(record.photo_item_url?.trim() ? [{ src: record.photo_item_url.trim(), label: "Item photo" }] : []),
-                    ...(record.photo_expiry_url?.trim() ? [{ src: record.photo_expiry_url.trim(), label: "Expiry label" }] : []),
+                    ...(peUrls.item_url ? [{ src: peUrls.item_url, label: "Item photo" }] : []),
+                    ...(peUrls.expiry_url ? [{ src: peUrls.expiry_url, label: "Expiry label" }] : []),
                   ]}
                 />
               </div>
-            )}
+            ) : null;
+            })()}
             {(record.inherited_tracking_number || linkedPkg?.tracking_number) && (
               <div className="col-span-2">
                 <p className="text-xs text-slate-400">Tracking (from package)</p>
@@ -2261,7 +2276,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                 /* After page refresh we only have counts — show category badges + note */
                 <>
                   <div className="flex flex-wrap gap-2 mb-2">
-                    {Object.entries(record.photo_evidence).filter(([, n]) => n > 0).map(([cat, n]) => (
+                    {Object.entries(photoEvidenceCategoryCounts(record.photo_evidence)).filter(([, n]) => n > 0).map(([cat, n]) => (
                       <span key={cat} className="flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
                         <Camera className="h-3 w-3" />{ALL_PHOTO_CATEGORIES[cat]?.label ?? cat} × {n}
                       </span>
@@ -5118,7 +5133,12 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
     if (pkgId && onSoftPackageWarning) {
       if (linkedPkg && !itemMatchesPackageExpectation(state.item_name, linkedPkg)) onSoftPackageWarning();
     }
-    const photoEvidence = Object.fromEntries(Object.entries(state.photos).map(([k, v]) => [k, v.length]));
+    const categoryCounts = Object.fromEntries(Object.entries(state.photos).map(([k, v]) => [k, v.length])) as Record<string, number>;
+    const photoEvidence = mergeReturnPhotoEvidence(categoryCounts, {
+      item_url: state.photo_item_url,
+      expiry_url: state.photo_expiry_url,
+      return_label_url: state.photo_return_label_url,
+    });
     const orderId =
       linkedPkg?.order_id?.trim() ||
       state.amazon_order_id.trim() ||
@@ -5149,12 +5169,9 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
         fnsku: state.fnsku.trim() || undefined,
         sku: state.sku.trim() || undefined,
         amazon_order_id: orderId,
-        notes: state.notes, photo_evidence: photoEvidence,
+        notes: state.notes, photo_evidence: photoEvidence ?? undefined,
         expiration_date: state.expiration_date || undefined,
         batch_number: state.batch_number || undefined,
-        photo_item_url:   state.photo_item_url   || undefined,
-        photo_expiry_url: state.photo_expiry_url || undefined,
-        photo_return_label_url: state.photo_return_label_url || undefined,
         package_id: pkgId,
         store_id:   state.store_id || undefined,
         created_by: actor,
@@ -6130,6 +6147,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                 const linkedPlt = r.pallet_id  ? pltMap.get(r.pallet_id)  : null;
                 const track = r.inherited_tracking_number ?? linkedPkg?.tracking_number ?? "";
                 const expiryStatus = getExpiryStatus(r.expiration_date, fefo_critical, fefo_warning);
+                const peUrls = getReturnPhotoEvidenceUrls(r.photo_evidence);
                 return (
                   <tr key={r.id} onClick={() => onRowClick(r)} className="group cursor-pointer transition hover:bg-sky-50/50 dark:hover:bg-sky-950/20">
                     <td className={TD_CHK} onClick={(e) => e.stopPropagation()}>
@@ -6184,8 +6202,8 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                     </td>
                     {/* ── Evidence Photo cell ── */}
                     <td className="hidden px-4 py-3 md:table-cell" onClick={(e) => e.stopPropagation()}>
-                      {r.photo_item_url ? (
-                        <PhotoThumb url={r.photo_item_url} alt={`Evidence: ${r.item_name}`} />
+                      {peUrls.item_url ? (
+                        <PhotoThumb url={peUrls.item_url} alt={`Evidence: ${r.item_name}`} />
                       ) : (
                         <span className="text-xs text-slate-400">—</span>
                       )}
@@ -6195,7 +6213,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                         ? <span className="inline-flex items-center gap-1 rounded-full bg-sky-100 px-2 py-0.5 font-mono text-[10px] font-bold text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">📦 {linkedPkg.package_number}{linkedPlt ? ` › ${linkedPlt.pallet_number}` : ""}</span>
                         : <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">⚠ Orphaned / Loose</span>}
                     </td>
-                    <td className="hidden px-4 py-3 xl:table-cell text-xs capitalize text-slate-400">{r.created_by ?? "—"}</td>
+                    <td className="hidden px-4 py-3 xl:table-cell text-xs text-slate-400">{operatorDisplayLabel(r)}</td>
                     <td className="hidden px-4 py-3 text-xs text-slate-400 lg:table-cell">{fmt(r.created_at)}</td>
                     <td className="px-3 py-3">
                       <RowActionMenu

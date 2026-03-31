@@ -14,6 +14,11 @@ import {
   storePlatformFromEmbed,
 } from "./claim-queue-helpers";
 import { RETURN_SELECT } from "./returns-constants";
+import {
+  hasReturnPhotoEvidenceCounts,
+  hasReturnPhotoEvidenceUrlSlots,
+  type ReturnPhotoEvidenceRow,
+} from "../../lib/return-photo-evidence";
 
 const DEFAULT_ORG = resolveOrganizationId();
 
@@ -57,11 +62,11 @@ function omitUndefined<T extends Record<string, unknown>>(obj: T): Record<string
 
 /**
  * Seeded MVP operator when the UI passes a display name (e.g. "Maysam") instead of
- * `auth.users.id`. Keeps `created_by_id` / `updated_by_id` valid UUIDs.
+ * `auth.users.id`. Keeps `created_by` / `updated_by` valid UUIDs.
  */
 const MVP_ACTOR_USER_ID = "00000000-0000-0000-0000-0000000000fe";
 
-/** Maps UI `actor` (name or UUID) to a UUID for `created_by_id` / `updated_by_id`. */
+/** Maps UI `actor` (name or UUID) to a UUID for `created_by` / `updated_by`. */
 function resolveActorUserId(actor?: string | null): string {
   const raw = (actor ?? DEFAULT_ACTOR).trim();
   if (isUuidString(raw)) return raw;
@@ -131,20 +136,20 @@ async function fetchPackageInheritedClaimPhotosReady(packageId: string | null | 
 
 function deriveStatus(
   conditions: string[],
-  photoEvidence: Record<string, number> | null | undefined,
+  photoEvidence: ReturnPhotoEvidenceRow | undefined,
   opts?: {
     /** Package has outer/box + return-label photos — counts toward ready_for_claim without per-item box uploads. */
     packageHasInheritedClaimPhotos?: boolean;
-    /** Item-level evidence URLs (item photo / expiry photo). */
-    hasItemEvidenceUrls?: boolean;
   },
 ): string {
   const needsClaim = conditions.some((c) => CLAIM_CONDITIONS.has(c));
   if (!needsClaim) return "received";
-  const hasCategoryPhotos = photoEvidence != null && Object.values(photoEvidence).some((n) => n > 0);
+  const pe = photoEvidence ?? null;
+  const fromItem =
+    hasReturnPhotoEvidenceCounts(pe) ||
+    hasReturnPhotoEvidenceUrlSlots(pe);
   const inherited = !!opts?.packageHasInheritedClaimPhotos;
-  const itemUrls = !!opts?.hasItemEvidenceUrls;
-  if (hasCategoryPhotos || inherited || itemUrls) return "ready_for_claim";
+  if (fromItem || inherited) return "ready_for_claim";
   return "pending_evidence";
 }
 
@@ -402,12 +407,10 @@ export type PalletRecord = {
   bol_photo_url?: string | null; // post-migration field
   photo_url?: string | null; // box/pallet general photo — added in 20260324_media_photo_urls.sql
   status: PalletStatus; notes: string | null; item_count: number;
-  /** Legacy text label (older rows); prefer `created_by_id` for new schema. */
+  /** Actor user id (UUID). */
   created_by?: string | null;
-  created_by_id?: string | null;
-  /** Last actor who updated this row — HR / performance analytics */
+  /** Last actor who updated this row */
   updated_by?: string | null;
-  updated_by_id?: string | null;
   created_at: string; updated_at: string;
   /** UUID of the connected store — added in 20260325_pallets_store_id.sql */
   store_id?: string | null;
@@ -463,10 +466,7 @@ export type PackageRecord = {
   /** Joined store row — present when fetched with stores(name,platform) select */
   stores?: { name: string; platform: string } | null;
   created_by?: string | null;
-  created_by_id?: string | null;
-  /** Last actor who updated this row — HR / performance analytics */
   updated_by?: string | null;
-  updated_by_id?: string | null;
   created_at: string; updated_at: string;
   /** External order id — migration 20260327_packages_amazon_order_id.sql */
   order_id?: string | null;
@@ -512,13 +512,10 @@ export type ReturnInsertPayload = {
   /** Stock Keeping Unit (Seller / warehouse MSKU) — column `sku` in DB V16.4+ */
   sku?: string;
   conditions: string[];
-  notes?: string; photo_evidence?: Record<string, number>;
+  notes?: string;
+  /** Category counts + optional `item_url` / `expiry_url` / `return_label_url` in the same JSONB object. */
+  photo_evidence?: Record<string, string | number> | null;
   expiration_date?: string; batch_number?: string;
-  /** Claim evidence photo URLs — added in 20260325_claims_evidence_expiry.sql */
-  photo_item_url?: string;
-  photo_expiry_url?: string;
-  /** Loose-item return label — migration 20260338_returns_photo_return_label_url.sql */
-  photo_return_label_url?: string;
   pallet_id?: string; package_id?: string;
   /** UUID of the connected store — added in 20260325_saas_stores_usage.sql */
   store_id?: string;
@@ -554,12 +551,9 @@ export type ReturnRecord = {
   /** Raw scanned product / barcode from intake — migration 20250325_returns_product_inherited_tracking.sql `product_identifier`. */
   product_identifier?: string | null;
   conditions: string[]; status: string;
-  notes: string | null; photo_evidence: Record<string, number> | null;
+  notes: string | null;
+  photo_evidence: ReturnPhotoEvidenceRow;
   expiration_date: string | null; batch_number: string | null;
-  /** Claim evidence URLs — added in 20260325_claims_evidence_expiry.sql */
-  photo_item_url?: string | null;
-  photo_expiry_url?: string | null;
-  photo_return_label_url?: string | null;
   /** UUID of the connected store — added in 20260325_saas_stores_usage.sql */
   store_id?: string | null;
   /** Joined store row — present when fetched with stores(name,platform) select */
@@ -569,10 +563,7 @@ export type ReturnRecord = {
   order_id?: string | null;
   customer_id?: string | null;
   created_by?: string | null;
-  created_by_id?: string | null;
-  /** Last actor who touched this row — HR / performance analytics */
   updated_by?: string | null;
-  updated_by_id?: string | null;
   created_at: string; updated_at: string;
   /** Expected item value for claims — migration 20260331_returns_estimated_value_reimbursement.sql */
   estimated_value?: number | null;
@@ -583,7 +574,7 @@ export type ReturnUpdatePayload = Partial<Pick<
   | "lpn" | "item_name" | "notes" | "status"
   | "conditions" | "expiration_date" | "batch_number"
   | "package_id" | "pallet_id"
-  | "photo_evidence" | "photo_item_url" | "photo_expiry_url" | "photo_return_label_url"
+  | "photo_evidence"
   | "asin" | "fnsku" | "sku" | "product_identifier" | "store_id" | "marketplace"
   | "order_id"
 >>;
@@ -609,8 +600,8 @@ export type AuditLogRecord = {
 //   • asin / fnsku (included in RETURN_SELECT in returns-constants.ts)
 //       → migration: 20260326_returns_asin_fnsku_name.sql  (run this before deploying)
 // NOTE: store_id in PALLET_SELECT requires migration 20260325_pallets_store_id.sql to be applied first.
-const PALLET_SELECT = "id,organization_id,pallet_number,tracking_number,manifest_photo_url,bol_photo_url,photo_url,store_id,status,notes,item_count,created_by,created_by_id,updated_by,updated_by_id,created_at,updated_at";
-const PKG_SELECT    = "id,organization_id,package_number,tracking_number,carrier_name,rma_number,expected_item_count,actual_item_count,pallet_id,store_id,status,discrepancy_note,manifest_url,manifest_photo_url,manifest_data,photo_url,photo_closed_url,photo_opened_url,photo_return_label_url,order_id,expected_items,created_by,created_by_id,updated_by,updated_by_id,created_at,updated_at";
+const PALLET_SELECT = "id,organization_id,pallet_number,tracking_number,manifest_photo_url,bol_photo_url,photo_url,store_id,status,notes,item_count,created_by,updated_by,created_at,updated_at";
+const PKG_SELECT    = "id,organization_id,package_number,tracking_number,carrier_name,rma_number,expected_item_count,actual_item_count,pallet_id,store_id,status,discrepancy_note,manifest_url,manifest_photo_url,manifest_data,photo_url,photo_closed_url,photo_opened_url,photo_return_label_url,order_id,expected_items,created_by,updated_by,created_at,updated_at";
 
 /** Supabase relation embeds: live child counts + joined store name/platform. */
 const PKG_LIST_SELECT = `${PKG_SELECT},stores(name,platform),returns(count)`;
@@ -671,7 +662,7 @@ export async function createPallet(
       manifest_photo_url: payload.manifest_photo_url ?? null,
       notes: payload.notes?.trim() || null,
       status: "open",
-      created_by_id: resolveActorUserId(payload.created_by),
+      created_by: resolveActorUserId(payload.created_by),
     };
     // bol_photo_url / photo_url / store_id only inserted if migration has been applied
     if (payload.bol_photo_url) insertRow.bol_photo_url = payload.bol_photo_url;
@@ -730,7 +721,7 @@ export async function updatePalletStatus(
     const id = uuidOrNull(palletId);
     if (!id) throw new Error("Invalid pallet id.");
     const { error } = await supabaseServer.from("pallets")
-      .update({ status, updated_by_id: resolveActorUserId(actor) }).eq("id", id);
+      .update({ status, updated_by: resolveActorUserId(actor) }).eq("id", id);
     if (error) throw new Error(error.message);
     void logPalletAudit({ organizationId: DEFAULT_ORG, palletId: id, action: "status_changed", field: "status", newValue: status, actor: actor ?? DEFAULT_ACTOR });
     return { ok: true };
@@ -756,9 +747,8 @@ export async function updatePallet(
     const org = resolveOrganizationIdForWrite(organizationId);
     const row: Record<string, unknown> = {
       ...omitUndefined(updates as Record<string, unknown>),
-      updated_by_id: resolveActorUserId(actor),
+      updated_by: resolveActorUserId(actor),
     };
-    delete row.updated_by;
     delete row.created_by;
     if ("notes" in row && row.notes !== undefined && row.notes !== null) {
       row.notes = String(row.notes).trim() || null;
@@ -824,7 +814,7 @@ export async function createPackage(
       pallet_id:           palletIdFk,
       manifest_url:        payload.manifest_url ?? null,
       status:              "open",
-      created_by_id:       resolveActorUserId(payload.created_by),
+      created_by:       resolveActorUserId(payload.created_by),
     };
     if (storeIdFk) insertRow.store_id = storeIdFk;
     if (payload.manifest_photo_url) insertRow.manifest_photo_url = payload.manifest_photo_url;
@@ -859,9 +849,8 @@ export async function updatePackage(
     if (!pkgId) throw new Error("Invalid package id.");
     const payload = omitUndefined({
       ...updates,
-      updated_by_id: resolveActorUserId(actor),
+      updated_by: resolveActorUserId(actor),
     } as Record<string, unknown>);
-    delete payload.updated_by;
     delete payload.created_by;
     if ("pallet_id" in payload) payload.pallet_id = uuidOrNull(payload.pallet_id as string);
     if ("store_id" in payload) {
@@ -963,7 +952,7 @@ export async function closePackage(
     const hasDiscrepancy = (pkg.expected_item_count > 0 && pkg.expected_item_count !== pkg.actual_item_count) || !!opts?.discrepancyNote;
     const newStatus: PackageStatus = hasDiscrepancy ? "suspicious" : "closed";
     const { error } = await supabaseServer.from("packages")
-      .update({ status: newStatus, discrepancy_note: opts?.discrepancyNote ?? null, updated_by_id: resolveActorUserId(actor) })
+      .update({ status: newStatus, discrepancy_note: opts?.discrepancyNote ?? null, updated_by: resolveActorUserId(actor) })
       .eq("id", id);
     if (error) throw new Error(error.message);
     void logPackageAudit({ organizationId: pkg.organization_id ?? DEFAULT_ORG, packageId: id, action: "status_changed", field: "status", newValue: newStatus, actor });
@@ -995,14 +984,8 @@ export async function insertReturn(
     const orgId = resolveOrganizationIdForWrite(payload.organization_id);
     const packageIdFk = uuidFkOrNull(payload.package_id ?? null, "package_id");
     const packageInherited = await fetchPackageInheritedClaimPhotosReady(packageIdFk);
-    const hasItemUrls = !!(
-      payload.photo_item_url?.trim() ||
-      payload.photo_expiry_url?.trim() ||
-      payload.photo_return_label_url?.trim()
-    );
     const status = deriveStatus(payload.conditions, payload.photo_evidence ?? null, {
       packageHasInheritedClaimPhotos: packageInherited,
-      hasItemEvidenceUrls: hasItemUrls,
     });
 
     /** Pallet FK only when linked to a real package — inherit from package row (never raw user text). */
@@ -1047,7 +1030,7 @@ export async function insertReturn(
       pallet_id:       effectivePalletId,
       package_id:      packageIdFk,
       status,
-      created_by_id:   resolveActorUserId(payload.created_by),
+      created_by:   resolveActorUserId(payload.created_by),
       store_id:        resolvedStoreId,
     };
     // Post-migration columns — only written once their migrations are applied
@@ -1056,9 +1039,6 @@ export async function insertReturn(
     if (payload.sku)              insertRow.sku              = payload.sku.trim();
     if (effectiveAmazonOrderId) insertRow.order_id = String(effectiveAmazonOrderId);
     if (payload.customer_id)    insertRow.customer_id    = payload.customer_id.trim();
-    if (payload.photo_item_url)   insertRow.photo_item_url   = payload.photo_item_url;
-    if (payload.photo_expiry_url) insertRow.photo_expiry_url = payload.photo_expiry_url;
-    if (payload.photo_return_label_url) insertRow.photo_return_label_url = payload.photo_return_label_url;
 
     const { data, error } = await supabaseServer.from("returns")
       .insert(insertRow).select(RETURN_SELECT).single();
@@ -1139,8 +1119,7 @@ export async function updateReturn(
       .single();
     if (loadErr || !existing) throw new Error(loadErr?.message ?? "Return not found.");
 
-    const patch: Record<string, unknown> = { ...updates, updated_by_id: resolveActorUserId(actor) };
-    delete patch.updated_by;
+    const patch: Record<string, unknown> = { ...updates, updated_by: resolveActorUserId(actor) };
     delete patch.created_by;
     // Remove post-migration columns from patch — they may not be in the DB yet
     delete patch.inherited_tracking_number;
@@ -1178,23 +1157,9 @@ export async function updateReturn(
               : String(updates.package_id),
           )
         : uuidOrNull(ex.package_id);
-    const nextPhotoItem =
-      updates.photo_item_url !== undefined ? updates.photo_item_url : ex.photo_item_url;
-    const nextPhotoExpiry =
-      updates.photo_expiry_url !== undefined ? updates.photo_expiry_url : ex.photo_expiry_url;
-    const nextPhotoReturnLabel =
-      updates.photo_return_label_url !== undefined
-        ? updates.photo_return_label_url
-        : ex.photo_return_label_url;
     const packageInherited = await fetchPackageInheritedClaimPhotosReady(nextPackageId);
-    const hasItemUrls = !!(
-      String(nextPhotoItem ?? "").trim() ||
-      String(nextPhotoExpiry ?? "").trim() ||
-      String(nextPhotoReturnLabel ?? "").trim()
-    );
     patch.status = deriveStatus(nextConditions, nextPhotoEvidence ?? null, {
       packageHasInheritedClaimPhotos: packageInherited,
-      hasItemEvidenceUrls: hasItemUrls,
     });
     if (patch.store_id != null) {
       const sid = String(patch.store_id).trim();

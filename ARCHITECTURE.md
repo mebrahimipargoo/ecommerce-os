@@ -16,10 +16,10 @@
 ## 🤖 Python Agent & Live Data Bridge
 - Python FastAPI handles all SP-API Amazon connections.
 - It polls `claim_submissions` for `ready_to_send` status.
-- It records all actions in `system_audit_logs` and `claim_history_logs`.
+- It records all actions in `audit_logs` and `claim_history_logs`.
 
 ## 📜 Audit & History Policy
-- Every status change, manual edit, or Agent action must be logged in `system_audit_logs`.
+- Every status change, manual edit, or Agent action must be logged in `audit_logs`.
 - We use Event Sourcing logic: Track what happened, when, and by whom.
 
 ## 🛠️ Module Roadmap

@@ -3,6 +3,11 @@
  * and per-slot mapping for the Claim PDF generator.
  */
 
+import {
+  getReturnPhotoEvidenceUrls,
+  type ReturnPhotoEvidenceRow,
+} from "../../lib/return-photo-evidence";
+
 export type ClaimEvidenceKey =
   | "outer_box"
   | "opened_box"
@@ -65,9 +70,7 @@ function isHttpUrl(u: string): boolean {
  */
 export function buildClaimEvidenceSlots(detail: {
   returnRow: {
-    photo_item_url?: string | null;
-    photo_expiry_url?: string | null;
-    photo_return_label_url?: string | null;
+    photo_evidence?: ReturnPhotoEvidenceRow;
   } | null;
   packageRow: {
     photo_url?: string | null;
@@ -139,12 +142,13 @@ export function buildClaimEvidenceSlots(detail: {
   }
 
   if (ret) {
-    add(ret.photo_item_url, "Defective Item Condition", "item", "defective_item", "item");
-    add(ret.photo_expiry_url, "Expiry Label", "item", "expiry", "expiry");
-    const rl = (ret.photo_return_label_url ?? "").trim();
+    const ev = getReturnPhotoEvidenceUrls(ret.photo_evidence);
+    add(ev.item_url, "Defective Item Condition", "item", "defective_item", "item");
+    add(ev.expiry_url, "Expiry Label", "item", "expiry", "expiry");
+    const rl = ev.return_label_url.trim();
     const pkgLabel = (pkg?.photo_return_label_url ?? "").trim();
     if (rl && rl !== pkgLabel) {
-      add(ret.photo_return_label_url, "Return Label (item)", "item", "box_label", "ret-label");
+      add(ev.return_label_url, "Return Label (item)", "item", "box_label", "ret-label");
     }
   }
 

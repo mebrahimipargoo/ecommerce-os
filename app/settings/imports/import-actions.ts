@@ -1,8 +1,9 @@
 "use server";
 
 import { supabaseServer } from "../../../lib/supabase-server";
-import { resolveActorUserProfileId } from "../../../lib/import-actor";
+import { resolveActorProfileId } from "../../../lib/import-actor";
 import { updateUploadAfterChunk as updateUploadProgressAfterChunk } from "../../../lib/import-upload-progress";
+import { mergeUploadMetadata, parseRawReportMetadata } from "../../../lib/raw-report-upload-metadata";
 import { resolveOrganizationId } from "../../../lib/organization";
 import type { RawReportType } from "../../../lib/raw-report-types";
 import { isUuidString } from "../../../lib/uuid";
@@ -23,6 +24,13 @@ function serializeColumnMappingJson(
   return JSON.parse(JSON.stringify(m)) as Record<string, string>;
 }
 
+/**
+ * Strict column list for `raw_report_uploads` (technical tracking only in `metadata` JSONB).
+ * Uploader is `created_by` → `profiles.id` (not `uploaded_by`).
+ */
+const RAW_REPORT_UPLOADS_SELECT =
+  "id, organization_id, file_name, report_type, status, column_mapping, metadata, created_at, updated_at, created_by";
+
 export async function updateUploadAfterChunk(
   input: Parameters<typeof updateUploadProgressAfterChunk>[0],
 ): ReturnType<typeof updateUploadProgressAfterChunk> {
@@ -35,21 +43,29 @@ export type RawReportUploadRow = {
   file_name: string;
   /** Current or legacy slug from `raw_report_uploads.report_type`. */
   report_type: string;
+  /** Parsed from `metadata.storage_prefix`. */
   storage_prefix: string | null;
   status: string;
+  /** Parsed from `metadata.upload_progress`. */
   upload_progress: number;
+  /** Parsed from `metadata.process_progress`. */
   process_progress: number;
-  /** DB column `uploaded_bytes` (cumulative bytes stored). */
+  /** Parsed from `metadata.uploaded_bytes`. */
   uploaded_bytes: number;
+  /** Parsed from `metadata.total_bytes`. */
   total_bytes: number;
   row_count: number | null;
   column_mapping: Record<string, string> | null;
-  /** DB column `error_log` (import failures). */
-  error_log: string | null;
-  uploaded_by: string | null;
+  /** Parsed from `metadata.error_message` only. */
+  errorMessage: string | null;
+  /** Raw JSONB for advanced UI. */
+  metadata: Record<string, unknown> | null;
+  /** FK to `profiles.id` — who created this upload row. */
+  created_by: string | null;
   created_at: string;
   updated_at: string;
-  uploaded_by_name?: string | null;
+  /** Optional client-only label — not resolved from DB joins. */
+  created_by_name?: string | null;
 };
 
 async function audit(
@@ -68,6 +84,32 @@ async function audit(
   });
 }
 
+/** True if any prior upload in this org has the same content fingerprint in `metadata.md5_hash`. */
+export async function rawUploadExistsWithMd5Hash(
+  md5Hash: string,
+): Promise<{ ok: true; exists: boolean } | { ok: false; error: string }> {
+  const orgId = resolveOrganizationId();
+  const normalized = md5Hash.trim().toLowerCase();
+  if (!/^[a-f0-9]{32}$/.test(normalized)) {
+    return { ok: false, error: "Invalid MD5 hash." };
+  }
+
+  try {
+    const { data, error } = await supabaseServer
+      .from("raw_report_uploads")
+      .select("id")
+      .eq("organization_id", orgId)
+      .contains("metadata", { md5_hash: normalized })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) return { ok: false, error: error.message };
+    return { ok: true, exists: !!data };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Lookup failed." };
+  }
+}
+
 export async function listRawReportUploads(): Promise<
   { ok: true; rows: RawReportUploadRow[] } | { ok: false; error: string }
 > {
@@ -75,7 +117,7 @@ export async function listRawReportUploads(): Promise<
   try {
     const { data, error } = await supabaseServer
       .from("raw_report_uploads")
-      .select("*")
+      .select(RAW_REPORT_UPLOADS_SELECT)
       .eq("organization_id", orgId)
       .order("created_at", { ascending: false })
       .limit(100);
@@ -83,45 +125,36 @@ export async function listRawReportUploads(): Promise<
     if (error) return { ok: false, error: error.message };
 
     const base = (data ?? []) as Record<string, unknown>[];
-    const ids = [...new Set(base.map((r) => r.uploaded_by).filter(Boolean))] as string[];
-    let nameById = new Map<string, string>();
-    if (ids.length > 0) {
-      const { data: profs } = await supabaseServer
-        .from("user_profiles")
-        .select("id, full_name")
-        .in("id", ids);
-      nameById = new Map((profs ?? []).map((p) => [p.id as string, p.full_name as string]));
-    }
 
     const rows: RawReportUploadRow[] = base.map((raw) => {
       const r = raw as Record<string, unknown>;
-      const uploadedBytes = Number(r.uploaded_bytes ?? r.bytes_uploaded ?? 0);
+      const meta = parseRawReportMetadata(r.metadata);
+      const metaObj =
+        r.metadata && typeof r.metadata === "object" && !Array.isArray(r.metadata)
+          ? (r.metadata as Record<string, unknown>)
+          : null;
       return {
         id: String(r.id),
         organization_id: String(r.organization_id),
         file_name: String(r.file_name ?? ""),
         report_type: String(r.report_type ?? ""),
-        storage_prefix: (r.storage_prefix as string | null) ?? null,
+        storage_prefix: meta.storagePrefix,
         status: String(r.status ?? ""),
-        upload_progress: Number(r.upload_progress ?? 0),
-        process_progress: Number(r.process_progress ?? 0),
-        uploaded_bytes: uploadedBytes,
-        total_bytes: Number(r.total_bytes ?? 0),
-        row_count: r.row_count != null ? Number(r.row_count) : null,
+        upload_progress: meta.uploadProgress,
+        process_progress: meta.processProgress,
+        uploaded_bytes: meta.uploadedBytes,
+        total_bytes: meta.totalBytes,
+        row_count: meta.rowCount,
         column_mapping:
           r.column_mapping && typeof r.column_mapping === "object"
             ? (r.column_mapping as Record<string, string>)
             : null,
-        error_log:
-          (r.error_log as string | null) ??
-          (r.error_message as string | null) ??
-          null,
-        uploaded_by: (r.uploaded_by as string | null) ?? null,
+        errorMessage: meta.errorMessage,
+        metadata: metaObj,
+        created_by: (r.created_by as string | null) ?? null,
         created_at: String(r.created_at ?? ""),
         updated_at: String(r.updated_at ?? ""),
-        uploaded_by_name: r.uploaded_by
-          ? nameById.get(String(r.uploaded_by)) ?? null
-          : null,
+        created_by_name: null,
       };
     });
 
@@ -135,13 +168,18 @@ export async function createRawReportUploadSession(input: {
   fileName: string;
   totalBytes: number;
   reportType: RawReportType;
+  /** Lowercase hex MD5 of full file content */
+  md5Hash: string;
+  fileExtension: string;
+  fileSizeBytes: number;
+  uploadChunksCount: number;
   /** Saved on the same row as the session — no separate mapping write required. */
   columnMapping?: Record<string, string> | null;
   actorUserId?: string | null;
 }): Promise<
   { ok: true; id: string; storagePrefix: string } | { ok: false; error: string }
 > {
-  const userId = await resolveActorUserProfileId(input.actorUserId);
+  const userId = await resolveActorProfileId(input.actorUserId);
   const orgId = resolveOrganizationId();
   const storagePrefix = `${orgId}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
@@ -151,19 +189,32 @@ export async function createRawReportUploadSession(input: {
       ? (JSON.parse(JSON.stringify(input.columnMapping)) as Record<string, string>)
       : null;
 
-  /**
-   * Strict payload: keys are DB column names (snake_case). JS `totalBytes` → `total_bytes`.
-   * Only columns verified in Supabase + required row identity fields.
-   */
+  const md5 = input.md5Hash.trim().toLowerCase();
+  if (!/^[a-f0-9]{32}$/.test(md5)) {
+    return { ok: false, error: "Invalid MD5 hash." };
+  }
+
+  /** Technical tracking lives only in `metadata` JSONB. */
+  const metadata = mergeUploadMetadata(null, {
+    total_bytes: input.totalBytes,
+    storage_prefix: storagePrefix,
+    upload_progress: 0,
+    uploaded_bytes: 0,
+    process_progress: 0,
+    md5_hash: md5,
+    file_extension: input.fileExtension,
+    file_size_bytes: input.fileSizeBytes,
+    upload_chunks_count: input.uploadChunksCount,
+  });
+
   const insertRow = {
     organization_id: orgId,
     file_name: input.fileName,
     report_type: input.reportType,
-    storage_prefix: storagePrefix,
     status: "pending" as const,
-    total_bytes: input.totalBytes,
-    upload_progress: 0,
     column_mapping,
+    metadata,
+    ...(userId ? { created_by: userId } : {}),
   };
 
   try {
@@ -196,29 +247,37 @@ export async function createRawReportUploadSession(input: {
 
 export async function finalizeRawReportUpload(input: {
   uploadId: string;
-  rowEstimate?: number | null;
+  /** Accurate data row count (excluding header; trailing blanks ignored). */
+  rowCount?: number | null;
   columnMapping?: Record<string, string> | null;
   actorUserId?: string | null;
 }): Promise<{ ok: boolean; error?: string }> {
-  const userId = await resolveActorUserProfileId(input.actorUserId);
+  const userId = await resolveActorProfileId(input.actorUserId);
   if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
 
   const orgId = resolveOrganizationId();
   const { data: row, error: fetchErr } = await supabaseServer
     .from("raw_report_uploads")
-    .select("id")
+    .select("id, metadata")
     .eq("id", input.uploadId)
     .eq("organization_id", orgId)
     .maybeSingle();
 
   if (fetchErr || !row) return { ok: false, error: fetchErr?.message ?? "Upload not found." };
 
+  const metadata = mergeUploadMetadata((row as { metadata?: unknown }).metadata, {
+    upload_progress: 100,
+    process_progress: 0,
+    ...(input.rowCount != null ? { row_count: input.rowCount } : {}),
+  });
+
   const { error } = await supabaseServer
     .from("raw_report_uploads")
     .update({
-      status: "complete",
-      upload_progress: 100,
+      /** Upload finished; Phase 3 processing runs separately via `/api/settings/imports/process`. */
+      status: "pending",
       column_mapping: serializeColumnMappingJson(input.columnMapping ?? null),
+      metadata,
       updated_at: new Date().toISOString(),
     })
     .eq("id", input.uploadId)
@@ -227,7 +286,7 @@ export async function finalizeRawReportUpload(input: {
   if (error) return { ok: false, error: error.message };
 
   await audit(userId, "import.upload_finalized", input.uploadId, {
-    rowEstimate: input.rowEstimate ?? null,
+    rowCount: input.rowCount ?? null,
   });
   return { ok: true };
 }
@@ -237,14 +296,26 @@ export async function failRawReportUpload(input: {
   message: string;
   actorUserId?: string | null;
 }): Promise<void> {
-  const userId = await resolveActorUserProfileId(input.actorUserId);
+  const userId = await resolveActorProfileId(input.actorUserId);
   const orgId = resolveOrganizationId();
   if (!isUuidString(input.uploadId)) return;
+
+  const { data: row } = await supabaseServer
+    .from("raw_report_uploads")
+    .select("metadata")
+    .eq("id", input.uploadId)
+    .eq("organization_id", orgId)
+    .maybeSingle();
+
+  const metadata = mergeUploadMetadata((row as { metadata?: unknown } | null)?.metadata, {
+    error_message: input.message,
+  });
 
   await supabaseServer
     .from("raw_report_uploads")
     .update({
       status: "failed",
+      metadata,
       updated_at: new Date().toISOString(),
     })
     .eq("id", input.uploadId)
@@ -258,7 +329,7 @@ export async function updateRawReportType(input: {
   reportType: RawReportType;
   actorUserId?: string | null;
 }): Promise<{ ok: boolean; error?: string }> {
-  const userId = await resolveActorUserProfileId(input.actorUserId);
+  const userId = await resolveActorProfileId(input.actorUserId);
   if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
 
   const orgId = resolveOrganizationId();
@@ -284,7 +355,7 @@ export async function recordColumnMappingDecision(input: {
   mapping: Record<string, string>;
   actorUserId?: string | null;
 }): Promise<{ ok: boolean; error?: string }> {
-  const userId = await resolveActorUserProfileId(input.actorUserId);
+  const userId = await resolveActorProfileId(input.actorUserId);
   if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
 
   const orgId = resolveOrganizationId();

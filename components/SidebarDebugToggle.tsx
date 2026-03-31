@@ -12,6 +12,7 @@ export function SidebarDebugToggle({ collapsed }: { collapsed: boolean }) {
 
   return (
     <div
+      suppressHydrationWarning
       className={[
         "group mb-1 flex min-h-[40px] items-center gap-2 rounded-xl px-3 py-2",
         collapsed ? "justify-center px-2" : "",

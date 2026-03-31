@@ -13,6 +13,7 @@ import type { ClaimEvidenceKey } from "./claim-evidence-settings";
 import { ClaimGenerationModal } from "./ClaimGenerationModal";
 import { ReturnIdentifiersColumn } from "../../components/ReturnIdentifiersColumn";
 import { InlineCopy } from "../returns/_components";
+import { getReturnPhotoEvidenceUrls } from "../../lib/return-photo-evidence";
 
 type StoreRow = { id: string; name: string; platform: string };
 
@@ -216,31 +217,40 @@ export function ClaimDetailModal({
               <section>
                 <p className="mb-2 text-xs font-bold uppercase tracking-wide text-slate-500">Photo evidence</p>
                 <div className="flex flex-wrap gap-2">
-                  {ret?.photo_item_url ? (
-                    <a
-                      href={ret.photo_item_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="block h-24 w-24 overflow-hidden rounded-lg border"
-                    >
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={ret.photo_item_url} alt="Item" className="h-full w-full object-cover" />
-                    </a>
-                  ) : null}
-                  {ret?.photo_expiry_url ? (
-                    <a
-                      href={ret.photo_expiry_url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="block h-24 w-24 overflow-hidden rounded-lg border"
-                    >
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={ret.photo_expiry_url} alt="Expiry" className="h-full w-full object-cover" />
-                    </a>
-                  ) : null}
-                  {!ret?.photo_item_url && !ret?.photo_expiry_url && (
-                    <p className="text-sm text-muted-foreground">No item/expiry photos on the linked return.</p>
-                  )}
+                  {(() => {
+                    const peUrls = getReturnPhotoEvidenceUrls(ret?.photo_evidence ?? null);
+                    const itemU = peUrls.item_url;
+                    const expU = peUrls.expiry_url;
+                    return (
+                      <>
+                        {itemU ? (
+                          <a
+                            href={itemU}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="block h-24 w-24 overflow-hidden rounded-lg border"
+                          >
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={itemU} alt="Item" className="h-full w-full object-cover" />
+                          </a>
+                        ) : null}
+                        {expU ? (
+                          <a
+                            href={expU}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="block h-24 w-24 overflow-hidden rounded-lg border"
+                          >
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img src={expU} alt="Expiry" className="h-full w-full object-cover" />
+                          </a>
+                        ) : null}
+                        {!itemU && !expU && (
+                          <p className="text-sm text-muted-foreground">No item/expiry photos on the linked return.</p>
+                        )}
+                      </>
+                    );
+                  })()}
                 </div>
               </section>
 

@@ -10,7 +10,7 @@ const BUCKET = "profiles";
 const ALLOWED = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
 
 /**
- * Uploads profile photo to public `profiles` bucket and sets user_profiles.photo_url.
+ * Uploads profile photo to public `profiles` bucket and sets `profiles.photo_url`.
  */
 export async function uploadUserProfilePhotoAction(
   formData: FormData,

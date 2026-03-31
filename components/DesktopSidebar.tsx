@@ -4,6 +4,7 @@ import React from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
+  FileText,
   LayoutDashboard,
   RotateCcw,
   ShieldAlert,
@@ -19,6 +20,7 @@ const NAV_SECTIONS = [
       { label: "Dashboard",           icon: LayoutDashboard, href: "/"                  },
       { label: "Returns Processing",  icon: RotateCcw,       href: "/returns"           },
       { label: "Claim Engine",        icon: ShieldAlert,     href: "/claim-engine"  },
+      { label: "Report history",      icon: FileText,        href: "/claim-engine/report-history" },
     ],
   },
   {

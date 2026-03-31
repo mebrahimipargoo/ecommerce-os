@@ -2,12 +2,34 @@ import { NextResponse } from "next/server";
 
 import { resolveOrganizationId } from "../../../../../lib/organization";
 import { updateUploadAfterChunk } from "../../../../../lib/import-upload-progress";
+import { parseRawReportMetadata } from "../../../../../lib/raw-report-upload-metadata";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 
 export const runtime = "nodejs";
 
 const BUCKET = "raw-reports";
+
+function formatStorageUploadError(rawMessage: string): { message: string; status: number } {
+  const m = rawMessage.toLowerCase();
+  const bucketMissing =
+    (m.includes("bucket") && (m.includes("not found") || m.includes("does not exist"))) ||
+    m.includes("no such bucket") ||
+    (m.includes("storage") && m.includes("not found")) ||
+    m.includes("resource was not found");
+
+  if (bucketMissing) {
+    return {
+      message: `Storage bucket "${BUCKET}" is missing or not accessible. In Supabase: Storage → create bucket "${BUCKET}" (private), then add policies so authenticated uploads can write objects under your org prefix.`,
+      status: 503,
+    };
+  }
+
+  return {
+    message: `Could not store chunk in bucket "${BUCKET}": ${rawMessage}`,
+    status: 500,
+  };
+}
 
 /**
  * Chunked CSV upload: keeps each request body small so 400MB+ files never load into memory at once.
@@ -21,6 +43,7 @@ export async function POST(req: Request): Promise<Response> {
     const totalPartsRaw = form.get("total_parts");
     const totalBytesRaw = form.get("total_bytes");
     const actorUserId = form.get("actor_user_id");
+    const fileExtensionRaw = form.get("file_extension");
     const file = form.get("file");
 
     if (typeof uploadId !== "string" || !isUuidString(uploadId)) {
@@ -39,13 +62,12 @@ export async function POST(req: Request): Promise<Response> {
     const orgId = resolveOrganizationId();
     const { data: row, error: fetchErr } = await supabaseServer
       .from("raw_report_uploads")
-      .select("id, storage_prefix, uploaded_by, organization_id")
+      .select("id, organization_id, metadata")
       .eq("id", uploadId)
       .eq("organization_id", orgId)
       .maybeSingle();
 
-    const prefix =
-      typeof row?.storage_prefix === "string" ? row.storage_prefix.trim() : "";
+    const prefix = parseRawReportMetadata(row?.metadata).storagePrefix?.trim() ?? "";
     if (fetchErr || !prefix) {
       console.error("[imports/chunk] session not found", {
         uploadId,
@@ -66,14 +88,29 @@ export async function POST(req: Request): Promise<Response> {
     const path = `${prefix}/part-${String(partIndex).padStart(6, "0")}`;
     const buf = Buffer.from(await file.arrayBuffer());
 
+    const ext =
+      typeof fileExtensionRaw === "string" ? fileExtensionRaw.trim().toLowerCase().replace(/^\./, "") : "";
+    const contentType =
+      ext === "xlsx"
+        ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        : ext === "txt"
+          ? "text/plain; charset=utf-8"
+          : "text/csv; charset=utf-8";
+
     const { error: upErr } = await supabaseServer.storage.from(BUCKET).upload(path, buf, {
       upsert: true,
-      contentType: "text/csv",
+      contentType,
     });
 
     if (upErr) {
-      console.error("[imports/chunk] storage upload failed", { uploadId, path, message: upErr.message });
-      return NextResponse.json({ ok: false, error: upErr.message }, { status: 500 });
+      const { message, status } = formatStorageUploadError(upErr.message);
+      console.error("[imports/chunk] storage upload failed", {
+        uploadId,
+        path,
+        bucket: BUCKET,
+        message: upErr.message,
+      });
+      return NextResponse.json({ ok: false, error: message }, { status });
     }
 
     const actor =

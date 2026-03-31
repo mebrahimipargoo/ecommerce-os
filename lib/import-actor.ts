@@ -5,17 +5,17 @@ import { resolveOrganizationId } from "./organization";
 import { isUuidString } from "./uuid";
 
 /**
- * Resolves the acting user profile id for import/audit actions.
+ * Resolves the acting `profiles.id` for import/audit actions.
  * Priority: validated explicit id → first admin in org → any org member (silent fallback).
  */
-export async function resolveActorUserProfileId(
+export async function resolveActorProfileId(
   explicitUserId?: string | null,
 ): Promise<string | null> {
   const orgId = resolveOrganizationId();
 
   async function verifyInOrg(id: string): Promise<boolean> {
     const { data, error } = await supabaseServer
-      .from("user_profiles")
+      .from("profiles")
       .select("id")
       .eq("organization_id", orgId)
       .eq("id", id)
@@ -29,7 +29,7 @@ export async function resolveActorUserProfileId(
   }
 
   const { data: superAdmin } = await supabaseServer
-    .from("user_profiles")
+    .from("profiles")
     .select("id")
     .eq("organization_id", orgId)
     .eq("role", "super_admin")
@@ -42,7 +42,7 @@ export async function resolveActorUserProfileId(
   }
 
   const { data: admin } = await supabaseServer
-    .from("user_profiles")
+    .from("profiles")
     .select("id")
     .eq("organization_id", orgId)
     .eq("role", "admin")
@@ -55,7 +55,7 @@ export async function resolveActorUserProfileId(
   }
 
   const { data: first } = await supabaseServer
-    .from("user_profiles")
+    .from("profiles")
     .select("id")
     .eq("organization_id", orgId)
     .order("created_at", { ascending: true })

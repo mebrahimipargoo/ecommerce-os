@@ -4,7 +4,8 @@ import { supabaseServer } from "../../lib/supabase-server";
 import { resolveOrganizationId } from "../../lib/organization";
 import { isUuidString } from "../../lib/uuid";
 
-export type UserProfileRow = {
+/** One row from the `profiles` table. */
+export type ProfileRow = {
   id: string;
   organization_id: string;
   full_name: string;
@@ -16,17 +17,17 @@ export type UserProfileRow = {
 };
 
 export async function listUserProfiles(): Promise<
-  { ok: true; rows: UserProfileRow[] } | { ok: false; error: string }
+  { ok: true; rows: ProfileRow[] } | { ok: false; error: string }
 > {
   try {
     const orgId = resolveOrganizationId();
     const { data, error } = await supabaseServer
-      .from("user_profiles")
+      .from("profiles")
       .select("*")
       .eq("organization_id", orgId)
       .order("full_name", { ascending: true });
     if (error) return { ok: false, error: error.message };
-    return { ok: true, rows: (data ?? []) as UserProfileRow[] };
+    return { ok: true, rows: (data ?? []) as ProfileRow[] };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Failed to load users." };
   }
@@ -44,7 +45,7 @@ export async function createUserProfile(input: {
   const role = input.role === "admin" ? "admin" : "operator";
   try {
     const { data, error } = await supabaseServer
-      .from("user_profiles")
+      .from("profiles")
       .insert({
         organization_id: orgId,
         full_name: fullName,
@@ -75,7 +76,7 @@ export async function updateUserProfile(
   if ("photo_url" in patch) row.photo_url = patch.photo_url;
   try {
     const { error } = await supabaseServer
-      .from("user_profiles")
+      .from("profiles")
       .update(row)
       .eq("id", id)
       .eq("organization_id", orgId);
@@ -91,7 +92,7 @@ export async function deleteUserProfile(id: string): Promise<{ ok: boolean; erro
   const orgId = resolveOrganizationId();
   try {
     const { error } = await supabaseServer
-      .from("user_profiles")
+      .from("profiles")
       .delete()
       .eq("id", id)
       .eq("organization_id", orgId);

@@ -619,9 +619,17 @@ export function ClaimEngineClient({
             Enterprise claims: identifiers, PDF exports, and marketplace filing fields.
           </p>
         </div>
-        <Link href="/" className="text-xs font-medium text-sky-600 hover:text-sky-500 dark:text-sky-400">
-          ← Dashboard
-        </Link>
+        <div className="flex flex-wrap items-center gap-3">
+          <Link
+            href="/claim-engine/report-history"
+            className="text-xs font-medium text-sky-600 hover:text-sky-500 dark:text-sky-400"
+          >
+            Report history
+          </Link>
+          <Link href="/" className="text-xs font-medium text-sky-600 hover:text-sky-500 dark:text-sky-400">
+            ← Dashboard
+          </Link>
+        </div>
       </header>
 
       <main className="flex-1 overflow-y-auto overflow-x-hidden bg-slate-50 dark:bg-gradient-to-br dark:from-slate-950 dark:via-slate-950 dark:to-slate-900">

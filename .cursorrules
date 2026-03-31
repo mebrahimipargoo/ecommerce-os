@@ -26,7 +26,7 @@ Business Model: Multi-tenant B2B SaaS and On-Premise (White-label). Composable S
 
 # 5. Enterprise Database & DBA Standards (CRITICAL)
 - Strict Multi-Tenancy: EVERY operational and configuration table MUST include an `organization_id` (UUID, NOT NULL) referencing the core `organizations` table.
-- Soft Deletes & Auditing: NEVER hard-delete data. All operational tables (pallets, packages, items) must have `deleted_at`, `created_by_id`, and `updated_by_id`. Use PostgreSQL Triggers to automatically log updates/deletes to the `audit_logs` table.
+- Soft Deletes & Auditing: NEVER hard-delete data. All operational tables (pallets, packages, items) must have `deleted_at`, `created_by`, and `updated_by`. Use PostgreSQL Triggers to automatically log updates/deletes to the `audit_logs` table.
 - Advanced Indexing: Always define Composite B-Tree indexes for tenant-scoping `(organization_id, store_id)`. Use B-Tree for searchable IDs (ASIN, tracking_number) and GIN indexes for ALL `JSONB` columns.
 - Big Data Analytics: Use `Materialized Views` for heavy dashboard aggregations to ensure sub-second UI load times.
 

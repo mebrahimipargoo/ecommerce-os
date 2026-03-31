@@ -12,7 +12,7 @@ import {
   deleteUserProfile,
   listUserProfiles,
   updateUserProfile,
-  type UserProfileRow,
+  type ProfileRow,
 } from "./users-actions";
 import { uploadUserProfilePhotoAction } from "./upload-profile-photo-action";
 
@@ -28,11 +28,11 @@ type Toast = { msg: string; ok: boolean } | null;
 
 export default function UsersPage() {
   const { role } = useUserRole();
-  const [rows, setRows] = useState<UserProfileRow[]>([]);
+  const [rows, setRows] = useState<ProfileRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<Toast>(null);
   const [modalOpen, setModalOpen] = useState(false);
-  const [editing, setEditing] = useState<UserProfileRow | null>(null);
+  const [editing, setEditing] = useState<ProfileRow | null>(null);
   const [saving, setSaving] = useState(false);
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
@@ -69,7 +69,7 @@ export default function UsersPage() {
     setModalOpen(true);
   }
 
-  function openEdit(row: UserProfileRow) {
+  function openEdit(row: ProfileRow) {
     setEditing(row);
     setFullName(row.full_name);
     setEmail(row.email);

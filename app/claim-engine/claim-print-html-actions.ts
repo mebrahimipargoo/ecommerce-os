@@ -6,6 +6,10 @@ import {
   CLAIM_SUBMISSIONS_TABLE,
 } from "./claim-submissions-constants";
 import { RETURNS_CLAIM_EMBED } from "../returns/returns-constants";
+import {
+  getReturnPhotoEvidenceUrls,
+  type ReturnPhotoEvidenceRow,
+} from "../../lib/return-photo-evidence";
 
 function resolveSkuFromReturnRow(ret: Record<string, unknown> | null): string | null {
   if (!ret) return null;
@@ -14,7 +18,7 @@ function resolveSkuFromReturnRow(ret: Record<string, unknown> | null): string | 
   return null;
 }
 
-/** Collect image URLs from `returns` (dedicated columns + optional `photo_urls` JSON/array). */
+/** Collect image URLs from `returns` (`photo_evidence` URL slots + optional `photo_urls` JSON/array). */
 export async function collectReturnPhotoUrls(
   ret: Record<string, unknown> | null,
 ): Promise<string[]> {
@@ -23,8 +27,10 @@ export async function collectReturnPhotoUrls(
   const add = (u: unknown) => {
     if (typeof u === "string" && u.trim()) urls.push(u.trim());
   };
-  add(ret.photo_item_url);
-  add(ret.photo_expiry_url);
+  const ev = getReturnPhotoEvidenceUrls(ret.photo_evidence as ReturnPhotoEvidenceRow | undefined);
+  add(ev.item_url);
+  add(ev.expiry_url);
+  add(ev.return_label_url);
   const raw = ret.photo_urls;
   if (Array.isArray(raw)) {
     for (const x of raw) add(x);
