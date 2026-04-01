@@ -70,6 +70,8 @@ export type PackageRecord = {
   manifest_photo_url?: string | null;
   /** Structured gallery — `{ urls }` and/or `label_urls`, `outer_box_urls`, `inside_content_urls`, `sealed_box_urls`. */
   photo_evidence?: unknown | null;
+  /** Parsed packing-slip lines (JSONB) — normalized in `normalizePackageRow` for reconciliation UI. */
+  manifest_data?: ExpectedItem[] | null;
 };
 
 export type PackageInsertPayload = {

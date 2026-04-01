@@ -407,7 +407,7 @@ export async function createPallet(
       .insert(insertRow)
       .select(PALLET_MUTATION_SELECT).single();
     if (error) throw new Error(error.message);
-    const row = normalizePalletRow(data as Record<string, unknown>);
+    const row = normalizePalletRow(data as unknown as Record<string, unknown>);
     void logPalletAudit({ organizationId: orgId, palletId: row.id, action: "created", actor });
     return { ok: true, data: row };
   } catch (err) {
@@ -425,7 +425,7 @@ export async function listPallets(organizationId?: string): Promise<{ ok: boolea
       console.error("[listPallets] Supabase error:", error.message, "| code:", error.code);
       throw new Error(error.message);
     }
-    const rows = (data ?? []) as Record<string, unknown>[];
+    const rows = (data ?? []) as unknown as Record<string, unknown>[];
     return { ok: true, data: rows.map(normalizePalletRow) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Failed to load pallets.";
@@ -441,7 +441,7 @@ export async function listOpenPallets(organizationId?: string): Promise<{ ok: bo
       .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(50);
     if (error) throw new Error(error.message);
-    const rows = (data ?? []) as Record<string, unknown>[];
+    const rows = (data ?? []) as unknown as Record<string, unknown>[];
     return { ok: true, data: rows.map(normalizePalletRow) };
   } catch (err) {
     return { ok: false, data: [], error: err instanceof Error ? err.message : "Failed to load open pallets." };
@@ -493,7 +493,7 @@ export async function updatePallet(
       .select(PALLET_MUTATION_SELECT)
       .single();
     if (error) throw new Error(error.message);
-    const rec = normalizePalletRow(data as Record<string, unknown>);
+    const rec = normalizePalletRow(data as unknown as Record<string, unknown>);
     void logPalletAudit({
       organizationId: org,
       palletId: id,
@@ -563,8 +563,8 @@ export async function createPackage(
       .insert(insertRow)
       .select(PACKAGE_MUTATION_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
-    void logPackageAudit({ organizationId: orgId, packageId: (data as { id: string }).id, action: "created", actor });
-    return { ok: true, data: normalizePackageRow(data as Record<string, unknown>) };
+    void logPackageAudit({ organizationId: orgId, packageId: (data as unknown as { id: string }).id, action: "created", actor });
+    return { ok: true, data: normalizePackageRow(data as unknown as Record<string, unknown>) };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Failed to create package." };
   }
@@ -598,7 +598,7 @@ export async function updatePackage(
       .update(payload)
       .eq("id", pkgId).select(PACKAGE_MUTATION_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
-    const row = normalizePackageRow(data as Record<string, unknown>);
+    const row = normalizePackageRow(data as unknown as Record<string, unknown>);
     // Keep denormalized returns.pallet_id in sync when package moves between pallets
     if ("pallet_id" in payload) {
       const { error: syncErr } = await supabaseServer.from("returns")
@@ -628,7 +628,7 @@ export async function listPackages(organizationId?: string): Promise<{ ok: boole
       console.error("[listPackages] Supabase error:", error.message, "| code:", error.code);
       throw new Error(error.message);
     }
-    const rows = (data ?? []) as Record<string, unknown>[];
+    const rows = (data ?? []) as unknown as Record<string, unknown>[];
     return { ok: true, data: rows.map(normalizePackageRow) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Failed to load packages.";
@@ -644,7 +644,7 @@ export async function listOpenPackages(organizationId?: string): Promise<{ ok: b
       .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(50);
     if (error) throw new Error(error.message);
-    const rows = (data ?? []) as Record<string, unknown>[];
+    const rows = (data ?? []) as unknown as Record<string, unknown>[];
     return { ok: true, data: rows.map(normalizePackageRow) };
   } catch (err) {
     return { ok: false, data: [], error: err instanceof Error ? err.message : "Failed to load open packages." };
@@ -957,6 +957,56 @@ export async function deleteReturn(returnId: string, actor?: string): Promise<{ 
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Failed to delete return." };
+  }
+}
+
+/** Deletes many returns in one round-trip; only returns ok after Supabase confirms success. */
+export async function bulkDeleteReturns(
+  returnIds: string[],
+  actor?: string,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const validIds = [...new Set(returnIds.map((id) => uuidOrNull(id)).filter((id): id is string => !!id))];
+    if (validIds.length === 0) {
+      return { ok: false, error: "No valid return ids to delete." };
+    }
+    const a = actor ?? DEFAULT_ACTOR;
+    for (const id of validIds) {
+      void logReturnAudit({ organizationId: DEFAULT_ORG, returnId: id, action: "deleted", actor: a });
+    }
+    const { error } = await supabaseServer.from("returns").delete().in("id", validIds);
+    if (error) {
+      console.error("[bulkDeleteReturns] Supabase error:", error.message, "| code:", error.code);
+      return { ok: false, error: error.message };
+    }
+    return { ok: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Failed to delete returns.";
+    console.error("[bulkDeleteReturns] Caught error:", msg);
+    return { ok: false, error: msg };
+  }
+}
+
+/** Exact row count for returns (non-deleted) — use with `listReturns()` to detect truncation from `.limit()`. */
+export async function countReturns(
+  organizationId?: string,
+): Promise<{ ok: boolean; count: number; error?: string }> {
+  const org = organizationId ?? DEFAULT_ORG;
+  try {
+    const { count, error } = await supabaseServer
+      .from("returns")
+      .select("id", { count: "exact", head: true })
+      .eq("organization_id", org)
+      .is("deleted_at", null);
+    if (error) {
+      console.error("[countReturns] Supabase error:", error.message, "| code:", error.code);
+      return { ok: false, count: 0, error: error.message };
+    }
+    return { ok: true, count: count ?? 0 };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Failed to count returns.";
+    console.error("[countReturns] Caught error:", msg);
+    return { ok: false, count: 0, error: msg };
   }
 }
 

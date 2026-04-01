@@ -15,11 +15,11 @@ import { ReturnIdentifiersColumn } from "../../components/ReturnIdentifiersColum
 import { SmartCameraUpload } from "../../components/ui/SmartCameraUpload";
 import { BarcodeScannerModal } from "../../components/ui/BarcodeScannerModal";
 import {
-  insertReturn, updateReturn, deleteReturn,
+  insertReturn, updateReturn, deleteReturn, bulkDeleteReturns,
   createPallet, updatePallet, updatePalletStatus, deletePallet,
   createPackage, updatePackage, closePackage, deletePackage,
-  listReturnsByPackage,
 } from "./actions";
+import { RETURN_SELECT } from "./returns-constants";
 import type {
   ExpectedItem,
   OrgSettings,
@@ -1184,8 +1184,10 @@ export function BulkActionsBar({ count, onDelete, onMove, onAssignPallet, onClea
 
 // ─── BulkMoveModal ─────────────────────────────────────────────────────────────
 
-export function BulkMoveModal({ selectedIds, packages: allPkgs, pallets: allPlts, actor, onClose, onMoved }: {
+export function BulkMoveModal({ selectedIds, packages: allPkgs, pallets: allPlts, returns: allReturns = [], actor, onClose, onMoved }: {
   selectedIds: string[]; packages: PackageRecord[]; pallets: PalletRecord[];
+  /** Live per-package counts (same as Packages table ITEMS column). */
+  returns?: ReturnRecord[];
   actor: string; onClose: () => void;
   onMoved: (updated: ReturnRecord[], failed: number) => void;
 }) {
@@ -1195,10 +1197,17 @@ export function BulkMoveModal({ selectedIds, packages: allPkgs, pallets: allPlts
   const [error,  setError]  = useState("");
   const openPkgs = allPkgs.filter((p) => p.status === "open");
   const openPlts = allPlts.filter((p) => p.status === "open");
+  const assignedByPackage = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const r of allReturns) {
+      if (r.package_id) m.set(r.package_id, (m.get(r.package_id) ?? 0) + 1);
+    }
+    return m;
+  }, [allReturns]);
   const pkgOpts  = openPkgs.map((p) => ({
     id: p.id,
     label: p.package_number,
-    sublabel: `${p.actual_item_count} items`,
+    sublabel: `${assignedByPackage.get(p.id) ?? 0} items`,
     tracking: p.tracking_number ?? undefined,
     rma: p.rma_number ?? undefined,
   }));
@@ -1568,7 +1577,10 @@ function ItemsSubTable({ items, role, actor, onItemClick, onItemDeleted, showToa
                         onDelete={canDelete(role) ? async () => {
                           const res = await deleteReturn(r.id, actor);
                           if (res.ok) onItemDeleted(r.id);
-                          else showToast(res.error ?? "Delete failed.", "error");
+                          else {
+                            console.error("[PackageItemsSubTable] deleteReturn failed:", res.error);
+                            showToast(res.error ?? "Delete failed.", "error");
+                          }
                         } : undefined}
                       />
                     </td>
@@ -1584,10 +1596,18 @@ function ItemsSubTable({ items, role, actor, onItemClick, onItemDeleted, showToa
 
 // ─── Packages Sub-Table (inside Pallet Drawer) ─────────────────────────────────
 
-function PackagesSubTable({ palletId, packages, onPackageClick, showToast }: {
-  palletId: string; packages: PackageRecord[]; onPackageClick: (p: PackageRecord) => void;
+function PackagesSubTable({ palletId, packages, returns: returnsForCount = [], onPackageClick, showToast }: {
+  palletId: string; packages: PackageRecord[]; returns?: ReturnRecord[];
+  onPackageClick: (p: PackageRecord) => void;
   showToast?: (msg: string, kind?: ToastKind) => void;
 }) {
+  const assignedByPackage = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const r of returnsForCount) {
+      if (r.package_id) m.set(r.package_id, (m.get(r.package_id) ?? 0) + 1);
+    }
+    return m;
+  }, [returnsForCount]);
   const rows = useMemo(() => packages.filter((p) => p.pallet_id === palletId), [packages, palletId]);
   if (rows.length === 0) return <p className="py-4 text-center text-xs text-slate-400">No packages linked to this pallet yet.</p>;
   return (
@@ -1602,7 +1622,9 @@ function PackagesSubTable({ palletId, packages, onPackageClick, showToast }: {
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-          {rows.map((p) => (
+          {rows.map((p) => {
+            const assignedCount = assignedByPackage.get(p.id) ?? 0;
+            return (
             <tr key={p.id} onClick={() => onPackageClick(p)} className="group cursor-pointer transition hover:bg-violet-50/50 dark:hover:bg-violet-950/20">
               <td className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
                 <div className="flex items-center gap-1.5 font-mono font-bold text-foreground">
@@ -1611,10 +1633,11 @@ function PackagesSubTable({ palletId, packages, onPackageClick, showToast }: {
                 </div>
               </td>
               <td className="hidden px-3 py-2.5 text-muted-foreground sm:table-cell">{p.carrier_name ?? "—"}</td>
-              <td className="px-3 py-2.5 font-bold text-slate-700 dark:text-slate-300">{p.actual_item_count}/{p.expected_item_count > 0 ? p.expected_item_count : "?"}</td>
+              <td className="px-3 py-2.5 font-bold text-slate-700 dark:text-slate-300">{assignedCount}/{p.expected_item_count > 0 ? p.expected_item_count : "?"}</td>
               <td className="px-3 py-2.5"><PkgStatusBadge status={p.status} /></td>
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -1843,9 +1866,17 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
 
   async function handleDelete() {
     setDeleting(true);
-    const res = await deleteReturn(record.id, actor);
-    if (res.ok) onDeleted(record.id);
-    else setDeleting(false);
+    try {
+      const res = await deleteReturn(record.id, actor);
+      if (res.ok) {
+        onDeleted(record.id);
+      } else {
+        console.error("[ItemDrawerContent] deleteReturn failed:", res.error);
+        onToast?.(res.error ?? "Could not delete this return.", "error");
+      }
+    } finally {
+      setDeleting(false);
+    }
   }
 
   return (
@@ -2419,7 +2450,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
 
 function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssigned, onClose }: {
   pkg: PackageRecord; allReturns: ReturnRecord[]; currentItems: ReturnRecord[];
-  actor: string; onAssigned: (updated: ReturnRecord) => void; onClose: () => void;
+  actor: string; onAssigned: (updated: ReturnRecord, prevPackageId: string | null) => void; onClose: () => void;
 }) {
   const [search,    setSearch]    = useState("");
   const [selected,  setSelected]  = useState<ReturnRecord | null>(null);
@@ -2437,12 +2468,13 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
     await doAssign(item);
   }
   async function doAssign(item: ReturnRecord) {
+    const prevPackageId = item.package_id ?? null;
     setAssigning(true);
     setAssignErr("");
     const res = await updateReturn(item.id, { package_id: pkg.id }, actor);
     setAssigning(false);
     if (res.ok && res.data) {
-      onAssigned(res.data);
+      onAssigned(res.data, prevPackageId);
     } else {
       const msg = res.error ?? "Failed to assign item. Please try again.";
       setAssignErr(msg);
@@ -2503,7 +2535,19 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
 
 // ─── Package Drawer Content ────────────────────────────────────────────────────
 
-export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = [], allReturns = [], onClose, onPackageUpdated, onItemAdded, onPackageDeleted, onOpenItem, onOpenPallet, showToast }: {
+/** Collapse duplicate rows from PostgREST embed fan-out (same as server `dedupeReturnsById`). */
+function dedupeReturnsRowsLocal(rows: unknown[] | null | undefined): ReturnRecord[] {
+  const map = new Map<string, ReturnRecord>();
+  for (const raw of rows ?? []) {
+    const r = raw as ReturnRecord;
+    if (r?.id && typeof r.id === "string" && !map.has(r.id)) map.set(r.id, r);
+  }
+  const out = [...map.values()];
+  out.sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
+  return out;
+}
+
+export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = [], allReturns = [], onClose, onPackageUpdated, onItemAdded, onPackageDeleted, onOpenItem, onOpenPallet, onReturnAssigned, onReturnRemoved, showToast }: {
   pkg: PackageRecord; role: UserRole; actor: string;
   openPallets?: PalletRecord[];
   /** Full returns list from page state — used for the "Assign Existing Item" flow. */
@@ -2515,11 +2559,13 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
   onOpenItem: (r: ReturnRecord) => void;
   /** Open pallet drawer from wizard (PLT link). */
   onOpenPallet?: (pallet: PalletRecord) => void;
+  /** After assigning an existing return to this package — sync parent `returns` / package counts (accordion + table). */
+  onReturnAssigned?: (updated: ReturnRecord, prevPackageId: string | null) => void;
+  /** When an item is deleted from this package — keep page `returns` / counts in sync (no full reload). */
+  onReturnRemoved?: (id: string) => void;
   showToast: (msg: string, kind?: ToastKind) => void;
 }) {
   const [pkg,        setPkg]        = useState(initPkg);
-  const [items,      setItems]      = useState<ReturnRecord[]>([]);
-  const [loading,    setLoading]    = useState(true);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [discOpen,   setDiscOpen]   = useState(false);
   const [assignOpen, setAssignOpen] = useState(false);
@@ -2649,12 +2695,44 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
     return null;
   }, []);
 
-  const mismatch   = pkg.expected_item_count > 0 && pkg.actual_item_count !== pkg.expected_item_count;
-  const pct        = pkg.expected_item_count > 0 ? Math.min(100, (pkg.actual_item_count / pkg.expected_item_count) * 100) : null;
-  const remaining  = pkg.expected_item_count > 0 ? pkg.expected_item_count - pkg.actual_item_count : null;
-  const atCapacity = remaining !== null && remaining <= 0;
+  /** Same source as the Packages accordion — `listReturns()` page state (`allReturns`). */
+  const items = useMemo(
+    () => dedupeReturnsRowsLocal(allReturns.filter((r) => r.package_id === pkg.id)),
+    [allReturns, pkg.id],
+  );
 
-  useEffect(() => { listReturnsByPackage(pkg.id).then((r) => { if (r.ok) setItems(r.data); setLoading(false); }); }, [pkg.id]);
+  /** If nothing in page state yet (e.g. race), load with `*` + store embed — avoids brittle explicit column lists on the client. */
+  const [itemsFallback, setItemsFallback] = useState<ReturnRecord[]>([]);
+  useEffect(() => {
+    if (items.length > 0) {
+      setItemsFallback([]);
+      return;
+    }
+    let cancelled = false;
+    void supabaseBrowser
+      .from("returns")
+      .select(RETURN_SELECT)
+      .eq("package_id", pkg.id)
+      .order("created_at", { ascending: false })
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          console.error("[PackageDrawerContent] items load:", error.message);
+          setItemsFallback([]);
+          return;
+        }
+        setItemsFallback(dedupeReturnsRowsLocal(data ?? []));
+      });
+    return () => { cancelled = true; };
+  }, [pkg.id, items.length]);
+
+  const displayItems = items.length > 0 ? items : itemsFallback;
+  const scannedCount = displayItems.length;
+
+  const mismatch   = pkg.expected_item_count > 0 && scannedCount !== pkg.expected_item_count;
+  const pct        = pkg.expected_item_count > 0 ? Math.min(100, (scannedCount / pkg.expected_item_count) * 100) : null;
+  const remaining  = pkg.expected_item_count > 0 ? pkg.expected_item_count - scannedCount : null;
+  const atCapacity = remaining !== null && remaining <= 0;
 
   /** Manifest upload from Edit mode — appends slip image to `photo_evidence` and updates expected_item_count. */
   async function handleEditManifestUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -2696,8 +2774,8 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
     }
   }
 
-  function handleItemAdded(r: ReturnRecord) { setItems((p) => [r, ...p]); setPkg((p) => ({ ...p, actual_item_count: p.actual_item_count + 1 })); onItemAdded(r); }
-  function handleItemDeleted(id: string) { setItems((p) => p.filter((r) => r.id !== id)); setPkg((p) => ({ ...p, actual_item_count: Math.max(0, p.actual_item_count - 1) })); }
+  function handleItemAdded(r: ReturnRecord) { onItemAdded(r); }
+  function handleItemDeleted(id: string) { onReturnRemoved?.(id); }
 
   async function handleSaveEdits() {
     setSaving(true); setSaveErr("");
@@ -2767,7 +2845,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
       {/* Count KPI */}
       <div className={`rounded-2xl border p-4 ${atCapacity ? "border-emerald-200 bg-emerald-50 dark:border-emerald-700/60 dark:bg-emerald-950/30" : mismatch ? "border-amber-200 bg-amber-50 dark:border-amber-700/60 dark:bg-amber-950/30" : "border-sky-200 bg-sky-50 dark:border-sky-700/60 dark:bg-sky-950/30"}`}>
         <div className="flex items-baseline gap-2">
-          <span className={`text-4xl font-extrabold ${atCapacity ? "text-emerald-600 dark:text-emerald-400" : mismatch ? "text-amber-600 dark:text-amber-400" : "text-sky-600 dark:text-sky-400"}`}>{pkg.actual_item_count}</span>
+          <span className={`text-4xl font-extrabold ${atCapacity ? "text-emerald-600 dark:text-emerald-400" : mismatch ? "text-amber-600 dark:text-amber-400" : "text-sky-600 dark:text-sky-400"}`}>{scannedCount}</span>
           {pkg.expected_item_count > 0 && <span className="text-xl text-slate-400">/ {pkg.expected_item_count} expected</span>}
         </div>
         <p className="mt-0.5 text-sm text-muted-foreground">
@@ -3091,7 +3169,20 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
       )}
 
       {/* Assign Existing Item Modal */}
-      {assignOpen && <AssignExistingItemModal pkg={pkg} allReturns={allReturns} currentItems={items} actor={actor} onAssigned={(updated) => { setItems((p) => [...p.filter((i) => i.id !== updated.id), updated]); showToast(`✓ Item assigned to ${pkg.package_number}`); setAssignOpen(false); }} onClose={() => setAssignOpen(false)} />}
+      {assignOpen && (
+        <AssignExistingItemModal
+          pkg={pkg}
+          allReturns={allReturns}
+          currentItems={displayItems}
+          actor={actor}
+          onAssigned={(updated, prevPackageId) => {
+            onReturnAssigned?.(updated, prevPackageId);
+            showToast(`✓ Item assigned to ${pkg.package_number}`);
+            setAssignOpen(false);
+          }}
+          onClose={() => setAssignOpen(false)}
+        />
+      )}
 
       {/* ── Read-only: reconciliation from saved manifest_data (upload lives in Edit) ── */}
       <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-4 dark:border-slate-700 dark:bg-slate-900/40">
@@ -3119,7 +3210,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
             No manifest line items on file. Use <strong>Edit</strong> to photograph or load a packing slip — reconciliation appears here once saved.
           </p>
         )}
-        {reconciliationLines && !loading && (
+        {reconciliationLines && (
           <div className="space-y-2">
             <div className="flex items-center gap-2">
               <p className="text-xs font-bold uppercase tracking-widest text-slate-400">Reconciliation</p>
@@ -3146,7 +3237,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                   {reconciliationLines.map((exp, slipIdx) => {
                     const need = exp.expected_qty ?? 1;
-                    const matched = items.filter((it) => physicalItemMatchesExpectedLine(it, exp));
+                    const matched = displayItems.filter((it) => physicalItemMatchesExpectedLine(it, exp));
                     const isMatch = matched.length >= need;
                     return (
                       <tr key={`slip-${slipIdx}-${exp.barcode}`} className={isMatch ? "bg-emerald-50/70 dark:bg-emerald-950/20" : "bg-rose-50/70 dark:bg-rose-950/20"}>
@@ -3168,7 +3259,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
                       </tr>
                     );
                   })}
-                  {items
+                  {displayItems
                     .filter((it) => !reconciliationLines.some((exp) => physicalItemMatchesExpectedLine(it, exp)))
                     .map((it) => (
                       <tr key={it.id} className="bg-amber-50/70 dark:bg-amber-950/20">
@@ -3188,7 +3279,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
                     ))}
                 </tbody>
               </table>
-              {items.length === 0 && reconciliationLines.length > 0 && (
+              {displayItems.length === 0 && reconciliationLines.length > 0 && (
                 <p className="py-4 text-center text-xs text-slate-400">
                   No items scanned yet — all {reconciliationLines.length} expected line-items are missing.
                 </p>
@@ -3200,12 +3291,8 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
 
       {/* Items sub-table */}
       <div>
-        <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-400">Items ({loading ? "…" : items.length})</p>
-        {loading ? (
-          <div className="flex justify-center py-6"><Loader2 className="h-5 w-5 animate-spin text-slate-400" /></div>
-        ) : (
-          <ItemsSubTable items={items} role={role} actor={actor} onItemClick={onOpenItem} onItemDeleted={handleItemDeleted} showToast={showToast} />
-        )}
+        <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-400">Items ({displayItems.length})</p>
+        <ItemsSubTable items={displayItems} role={role} actor={actor} onItemClick={onOpenItem} onItemDeleted={handleItemDeleted} showToast={showToast} />
       </div>
 
       {wizardOpen && (() => {
@@ -3218,6 +3305,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
             organizationId={pkg.organization_id}
             openPackages={[pkgWithExpected]}
             openPallets={openPallets}
+            existingReturns={allReturns}
             onCreatePackage={() => {}}
             onCreatePallet={() => {}}
             inheritedContext={{ packageId: pkg.id, packageLabel: pkg.package_number, palletId: pkg.pallet_id ?? undefined, palletLabel: openPallets.find((p) => p.id === pkg.pallet_id)?.pallet_number }}
@@ -3234,18 +3322,20 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
           />
         );
       })()}
-      {discOpen && <DiscrepancyModal pkg={pkg} onConfirm={(note) => handleClose(note)} onCancel={() => setDiscOpen(false)} />}
+      {discOpen && <DiscrepancyModal pkg={pkg} scannedCount={scannedCount} onConfirm={(note) => handleClose(note)} onCancel={() => setDiscOpen(false)} />}
     </div>
   );
 }
 
 // ─── Pallet Drawer Content ─────────────────────────────────────────────────────
 
-export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_ORGANIZATION_ID, packages, onClose, onPalletUpdated, onPalletDeleted, onOpenPackage, showToast }: {
+export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_ORGANIZATION_ID, packages, allReturns = [], onClose, onPalletUpdated, onPalletDeleted, onOpenPackage, showToast }: {
   pallet: PalletRecord; role: UserRole; actor: string;
   /** Workspace org for storage paths and `updatePallet` scoping. */
   organizationId?: string;
   packages: PackageRecord[];
+  /** For accurate per-package item counts in the sub-table. */
+  allReturns?: ReturnRecord[];
   onClose: () => void;
   onPalletUpdated: (p: PalletRecord) => void;
   onPalletDeleted: (id: string) => void;
@@ -3385,7 +3475,7 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
       {/* Packages sub-table */}
       <div>
         <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-400">Packages in this Pallet</p>
-        <PackagesSubTable palletId={plt.id} packages={packages} onPackageClick={onOpenPackage} showToast={showToast} />
+        <PackagesSubTable palletId={plt.id} packages={packages} returns={allReturns} onPackageClick={onOpenPackage} showToast={showToast} />
       </div>
 
       {/* Pallet info note: drill into packages above to see items */}
@@ -3525,18 +3615,22 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
 
 // ─── DiscrepancyModal ──────────────────────────────────────────────────────────
 
-export function DiscrepancyModal({ pkg, onConfirm, onCancel }: {
-  pkg: PackageRecord; onConfirm: (note: string) => void; onCancel: () => void;
+export function DiscrepancyModal({ pkg, scannedCount, onConfirm, onCancel }: {
+  pkg: PackageRecord;
+  /** Live count from assigned returns (same as accordion / ITEMS column); falls back to `actual_item_count`. */
+  scannedCount?: number;
+  onConfirm: (note: string) => void; onCancel: () => void;
 }) {
   const [note, setNote] = useState("");
-  const diff = pkg.actual_item_count - pkg.expected_item_count;
+  const scanned = scannedCount ?? pkg.actual_item_count;
+  const diff = scanned - pkg.expected_item_count;
   return (
     <div className="fixed inset-0 z-[400] flex items-center justify-center bg-black/60 p-2 sm:p-4 backdrop-blur-sm">
       <div className="w-[95vw] max-w-lg overflow-hidden rounded-2xl sm:rounded-3xl border border-amber-200 bg-white shadow-2xl dark:border-amber-700/50 dark:bg-slate-950">
         <div className="bg-amber-50 p-6 dark:bg-amber-950/40">
           <div className="flex items-center gap-3 mb-4"><div className="flex h-12 w-12 items-center justify-center rounded-full bg-amber-100 dark:bg-amber-900/60"><AlertTriangle className="h-6 w-6 text-amber-600 dark:text-amber-400" /></div><div><h3 className="text-lg font-bold text-foreground">Count Discrepancy</h3><p className="text-sm text-amber-700 dark:text-amber-300">Package will be flagged</p></div></div>
           <div className="grid grid-cols-3 gap-2">
-            {[["Expected", pkg.expected_item_count], ["Scanned", pkg.actual_item_count], ["Diff", diff > 0 ? `+${diff}` : diff]].map(([l, v]) => (
+            {[["Expected", pkg.expected_item_count], ["Scanned", scanned], ["Diff", diff > 0 ? `+${diff}` : diff]].map(([l, v]) => (
               <div key={String(l)} className="rounded-xl bg-white/80 p-3 text-center dark:bg-slate-900/60"><p className="text-2xl font-bold text-foreground">{v}</p><p className="text-xs text-slate-400">{l}</p></div>
             ))}
           </div>
@@ -3555,9 +3649,11 @@ export function DiscrepancyModal({ pkg, onConfirm, onCancel }: {
 
 // ─── Wizard Steps ──────────────────────────────────────────────────────────────
 
-export function WizardStep1({ state, setState, openPackages, openPallets, onCreatePackage, onCreatePallet, inherited, aiLabelEnabled = false, onAdvance, onNavigateToPackage, onNavigateToPallet }: {
+export function WizardStep1({ state, setState, openPackages, openPallets, existingReturns = [], onCreatePackage, onCreatePallet, inherited, aiLabelEnabled = false, onAdvance, onNavigateToPackage, onNavigateToPallet }: {
   state: WizardState; setState: React.Dispatch<React.SetStateAction<WizardState>>;
   openPackages: PackageRecord[]; openPallets: PalletRecord[];
+  /** Live counts for package picker (same as Packages ITEMS column). */
+  existingReturns?: ReturnRecord[];
   onCreatePackage: () => void; onCreatePallet: () => void;
   inherited?: WizardInheritedContext;
   aiLabelEnabled?: boolean;
@@ -3567,10 +3663,17 @@ export function WizardStep1({ state, setState, openPackages, openPallets, onCrea
   onNavigateToPallet?: (palletId: string) => void;
 }) {
   const up = (k: keyof WizardState, v: unknown) => setState((p) => ({ ...p, [k]: v }));
+  const assignedByPackage = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const r of existingReturns) {
+      if (r.package_id) m.set(r.package_id, (m.get(r.package_id) ?? 0) + 1);
+    }
+    return m;
+  }, [existingReturns]);
   const pkgOpts = openPackages.map((p) => ({
     id: p.id,
     label: p.package_number,
-    sublabel: `${p.actual_item_count}/${p.expected_item_count > 0 ? p.expected_item_count : "?"} items`,
+    sublabel: `${assignedByPackage.get(p.id) ?? 0}/${p.expected_item_count > 0 ? p.expected_item_count : "?"} items`,
     tracking: p.tracking_number ?? undefined,
     rma: p.rma_number ?? undefined,
   }));
@@ -4809,11 +4912,13 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
 
 // ─── Single Item Wizard Modal ──────────────────────────────────────────────────
 
-export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast, onNavigateToPackage, onNavigateToPallet, organizationId = MVP_ORGANIZATION_ID }: {
+export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, existingReturns = [], onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast, onNavigateToPackage, onNavigateToPallet, organizationId = MVP_ORGANIZATION_ID }: {
   onClose: () => void;
   /** Called with the saved record AND the in-session photo files for gallery display. */
   onSuccess: (r: ReturnRecord, photos: Record<string, File[]>) => void;
   actor: string; openPackages: PackageRecord[]; openPallets: PalletRecord[];
+  /** Live package item counts for step-1 combobox (optional). */
+  existingReturns?: ReturnRecord[];
   onCreatePackage: () => void; onCreatePallet: () => void;
   inheritedContext?: WizardInheritedContext;
   aiLabelEnabled?: boolean;
@@ -5237,6 +5342,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
               setState={setState}
               openPackages={openPackages}
               openPallets={openPallets}
+              existingReturns={existingReturns}
               onCreatePackage={onCreatePackage}
               onCreatePallet={onCreatePallet}
               inherited={inheritedContext}
@@ -6072,7 +6178,7 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
 
 // ─── Items Data Table ──────────────────────────────────────────────────────────
 
-export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSettings, onRowClick, onRowEdit, onBulkDeleted, onBulkMoved, onNewItem, externalSearch = "", onToast }: {
+export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSettings, onRowClick, onRowEdit, onBulkDeleted, onBulkMoved, onNewItem, externalSearch = "", onToast, returnsTotalInDb = null }: {
   items: ReturnRecord[]; packages: PackageRecord[]; pallets: PalletRecord[];
   role: UserRole; actor: string;
   fefoSettings?: { fefo_critical_days: number; fefo_warning_days: number };
@@ -6084,6 +6190,8 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
   externalSearch?: string;
   /** Copy-to-clipboard feedback (page-level toast). */
   onToast?: (msg: string, kind?: ToastKind) => void;
+  /** Exact DB count (when known) — shows truncation banner vs `listReturns()` limit. */
+  returnsTotalInDb?: number | null;
 }) {
   const fefo_critical = fefoSettings?.fefo_critical_days ?? 30;
   const fefo_warning  = fefoSettings?.fefo_warning_days  ?? 90;
@@ -6140,15 +6248,33 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
   async function handleBulkDelete() {
     if (!window.confirm(`Delete ${selectedIds.size} item(s)? This cannot be undone.`)) return;
     setBulkDeleting(true);
-    await Promise.all([...selectedIds].map((id) => deleteReturn(id, actor)));
-    onBulkDeleted([...selectedIds]);
-    setSelectedIds(new Set()); setBulkDeleting(false);
+    const ids = [...selectedIds];
+    try {
+      const res = await bulkDeleteReturns(ids, actor);
+      if (!res.ok) {
+        console.error("[ItemsDataTable] bulkDeleteReturns failed:", res.error);
+        onToast?.(res.error ?? "Could not delete items. Nothing was removed.", "error");
+        return;
+      }
+      onBulkDeleted(ids);
+      setSelectedIds(new Set());
+    } catch (e) {
+      console.error("[ItemsDataTable] bulkDeleteReturns threw:", e);
+      onToast?.(e instanceof Error ? e.message : "Could not delete items.", "error");
+    } finally {
+      setBulkDeleting(false);
+    }
   }
 
   const INPUT_SM_DARK = `${INPUT_SM} dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500`;
 
   return (
     <div className="space-y-3">
+      {returnsTotalInDb != null && returnsTotalInDb > items.length && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-100">
+          This session loads the latest {items.length} of {returnsTotalInDb} return items in the database. The table shows {PER} rows per page; use Next / Prev below or narrow with filters.
+        </div>
+      )}
       {selectedIds.size > 0 && (
         <BulkActionsBar count={selectedIds.size} onDelete={canDelete(role) ? handleBulkDelete : undefined} onMove={() => setShowBulkMove(true)} onClear={() => setSelectedIds(new Set())} deleting={bulkDeleting} />
       )}
@@ -6275,6 +6401,10 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                           if (!window.confirm("Delete this return? This cannot be undone.")) return;
                           const res = await deleteReturn(r.id, actor);
                           if (res.ok) onBulkDeleted([r.id]);
+                          else {
+                            console.error("[ItemsDataTable] deleteReturn failed:", res.error);
+                            onToast?.(res.error ?? "Could not delete this return.", "error");
+                          }
                         } : undefined}
                       />
                     </td>
@@ -6296,7 +6426,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
       {total > 1 && <div className="flex items-center justify-between text-sm text-slate-500"><p>Page {page} of {total} · {filtered.length} items</p><div className="flex gap-2"><button disabled={page<=1} onClick={() => setPage((p)=>p-1)} className="flex h-9 items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800">← Prev</button><button disabled={page>=total} onClick={() => setPage((p)=>p+1)} className="flex h-9 items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800">Next →</button></div></div>}
 
       {showBulkMove && (
-        <BulkMoveModal selectedIds={[...selectedIds]} packages={packages} pallets={pallets} actor={actor} onClose={() => setShowBulkMove(false)}
+        <BulkMoveModal selectedIds={[...selectedIds]} packages={packages} pallets={pallets} returns={items} actor={actor} onClose={() => setShowBulkMove(false)}
           onMoved={(updated, failed) => { onBulkMoved(updated); setSelectedIds(new Set()); setShowBulkMove(false); if (failed > 0) window.alert(`${failed} item(s) failed to move.`); }}
         />
       )}
@@ -6327,6 +6457,15 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const PER = 25;
 
+  /** Live assigned count per package — matches accordion rows (source of truth vs denormalized `actual_item_count`). */
+  const assignedByPackage = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const r of allReturns) {
+      if (r.package_id) m.set(r.package_id, (m.get(r.package_id) ?? 0) + 1);
+    }
+    return m;
+  }, [allReturns]);
+
   function toggleExpand(id: string, e: React.MouseEvent) { e.stopPropagation(); setExpandedIds((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; }); }
 
   function handleSort(f: string) { if (sortField === f) setSortAsc((a) => !a); else { setSortField(f); setSortAsc(false); } setPage(1); }
@@ -6341,11 +6480,16 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
     if (carrierF) d = d.filter((p) => p.carrier_name === carrierF);
     if (dateFrom) d = d.filter((p) => p.created_at >= dateFrom);
     if (dateTo)   d = d.filter((p) => p.created_at <= dateTo + "T23:59:59.999Z");
-    d.sort((a, b) =>
-      compareSortKeys(sortKeyPackage(a, sortField), sortKeyPackage(b, sortField), sortAsc),
-    );
+    d.sort((a, b) => {
+      if (sortField === "pkg_items_sort") {
+        const ca = assignedByPackage.get(a.id) ?? 0;
+        const cb = assignedByPackage.get(b.id) ?? 0;
+        return compareSortKeys(ca * 1_000_000 + a.expected_item_count, cb * 1_000_000 + b.expected_item_count, sortAsc);
+      }
+      return compareSortKeys(sortKeyPackage(a, sortField), sortKeyPackage(b, sortField), sortAsc);
+    });
     return d;
-  }, [packages, search, externalSearch, statusF, carrierF, dateFrom, dateTo, sortField, sortAsc]);
+  }, [packages, search, externalSearch, statusF, carrierF, dateFrom, dateTo, sortField, sortAsc, assignedByPackage]);
 
   const hasActiveFilters = !!(externalSearch.trim() || search || statusF || carrierF || dateFrom || dateTo);
 
@@ -6358,8 +6502,29 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
   async function handleBulkDelete() {
     if (!window.confirm(`Delete ${selectedIds.size} package(s)?`)) return;
     setBulkDeleting(true);
-    await Promise.all([...selectedIds].map((id) => deletePackage(id, actor)));
-    onBulkDeleted([...selectedIds]); setSelectedIds(new Set()); setBulkDeleting(false);
+    const ids = [...selectedIds];
+    try {
+      const results = await Promise.all(ids.map((id) => deletePackage(id, actor)));
+      const failed = ids.filter((_, i) => !results[i].ok);
+      const succeeded = ids.filter((_, i) => results[i].ok);
+      if (failed.length) {
+        const firstErr = results[ids.indexOf(failed[0])]?.error ?? "Unknown error";
+        console.error("[PackagesDataTable] bulk delete failed for", failed.length, "id(s):", firstErr);
+        onToast?.(
+          failed.length === ids.length
+            ? `Could not delete packages: ${firstErr}`
+            : `${failed.length} package(s) could not be deleted (${firstErr}). ${succeeded.length} removed.`,
+          "error",
+        );
+      }
+      if (succeeded.length) onBulkDeleted(succeeded);
+      setSelectedIds(new Set());
+    } catch (e) {
+      console.error("[PackagesDataTable] bulk delete threw:", e);
+      onToast?.(e instanceof Error ? e.message : "Bulk delete failed.", "error");
+    } finally {
+      setBulkDeleting(false);
+    }
   }
 
   return (
@@ -6403,7 +6568,8 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
               {rows.map((p) => {
-                const pct = p.expected_item_count > 0 ? Math.min(100, (p.actual_item_count / p.expected_item_count) * 100) : null;
+                const assignedCount = assignedByPackage.get(p.id) ?? 0;
+                const pct = p.expected_item_count > 0 ? Math.min(100, (assignedCount / p.expected_item_count) * 100) : null;
                 const isExpanded = expandedIds.has(p.id);
                 const pkgItems = allReturns.filter((r) => r.package_id === p.id);
                 return (
@@ -6448,7 +6614,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                           )}
                         </div>
                       </td>
-                      <td className="px-4 py-3"><div className="flex items-center gap-2"><span className="text-sm font-bold text-slate-700 dark:text-slate-300">{p.actual_item_count}/{p.expected_item_count > 0 ? p.expected_item_count : "?"}</span>{pct !== null && <div className="hidden h-1.5 w-12 overflow-hidden rounded-full bg-muted sm:block"><div className={`h-full rounded-full ${pct >= 100 ? "bg-emerald-500" : "bg-sky-500"}`} style={{ width: `${pct}%` }} /></div>}</div></td>
+                      <td className="px-4 py-3"><div className="flex items-center gap-2"><span className="text-sm font-bold text-slate-700 dark:text-slate-300">{assignedCount}/{p.expected_item_count > 0 ? p.expected_item_count : "?"}</span>{pct !== null && <div className="hidden h-1.5 w-12 overflow-hidden rounded-full bg-muted sm:block"><div className={`h-full rounded-full ${pct >= 100 ? "bg-emerald-500" : "bg-sky-500"}`} style={{ width: `${pct}%` }} /></div>}</div></td>
                       <td className="px-4 py-3"><PkgStatusBadge status={p.status} /></td>
                       <td className="hidden px-4 py-3 text-xs capitalize text-slate-400 md:table-cell">{operatorDisplayLabel(p)}</td>
                       <td className="hidden px-4 py-3 text-xs text-slate-400 md:table-cell">{fmt(p.created_at)}</td>
@@ -6606,8 +6772,29 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
   async function handleBulkDelete() {
     if (!window.confirm(`Delete ${selectedIds.size} pallet(s)?`)) return;
     setBulkDeleting(true);
-    await Promise.all([...selectedIds].map((id) => deletePallet(id, actor)));
-    onBulkDeleted([...selectedIds]); setSelectedIds(new Set()); setBulkDeleting(false);
+    const ids = [...selectedIds];
+    try {
+      const results = await Promise.all(ids.map((id) => deletePallet(id, actor)));
+      const failed = ids.filter((_, i) => !results[i].ok);
+      const succeeded = ids.filter((_, i) => results[i].ok);
+      if (failed.length) {
+        const firstErr = results[ids.indexOf(failed[0])]?.error ?? "Unknown error";
+        console.error("[PalletsDataTable] bulk delete failed for", failed.length, "id(s):", firstErr);
+        onToast?.(
+          failed.length === ids.length
+            ? `Could not delete pallets: ${firstErr}`
+            : `${failed.length} pallet(s) could not be deleted (${firstErr}). ${succeeded.length} removed.`,
+          "error",
+        );
+      }
+      if (succeeded.length) onBulkDeleted(succeeded);
+      setSelectedIds(new Set());
+    } catch (e) {
+      console.error("[PalletsDataTable] bulk delete threw:", e);
+      onToast?.(e instanceof Error ? e.message : "Bulk delete failed.", "error");
+    } finally {
+      setBulkDeleting(false);
+    }
   }
 
   return (
@@ -6708,7 +6895,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                                       const pkItemCount = allReturns.filter((r) => r.package_id === pk.id).length;
                                       const pkgItems = allReturns.filter((r) => r.package_id === pk.id);
                                       const nestedOpen = nestedPkgExpandedIds.has(pk.id);
-                                      const pct = pk.expected_item_count > 0 ? Math.min(100, (pk.actual_item_count / pk.expected_item_count) * 100) : null;
+                                      const pct = pk.expected_item_count > 0 ? Math.min(100, (pkItemCount / pk.expected_item_count) * 100) : null;
                                       return (
                                         <React.Fragment key={pk.id}>
                                           <tr className="group hover:bg-slate-50 dark:hover:bg-slate-800/50">

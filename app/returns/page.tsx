@@ -5,7 +5,7 @@ import { Boxes, Package2, ScanLine } from "lucide-react";
 import { DatabaseTag } from "../../components/DatabaseTag";
 import { useGlobalSearch } from "../../components/GlobalSearchContext";
 import { useUserRole } from "../../components/UserRoleContext";
-import { listReturns, listPackages, listPallets, getOrgSettings } from "./actions";
+import { listReturns, listPackages, listPallets, getOrgSettings, countReturns } from "./actions";
 import type { OrgSettings, PackageRecord, PalletRecord, ReturnRecord } from "./returns-action-types";
 import { getFefoSettings } from "../settings/workspace-settings-actions";
 import {
@@ -37,6 +37,8 @@ export default function ReturnsPage() {
   const [fetchErrors,  setFetchErrors]  = useState<string[]>([]);
   const [orgSettings,  setOrgSettings]  = useState<OrgSettings>(DEFAULT_ORG_SETTINGS);
   const [fefoSettings, setFefoSettings] = useState<InventoryModuleConfig>(DEFAULT_FEFO);
+  /** Exact DB total (non-deleted returns) — compares to `listReturns()` row cap. */
+  const [returnsTotalCount, setReturnsTotalCount] = useState<number | null>(null);
   /** In-session File objects keyed by returnId — enables live photo gallery in the drawer. */
   const [sessionPhotos, setSessionPhotos] = useState<Map<string, Record<string, File[]>>>(new Map());
 
@@ -71,13 +73,15 @@ export default function ReturnsPage() {
       setLoading(true);
       setFetchErrors([]);
       try {
-        const [r, p, pl, settings, fefo] = await Promise.all([
-          listReturns(), listPackages(), listPallets(), getOrgSettings(), getFefoSettings(),
+        const [r, p, pl, settings, fefo, retCount] = await Promise.all([
+          listReturns(), listPackages(), listPallets(), getOrgSettings(), getFefoSettings(), countReturns(),
         ]);
         if (cancelled) return;
         const errs: string[] = [];
         if (r.ok)  setReturns(r.data   ?? []);
         else       errs.push(`Items: ${r.error ?? "unknown error"}`);
+        if (retCount.ok) setReturnsTotalCount(retCount.count);
+        else { setReturnsTotalCount(null); console.error("[ReturnsPage] countReturns failed:", retCount.error); }
         if (p.ok)  setPackages(p.data  ?? []);
         else       errs.push(`Packages: ${p.error ?? "unknown error"}`);
         if (pl.ok) setPallets(pl.data  ?? []);
@@ -146,6 +150,34 @@ export default function ReturnsPage() {
   function removePallet(id: string)      { setPallets((p) => p.filter((x) => x.id !== id)); }
   function bulkRemovePallets(ids: string[]) { const s = new Set(ids); setPallets((p) => p.filter((x) => !s.has(x.id))); }
 
+  /** Assign/move existing return to a package — sync items list + denormalized counts from live `returns` rows. */
+  function syncReturnAfterPackageAssignment(updated: ReturnRecord, prevPackageId: string | null) {
+    setReturns((prev) => {
+      const merged = prev.map((x) => (x.id === updated.id ? updated : x));
+      const affected = new Set<string>();
+      if (prevPackageId) affected.add(prevPackageId);
+      if (updated.package_id) affected.add(updated.package_id);
+      queueMicrotask(() => {
+        setPackages((pkgs) =>
+          pkgs.map((pkg) => {
+            if (!affected.has(pkg.id)) return pkg;
+            const n = merged.filter((r) => r.package_id === pkg.id).length;
+            return { ...pkg, actual_item_count: n };
+          }),
+        );
+        setDrawerStack((stack) =>
+          stack.map((d) => {
+            if (d.type !== "package") return d;
+            if (!affected.has(d.record.id)) return d;
+            const n = merged.filter((r) => r.package_id === d.record.id).length;
+            return { ...d, record: { ...d.record, actual_item_count: n } };
+          }),
+        );
+      });
+      return merged;
+    });
+  }
+
   // ── Open wizard with optional inherited context ───────────────────────────────
   function openWizard(ctx?: WizardInheritedContext) {
     setWizardInherited(ctx);
@@ -169,8 +201,23 @@ export default function ReturnsPage() {
   }
 
   // ── Tab config ───────────────────────────────────────────────────────────────
-  const tabs: { id: ActiveTab; label: string; icon: React.ElementType; count: number; accent: string }[] = [
-    { id: "items",    label: "Items",    icon: ScanLine,  count: returns.length,  accent: "text-sky-600 border-sky-500 dark:text-sky-400 dark:border-sky-400" },
+  const tabs: { id: ActiveTab; label: string; icon: React.ElementType; count: number; countTitle?: string; accent: string }[] = [
+    {
+      id: "items",
+      label: "Items",
+      icon: ScanLine,
+      count: returns.length,
+      countTitle: (() => {
+        if (returnsTotalCount != null && returnsTotalCount > returns.length) {
+          return `${returns.length} loaded in this session (${returnsTotalCount} total in database)`;
+        }
+        if (returns.length > 25) {
+          return `${returns.length} items — table shows 25 per page`;
+        }
+        return undefined;
+      })(),
+      accent: "text-sky-600 border-sky-500 dark:text-sky-400 dark:border-sky-400",
+    },
     { id: "packages", label: "Packages", icon: Package2,  count: packages.length, accent: "text-violet-600 border-violet-500 dark:text-violet-400 dark:border-violet-400" },
     { id: "pallets",  label: "Pallets",  icon: Boxes,     count: pallets.length,  accent: "text-slate-700 border-slate-600 dark:text-slate-300 dark:border-slate-400" },
   ];
@@ -196,7 +243,10 @@ export default function ReturnsPage() {
                 className={`flex items-center gap-2 border-b-2 px-5 py-4 text-sm font-semibold transition whitespace-nowrap ${active ? t.accent : "border-transparent text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"}`}>
                 <Icon className="h-4 w-4" />
                 {t.label}
-                <span className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${active ? "bg-sky-100 text-sky-700 dark:bg-sky-900/60 dark:text-sky-300" : "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400"}`}>{t.count}</span>
+                <span
+                  title={t.countTitle}
+                  className={`rounded-full px-2 py-0.5 text-[10px] font-bold ${active ? "bg-sky-100 text-sky-700 dark:bg-sky-900/60 dark:text-sky-300" : "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400"}`}
+                >{t.count}</span>
               </button>
             );
           })}
@@ -238,6 +288,7 @@ export default function ReturnsPage() {
                   fefoSettings={fefoSettings}
                   externalSearch={globalSearchQuery}
                   onToast={showToast}
+                  returnsTotalInDb={returnsTotalCount}
                   onRowClick={(r) => openDrawer({ type: "item", record: r })}
                   onRowEdit={(r)  => openDrawer({ type: "item", record: r })}
                   onBulkDeleted={bulkRemoveReturns}
@@ -321,6 +372,8 @@ export default function ReturnsPage() {
             onClose={closeDrawer}
             onPackageUpdated={(p) => { updatePackage_(p); setDrawerStack((prev) => prev.map((d) => d.type === "package" && d.record.id === p.id ? { type: "package", record: p } : d)); }}
             onItemAdded={(r) => { addReturn(r); showToast(`✓ Item logged — ${r.asin ?? r.fnsku ?? r.sku ?? r.item_name}`); }}
+            onReturnAssigned={syncReturnAfterPackageAssignment}
+            onReturnRemoved={removeReturn}
             onPackageDeleted={(id) => { removePackage(id); closeDrawer(); showToast("Package deleted.", "warning"); }}
             onOpenItem={(r) => pushDrawer({ type: "item", record: r })}
             onOpenPallet={(plt) => pushDrawer({ type: "pallet", record: plt })}
@@ -335,6 +388,7 @@ export default function ReturnsPage() {
             actor={actor}
             organizationId={resolveOrganizationId()}
             packages={packages}
+            allReturns={visibleReturns}
             onClose={closeDrawer}
             onPalletUpdated={updatePallet_}
             onPalletDeleted={(id) => { removePallet(id); closeDrawer(); showToast("Pallet deleted.", "warning"); }}
@@ -353,6 +407,7 @@ export default function ReturnsPage() {
           organizationId={resolveOrganizationId()}
           openPackages={openPackages}
           openPallets={openPallets}
+          existingReturns={visibleReturns}
           onCreatePackage={() => { setWizardOpen(false); setCreatePackageOpen(true); }}
           onCreatePallet={() => { setWizardOpen(false); setCreatePalletOpen(true); }}
           inheritedContext={wizardInherited}
