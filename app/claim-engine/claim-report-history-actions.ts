@@ -49,6 +49,8 @@ function resolveStatusLabel(
 ): ClaimReportHistoryStatusLabel {
   const hasUrl = Boolean(reportUrl?.trim());
   const st = status ?? "";
+  /** `"failed"` is always a terminal failure regardless of whether a PDF was generated. */
+  if (st === "failed") return "Failed";
   if (!hasUrl) {
     if (st === "rejected") return "Failed";
     return "Generating...";

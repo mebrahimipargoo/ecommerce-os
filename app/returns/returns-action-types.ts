@@ -15,8 +15,10 @@ export type PalletRecord = {
   id: string; organization_id: string;
   pallet_number: string;
   tracking_number?: string | null;
-  /** Canonical image storage — `{ urls: string[] }`. */
-  photo_evidence?: unknown | null;
+  /** Primary pallet overview image (media bucket). */
+  photo_url?: string | null;
+  bol_photo_url?: string | null;
+  manifest_photo_url?: string | null;
   status: PalletStatus; notes: string | null; item_count: number;
   created_by?: string | null;
   updated_by?: string | null;
@@ -29,14 +31,17 @@ export type PalletRecord = {
 
 export type PalletInsertPayload = {
   pallet_number: string;
-  photo_evidence?: Record<string, unknown> | null;
+  photo_url?: string | null;
+  bol_photo_url?: string | null;
+  manifest_photo_url?: string | null;
   store_id?: string;
   notes?: string; organization_id?: string; created_by?: string;
 };
 
 export type PalletUpdatePayload = Partial<Pick<
   PalletRecord,
-  | "status" | "notes" | "tracking_number" | "photo_evidence"
+  | "status" | "notes" | "tracking_number"
+  | "photo_url" | "bol_photo_url" | "manifest_photo_url"
 >>;
 
 export type PackageStatus = "open" | "closed" | "suspicious" | "submitted";
@@ -51,16 +56,19 @@ export type PackageRecord = {
   expected_item_count: number; actual_item_count: number;
   pallet_id: string | null; status: PackageStatus;
   discrepancy_note: string | null;
-  expected_items?: ExpectedItem[] | null;
   manifest_url?: string | null;
-  manifest_data?: ExpectedItem[] | null;
   store_id?: string | null;
   stores?: { name: string; platform: string } | null;
   created_by?: string | null;
   updated_by?: string | null;
   created_at: string; updated_at: string;
   order_id?: string | null;
-  /** Canonical image storage — `{ urls: string[] }` (opened → label → optional closed ordering for claims). */
+  photo_url?: string | null;
+  photo_return_label_url?: string | null;
+  photo_opened_url?: string | null;
+  photo_closed_url?: string | null;
+  manifest_photo_url?: string | null;
+  /** Structured gallery — `{ urls }` and/or `label_urls`, `outer_box_urls`, `inside_content_urls`, `sealed_box_urls`. */
   photo_evidence?: unknown | null;
 };
 
@@ -69,16 +77,20 @@ export type PackageInsertPayload = {
   carrier_name?: string; rma_number?: string; expected_item_count?: number;
   pallet_id?: string; store_id?: string; organization_id?: string; created_by?: string;
   manifest_url?: string;
-  manifest_data?: ExpectedItem[] | null;
   order_id?: string | null;
+  photo_url?: string | null;
+  photo_return_label_url?: string | null;
+  photo_opened_url?: string | null;
+  photo_closed_url?: string | null;
+  manifest_photo_url?: string | null;
   photo_evidence?: Record<string, unknown> | null;
 };
 
 export type PackageUpdatePayload = Partial<Pick<
   PackageRecord,
-  | "carrier_name" | "tracking_number" | "rma_number" | "expected_item_count" | "status" | "discrepancy_note" | "pallet_id" | "manifest_url" | "manifest_data"
+  | "carrier_name" | "tracking_number" | "rma_number" | "expected_item_count" | "status" | "discrepancy_note" | "pallet_id" | "manifest_url"
   | "order_id"
-  | "expected_items"
+  | "photo_url" | "photo_return_label_url" | "photo_opened_url" | "photo_closed_url" | "manifest_photo_url"
   | "photo_evidence"
 >>;
 

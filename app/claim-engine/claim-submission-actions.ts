@@ -29,7 +29,9 @@ export type ClaimSubmissionStatus =
   | "evidence_requested"
   | "investigating"
   | "accepted"
-  | "rejected";
+  | "rejected"
+  /** Terminal failure — agent or marketplace returned an unrecoverable error. Added by Neda's migration. */
+  | "failed";
 
 export type ClaimSubmissionListRow = {
   id: string;
@@ -49,6 +51,8 @@ export type ClaimSubmissionListRow = {
   asin: string | null;
   fnsku: string | null;
   sku: string | null;
+  /** UUID of the operator/agent that created the submission — links to `profiles.id`. Added by Neda's migration. */
+  created_by: string | null;
 };
 
 async function signedUrlForPath(path: string | null): Promise<string | null> {
@@ -229,6 +233,7 @@ export async function listClaimSubmissions(
         asin: (ret?.asin as string | null) ?? null,
         fnsku: (ret?.fnsku as string | null) ?? null,
         sku: resolveReturnSku(ret),
+        created_by: (r.created_by as string | null) ?? null,
       });
     }
 

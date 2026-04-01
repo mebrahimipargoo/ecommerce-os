@@ -60,7 +60,8 @@ export async function getClaimEngineKpis(
     if (error) throw new Error(error.message);
     const rows = data ?? [];
 
-    const active = rows.filter((r) => r.status !== "accepted" && r.status !== "rejected");
+    const TERMINAL_STATUSES = new Set(["accepted", "rejected", "failed"]);
+    const active = rows.filter((r) => !TERMINAL_STATUSES.has(String(r.status ?? "")));
     const totalActiveClaims = active.length;
     const totalClaimValueUsd = active.reduce((sum, r) => sum + Number(r.claim_amount ?? 0), 0);
 
@@ -82,9 +83,9 @@ export async function getClaimEngineKpis(
       return sum + Number(raw.claim_amount ?? 0);
     }, 0);
 
-    const finished = rows.filter((r) => r.status === "accepted" || r.status === "rejected");
+    const finished = rows.filter((r) => r.status === "accepted" || r.status === "rejected" || r.status === "failed");
     const accepted = finished.filter((r) => r.status === "accepted").length;
-    const denied = finished.filter((r) => r.status === "rejected").length;
+    const denied = finished.filter((r) => r.status === "rejected" || r.status === "failed").length;
     const denom = accepted + denied;
     const successRatePercent = denom > 0 ? Math.round((accepted / denom) * 1000) / 10 : 0;
 

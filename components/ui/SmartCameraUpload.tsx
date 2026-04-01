@@ -181,34 +181,7 @@ export function SmartCameraUpload({
         )}
       </div>
 
-      {/* ── Thumbnail grid ── */}
-      {files.length > 0 && (
-        <div className="grid grid-cols-4 gap-2 px-4 pt-3">
-          {files.map((file, i) => {
-            const url = URL.createObjectURL(file);
-            return (
-              <div
-                key={i}
-                className="relative aspect-square overflow-hidden rounded-xl border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800"
-              >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={url} alt={`Evidence ${i + 1}`} className="h-full w-full object-contain" />
-                {/* Always-visible delete button — visible on both touch and pointer devices */}
-                <button
-                  type="button"
-                  onClick={(e) => { e.stopPropagation(); removeFile(i); }}
-                  className="absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded-full bg-black/70 text-white shadow-md transition hover:bg-rose-600 active:scale-95"
-                  aria-label={`Remove photo ${i + 1}`}
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {/* ── Capture CTA ── */}
+      {/* ── Capture CTA (thumbnails render below — matches mobile “capture then see proof” flow) ── */}
       {canAddMore && (
         <>
           {/* ── MOBILE: single large camera button ── */}
@@ -311,6 +284,33 @@ export function SmartCameraUpload({
             </div>
           )}
         </>
+      )}
+
+      {/* ── Thumbnail grid (below capture controls) ── */}
+      {files.length > 0 && (
+        <div className="grid grid-cols-4 gap-2 px-4 pb-3 pt-2">
+          {files.map((file, i) => {
+            const url = URL.createObjectURL(file);
+            return (
+              <div
+                key={i}
+                className="relative aspect-square overflow-hidden rounded-xl border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800"
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={url} alt={`Evidence ${i + 1}`} className="h-full w-full object-contain" />
+                {/* Always-visible delete button — visible on both touch and pointer devices */}
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); removeFile(i); }}
+                  className="absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded-full bg-black/70 text-white shadow-md transition hover:bg-rose-600 active:scale-95"
+                  aria-label={`Remove photo ${i + 1}`}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
       )}
 
       {/* ── Hidden file inputs ── */}

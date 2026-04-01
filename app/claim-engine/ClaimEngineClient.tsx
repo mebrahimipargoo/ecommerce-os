@@ -127,6 +127,8 @@ const CLAIM_ROW_STATUS_STYLES: Record<string, string> = {
   investigating: "border-violet-600/60 bg-violet-950/40 text-violet-100",
   accepted: STATUS_STYLES.recovered,
   rejected: "border-rose-700/60 bg-rose-950/50 text-rose-300",
+  /** Added by Neda's migration — terminal system failure. */
+  failed: "border-rose-800/70 bg-rose-950/60 text-rose-200",
 };
 
 const SUBMISSION_STATUS_STYLES: Record<string, string> = {
@@ -137,6 +139,8 @@ const SUBMISSION_STATUS_STYLES: Record<string, string> = {
   investigating: "border-violet-700/60 bg-violet-950/50 text-violet-200",
   accepted: "border-emerald-700/60 bg-emerald-950/50 text-emerald-200",
   rejected: "border-rose-700/60 bg-rose-950/50 text-rose-200",
+  /** Added by Neda's migration — terminal system failure, shown in queue and history. */
+  failed: "border-rose-800/70 bg-rose-950/60 text-rose-200",
 };
 
 function resolveStore(claim: ClaimRecord, stores: StoreRow[]): StoreRow | null {

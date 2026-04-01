@@ -8,6 +8,7 @@ import {
   type StorageBucketName,
 } from "./media-upload-types";
 
+/** Default bucket for item/package/pallet evidence images — must exist in Supabase Storage. */
 const DEFAULT_BUCKET = "media";
 
 /**

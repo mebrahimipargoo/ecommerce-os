@@ -15,7 +15,10 @@ import {
 } from "./claim-queue-helpers";
 import {
   PACKAGE_LIST_SELECT,
+  PACKAGE_MUTATION_SELECT,
   PALLET_LIST_SELECT,
+  PALLET_MUTATION_SELECT,
+  RETURN_LIST_SELECT,
   RETURN_SELECT,
 } from "./returns-constants";
 import {
@@ -23,10 +26,6 @@ import {
   hasReturnPhotoEvidenceUrlSlots,
   type ReturnPhotoEvidenceRow,
 } from "../../lib/return-photo-evidence";
-import {
-  normalizeEntityPhotoEvidenceUrls,
-  resolvePackageClaimPhotoUrls,
-} from "../../lib/entity-photo-evidence";
 import type {
   AuditLogRecord,
   DashboardSnapshot,
@@ -47,6 +46,20 @@ import type {
 } from "./returns-action-types";
 
 const DEFAULT_ORG = resolveOrganizationId();
+
+/** Collapse duplicate rows (same `id`) from PostgREST embed fan-out; keep newest-first by `created_at`. */
+function dedupeReturnsById(rows: unknown[] | null | undefined): ReturnRecord[] {
+  const map = new Map<string, ReturnRecord>();
+  for (const raw of rows ?? []) {
+    const r = raw as ReturnRecord;
+    if (r?.id && typeof r.id === "string" && !map.has(r.id)) {
+      map.set(r.id, r);
+    }
+  }
+  const out = [...map.values()];
+  out.sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""));
+  return out;
+}
 
 /** Rejects invalid client values (e.g. mistyped default store id in localStorage). */
 function resolveOrganizationIdForWrite(clientOrg?: string | null): string {
@@ -139,27 +152,11 @@ function parseDuplicateError(message: string): string {
 
 // ─── Claim-eligible conditions: see ./claim-queue-helpers (CLAIM_CONDITIONS) ───
 
-/** True when the package has outer-box + return-label photos operators can inherit for claims. */
-async function fetchPackageInheritedClaimPhotosReady(packageId: string | null | undefined): Promise<boolean> {
-  const id = uuidOrNull(packageId ?? null);
-  if (!id) return false;
-  const { data } = await supabaseServer
-    .from("packages")
-    .select("photo_evidence")
-    .eq("id", id)
-    .maybeSingle();
-  if (!data) return false;
-  const resolved = resolvePackageClaimPhotoUrls(data as { photo_evidence?: unknown });
-  const opened = !!String(resolved.opened ?? "").trim();
-  const label = !!String(resolved.label ?? "").trim();
-  return opened && label;
-}
-
 function deriveStatus(
   conditions: string[],
   photoEvidence: ReturnPhotoEvidenceRow | undefined,
-  opts?: {
-    /** Package has outer/box + return-label photos — counts toward ready_for_claim without per-item box uploads. */
+  _opts?: {
+    /** @deprecated Claim readiness uses `returns.photo_evidence` only — package inheritance removed. */
     packageHasInheritedClaimPhotos?: boolean;
   },
 ): string {
@@ -169,8 +166,7 @@ function deriveStatus(
   const fromItem =
     hasReturnPhotoEvidenceCounts(pe) ||
     hasReturnPhotoEvidenceUrlSlots(pe);
-  const inherited = !!opts?.packageHasInheritedClaimPhotos;
-  if (fromItem || inherited) return "ready_for_claim";
+  if (fromItem) return "ready_for_claim";
   return "pending_evidence";
 }
 
@@ -178,7 +174,7 @@ function deriveStatus(
 export async function buildClaimSubmissionSourcePayloadForReturn(
   conditions: string[],
   amazonOrderId: string | null | undefined,
-  packageId: string | null | undefined,
+  _packageId: string | null | undefined,
   claimMeta?: {
     expirationDate?: string | null;
     batchNumber?: string | null;
@@ -187,11 +183,9 @@ export async function buildClaimSubmissionSourcePayloadForReturn(
   extras?: { selectedEvidenceUrls?: string[] | null },
 ): Promise<Record<string, unknown>> {
   const base = buildClaimSourcePayload(conditions, amazonOrderId, claimMeta);
-  const withPkg = await mergePackageBoxEvidenceIntoPayload(packageId, base);
-  const withPlt = await mergePalletEvidenceIntoPayload(packageId, withPkg);
   const urls = extras?.selectedEvidenceUrls?.filter((u) => typeof u === "string" && u.trim().length > 0) ?? [];
-  if (urls.length > 0) return { ...withPlt, selected_claim_evidence_urls: urls };
-  return withPlt;
+  if (urls.length > 0) return { ...base, selected_claim_evidence_urls: urls };
+  return base;
 }
 
 function buildClaimSourcePayload(
@@ -219,68 +213,6 @@ function buildClaimSourcePayload(
     if (lot) payload.batch_number = lot;
   }
   return payload;
-}
-
-/** Merges package-level box / label photos into the JSONB claim payload (box → item inheritance). */
-async function mergePackageBoxEvidenceIntoPayload(
-  packageId: string | null | undefined,
-  payload: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const id = uuidOrNull(packageId ?? null);
-  if (!id) return payload;
-  const { data } = await supabaseServer
-    .from("packages")
-    .select("photo_evidence")
-    .eq("id", id)
-    .maybeSingle();
-  if (!data) return payload;
-  const urls = normalizeEntityPhotoEvidenceUrls((data as { photo_evidence?: unknown }).photo_evidence);
-  const opened = urls[0] ?? null;
-  const label = urls[1] ?? null;
-  const closed = urls[2] ?? null;
-  const outer = opened || closed || urls[0] || null;
-  return {
-    ...payload,
-    package_box_evidence: {
-      outer_box_url: outer,
-      return_label_url: label,
-      photo_closed_url: closed,
-      photo_opened_url: opened,
-      photo_return_label_url: label,
-    },
-  };
-}
-
-/** Pallet-level manifest / BOL / box photos linked via package → pallet (item inherits for claims). */
-async function mergePalletEvidenceIntoPayload(
-  packageId: string | null | undefined,
-  payload: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const pkgId = uuidOrNull(packageId ?? null);
-  if (!pkgId) return payload;
-  const { data: pkg } = await supabaseServer
-    .from("packages")
-    .select("pallet_id")
-    .eq("id", pkgId)
-    .maybeSingle();
-  const palletId = pkg?.pallet_id ? String(pkg.pallet_id).trim() : "";
-  if (!palletId || !isUuidString(palletId)) return payload;
-  const { data: plt } = await supabaseServer
-    .from("pallets")
-    .select("photo_evidence")
-    .eq("id", palletId)
-    .maybeSingle();
-  if (!plt) return payload;
-  const urls = normalizeEntityPhotoEvidenceUrls((plt as { photo_evidence?: unknown }).photo_evidence);
-  return {
-    ...payload,
-    pallet_evidence: {
-      incident_photo_urls: urls,
-      manifest_photo_url: urls[0] ?? null,
-      bol_photo_url: urls[1] ?? null,
-      photo_url: urls[2] ?? null,
-    },
-  };
 }
 
 /** Resolves non-null `store_id` for `claim_submissions` (return → package → default Amazon store). Exported for batch sync. */
@@ -440,30 +372,13 @@ function parseManifestData(raw: unknown): ExpectedItem[] | null | undefined {
 }
 
 function normalizePackageRow(row: Record<string, unknown>): PackageRecord {
-  const ret = row.returns as { count: number }[] | undefined;
-  const { returns: _r, ...rest } = row;
-  const base = rest as PackageRecord;
-  const md = parseManifestData(rest.manifest_data);
-  const withManifest = md !== undefined ? { ...base, manifest_data: md } : base;
-  const c = ret?.[0]?.count;
-  if (typeof c === "number") return { ...withManifest, actual_item_count: c };
-  return withManifest;
+  const base = row as PackageRecord;
+  const md = parseManifestData(row.manifest_data);
+  return md !== undefined ? { ...base, manifest_data: md } : base;
 }
 
 function normalizePalletRow(row: Record<string, unknown>): PalletRecord {
-  const pkgs = row.packages as { count: number }[] | undefined;
-  const rets = row.returns as { count: number }[] | undefined;
-  const { packages: _p, returns: _r, ...rest } = row;
-  const base = rest as PalletRecord;
-  const pc = pkgs?.[0]?.count;
-  const rc = rets?.[0]?.count;
-  return {
-    ...base,
-    ...(typeof pc === "number" ? { child_packages_count: pc } : {}),
-    ...(typeof rc === "number"
-      ? { child_returns_count: rc, item_count: rc }
-      : {}),
-  };
+  return row as PalletRecord;
 }
 
 // ─── Pallet Actions ───────────────────────────────────────────────────────────
@@ -481,12 +396,16 @@ export async function createPallet(
       status: "open",
       created_by: resolveActorUserId(payload.created_by),
     };
-    if (payload.photo_evidence != null) insertRow.photo_evidence = payload.photo_evidence;
+    if (payload.photo_url !== undefined) insertRow.photo_url = String(payload.photo_url ?? "").trim() || null;
+    if (payload.bol_photo_url !== undefined) insertRow.bol_photo_url = String(payload.bol_photo_url ?? "").trim() || null;
+    if (payload.manifest_photo_url !== undefined) {
+      insertRow.manifest_photo_url = String(payload.manifest_photo_url ?? "").trim() || null;
+    }
     const sid = uuidFkOrNull(payload.store_id ?? null, "store_id");
     if (sid) insertRow.store_id = sid;
     const { data, error } = await supabaseServer.from("pallets")
       .insert(insertRow)
-      .select(PALLET_LIST_SELECT).single();
+      .select(PALLET_MUTATION_SELECT).single();
     if (error) throw new Error(error.message);
     const row = normalizePalletRow(data as Record<string, unknown>);
     void logPalletAudit({ organizationId: orgId, palletId: row.id, action: "created", actor });
@@ -560,6 +479,7 @@ export async function updatePallet(
       updated_by: resolveActorUserId(actor),
     };
     delete row.created_by;
+    delete row.photo_evidence;
     if ("notes" in row && row.notes !== undefined && row.notes !== null) {
       row.notes = String(row.notes).trim() || null;
     }
@@ -570,7 +490,7 @@ export async function updatePallet(
       .update(row)
       .eq("id", id)
       .eq("organization_id", org)
-      .select(PALLET_LIST_SELECT)
+      .select(PALLET_MUTATION_SELECT)
       .single();
     if (error) throw new Error(error.message);
     const rec = normalizePalletRow(data as Record<string, unknown>);
@@ -607,11 +527,7 @@ export async function createPackage(
   try {
     const orgId = resolveOrganizationIdForWrite(payload.organization_id);
     const actor = payload.created_by      ?? DEFAULT_ACTOR;
-    const md = parseManifestData(payload.manifest_data);
-    const lines = Array.isArray(md) && md.length > 0 ? md : null;
-    const qtyFromManifest = sumManifestLineQty(lines);
-    const fallbackCount = coerceNonNegativeInt(payload.expected_item_count, 0);
-    const expected_item_count = qtyFromManifest > 0 ? qtyFromManifest : fallbackCount;
+    const expected_item_count = coerceNonNegativeInt(payload.expected_item_count, 0);
     const palletIdFk = uuidFkOrNull(payload.pallet_id ?? null, "pallet_id");
     const storeIdFk = uuidFkOrNull(payload.store_id ?? null, "store_id");
     const insertRow: Record<string, unknown> = {
@@ -627,16 +543,25 @@ export async function createPackage(
       created_by:       resolveActorUserId(payload.created_by),
     };
     if (storeIdFk) insertRow.store_id = storeIdFk;
-    if (lines) {
-      insertRow.manifest_data = lines;
-      insertRow.expected_items = lines;
-    }
     if (payload.photo_evidence != null) insertRow.photo_evidence = payload.photo_evidence;
+    if (payload.photo_url !== undefined) insertRow.photo_url = String(payload.photo_url ?? "").trim() || null;
+    if (payload.photo_return_label_url !== undefined) {
+      insertRow.photo_return_label_url = String(payload.photo_return_label_url ?? "").trim() || null;
+    }
+    if (payload.photo_opened_url !== undefined) {
+      insertRow.photo_opened_url = String(payload.photo_opened_url ?? "").trim() || null;
+    }
+    if (payload.photo_closed_url !== undefined) {
+      insertRow.photo_closed_url = String(payload.photo_closed_url ?? "").trim() || null;
+    }
+    if (payload.manifest_photo_url !== undefined) {
+      insertRow.manifest_photo_url = String(payload.manifest_photo_url ?? "").trim() || null;
+    }
     if (payload.order_id?.trim()) insertRow.order_id = payload.order_id.trim();
 
     const { data, error } = await supabaseServer.from("packages")
       .insert(insertRow)
-      .select(PACKAGE_LIST_SELECT).single();
+      .select(PACKAGE_MUTATION_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
     void logPackageAudit({ organizationId: orgId, packageId: (data as { id: string }).id, action: "created", actor });
     return { ok: true, data: normalizePackageRow(data as Record<string, unknown>) };
@@ -653,9 +578,10 @@ export async function updatePackage(
   try {
     const pkgId = uuidOrNull(packageId);
     if (!pkgId) throw new Error("Invalid package id.");
+    const safeUpdates = { ...(updates as Record<string, unknown>) };
+    delete safeUpdates.updated_by;
     const payload = omitUndefined({
-      ...updates,
-      updated_by: resolveActorUserId(actor),
+      ...safeUpdates,
     } as Record<string, unknown>);
     delete payload.created_by;
     if ("pallet_id" in payload) payload.pallet_id = uuidOrNull(payload.pallet_id as string);
@@ -663,19 +589,14 @@ export async function updatePackage(
       const s = uuidOrNull(payload.store_id as string);
       payload.store_id = s;
     }
-    if ("manifest_data" in payload && payload.manifest_data != null) {
-      const parsed = parseManifestData(payload.manifest_data);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        payload.manifest_data = parsed;
-        payload.expected_items = parsed;
-      }
-    }
+    delete payload.manifest_data;
+    delete payload.expected_items;
     if ("expected_item_count" in payload) {
       payload.expected_item_count = coerceNonNegativeInt(payload.expected_item_count, 0);
     }
     const { data, error } = await supabaseServer.from("packages")
       .update(payload)
-      .eq("id", pkgId).select(PACKAGE_LIST_SELECT).single();
+      .eq("id", pkgId).select(PACKAGE_MUTATION_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
     const row = normalizePackageRow(data as Record<string, unknown>);
     // Keep denormalized returns.pallet_id in sync when package moves between pallets
@@ -734,10 +655,10 @@ export async function listReturnsByPackage(packageId: string): Promise<{ ok: boo
   try {
     const id = uuidOrNull(packageId);
     if (!id) return { ok: true, data: [] };
-    const { data, error } = await supabaseServer.from("returns").select(RETURN_SELECT)
+    const { data, error } = await supabaseServer.from("returns").select(RETURN_LIST_SELECT)
       .eq("package_id", id).is("deleted_at", null).order("created_at", { ascending: false });
     if (error) throw new Error(error.message);
-    return { ok: true, data: (data ?? []) as unknown as ReturnRecord[] };
+    return { ok: true, data: dedupeReturnsById(data ?? []) };
   } catch (err) {
     return { ok: false, data: [], error: err instanceof Error ? err.message : "Failed to load package items." };
   }
@@ -789,10 +710,8 @@ export async function insertReturn(
   try {
     const orgId = resolveOrganizationIdForWrite(payload.organization_id);
     const packageIdFk = uuidFkOrNull(payload.package_id ?? null, "package_id");
-    const packageInherited = await fetchPackageInheritedClaimPhotosReady(packageIdFk);
-    const status = deriveStatus(payload.conditions, payload.photo_evidence ?? null, {
-      packageHasInheritedClaimPhotos: packageInherited,
-    });
+    /** Status / claims use `returns.photo_evidence` only — do not read packages.photo_evidence here. */
+    const status = deriveStatus(payload.conditions, payload.photo_evidence ?? null, {});
 
     /** Pallet FK only when linked to a real package — inherit from package row (never raw user text). */
     let effectivePalletId: string | null = null;
@@ -844,7 +763,6 @@ export async function insertReturn(
     if (payload.fnsku)            insertRow.fnsku            = payload.fnsku.trim();
     if (payload.sku)              insertRow.sku              = payload.sku.trim();
     if (effectiveAmazonOrderId) insertRow.order_id = String(effectiveAmazonOrderId);
-    if (payload.customer_id)    insertRow.customer_id    = payload.customer_id.trim();
 
     const { data, error } = await supabaseServer.from("returns")
       .insert(insertRow).select(RETURN_SELECT).single();
@@ -925,7 +843,9 @@ export async function updateReturn(
       .single();
     if (loadErr || !existing) throw new Error(loadErr?.message ?? "Return not found.");
 
-    const patch: Record<string, unknown> = { ...updates, updated_by: resolveActorUserId(actor) };
+    const safeUpdates = { ...(updates as Record<string, unknown>) };
+    delete safeUpdates.updated_by;
+    const patch: Record<string, unknown> = { ...safeUpdates };
     delete patch.created_by;
     // Remove post-migration columns from patch — they may not be in the DB yet
     delete patch.inherited_tracking_number;
@@ -963,10 +883,7 @@ export async function updateReturn(
               : String(updates.package_id),
           )
         : uuidOrNull(ex.package_id);
-    const packageInherited = await fetchPackageInheritedClaimPhotosReady(nextPackageId);
-    patch.status = deriveStatus(nextConditions, nextPhotoEvidence ?? null, {
-      packageHasInheritedClaimPhotos: packageInherited,
-    });
+    patch.status = deriveStatus(nextConditions, nextPhotoEvidence ?? null, {});
     if (patch.store_id != null) {
       const sid = String(patch.store_id).trim();
       if (sid && !isUuidString(sid)) {
@@ -1049,14 +966,14 @@ export async function listClaimPipelineReturns(
 ): Promise<{ ok: boolean; data: ReturnRecord[]; error?: string }> {
   try {
     const { data, error } = await supabaseServer.from("returns")
-      .select(RETURN_SELECT)
+      .select(RETURN_LIST_SELECT)
       .eq("organization_id", organizationId ?? DEFAULT_ORG)
       .in("status", ["ready_for_claim", "pending_evidence"])
       .is("deleted_at", null)
       .order("created_at", { ascending: false })
       .limit(200);
     if (error) throw new Error(error.message);
-    return { ok: true, data: (data ?? []) as unknown as ReturnRecord[] };
+    return { ok: true, data: dedupeReturnsById(data ?? []) };
   } catch (err) {
     return { ok: false, data: [], error: err instanceof Error ? err.message : "Failed to load claim pipeline items." };
   }
@@ -1064,7 +981,7 @@ export async function listClaimPipelineReturns(
 
 export async function listReturns(organizationId?: string): Promise<{ ok: boolean; data: ReturnRecord[]; error?: string }> {
   try {
-    const { data, error } = await supabaseServer.from("returns").select(RETURN_SELECT)
+    const { data, error } = await supabaseServer.from("returns").select(RETURN_LIST_SELECT)
       .eq("organization_id", organizationId ?? DEFAULT_ORG)
       .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(200);
@@ -1072,7 +989,7 @@ export async function listReturns(organizationId?: string): Promise<{ ok: boolea
       console.error("[listReturns] Supabase error:", error.message, "| code:", error.code, "| details:", error.details);
       throw new Error(error.message);
     }
-    return { ok: true, data: (data ?? []) as unknown as ReturnRecord[] };
+    return { ok: true, data: dedupeReturnsById(data ?? []) };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Failed to load returns.";
     console.error("[listReturns] Caught error:", msg);
@@ -1082,10 +999,10 @@ export async function listReturns(organizationId?: string): Promise<{ ok: boolea
 
 export async function listReturnsByPallet(palletId: string): Promise<{ ok: boolean; data: ReturnRecord[]; error?: string }> {
   try {
-    const { data, error } = await supabaseServer.from("returns").select(RETURN_SELECT)
+    const { data, error } = await supabaseServer.from("returns").select(RETURN_LIST_SELECT)
       .eq("pallet_id", palletId).is("deleted_at", null).order("created_at", { ascending: false });
     if (error) throw new Error(error.message);
-    return { ok: true, data: (data ?? []) as unknown as ReturnRecord[] };
+    return { ok: true, data: dedupeReturnsById(data ?? []) };
   } catch (err) {
     return { ok: false, data: [], error: err instanceof Error ? err.message : "Failed to load pallet items." };
   }

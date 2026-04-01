@@ -7,7 +7,10 @@ import {
   getReturnPhotoEvidenceUrls,
   type ReturnPhotoEvidenceRow,
 } from "../../lib/return-photo-evidence";
-import { normalizeEntityPhotoEvidenceUrls } from "../../lib/entity-photo-evidence";
+import {
+  normalizeEntityPhotoEvidenceUrls,
+  palletPhotoEvidenceUrlsFromRow,
+} from "../../lib/entity-photo-evidence";
 
 export type ClaimEvidenceKey =
   | "outer_box"
@@ -76,8 +79,11 @@ export function buildClaimEvidenceSlots(detail: {
   packageRow: {
     photo_evidence?: unknown;
   } | null;
+  /** Pallet TEXT columns only (no JSONB on `pallets`). */
   pallet: {
-    photo_evidence?: unknown;
+    manifest_photo_url?: string | null;
+    bol_photo_url?: string | null;
+    photo_url?: string | null;
   } | null;
 }): ClaimEvidenceSlot[] {
   const slots: ClaimEvidenceSlot[] = [];
@@ -106,7 +112,7 @@ export function buildClaimEvidenceSlots(detail: {
   const pkg = detail.packageRow;
   const ret = detail.returnRow;
 
-  const pltUrls = plt ? normalizeEntityPhotoEvidenceUrls(plt.photo_evidence) : [];
+  const pltUrls = plt ? palletPhotoEvidenceUrlsFromRow(plt) : [];
   const pkgUrls = pkg ? normalizeEntityPhotoEvidenceUrls(pkg.photo_evidence) : [];
 
   if (pltUrls.length > 0) {

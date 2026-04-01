@@ -36,14 +36,15 @@ import { getBarcodeModeFromStorage, getDefaultStoreIdFromStorage } from "../../l
 import { classifyProductBarcode } from "../../lib/product-barcode-classify";
 import { parseBarcodeSource } from "../../lib/utils/barcode-parser";
 import { supabase as supabaseBrowser } from "../../src/lib/supabase";
-import { uploadToIncidentPhotos, uploadToStorage } from "../../lib/supabase/storage";
+import { uploadToMedia, uploadToStorage } from "../../lib/supabase/storage";
 import { MasterUploader } from "../../components/MasterUploader";
 import {
   buildEntityPhotoEvidence,
+  buildStructuredPackagePhotoEvidence,
   mergeEntityPhotoEvidence,
   normalizeEntityPhotoEvidenceUrls,
+  palletPhotoEvidenceUrlsFromRow,
   resolvePackageClaimPhotoUrls,
-  setPackageClaimEvidenceSlot,
 } from "../../lib/entity-photo-evidence";
 import { fetchProductFromAmazon } from "../../lib/api/amazon-mock";
 import { operatorDisplayLabel } from "../../lib/operator-display";
@@ -59,6 +60,61 @@ import { isAdminRole, type UserRole } from "../../components/UserRoleContext";
 
 /** Seeded MVP org — use in client `stores` queries so RLS returns rows for local dev. */
 export const MVP_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001";
+
+/** Wizard / review summary — legacy TEXT columns first, then `urls` tail from `photo_evidence` JSONB. */
+function packageEvidenceGalleryUrls(pkg: PackageRecord | undefined | null): string[] {
+  if (!pkg) return [];
+  const pe = normalizeEntityPhotoEvidenceUrls(pkg.photo_evidence);
+  const o = pkg.photo_opened_url?.trim() || pe[0] || "";
+  const l = pkg.photo_return_label_url?.trim() || pe[1] || "";
+  const c = pkg.photo_closed_url?.trim() || pe[2] || "";
+  const u = pkg.photo_url?.trim() || pe[3] || "";
+  const head = [o, l, c, u].filter(Boolean);
+  return [...head, ...pe.slice(4)];
+}
+
+/** Pallet gallery — `pallets.manifest_photo_url`, `bol_photo_url`, `photo_url` (ordered for summary / claims). */
+function palletEvidenceValue(p: PalletRecord | null | undefined): unknown | null {
+  if (!p) return null;
+  const urls = palletPhotoEvidenceUrlsFromRow(p);
+  return urls.length ? { urls } : null;
+}
+
+function validateCreatePackageModal(input: {
+  pkgNum: string;
+  pkgStoreId: string;
+  palletId: string;
+  noBoxMode: boolean;
+  noLabel: boolean;
+  noOuterDamage: boolean;
+  noInsideInspect: boolean;
+  labelUrls: string[];
+  outerUrls: string[];
+  insideUrls: string[];
+}): { ok: boolean; error?: string } {
+  if (!input.pkgNum.trim()) {
+    return { ok: false, error: "Package number is required." };
+  }
+  if (!input.pkgStoreId.trim()) {
+    return { ok: false, error: "Select a store." };
+  }
+  const storeMsg = uuidFkInvalidMessage(input.pkgStoreId, "Store");
+  if (storeMsg) return { ok: false, error: storeMsg };
+  const pltMsg = uuidFkInvalidMessage(input.palletId, "Pallet");
+  if (pltMsg) return { ok: false, error: pltMsg };
+  if (!input.noBoxMode) {
+    if (!input.noLabel && input.labelUrls.length === 0) {
+      return { ok: false, error: "Add a shipping label photo or check “No label found”." };
+    }
+    if (!input.noOuterDamage && input.outerUrls.length === 0) {
+      return { ok: false, error: "Add an outer box photo or check “No box damage / issues”." };
+    }
+    if (!input.noInsideInspect && input.insideUrls.length === 0) {
+      return { ok: false, error: "Add an inside-content photo or check “Content cannot be inspected”." };
+    }
+  }
+  return { ok: true };
+}
 
 /** Simulated org setting: show expiry-label upload when expiration is within this many days (FEFO). */
 export const CLAIM_EXPIRY_EVIDENCE_THRESHOLD_DAYS = 90;
@@ -278,6 +334,13 @@ export const BTN_PRIMARY_INLINE = "inline-flex h-14 shrink-0 min-w-[12rem] items
 export const BTN_FOOTER_PRIMARY = "inline-flex h-10 min-w-[5.5rem] shrink-0 items-center justify-center gap-2 rounded-md bg-sky-500 px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-600 disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500";
 export const BTN_FOOTER_GHOST = "inline-flex h-10 min-w-[5.5rem] shrink-0 items-center justify-center gap-2 rounded-md border border-slate-200 bg-white px-4 text-sm font-medium text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800";
 export const BTN_GHOST   = "flex h-10 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800";
+
+/** Create Package / Create Pallet — equal-width footer actions (sticky bar). */
+export const MODAL_FOOTER_GRID = "grid grid-cols-2 gap-3";
+export const MODAL_FOOTER_CANCEL =
+  "flex h-12 w-full items-center justify-center rounded-2xl border border-slate-200 bg-white text-sm font-semibold text-slate-800 shadow-sm transition hover:bg-slate-50 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800";
+export const MODAL_FOOTER_SUBMIT =
+  "inline-flex h-12 w-full items-center justify-center gap-2 rounded-2xl bg-sky-500 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-600 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500";
 
 /** Checkbox column — fixed width + centered so TableHead matches TableCell */
 export const TH_CHK = "w-10 min-w-[2.5rem] px-0 py-3 text-center align-middle";
@@ -548,8 +611,15 @@ export type WizardState = {
   photo_expiry_url: string;
   /** Loose-item optional return label (no package to inherit from). */
   photo_return_label_url: string;
-  /** Extra gallery URLs in `photo_evidence.urls` (incident-photos bucket). */
+  /** Extra gallery URLs in `photo_evidence.urls` (`media` bucket). */
   evidence_gallery_urls: string[];
+  /**
+   * Package-context shots captured during the item wizard — stored only on `returns.photo_evidence`
+   * (never written to `packages`).
+   */
+  wizard_outer_box_url: string;
+  wizard_opened_box_url: string;
+  wizard_pkg_return_label_url: string;
   /** Connected store UUID — links this item to a specific store account. */
   store_id: string;
   /** Optional Amazon order ID — stored on `returns.order_id` and `claim_submissions.source_payload.amazon_order_id`. */
@@ -567,6 +637,7 @@ export const EMPTY_WIZARD: WizardState = {
   notes: "", photos: {},
   photo_item_url: "", photo_expiry_url: "", photo_return_label_url: "",
   evidence_gallery_urls: [],
+  wizard_outer_box_url: "", wizard_opened_box_url: "", wizard_pkg_return_label_url: "",
   store_id: "",
   amazon_order_id: "",
   catalog_resolution: "idle",
@@ -1466,7 +1537,7 @@ function ItemsSubTable({ items, role, actor, onItemClick, onItemDeleted, showToa
         </select>
       </div>
       {filtered.length === 0
-        ? <p className="py-4 text-center text-xs text-slate-400">No items{search || statusF ? " match your filters" : " scanned yet"}.</p>
+        ? <p className="py-4 text-center text-xs text-slate-400">{search || statusF ? "No records match your filters." : "No data."}</p>
         : (
           <div className="rounded-xl border border-border">
             <table className="w-full text-xs">
@@ -1572,6 +1643,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   const [editFnsku,  setEditFnsku]  = useState(record.fnsku ?? "");
   const [editSku, setEditSku] = useState(record.sku ?? "");
   const [editStoreId, setEditStoreId] = useState(record.store_id ?? "");
+  const [editPackageId, setEditPackageId] = useState(record.package_id ?? "");
   const [itemStoresList, setItemStoresList] = useState<{ id: string; name: string; platform: string }[]>([]);
   const [editItem,   setEditItem]   = useState(record.item_name);
   const [editNotes,  setEditNotes]  = useState(record.notes ?? "");
@@ -1621,6 +1693,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     setEditFnsku(record.fnsku ?? "");
     setEditSku(record.sku ?? "");
     setEditStoreId(record.store_id ?? "");
+    setEditPackageId(record.package_id ?? "");
     setEditItem(record.item_name);
     setEditNotes(record.notes ?? "");
     setEditOrderId(record.order_id ?? "");
@@ -1632,7 +1705,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
     setItemEditFiles([]);
     setEditCatalogStatus("idle");
     setEditCatalogPreview(null);
-  }, [record.id, record.lpn, record.asin, record.fnsku, record.sku, record.store_id, record.item_name, record.notes, record.order_id, record.photo_evidence, record.expiration_date]);
+  }, [record.id, record.lpn, record.asin, record.fnsku, record.sku, record.store_id, record.package_id, record.item_name, record.notes, record.order_id, record.photo_evidence, record.expiration_date]);
 
   async function handleEditBarcodeLookup(barcode: string) {
     if (!barcode.trim()) { setEditCatalogStatus("idle"); return; }
@@ -1761,6 +1834,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
       sku: editSku.trim() || null,
       store_id: editStoreId.trim() || null,
       marketplace: pickedStore ? platformToMarketplace(pickedStore.platform) : record.marketplace,
+      package_id: editPackageId.trim() || null,
     }, actor);
     setSaving(false);
     if (res.ok && res.data) { onUpdated(res.data); setEditing(false); setEditNewPhotos({}); }
@@ -1894,8 +1968,17 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
                 <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">No active stores found. Add a store in Settings → Stores.</p>
               )}
             </div>
+            <div>
+              <label className={LABEL}>Assign to Package <span className="text-xs font-normal text-slate-400">(optional)</span></label>
+              <select className={INPUT} value={editPackageId} onChange={(e) => setEditPackageId(e.target.value)}>
+                <option value="">— no package —</option>
+                {packages.filter((p) => p.status === "open").map((p) => (
+                  <option key={p.id} value={p.id}>{p.package_number}{p.carrier_name ? ` · ${p.carrier_name}` : ""}</option>
+                ))}
+              </select>
+            </div>
           </div>
-          {!record.package_id && (
+          {!editPackageId && (
             <div><label className={LABEL}>LPN <span className="text-xs font-normal text-slate-400">(optional)</span></label><input className={INPUT} value={editLpn} onChange={(e) => setEditLpn(e.target.value)} placeholder="Orphan label scan…" /></div>
           )}
           <div><label className={LABEL}>Item Name <span className="text-rose-500">*</span></label><input className={INPUT} value={editItem} onChange={(e) => setEditItem(e.target.value)} /></div>
@@ -2342,6 +2425,7 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
   const [selected,  setSelected]  = useState<ReturnRecord | null>(null);
   const [confirm,   setConfirm]   = useState(false);
   const [assigning, setAssigning] = useState(false);
+  const [assignErr, setAssignErr] = useState("");
   const currentIds = useMemo(() => new Set(currentItems.map((i) => i.id)), [currentItems]);
   const candidates = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -2354,10 +2438,17 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
   }
   async function doAssign(item: ReturnRecord) {
     setAssigning(true);
-    const res = await import("./actions").then((m) => m.updateReturn(item.id, { package_id: pkg.id }, actor));
+    setAssignErr("");
+    const res = await updateReturn(item.id, { package_id: pkg.id }, actor);
     setAssigning(false);
-    if (res.ok && res.data) onAssigned(res.data);
-    else setConfirm(false);
+    if (res.ok && res.data) {
+      onAssigned(res.data);
+    } else {
+      const msg = res.error ?? "Failed to assign item. Please try again.";
+      setAssignErr(msg);
+      console.error("[AssignExistingItemModal] doAssign failed:", msg);
+      setConfirm(false);
+    }
   }
 
   return (
@@ -2387,6 +2478,9 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
               </button>
             ))}
           </div>
+          {assignErr && (
+            <p className="mt-2 rounded-xl bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 dark:bg-rose-950/40 dark:text-rose-400">{assignErr}</p>
+          )}
         </div>
       </div>
       {confirm && selected && (
@@ -2473,6 +2567,22 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
     return () => { cancelled = true; };
   }, [editing, editPalletId, pkg.pallet_id, pkg.id]);
 
+  /** List queries omit `photo_evidence` — load JSONB once for edit/reconciliation UI. */
+  useEffect(() => {
+    let cancelled = false;
+    void supabaseBrowser
+      .from("packages")
+      .select("photo_evidence")
+      .eq("id", initPkg.id)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (cancelled || error || !data) return;
+        const pe = (data as { photo_evidence?: unknown }).photo_evidence;
+        setPkg((p) => ({ ...p, photo_evidence: pe ?? null }));
+      });
+    return () => { cancelled = true; };
+  }, [initPkg.id]);
+
   const packageLinkedToPallet = useMemo(() => {
     const raw = (editing ? editPalletId : pkg.pallet_id) ?? "";
     return Boolean(raw.trim() && isUuidString(raw.trim()));
@@ -2536,21 +2646,8 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
   const [editManifestErr, setEditManifestErr] = useState("");
 
   const reconciliationLines = useMemo((): SlipExpectedItem[] | null => {
-    const md = pkg.manifest_data;
-    const ex = pkg.expected_items;
-    const raw =
-      md && Array.isArray(md) && md.length > 0
-        ? md
-        : ex && Array.isArray(ex) && ex.length > 0
-          ? ex
-          : null;
-    if (!raw) return null;
-    return raw.map((it) => ({
-      barcode: String(it.sku ?? "").trim(),
-      name: String(it.description ?? it.sku ?? "").trim(),
-      expected_qty: it.expected_qty ?? 1,
-    }));
-  }, [pkg.manifest_data, pkg.expected_items]);
+    return null;
+  }, []);
 
   const mismatch   = pkg.expected_item_count > 0 && pkg.actual_item_count !== pkg.expected_item_count;
   const pct        = pkg.expected_item_count > 0 ? Math.min(100, (pkg.actual_item_count / pkg.expected_item_count) * 100) : null;
@@ -2559,7 +2656,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
 
   useEffect(() => { listReturnsByPackage(pkg.id).then((r) => { if (r.ok) setItems(r.data); setLoading(false); }); }, [pkg.id]);
 
-  /** Manifest upload from Edit mode — appends slip image to `photo_evidence`, saves manifest_data + expected_items. */
+  /** Manifest upload from Edit mode — appends slip image to `photo_evidence` and updates expected_item_count. */
   async function handleEditManifestUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = "";
@@ -2576,16 +2673,10 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
         setEditManifestErr("No items detected on the packing slip — try a clearer photo.");
         return;
       }
-      const manifest_data: ExpectedItem[] = items.map((it) => ({
-        sku: it.barcode,
-        expected_qty: it.expected_qty ?? 1,
-        description: it.name,
-      }));
-      const expected_item_count = manifest_data.reduce((a, it) => a + (it.expected_qty ?? 1), 0);
+      const expected_item_count = items.reduce((a, it) => a + (it.expected_qty ?? 1), 0);
       const res = await updatePackage(
         pkg.id,
         {
-          manifest_data,
           expected_item_count,
           photo_evidence: mergeEntityPhotoEvidence(pkg.photo_evidence, [publicUrl]) ?? undefined,
         },
@@ -2631,7 +2722,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
       rma_number:           editRmaNumber  || null,
       expected_item_count:  parseInt(editExpected, 10) || 0,
       order_id:             editOrderId.trim() || null,
-      ...(editPalletId ? { pallet_id: editPalletId } : {}),
+      pallet_id:            editPalletId.trim() || null,
       photo_evidence: mergedPe ?? null,
     }, actor);
     setSaving(false);
@@ -2788,38 +2879,6 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
                 >
                   📸 Take photo of packing list
                 </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    void (async () => {
-                      const mockItems: SlipExpectedItem[] = [
-                        { barcode: "111", name: "Item 111", expected_qty: 1 },
-                        { barcode: "222", name: "Item 222", expected_qty: 2 },
-                      ];
-                      const manifest_data: ExpectedItem[] = mockItems.map((it) => ({
-                        sku: it.barcode,
-                        expected_qty: it.expected_qty ?? 1,
-                        description: it.name,
-                      }));
-                      const expected_item_count = manifest_data.reduce((a, it) => a + (it.expected_qty ?? 1), 0);
-                      const res = await updatePackage(
-                        pkg.id,
-                        { manifest_data, expected_item_count },
-                        actor,
-                      );
-                      if (res.ok && res.data) {
-                        setPkg(res.data);
-                        onPackageUpdated(res.data);
-                        setEditExpected(String(res.data.expected_item_count));
-                      } else {
-                        setEditManifestErr(res.error ?? "Could not save mock manifest.");
-                      }
-                    })();
-                  }}
-                  className="flex w-full items-center justify-center gap-2 rounded-xl border border-violet-300 bg-white py-2.5 text-xs font-semibold text-violet-700 transition hover:bg-violet-100 dark:border-violet-700/50 dark:bg-slate-900 dark:text-violet-300"
-                >
-                  🧪 Load mock manifest (test reconciliation)
-                </button>
               </div>
             )}
             {(reconciliationLines || normalizeEntityPhotoEvidenceUrls(pkg.photo_evidence).length > 0) && (
@@ -2830,7 +2889,6 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
                     const res = await updatePackage(
                       pkg.id,
                       {
-                        manifest_data: null,
                         expected_item_count: 0,
                       },
                       actor,
@@ -3151,22 +3209,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
       </div>
 
       {wizardOpen && (() => {
-        // Merge saved manifest lines into the package so the wizard's
-        // itemMatchesPackageExpectation can check against the real manifest.
-        const rawManifest =
-          (pkg.manifest_data && pkg.manifest_data.length > 0
-            ? pkg.manifest_data
-            : pkg.expected_items) ?? [];
-        const pkgWithExpected: PackageRecord = {
-          ...pkg,
-          expected_items: rawManifest.length
-            ? rawManifest
-            : (reconciliationLines ?? []).map((e: SlipExpectedItem) => ({
-                sku: e.barcode,
-                expected_qty: e.expected_qty ?? 1,
-                description: e.name,
-              })),
-        };
+        const pkgWithExpected: PackageRecord = { ...pkg };
         return (
           <SingleItemWizardModal
             onClose={() => setWizardOpen(false)}
@@ -3180,7 +3223,6 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
             inheritedContext={{ packageId: pkg.id, packageLabel: pkg.package_number, palletId: pkg.pallet_id ?? undefined, palletLabel: openPallets.find((p) => p.id === pkg.pallet_id)?.pallet_number }}
             onSoftPackageWarning={() => showToast("⚠ This item is not on the scanned packing slip.", "warning")}
             onToast={showToast}
-            onLinkedPackageUpdated={onPackageUpdated}
             onNavigateToPackage={(id) => { if (id === pkg.id) setWizardOpen(false); }}
             onNavigateToPallet={(palletId) => {
               const plt = openPallets.find((p) => p.id === palletId);
@@ -3265,7 +3307,7 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
       const url = await uploadToStorage(f, "pallets/bol", orgId);
       const res = await updatePallet(
         plt.id,
-        { photo_evidence: mergeEntityPhotoEvidence(plt.photo_evidence, [url]) ?? undefined },
+        { bol_photo_url: url },
         actor,
         orgId,
       );
@@ -3292,7 +3334,7 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
       const url = await uploadToStorage(f, "pallets", orgId);
       const res = await updatePallet(
         plt.id,
-        { photo_evidence: mergeEntityPhotoEvidence(plt.photo_evidence, [url]) ?? undefined },
+        { photo_url: url },
         actor,
         orgId,
       );
@@ -3328,11 +3370,11 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
         </p>
       )}
       {plt.notes && <p className="rounded-xl bg-slate-50 p-3 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300">{plt.notes}</p>}
-      {normalizeEntityPhotoEvidenceUrls(plt.photo_evidence).length > 0 && (
+      {palletPhotoEvidenceUrlsFromRow(plt).length > 0 && (
         <div>
           <p className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">Pallet photos</p>
           <PhotoGallery
-            photos={normalizeEntityPhotoEvidenceUrls(plt.photo_evidence).map((src, i) => ({
+            photos={palletPhotoEvidenceUrlsFromRow(plt).map((src, i) => ({
               src,
               label: `Photo ${i + 1}`,
             }))}
@@ -3414,15 +3456,15 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
                 <label className={LABEL}>Pallet photo <span className="text-xs font-normal text-slate-400">(optional)</span></label>
                 <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-amber-300 bg-amber-50 py-3 text-sm font-semibold text-amber-800 dark:border-amber-700/60 dark:bg-amber-950/30 dark:text-amber-200 ${generalPhotoUploading ? "opacity-60" : ""}`}>
                   {generalPhotoUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Camera className="h-4 w-4" />}
-                  {generalPhotoUploading ? "Uploading…" : normalizeEntityPhotoEvidenceUrls(plt.photo_evidence).length > 2 ? "Add pallet photo" : "Upload pallet photo"}
+                  {generalPhotoUploading ? "Uploading…" : plt.photo_url?.trim() ? "Replace pallet photo" : "Upload pallet photo"}
                   <input type="file" className="hidden" accept="image/*" capture="environment" onChange={handleGeneralPalletPhotoUpload} disabled={generalPhotoUploading} />
                 </label>
-                {normalizeEntityPhotoEvidenceUrls(plt.photo_evidence).length > 0 ? (
+                {plt.photo_url?.trim() ? (
                   <div className="mt-3 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800/50">
                     <p className="border-b border-slate-200 px-3 py-2 text-xs font-semibold text-foreground dark:border-slate-700">Latest uploads (see gallery above)</p>
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
-                      src={normalizeEntityPhotoEvidenceUrls(plt.photo_evidence).slice(-1)[0] ?? ""}
+                      src={plt.photo_url.trim()}
                       alt="Pallet"
                       className="max-h-48 w-full object-contain"
                     />
@@ -3437,8 +3479,7 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
                   <input type="file" className="hidden" accept="image/*,application/pdf" onChange={handleBolUpload} disabled={bolUploading} />
                 </label>
                 {(() => {
-                  const bol = normalizeEntityPhotoEvidenceUrls(plt.photo_evidence).find((u) => u.toLowerCase().includes(".pdf"))
-                    ?? normalizeEntityPhotoEvidenceUrls(plt.photo_evidence)[1];
+                  const bol = plt.bol_photo_url?.trim() ?? "";
                   return bol ? (
                   <div className="mt-3 overflow-hidden rounded-xl border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800/50">
                     <p className="border-b border-slate-200 px-3 py-2 text-xs font-semibold text-foreground dark:border-slate-700">BoL preview</p>
@@ -4218,11 +4259,8 @@ export function WizardStep2({
   inheritedPackagePhotos,
   packageInheritsBoxPhotos,
   isLooseItem = false,
-  actor,
   linkedPackageId,
   linkedPackage,
-  onPackageUpdated,
-  onToast,
   organizationId = MVP_ORGANIZATION_ID,
 }: {
   state: WizardState;
@@ -4238,11 +4276,8 @@ export function WizardStep2({
   packageInheritsBoxPhotos: boolean;
   /** No parent box — hide package photo backfill; optional item-level return label only. */
   isLooseItem?: boolean;
-  actor: string;
   linkedPackageId?: string;
   linkedPackage?: PackageRecord | null;
-  onPackageUpdated?: (p: PackageRecord) => void;
-  onToast?: (msg: string, kind?: ToastKind) => void;
   organizationId?: string;
 }) {
   const orgId = isUuidString((organizationId ?? "").trim()) ? (organizationId ?? "").trim() : MVP_ORGANIZATION_ID;
@@ -4253,86 +4288,16 @@ export function WizardStep2({
   const labelUrl = inheritedPackagePhotos?.photo_return_label_url ?? null;
   const showExpiryPhotoSlot = shouldShowExpiryLabelPhoto(state);
 
-  const [pkgOpenedFiles, setPkgOpenedFiles] = useState<File[]>([]);
-  const [pkgOuterBoxFiles, setPkgOuterBoxFiles] = useState<File[]>([]);
-  const [pkgLabelFiles, setPkgLabelFiles] = useState<File[]>([]);
-
   const pkgClaimResolved = linkedPackage ? resolvePackageClaimPhotoUrls(linkedPackage) : { opened: null as string | null, label: null as string | null };
   const hasPkgOpenedOnly = !!pkgClaimResolved.opened?.trim();
   const pkgPe = normalizeEntityPhotoEvidenceUrls(linkedPackage?.photo_evidence);
-  const hasPkgOuterPhoto = !!pkgPe[3]?.trim();
+  const hasPkgOuterPhoto = !!(linkedPackage?.photo_url?.trim() || pkgPe[3]?.trim());
   const hasPkgReturnLabel = !!pkgClaimResolved.label?.trim();
   const packageMissingMandatoryPhotos = !hasPkgOpenedOnly || !hasPkgReturnLabel;
   const showPackageBackfill =
     !!photoCtx?.hasPackageLink && !!linkedPackageId && packageMissingMandatoryPhotos;
   const showOptionalOuterUpload =
     !!photoCtx?.hasPackageLink && !!linkedPackageId && !hasPkgOuterPhoto;
-
-  async function onPkgOuterBoxFilesChange(files: File[]) {
-    setPkgOuterBoxFiles(files);
-    if (files.length === 0 || !linkedPackageId) return;
-    try {
-      const url = await uploadToStorage(files[files.length - 1], "packages", orgId);
-      const res = await updatePackage(linkedPackageId, {
-        photo_evidence: mergeEntityPhotoEvidence(linkedPackage?.photo_evidence, [url]) ?? undefined,
-      }, actor);
-      if (res.ok && res.data) {
-        onPackageUpdated?.(res.data);
-        setPkgOuterBoxFiles([]);
-        onToast?.("Outer box photo saved on package.", "success");
-      } else {
-        onToast?.(res.error ?? "Could not update package", "error");
-        setPkgOuterBoxFiles([]);
-      }
-    } catch (e) {
-      onToast?.(e instanceof Error ? e.message : "Upload failed", "error");
-      setPkgOuterBoxFiles([]);
-    }
-  }
-
-  async function onPkgOpenedFilesChange(files: File[]) {
-    setPkgOpenedFiles(files);
-    if (files.length === 0 || !linkedPackageId) return;
-    try {
-      const url = await uploadToStorage(files[files.length - 1], "packages/claim_opened", orgId);
-      const res = await updatePackage(linkedPackageId, {
-        photo_evidence: setPackageClaimEvidenceSlot(linkedPackage?.photo_evidence, 0, url) ?? undefined,
-      }, actor);
-      if (res.ok && res.data) {
-        onPackageUpdated?.(res.data);
-        setPkgOpenedFiles([]);
-        onToast?.("Opened box photo saved on package.", "success");
-      } else {
-        onToast?.(res.error ?? "Could not update package", "error");
-        setPkgOpenedFiles([]);
-      }
-    } catch (e) {
-      onToast?.(e instanceof Error ? e.message : "Upload failed", "error");
-      setPkgOpenedFiles([]);
-    }
-  }
-
-  async function onPkgLabelFilesChange(files: File[]) {
-    setPkgLabelFiles(files);
-    if (files.length === 0 || !linkedPackageId) return;
-    try {
-      const url = await uploadToStorage(files[files.length - 1], "packages/claim_return_label", orgId);
-      const res = await updatePackage(linkedPackageId, {
-        photo_evidence: setPackageClaimEvidenceSlot(linkedPackage?.photo_evidence, 1, url) ?? undefined,
-      }, actor);
-      if (res.ok && res.data) {
-        onPackageUpdated?.(res.data);
-        setPkgLabelFiles([]);
-        onToast?.("Return label photo saved on package.", "success");
-      } else {
-        onToast?.(res.error ?? "Could not update package", "error");
-        setPkgLabelFiles([]);
-      }
-    } catch (e) {
-      onToast?.(e instanceof Error ? e.message : "Upload failed", "error");
-      setPkgLabelFiles([]);
-    }
-  }
 
   return (
     <div className="space-y-5">
@@ -4405,16 +4370,13 @@ export function WizardStep2({
           {showOptionalOuterUpload && (
             <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-950">
               <p className="mb-2 text-[10px] font-bold uppercase tracking-wide text-slate-500 dark:text-slate-400">Optional — outer box</p>
-              <SmartCameraUpload
+              <MasterUploader
                 label="Outer box (optional)"
-                hint="Exterior carton — appended to the linked package photo_evidence.urls."
-                required={false}
-                maxPhotos={1}
-                files={pkgOuterBoxFiles}
-                onChange={onPkgOuterBoxFilesChange}
-                accentClass="border-slate-300 dark:border-slate-700"
-                icon={Package2}
-                iconColor="text-slate-600 dark:text-slate-400"
+                hint="Exterior carton — saved on this return only (photo_evidence.urls)."
+                value={state.wizard_outer_box_url.trim() ? [state.wizard_outer_box_url.trim()] : []}
+                onChange={(urls) => setState((p) => ({ ...p, wizard_outer_box_url: urls[0] ?? "" }))}
+                organizationId={orgId}
+                maxFiles={1}
               />
             </div>
           )}
@@ -4422,36 +4384,30 @@ export function WizardStep2({
           {showPackageBackfill && (
             <div className="rounded-2xl border-2 border-dashed border-amber-300/90 bg-amber-50/90 p-4 ring-1 ring-amber-200/60 dark:border-amber-700/70 dark:bg-amber-950/35 dark:ring-amber-900/40">
               <p className="mb-1 text-xs font-bold uppercase tracking-wide text-amber-900 dark:text-amber-200">
-                Quick add for package
+                Package claim photos missing on file
               </p>
               <p className="mb-3 text-[11px] leading-snug text-amber-950/90 dark:text-amber-100/90">
-                This linked package is missing mandatory claim photos (opened box and/or return label). Capture them here — they are saved on the <span className="font-semibold">package record</span> only (not on this return item).
+                The linked package does not have opened-box and/or return-label shots on record. Capture them here — they are stored on <span className="font-semibold">this return item</span> only (<span className="font-mono">returns.photo_evidence</span>), not on the package row.
               </p>
               <div className="space-y-4">
                 {!hasPkgOpenedOnly && (
-                  <SmartCameraUpload
+                  <MasterUploader
                     label="Opened box"
-                    hint="Interior / opened carton — stored in packages.photo_evidence (opened slot)."
-                    required
-                    maxPhotos={1}
-                    files={pkgOpenedFiles}
-                    onChange={onPkgOpenedFilesChange}
-                    accentClass="border-amber-200 dark:border-amber-800/50"
-                    icon={Package2}
-                    iconColor="text-amber-700 dark:text-amber-400"
+                    hint="Interior / opened carton — saved on this return (photo_evidence.urls)."
+                    value={state.wizard_opened_box_url.trim() ? [state.wizard_opened_box_url.trim()] : []}
+                    onChange={(urls) => setState((p) => ({ ...p, wizard_opened_box_url: urls[0] ?? "" }))}
+                    organizationId={orgId}
+                    maxFiles={1}
                   />
                 )}
                 {!hasPkgReturnLabel && (
-                  <SmartCameraUpload
+                  <MasterUploader
                     label="Return label"
-                    hint="Return / RMA label on the carton — stored on the linked package."
-                    required
-                    maxPhotos={1}
-                    files={pkgLabelFiles}
-                    onChange={onPkgLabelFilesChange}
-                    accentClass="border-sky-200 dark:border-sky-800/50"
-                    icon={Barcode}
-                    iconColor="text-sky-600 dark:text-sky-400"
+                    hint="Return / RMA label on the carton — saved on this return (photo_evidence.urls)."
+                    value={state.wizard_pkg_return_label_url.trim() ? [state.wizard_pkg_return_label_url.trim()] : []}
+                    onChange={(urls) => setState((p) => ({ ...p, wizard_pkg_return_label_url: urls[0] ?? "" }))}
+                    organizationId={orgId}
+                    maxFiles={1}
                   />
                 )}
               </div>
@@ -4496,11 +4452,11 @@ export function WizardStep2({
 
             <MasterUploader
               label="Additional evidence (gallery)"
-              hint="Optional — multiple images merged into photo_evidence.urls."
+              hint="Optional — up to 3 images merged into photo_evidence.urls."
               value={state.evidence_gallery_urls}
               onChange={(urls) => setState((p) => ({ ...p, evidence_gallery_urls: urls }))}
               organizationId={orgId}
-              maxFiles={24}
+              maxFiles={3}
             />
           </div>
 
@@ -4521,6 +4477,7 @@ export function WizardStep2({
                   label={cat.label}
                   hint={cat.hint}
                   required={!cat.optional}
+                  maxPhotos={3}
                   icon={cat.icon}
                   iconColor={cat.iconColor}
                   accentClass={cat.accentClass}
@@ -4556,13 +4513,20 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
   onToast?: (msg: string, kind?: ToastKind) => void;
   onNavigateToPackage?: (packageId: string) => void;
   onNavigateToPallet?: (palletId: string) => void;
-  /** Pallet `photo_evidence` when the linked pallet is not fully loaded in `pallets` (DB fetch in wizard). */
-  palletEvidenceFromDb?: { photo_evidence?: unknown | null } | null;
-  /** Fresh package `photo_evidence` + ids from DB when `openPackages` is stale or incomplete. */
+  /** Pallet photo columns when the linked pallet is not fully loaded in `pallets` (DB fetch in wizard). */
+  palletEvidenceFromDb?: {
+    photo_url?: string | null;
+    bol_photo_url?: string | null;
+    manifest_photo_url?: string | null;
+  } | null;
+  /** Fresh package link + legacy photo columns from DB when `openPackages` is stale (no `packages.photo_evidence`). */
   packageEvidenceFromDb?: {
-    photo_evidence?: unknown | null;
     pallet_id?: string | null;
     order_id?: string | null;
+    photo_opened_url?: string | null;
+    photo_return_label_url?: string | null;
+    photo_closed_url?: string | null;
+    photo_url?: string | null;
   } | null;
 }) {
   const photoTotal = Object.values(state.photos).reduce((a, files) => a + files.length, 0);
@@ -4574,12 +4538,12 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
     if (pkgFromList && fromDb) {
       return {
         ...pkgFromList,
-        photo_evidence:
-          fromDb.photo_evidence !== undefined && fromDb.photo_evidence !== null
-            ? fromDb.photo_evidence
-            : pkgFromList.photo_evidence,
         pallet_id: fromDb.pallet_id ?? pkgFromList.pallet_id,
         order_id: fromDb.order_id ?? pkgFromList.order_id,
+        photo_opened_url: fromDb.photo_opened_url ?? pkgFromList.photo_opened_url,
+        photo_return_label_url: fromDb.photo_return_label_url ?? pkgFromList.photo_return_label_url,
+        photo_closed_url: fromDb.photo_closed_url ?? pkgFromList.photo_closed_url,
+        photo_url: fromDb.photo_url ?? pkgFromList.photo_url,
       };
     }
     if (pkgFromList) return pkgFromList;
@@ -4596,7 +4560,10 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
         order_id: fromDb.order_id ?? null,
         status: "open",
         discrepancy_note: null,
-        photo_evidence: fromDb.photo_evidence ?? null,
+        photo_opened_url: fromDb.photo_opened_url ?? null,
+        photo_return_label_url: fromDb.photo_return_label_url ?? null,
+        photo_closed_url: fromDb.photo_closed_url ?? null,
+        photo_url: fromDb.photo_url ?? null,
         created_at: "",
         updated_at: "",
       } as PackageRecord;
@@ -4624,9 +4591,11 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
   /** Read-only thumbnails for scan confirmation — warehouse does not filter claim evidence here. */
   const summaryPhotos = useMemo((): PhotoItem[] => {
     const lines: PhotoItem[] = [];
-    const pltUrls = normalizeEntityPhotoEvidenceUrls(
-      linkedPlt?.photo_evidence ?? palletEvidenceFromDb?.photo_evidence,
-    );
+    const pltUrls = linkedPlt
+      ? normalizeEntityPhotoEvidenceUrls(palletEvidenceValue(linkedPlt))
+      : palletEvidenceFromDb
+        ? palletPhotoEvidenceUrlsFromRow(palletEvidenceFromDb)
+        : [];
     const pltLabels = ["Pallet — manifest", "Pallet — BOL", "Pallet — overview"];
     pltUrls.forEach((src, i) => {
       lines.push({
@@ -4634,7 +4603,7 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
         src,
       });
     });
-    const pkgUrls = normalizeEntityPhotoEvidenceUrls(linkedPkg?.photo_evidence);
+    const pkgUrls = packageEvidenceGalleryUrls(linkedPkg);
     const pkgLabels = ["Package — opened box", "Package — return label", "Package — closed box"];
     pkgUrls.forEach((src, i) => {
       if (i <= 2) {
@@ -4663,6 +4632,15 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
         src: state.photo_return_label_url.trim(),
       });
     }
+    if (state.wizard_outer_box_url?.trim()) {
+      lines.push({ label: "Return — outer box (item wizard)", src: state.wizard_outer_box_url.trim() });
+    }
+    if (state.wizard_opened_box_url?.trim()) {
+      lines.push({ label: "Return — opened box (item wizard)", src: state.wizard_opened_box_url.trim() });
+    }
+    if (state.wizard_pkg_return_label_url?.trim()) {
+      lines.push({ label: "Return — package return label (item wizard)", src: state.wizard_pkg_return_label_url.trim() });
+    }
     for (const [cat, files] of Object.entries(state.photos)) {
       files.forEach((f, i) => {
         const id = `cat:${cat}:${i}`;
@@ -4675,7 +4653,7 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
       });
     }
     return lines;
-  }, [linkedPlt, linkedPkg, palletEvidenceFromDb, packageEvidenceFromDb, state.loose_item, state.photo_item_url, state.photo_expiry_url, state.photo_return_label_url, state.photos, blobMap]);
+  }, [linkedPlt, linkedPkg, palletEvidenceFromDb, packageEvidenceFromDb, state.loose_item, state.photo_item_url, state.photo_expiry_url, state.photo_return_label_url, state.wizard_outer_box_url, state.wizard_opened_box_url, state.wizard_pkg_return_label_url, state.photos, blobMap]);
 
   const summaryPhotoCount = summaryPhotos.length;
   const pkgOrder = linkedPkg?.order_id?.trim() ?? "";
@@ -4831,7 +4809,7 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
 
 // ─── Single Item Wizard Modal ──────────────────────────────────────────────────
 
-export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast, onNavigateToPackage, onNavigateToPallet, onLinkedPackageUpdated, organizationId = MVP_ORGANIZATION_ID }: {
+export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast, onNavigateToPackage, onNavigateToPallet, organizationId = MVP_ORGANIZATION_ID }: {
   onClose: () => void;
   /** Called with the saved record AND the in-session photo files for gallery display. */
   onSuccess: (r: ReturnRecord, photos: Record<string, File[]>) => void;
@@ -4844,8 +4822,6 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
   onToast?: (msg: string, kind?: ToastKind) => void;
   onNavigateToPackage?: (packageId: string) => void;
   onNavigateToPallet?: (palletId: string) => void;
-  /** After Step 2 uploads box/label photos to the linked package row. */
-  onLinkedPackageUpdated?: (p: PackageRecord) => void;
   /** Workspace org for `returns.organization_id` / claim_submissions (defaults to MVP seed). */
   organizationId?: string;
 }) {
@@ -4859,15 +4835,20 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
   const [submitting, setSubmitting] = useState(false);
   const [submitErr, setSubmitErr] = useState("");
   const [flash, setFlash] = useState(false);
-  const [fetchedPkgPhotos, setFetchedPkgPhotos] = useState<{
-    photo_evidence: unknown | null;
-    /** From DB — may be missing on stale `openPackages` rows; used for pallet gallery + inheritance. */
+  /** Fresh `order_id` / pallet link + legacy claim photo URLs from DB (no `packages.photo_evidence` read — item photos stay on `returns` only). */
+  const [fetchedPkgMeta, setFetchedPkgMeta] = useState<{
     pallet_id?: string | null;
     order_id?: string | null;
+    photo_opened_url?: string | null;
+    photo_return_label_url?: string | null;
+    photo_closed_url?: string | null;
+    photo_url?: string | null;
   } | null>(null);
-  /** Pallet photos when package → pallet chain is resolved (matches claim payload family tree). */
+  /** Pallet photo columns when package → pallet chain is resolved (matches claim payload family tree). */
   const [fetchedPalletEvidence, setFetchedPalletEvidence] = useState<{
-    photo_evidence: unknown | null;
+    photo_url?: string | null;
+    bol_photo_url?: string | null;
+    manifest_photo_url?: string | null;
   } | null>(null);
   /** Resolves `marketplace` on submit when Step 1 synced only `store_id` (same source as listStores in WizardStep1). */
   const [wizardStoresForSubmit, setWizardStoresForSubmit] = useState<{ id: string; platform: string }[]>([]);
@@ -4887,7 +4868,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
 
   useEffect(() => {
     if (!resolvedPkgId?.trim() || !isUuidString(resolvedPkgId.trim())) {
-      setFetchedPkgPhotos(null);
+      setFetchedPkgMeta(null);
       setFetchedPalletEvidence(null);
       return;
     }
@@ -4904,14 +4885,16 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
       if (localPlt) {
         if (!cancelled) {
           setFetchedPalletEvidence({
-            photo_evidence: localPlt.photo_evidence ?? null,
+            photo_url: localPlt.photo_url,
+            bol_photo_url: localPlt.bol_photo_url,
+            manifest_photo_url: localPlt.manifest_photo_url,
           });
         }
         return;
       }
       void supabaseBrowser
         .from("pallets")
-        .select("photo_evidence")
+        .select("photo_url, bol_photo_url, manifest_photo_url")
         .eq("id", pid)
         .eq("organization_id", workspaceOrgId)
         .maybeSingle()
@@ -4921,48 +4904,82 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
             setFetchedPalletEvidence(null);
             return;
           }
+          const row = data as {
+            photo_url?: string | null;
+            bol_photo_url?: string | null;
+            manifest_photo_url?: string | null;
+          };
           setFetchedPalletEvidence({
-            photo_evidence: (data as { photo_evidence?: unknown }).photo_evidence ?? null,
+            photo_url: row.photo_url ?? null,
+            bol_photo_url: row.bol_photo_url ?? null,
+            manifest_photo_url: row.manifest_photo_url ?? null,
           });
         });
     }
 
-    /** Always load from DB so pallet_id + photos are not stale vs. cached `openPackages`. */
+    /** Load pallet link + marketplace order id + legacy package photo columns only (no `photo_evidence` JSONB). */
     void supabaseBrowser
       .from("packages")
-      .select("photo_evidence, order_id, pallet_id")
+      .select("order_id, pallet_id, photo_opened_url, photo_return_label_url, photo_closed_url, photo_url")
       .eq("id", pkgKey)
       .eq("organization_id", workspaceOrgId)
       .maybeSingle()
       .then(({ data }) => {
         if (cancelled) return;
         if (!data) {
-          setFetchedPkgPhotos(null);
+          setFetchedPkgMeta(null);
           setFetchedPalletEvidence(null);
           return;
         }
-        setFetchedPkgPhotos({
-          photo_evidence: (data as { photo_evidence?: unknown }).photo_evidence ?? null,
-          pallet_id: (data as { pallet_id?: string | null }).pallet_id ?? null,
-          order_id: (data as { order_id?: string | null }).order_id ?? null,
+        const row = data as {
+          order_id?: string | null;
+          pallet_id?: string | null;
+          photo_opened_url?: string | null;
+          photo_return_label_url?: string | null;
+          photo_closed_url?: string | null;
+          photo_url?: string | null;
+        };
+        setFetchedPkgMeta({
+          pallet_id: row.pallet_id ?? null,
+          order_id: row.order_id ?? null,
+          photo_opened_url: row.photo_opened_url ?? null,
+          photo_return_label_url: row.photo_return_label_url ?? null,
+          photo_closed_url: row.photo_closed_url ?? null,
+          photo_url: row.photo_url ?? null,
         });
-        const oid = (data.order_id as string | null | undefined)?.trim();
+        const oid = row.order_id?.trim();
         if (oid) setState((p) => (p.amazon_order_id.trim() ? p : { ...p, amazon_order_id: oid }));
-        applyPalletEvidence((data as { pallet_id?: string | null }).pallet_id ?? null);
+        applyPalletEvidence(row.pallet_id ?? null);
       });
     return () => { cancelled = true; };
-  }, [resolvedPkgId, openPallets, workspaceOrgId]);
+  }, [resolvedPkgId, openPallets, openPackages, workspaceOrgId]);
 
   const inheritedPackagePhotos = useMemo(() => {
-    if (!fetchedPkgPhotos) return null;
-    const pe = normalizeEntityPhotoEvidenceUrls(fetchedPkgPhotos.photo_evidence);
-    return {
-      photo_opened_url: pe[0] ?? null,
-      photo_closed_url: pe[2] ?? null,
-      photo_return_label_url: pe[1] ?? null,
-      photo_url: pe[3] ?? null,
-    };
-  }, [fetchedPkgPhotos]);
+    const id = resolvedPkgId?.trim();
+    if (!id) return null;
+    const base = openPackages.find((p) => p.id === id);
+    const meta = fetchedPkgMeta;
+    const merged = base
+      ? {
+          photo_opened_url: (meta?.photo_opened_url ?? base.photo_opened_url)?.trim() || null,
+          photo_closed_url: (meta?.photo_closed_url ?? base.photo_closed_url)?.trim() || null,
+          photo_return_label_url: (meta?.photo_return_label_url ?? base.photo_return_label_url)?.trim() || null,
+          photo_url: (meta?.photo_url ?? base.photo_url)?.trim() || null,
+        }
+      : meta
+        ? {
+            photo_opened_url: meta.photo_opened_url?.trim() || null,
+            photo_closed_url: meta.photo_closed_url?.trim() || null,
+            photo_return_label_url: meta.photo_return_label_url?.trim() || null,
+            photo_url: meta.photo_url?.trim() || null,
+          }
+        : null;
+    if (!merged) return null;
+    if (!merged.photo_opened_url && !merged.photo_closed_url && !merged.photo_return_label_url && !merged.photo_url) {
+      return null;
+    }
+    return merged;
+  }, [resolvedPkgId, openPackages, fetchedPkgMeta]);
 
   const packageInheritsBoxPhotos = !!(
     inheritedPackagePhotos &&
@@ -4974,12 +4991,20 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
     const id = resolvedPkgId?.trim();
     if (!id) return undefined;
     const base = openPackages.find((p) => p.id === id);
-    const pe = fetchedPkgPhotos?.photo_evidence;
+    const meta = fetchedPkgMeta;
     if (base) {
-      if (pe !== undefined && pe !== null) return { ...base, photo_evidence: pe };
-      return base;
+      if (!meta) return base;
+      return {
+        ...base,
+        order_id: meta.order_id ?? base.order_id,
+        pallet_id: meta.pallet_id ?? base.pallet_id,
+        photo_opened_url: meta.photo_opened_url ?? base.photo_opened_url,
+        photo_return_label_url: meta.photo_return_label_url ?? base.photo_return_label_url,
+        photo_closed_url: meta.photo_closed_url ?? base.photo_closed_url,
+        photo_url: meta.photo_url ?? base.photo_url,
+      };
     }
-    if (fetchedPkgPhotos) {
+    if (meta) {
       return {
         id,
         organization_id: workspaceOrgId,
@@ -4988,17 +5013,20 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
         carrier_name: null,
         expected_item_count: 0,
         actual_item_count: 0,
-        pallet_id: fetchedPkgPhotos.pallet_id ?? null,
-        order_id: fetchedPkgPhotos.order_id ?? null,
+        pallet_id: meta.pallet_id ?? null,
+        order_id: meta.order_id ?? null,
         status: "open",
         discrepancy_note: null,
-        photo_evidence: fetchedPkgPhotos.photo_evidence ?? null,
+        photo_opened_url: meta.photo_opened_url ?? null,
+        photo_return_label_url: meta.photo_return_label_url ?? null,
+        photo_closed_url: meta.photo_closed_url ?? null,
+        photo_url: meta.photo_url ?? null,
         created_at: "",
         updated_at: "",
       } as PackageRecord;
     }
     return undefined;
-  }, [resolvedPkgId, openPackages, fetchedPkgPhotos, workspaceOrgId]);
+  }, [resolvedPkgId, openPackages, fetchedPkgMeta, workspaceOrgId]);
 
   const conditions = conditionsFromKeys(state.condition_keys);
   const pkgIdForWarn = isLooseItem ? undefined : (inheritedContext?.packageId ?? state.package_link_id) || undefined;
@@ -5047,8 +5075,31 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
     }
     const cats = getCategoriesForConditions(conditions, photoCtxForStep2);
     const catsOk = cats.every((c) => c.optional || (state.photos[c.id]?.length ?? 0) > 0);
-    return !expiryBlocking && catsOk;
-  }, [state.condition_keys, state.expiration_date, state.photo_expiry_url, state.photos, conditions, photoCtxForStep2, isLooseItem]);
+    if (expiryBlocking || !catsOk) return false;
+
+    const pkg = linkedPackageForWizard;
+    const pid = resolvedPkgId?.trim() ?? "";
+    if (!pkg || !pid || !isUuidString(pid)) return true;
+
+    const resolved = resolvePackageClaimPhotoUrls(pkg);
+    const hasOpened = !!resolved.opened?.trim();
+    const hasLabel = !!resolved.label?.trim();
+    if (!hasOpened && !state.wizard_opened_box_url.trim()) return false;
+    if (!hasLabel && !state.wizard_pkg_return_label_url.trim()) return false;
+    return true;
+  }, [
+    state.condition_keys,
+    state.expiration_date,
+    state.photo_expiry_url,
+    state.photos,
+    state.wizard_opened_box_url,
+    state.wizard_pkg_return_label_url,
+    conditions,
+    photoCtxForStep2,
+    isLooseItem,
+    linkedPackageForWizard,
+    resolvedPkgId,
+  ]);
 
   async function handleSubmit() {
     setSubmitting(true); setSubmitErr("");
@@ -5083,11 +5134,18 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
       const conditionCategoryUrls: string[] = [];
       for (const [, files] of Object.entries(state.photos)) {
         for (let i = 0; i < files.length; i++) {
-          const url = await uploadToIncidentPhotos(files[i], "incident", workspaceOrgId);
+          const url = await uploadToMedia(files[i], "incident", workspaceOrgId);
           conditionCategoryUrls.push(url);
         }
       }
 
+      const wizardGalleryExtras = [
+        state.wizard_outer_box_url,
+        state.wizard_opened_box_url,
+        state.wizard_pkg_return_label_url,
+      ]
+        .map((s) => s.trim())
+        .filter(Boolean);
       const photoEvidence = mergeReturnPhotoEvidence(
         categoryCounts,
         {
@@ -5095,7 +5153,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
           expiry_url: state.photo_expiry_url,
           return_label_url: state.photo_return_label_url,
         },
-        { galleryUrls: [...state.evidence_gallery_urls, ...conditionCategoryUrls] },
+        { galleryUrls: [...state.evidence_gallery_urls, ...conditionCategoryUrls, ...wizardGalleryExtras] },
       );
 
       const storeRow = wizardStoresForSubmit.find((s) => s.id === state.store_id);
@@ -5172,7 +5230,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
           </div>
           <StepIndicator step={step} total={3} />
         </div>
-        <div className="flex-1 overflow-y-auto p-4 sm:p-6">
+        <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
           {step === 1 && (
             <WizardStep1
               state={state}
@@ -5201,12 +5259,9 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
                 orphanLpn: !!state.lpn.trim(),
                 packageInheritsBoxPhotos,
               }}
-              actor={actor}
               organizationId={workspaceOrgId}
               linkedPackageId={resolvedPkgId || undefined}
               linkedPackage={linkedPackageForWizard}
-              onPackageUpdated={onLinkedPackageUpdated}
-              onToast={onToast}
             />
           )}
           {step === 3 && (
@@ -5223,12 +5278,12 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
               onNavigateToPackage={onNavigateToPackage}
               onNavigateToPallet={onNavigateToPallet}
               palletEvidenceFromDb={fetchedPalletEvidence}
-              packageEvidenceFromDb={fetchedPkgPhotos}
+              packageEvidenceFromDb={fetchedPkgMeta}
             />
           )}
         </div>
         {submitErr && <p className="shrink-0 px-4 sm:px-6 pb-2 text-sm font-semibold text-rose-600 dark:text-rose-400">{submitErr}</p>}
-        <div className="flex shrink-0 items-center justify-between gap-2 border-t border-slate-200 px-4 py-3 sm:px-6 sm:py-4 dark:border-slate-700">
+        <div className="sticky bottom-0 z-30 flex shrink-0 items-center justify-between gap-2 border-t border-slate-200 bg-white px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-6 sm:py-4 dark:border-slate-700 dark:bg-slate-950">
           <div className="flex min-w-0 items-center gap-2">
             {step > 1 && <button type="button" onClick={() => setStep((s) => s - 1)} className={`${BTN_FOOTER_GHOST} px-3`}><ArrowLeft className="h-4 w-4" /></button>}
           </div>
@@ -5263,14 +5318,22 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
   const [amazonOrderId, setAmazonOrderId] = useState("");
   const [ocrFile, setOcrFile] = useState<File | null>(null); const [ocrLoad, setOcrLoad] = useState(false); const [ocrDone, setOcrDone] = useState(false);
   const [saving, setSaving] = useState(false); const [error, setError] = useState("");
-  /** Box-level claim evidence — stored in `packages.photo_evidence` JSONB (`urls` array). */
-  const [boxEvidenceUrls, setBoxEvidenceUrls] = useState<string[]>([]);
-  /** Persisted packing-slip image URL (saved with the package row). */
+  /** Box photos — mapped to `photo_return_label_url`, `photo_url`, `photo_opened_url`, `photo_closed_url` + structured `photo_evidence`. */
+  const [labelUrls, setLabelUrls] = useState<string[]>([]);
+  const [outerUrls, setOuterUrls] = useState<string[]>([]);
+  const [insideUrls, setInsideUrls] = useState<string[]>([]);
+  const [sealedUrls, setSealedUrls] = useState<string[]>([]);
+  const [noLabel, setNoLabel] = useState(false);
+  const [noOuterDamage, setNoOuterDamage] = useState(false);
+  const [noInsideInspect, setNoInsideInspect] = useState(false);
+  /** Poly / loose — optional reference shots only (`photo_evidence.urls`). */
+  const [extraEvidenceUrls, setExtraEvidenceUrls] = useState<string[]>([]);
+  /** Persisted packing-slip image URL → `manifest_photo_url`. */
   const [manifestPhotoUrl, setManifestPhotoUrl] = useState<string | null>(null);
-  /** Parsed manifest lines — saved as manifest_data JSONB; count rolls up to expected_item_count. */
+  /** Parsed manifest lines — count becomes expected_item_count (integer); not persisted to DB separately. */
   const [manifestParsedLines, setManifestParsedLines] = useState<ExpectedItem[] | null>(null);
   const [manifestOcrLoad, setManifestOcrLoad] = useState(false);
-  /** Poly / loose shipment — skip mandatory opened-box + return-label photos. */
+  /** Poly / loose — skip mandatory carton photos. */
   const [noBoxMode, setNoBoxMode] = useState(false);
   const manifestFileRef = useRef<HTMLInputElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -5358,6 +5421,34 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
     onScan: (code) => setRmaNumber(code),
   });
 
+  const createPackageValidation = useMemo(
+    () =>
+      validateCreatePackageModal({
+        pkgNum,
+        pkgStoreId,
+        palletId,
+        noBoxMode,
+        noLabel,
+        noOuterDamage,
+        noInsideInspect,
+        labelUrls,
+        outerUrls,
+        insideUrls,
+      }),
+    [
+      pkgNum,
+      pkgStoreId,
+      palletId,
+      noBoxMode,
+      noLabel,
+      noOuterDamage,
+      noInsideInspect,
+      labelUrls,
+      outerUrls,
+      insideUrls,
+    ],
+  );
+
   async function handleOcr(file: File) {
     setOcrFile(file);
     setOcrLoad(true);
@@ -5399,7 +5490,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
     e.target.value = "";
   }
 
-  /** Standalone manifest capture (when AI packing slip block is off) — still saves photo + manifest_data. */
+  /** Standalone manifest capture (when AI packing slip block is off) — saves photo URL and updates expected_item_count. */
   async function handleStandaloneManifestUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = "";
@@ -5425,49 +5516,71 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
     }
   }
   async function handleCreate() {
-    if (!pkgNum.trim()) return;
-    if (!pkgStoreId.trim()) {
-      setError("Select a store.");
-      return;
-    }
-    const storeMsg = uuidFkInvalidMessage(pkgStoreId, "Store");
-    if (storeMsg) {
-      setError(storeMsg);
-      return;
-    }
-    const pltMsg = uuidFkInvalidMessage(palletId, "Pallet");
-    if (pltMsg) {
-      setError(pltMsg);
-      return;
-    }
-    if (!noBoxMode && boxEvidenceUrls.length < 2) {
-      setError("Upload at least two box photos (e.g. opened carton + return label), or turn on “No box / poly mailer”.");
-      return;
-    }
-    setSaving(true); setError("");
-    const boxUrls = [...boxEvidenceUrls];
-    if (manifestPhotoUrl) boxUrls.push(manifestPhotoUrl);
-    const res = await createPackage({
-      organization_id: organizationId,
-      package_number: pkgNum.trim(),
-      tracking_number: tracking.trim() || undefined,
-      carrier_name: carrier || undefined,
-      rma_number: rmaNumber.trim() || undefined,
-      order_id: amazonOrderId.trim() || undefined,
-      expected_item_count:
-        manifestParsedLines && manifestParsedLines.length > 0
-          ? manifestParsedLines.reduce((a, it) => a + (it.expected_qty ?? 1), 0)
-          : expected
-            ? parseInt(expected, 10) || 0
-            : 0,
-      pallet_id: palletId || undefined,
-      store_id: pkgStoreId || undefined,
-      created_by: actor,
-      ...(manifestParsedLines && manifestParsedLines.length > 0 ? { manifest_data: manifestParsedLines } : {}),
-      ...(boxUrls.length > 0 ? { photo_evidence: buildEntityPhotoEvidence(boxUrls) ?? undefined } : {}),
+    const v = validateCreatePackageModal({
+      pkgNum,
+      pkgStoreId,
+      palletId,
+      noBoxMode,
+      noLabel,
+      noOuterDamage,
+      noInsideInspect,
+      labelUrls,
+      outerUrls,
+      insideUrls,
     });
-    setSaving(false);
-    if (res.ok && res.data) onCreated(res.data); else setError(res.error ?? "Failed.");
+    if (!v.ok) {
+      console.error("[CreatePackageModal] validation blocked:", v.error ?? "(no message)");
+      if (v.error) setError(v.error);
+      return;
+    }
+    setError("");
+    setSaving(true);
+    try {
+      const struct = !noBoxMode
+        ? buildStructuredPackagePhotoEvidence({
+            label_urls: labelUrls,
+            outer_box_urls: outerUrls,
+            inside_content_urls: insideUrls,
+            sealed_box_urls: sealedUrls,
+          })
+        : null;
+      const polyOnly =
+        noBoxMode && extraEvidenceUrls.length > 0 ? buildEntityPhotoEvidence(extraEvidenceUrls) : null;
+      const photo_evidence = noBoxMode
+        ? (polyOnly ?? undefined)
+        : struct
+          ? (struct as Record<string, unknown>)
+          : undefined;
+      const res = await createPackage({
+        organization_id: organizationId,
+        package_number: pkgNum.trim(),
+        tracking_number: tracking.trim() || undefined,
+        carrier_name: carrier || undefined,
+        rma_number: rmaNumber.trim() || undefined,
+        order_id: amazonOrderId.trim() || undefined,
+        expected_item_count:
+          manifestParsedLines && manifestParsedLines.length > 0
+            ? manifestParsedLines.length
+            : expected
+              ? parseInt(expected, 10) || 0
+              : 0,
+        pallet_id: palletId || undefined,
+        store_id: pkgStoreId || undefined,
+        created_by: actor,
+        ...(manifestPhotoUrl ? { manifest_photo_url: manifestPhotoUrl } : {}),
+        ...(photo_evidence ? { photo_evidence } : {}),
+      });
+      if (res.ok && res.data) onCreated(res.data);
+      else {
+        console.error("[CreatePackageModal] createPackage failed:", res.error);
+        setError(res.error ?? "Failed.");
+      }
+    } catch (e) {
+      console.error("[CreatePackageModal] createPackage threw:", e);
+      setError(e instanceof Error ? e.message : "Failed.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -5475,7 +5588,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
       className="fixed inset-0 z-[300] flex items-end justify-center bg-black/50 backdrop-blur-sm sm:items-center sm:p-4"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div className="flex max-h-[92dvh] w-full max-w-lg flex-col overflow-hidden rounded-t-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950 sm:max-h-[88vh] sm:rounded-3xl">
+      <div className="flex h-[90vh] max-h-[90dvh] w-full max-w-lg flex-col overflow-hidden rounded-t-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950 sm:rounded-3xl">
         <div className="shrink-0 border-b border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-950 sm:p-6">
           <div className="flex items-center justify-between gap-2">
             <div>
@@ -5488,7 +5601,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
             <button type="button" onClick={onClose} className="rounded-full p-2 text-slate-400 hover:bg-accent hover:text-accent-foreground"><X className="h-5 w-5" /></button>
           </div>
         </div>
-        <div className="min-h-0 flex-1 max-h-[80vh] overflow-y-auto p-4 sm:p-6 space-y-5">
+        <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6 space-y-5">
           {aiPackingSlipEnabled && (
             <>
               <div className="flex items-center gap-2 mb-1">
@@ -5590,68 +5703,57 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
             )}
           </div>
 
-          {/* ── Packing slip / manifest (when AI packing-slip block above is disabled) ── */}
-          {!aiPackingSlipEnabled && (
-            <div className="rounded-2xl border-2 border-violet-200 bg-violet-50/80 p-4 space-y-3 dark:border-violet-800/50 dark:bg-violet-950/25">
-              <div className="flex items-center gap-2">
-                <Sparkles className="h-4 w-4 text-violet-600 dark:text-violet-400" />
-                <p className="text-sm font-bold text-violet-800 dark:text-violet-200">Packing slip / manifest</p>
-              </div>
-              <p className="text-xs text-violet-700 dark:text-violet-300">
-                Optional — photo and parsed lines are saved on the package for reconciliation.
-              </p>
-              <input
-                ref={manifestFileRef}
-                type="file"
-                accept="image/*"
-                capture="environment"
-                className="hidden"
-                onChange={handleStandaloneManifestUpload}
-              />
-              {manifestOcrLoad ? (
-                <div className="flex items-center gap-2 rounded-xl bg-violet-100/80 px-3 py-2 dark:bg-violet-950/40">
-                  <Loader2 className="h-4 w-4 animate-spin text-violet-500" />
-                  <span className="text-sm font-semibold text-violet-800 dark:text-violet-200">Processing manifest…</span>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <button
-                    type="button"
-                    onClick={() => manifestFileRef.current?.click()}
-                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-violet-600 py-3 text-sm font-semibold text-white hover:bg-violet-700"
-                  >
-                    📸 Scan packing slip / manifest
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const lines: ExpectedItem[] = [
-                        { sku: "111", expected_qty: 1, description: "Item 111" },
-                        { sku: "222", expected_qty: 2, description: "Item 222" },
-                      ];
-                      setManifestParsedLines(lines);
-                      setExpected(String(lines.reduce((a, it) => a + (it.expected_qty ?? 1), 0)));
-                    }}
-                    className="flex w-full items-center justify-center gap-2 rounded-xl border border-violet-300 bg-white py-2.5 text-xs font-semibold text-violet-700 dark:border-violet-700/50 dark:bg-slate-900 dark:text-violet-300"
-                  >
-                    🧪 Load mock manifest (test)
-                  </button>
-                </div>
-              )}
-              {manifestParsedLines && manifestParsedLines.length > 0 && (
-                <p className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
-                  ✓ {manifestParsedLines.length} manifest line(s) — will save with the package.
-                </p>
-              )}
+          {/* ── Packing slip image → manifest_photo_url (always visible) ───────────── */}
+          <div className="rounded-2xl border-2 border-violet-200 bg-violet-50/80 p-4 space-y-3 dark:border-violet-800/50 dark:bg-violet-950/25">
+            <div className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-violet-600 dark:text-violet-400" />
+              <p className="text-sm font-bold text-violet-800 dark:text-violet-200">Packing slip (OCR)</p>
             </div>
-          )}
+            <p className="text-xs text-violet-700 dark:text-violet-300">
+              Scan or photograph the packing slip — image is saved to <span className="font-mono">manifest_photo_url</span>. Parsed lines (when available) update expected counts.
+            </p>
+            <input
+              ref={manifestFileRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="hidden"
+              onChange={handleStandaloneManifestUpload}
+            />
+            {manifestOcrLoad ? (
+              <div className="flex items-center gap-2 rounded-xl bg-violet-100/80 px-3 py-2 dark:bg-violet-950/40">
+                <Loader2 className="h-4 w-4 animate-spin text-violet-500" />
+                <span className="text-sm font-semibold text-violet-800 dark:text-violet-200">Uploading & processing…</span>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  onClick={() => manifestFileRef.current?.click()}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-violet-600 py-3 text-sm font-semibold text-white shadow-sm hover:bg-violet-700"
+                >
+                  📸 Scan packing slip
+                </button>
+              </div>
+            )}
+            {manifestPhotoUrl ? (
+              <p className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
+                ✓ Packing slip image saved — will store on create.
+              </p>
+            ) : null}
+            {manifestParsedLines && manifestParsedLines.length > 0 && (
+              <p className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
+                ✓ {manifestParsedLines.length} manifest line(s) detected.
+              </p>
+            )}
+          </div>
 
-          {/* ── Claim Evidence Photos (JSONB `photo_evidence.urls` only) ───────────── */}
-          <div className="rounded-2xl border-2 border-rose-200 bg-rose-50 p-4 space-y-3 dark:border-rose-700/50 dark:bg-rose-950/20">
+          {/* ── Box photos → packages.photo_evidence (JSONB); packing slip uses manifest_photo_url above ── */}
+          <div className="rounded-2xl border-2 border-rose-200 bg-rose-50 p-4 space-y-4 dark:border-rose-700/50 dark:bg-rose-950/20">
             <div className="flex flex-wrap items-center gap-2">
               <Camera className="h-4 w-4 text-rose-600 dark:text-rose-400" />
-              <p className="text-sm font-bold text-rose-800 dark:text-rose-200">Claim Evidence Photos</p>
-              <span className="ml-auto rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-rose-600 dark:bg-rose-900/40 dark:text-rose-300">Box Level</span>
+              <p className="text-sm font-bold text-rose-800 dark:text-rose-200">Package photos</p>
+              <span className="ml-auto rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-rose-600 dark:bg-rose-900/40 dark:text-rose-300">Box level</span>
             </div>
             <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-rose-200 bg-white/80 p-3 dark:border-rose-800/50 dark:bg-slate-900/40">
               <input
@@ -5663,46 +5765,133 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
               <div>
                 <p className="text-sm font-semibold text-rose-900 dark:text-rose-100">No box / poly mailer</p>
                 <p className="mt-0.5 text-[11px] text-rose-700/90 dark:text-rose-300/90">
-                  Skip required box photos (e.g. loose or non-carton shipments).
+                  Skip required carton photos; use optional reference shots below.
                 </p>
               </div>
             </label>
-            <p className="text-[11px] text-rose-800/90 dark:text-rose-200/90">
-              {!noBoxMode
-                ? "Upload at least two photos (e.g. opened carton, then return label). Stored in packages.photo_evidence."
-                : "Optional — add any reference shots for this shipment."}
-            </p>
-            <MasterUploader
-              label="Box photos"
-              hint="Drag-drop, choose files, or camera — incident-photos bucket."
-              value={boxEvidenceUrls}
-              onChange={setBoxEvidenceUrls}
-              organizationId={organizationId}
-              maxFiles={24}
-            />
+
+            {!noBoxMode ? (
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold text-rose-900 dark:text-rose-100">Shipping label</span>
+                    <span className="text-rose-500">*</span>
+                    <label className="ml-auto flex cursor-pointer items-center gap-2 text-xs font-medium text-rose-800 dark:text-rose-200">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-slate-300"
+                        checked={noLabel}
+                        onChange={(e) => {
+                          const c = e.target.checked;
+                          setNoLabel(c);
+                          if (c) setLabelUrls([]);
+                        }}
+                      />
+                      No label found
+                    </label>
+                  </div>
+                  <MasterUploader
+                    label=""
+                    hint="Up to 3 images — stored in photo_evidence.label_urls."
+                    value={labelUrls}
+                    onChange={setLabelUrls}
+                    organizationId={organizationId}
+                    maxFiles={3}
+                    disabled={noLabel}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold text-rose-900 dark:text-rose-100">Outer box condition</span>
+                    <span className="text-rose-500">*</span>
+                    <label className="ml-auto flex cursor-pointer items-center gap-2 text-xs font-medium text-rose-800 dark:text-rose-200">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-slate-300"
+                        checked={noOuterDamage}
+                        onChange={(e) => {
+                          const c = e.target.checked;
+                          setNoOuterDamage(c);
+                          if (c) setOuterUrls([]);
+                        }}
+                      />
+                      No box damage / issues
+                    </label>
+                  </div>
+                  <MasterUploader
+                    label=""
+                    hint="Up to 3 images — stored in photo_evidence.outer_box_urls."
+                    value={outerUrls}
+                    onChange={setOuterUrls}
+                    organizationId={organizationId}
+                    maxFiles={3}
+                    disabled={noOuterDamage}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-semibold text-rose-900 dark:text-rose-100">Inside content</span>
+                    <span className="text-rose-500">*</span>
+                    <label className="ml-auto flex cursor-pointer items-center gap-2 text-xs font-medium text-rose-800 dark:text-rose-200">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-slate-300"
+                        checked={noInsideInspect}
+                        onChange={(e) => {
+                          const c = e.target.checked;
+                          setNoInsideInspect(c);
+                          if (c) setInsideUrls([]);
+                        }}
+                      />
+                      Content cannot be inspected
+                    </label>
+                  </div>
+                  <MasterUploader
+                    label=""
+                    hint="Up to 3 images — stored in photo_evidence.inside_content_urls."
+                    value={insideUrls}
+                    onChange={setInsideUrls}
+                    organizationId={organizationId}
+                    maxFiles={3}
+                    disabled={noInsideInspect}
+                  />
+                </div>
+                <MasterUploader
+                  label="Box sealed (optional)"
+                  hint="Up to 3 images — stored in photo_evidence.sealed_box_urls."
+                  value={sealedUrls}
+                  onChange={setSealedUrls}
+                  organizationId={organizationId}
+                  maxFiles={3}
+                />
+              </div>
+            ) : (
+              <MasterUploader
+                label="Reference photos (optional)"
+                hint="Up to 3 images — stored in photo_evidence.urls."
+                value={extraEvidenceUrls}
+                onChange={setExtraEvidenceUrls}
+                organizationId={organizationId}
+                maxFiles={3}
+              />
+            )}
           </div>
 
           {error && <p className="rounded-xl bg-rose-50 px-4 py-2 text-sm text-rose-700 dark:bg-rose-950/40 dark:text-rose-400">{error}</p>}
         </div>
-        <div className="flex shrink-0 flex-col gap-3 border-t border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-950">
-          <div className="flex w-full flex-wrap items-center justify-end gap-2">
-            <button type="button" onClick={onClose} className="rounded-full border border-slate-200 px-4 py-2.5 text-sm font-semibold text-foreground hover:bg-accent dark:border-slate-600">
+        <div className="sticky bottom-0 z-20 shrink-0 border-t border-slate-200 bg-white p-4 pb-[max(1rem,env(safe-area-inset-bottom))] dark:border-slate-700 dark:bg-slate-950 sm:p-6">
+          <div className={MODAL_FOOTER_GRID}>
+            <button type="button" onClick={onClose} className={MODAL_FOOTER_CANCEL}>
               Cancel
             </button>
             <button
               type="button"
               onClick={handleCreate}
-              disabled={
-                saving ||
-                !pkgNum.trim() ||
-                !pkgStoreId.trim() ||
-                !isUuidString(pkgStoreId.trim()) ||
-                (!noBoxMode && boxEvidenceUrls.length < 2)
-              }
-              className={BTN_PRIMARY}
+              disabled={saving || !createPackageValidation.ok}
+              className={MODAL_FOOTER_SUBMIT}
             >
               {saving ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}
-              {saving ? "Creating…" : "Create Package"}
+              {saving ? "Creating…" : "Create"}
             </button>
           </div>
         </div>
@@ -5719,12 +5908,11 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
   organizationId?: string;
 }) {
   const [palletNum, setPalletNum] = useState(generatePalletNumber()); const [notes, setNotes] = useState(""); const [file, setFile] = useState<File | null>(null);
-  const [bolFile, setBolFile] = useState<File | null>(null);
   const [ocrLoad, setOcrLoad] = useState(false); const [ocrResult, setOcrResult] = useState<{ pallet_number: string; total_items: number; confidence: number } | null>(null);
   const [saving, setSaving] = useState(false); const [error, setError] = useState("");
-  const [palletEvidenceUrls, setPalletEvidenceUrls] = useState<string[]>([]);
+  const [palletPhotoUrls, setPalletPhotoUrls] = useState<string[]>([]);
+  const [bolUrls, setBolUrls] = useState<string[]>([]);
   const fileRef = useRef<HTMLInputElement>(null);
-  const bolRef = useRef<HTMLInputElement>(null);
 
   // ── Store state (Pallet form — top of hierarchy) ──────────────────────────
   const [palletStoreId,  setPalletStoreId]  = useState("");
@@ -5752,18 +5940,14 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
     }
     setSaving(true); setError("");
     try {
-      let manifestUrl: string | undefined;
-      let bolUrl: string | undefined;
-      if (file) manifestUrl = await uploadToStorage(file, "pallets/manifest", organizationId);
-      if (bolFile) bolUrl = await uploadToStorage(bolFile, "pallets/bol", organizationId);
-      const peUrls: string[] = [];
-      if (manifestUrl) peUrls.push(manifestUrl);
-      if (bolUrl) peUrls.push(bolUrl);
-      peUrls.push(...palletEvidenceUrls);
+      let manifestPhotoUrl: string | undefined;
+      if (file) manifestPhotoUrl = await uploadToStorage(file, "pallets/manifest", organizationId);
       const res = await createPallet({
         organization_id: organizationId,
         pallet_number: palletNum.trim(),
-        ...(peUrls.length > 0 ? { photo_evidence: buildEntityPhotoEvidence(peUrls) ?? undefined } : {}),
+        photo_url: palletPhotoUrls[0]?.trim() || null,
+        bol_photo_url: bolUrls[0]?.trim() || null,
+        ...(manifestPhotoUrl ? { manifest_photo_url: manifestPhotoUrl } : {}),
         store_id: palletStoreId,
         notes,
         created_by: actor,
@@ -5781,7 +5965,7 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
       className="fixed inset-0 z-[300] flex items-end justify-center bg-black/50 backdrop-blur-sm sm:items-center sm:p-4"
       onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
     >
-      <div className="flex max-h-[92dvh] w-full max-w-lg flex-col overflow-hidden rounded-t-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950 sm:max-h-[88vh] sm:rounded-3xl">
+      <div className="flex h-[90vh] max-h-[90dvh] w-full max-w-lg flex-col overflow-hidden rounded-t-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-950 sm:rounded-3xl">
         <div className="shrink-0 border-b border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-950 sm:p-6">
           <div className="flex items-center justify-between gap-2">
             <div>
@@ -5791,7 +5975,7 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
             <button type="button" onClick={onClose} className="rounded-full p-2 text-slate-400 hover:bg-accent hover:text-accent-foreground"><X className="h-5 w-5" /></button>
           </div>
         </div>
-        <div className="min-h-0 flex-1 max-h-[80vh] overflow-y-auto p-4 sm:p-6 space-y-4">
+        <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
           {aiManifestEnabled && (
             <>
               <div className="flex items-center gap-2 mb-1">
@@ -5818,19 +6002,27 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
               />
             </div>
           </div>
-          <div>
-            <label className={LABEL}>Bill of Lading (BoL) <span className="text-xs font-normal text-slate-400">(optional)</span></label>
-            {!bolFile ? (
-              <button type="button" onClick={() => bolRef.current?.click()} className="flex w-full items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-border py-3 text-sm font-medium text-muted-foreground transition hover:bg-accent">
-                <FileText className="h-4 w-4" />Upload BoL scan
-              </button>
-            ) : (
-              <div className="flex items-center justify-between rounded-2xl border border-border bg-muted/40 px-4 py-3 text-sm">
-                <span className="truncate font-medium text-foreground">{bolFile.name}</span>
-                <button type="button" className="text-xs text-sky-600 underline dark:text-sky-400" onClick={() => setBolFile(null)}>Remove</button>
-              </div>
-            )}
-            <input ref={bolRef} type="file" className="hidden" accept="image/*,application/pdf" capture="environment" onChange={(e) => { const f = e.target.files?.[0]; if (f) setBolFile(f); e.target.value = ""; }} />
+          <div className="rounded-2xl border border-amber-200 bg-amber-50/80 p-4 space-y-3 dark:border-amber-800/40 dark:bg-amber-950/20">
+            <div className="flex items-center gap-2">
+              <FileText className="h-4 w-4 text-amber-700 dark:text-amber-400" />
+              <p className="text-sm font-bold text-amber-900 dark:text-amber-100">Pallet documentation</p>
+            </div>
+            <MasterUploader
+              label="Pallet photo (optional)"
+              hint="Up to 3 images — first is saved to photo_url (extras are not stored on the pallet row)."
+              value={palletPhotoUrls}
+              onChange={setPalletPhotoUrls}
+              organizationId={organizationId}
+              maxFiles={3}
+            />
+            <MasterUploader
+              label="Bill of Lading (optional)"
+              hint="Up to 3 images — first is saved to bol_photo_url (extras are not stored on the pallet row)."
+              value={bolUrls}
+              onChange={setBolUrls}
+              organizationId={organizationId}
+              maxFiles={3}
+            />
           </div>
           <div>
             <label className={LABEL}>Store <span className="text-rose-500">*</span></label>
@@ -5855,29 +6047,21 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
             )}
           </div>
           <div><label className={LABEL}>Notes (optional)</label><textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="w-full resize-none rounded-2xl border border-slate-200 bg-white p-4 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" /></div>
-          <MasterUploader
-            label="Pallet photos"
-            hint="Optional — stored in pallets.photo_evidence (incident-photos bucket)."
-            value={palletEvidenceUrls}
-            onChange={setPalletEvidenceUrls}
-            organizationId={organizationId}
-            maxFiles={24}
-          />
           {error && <p className="rounded-xl bg-rose-50 px-4 py-2 text-sm text-rose-700 dark:bg-rose-950/40 dark:text-rose-400">{error}</p>}
         </div>
-        <div className="flex shrink-0 flex-col gap-3 border-t border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-950">
-          <div className="flex w-full flex-wrap items-center justify-end gap-2">
-            <button type="button" onClick={onClose} className="rounded-full border border-slate-200 px-4 py-2.5 text-sm font-semibold text-foreground hover:bg-accent dark:border-slate-600">
+        <div className="sticky bottom-0 z-20 shrink-0 border-t border-slate-200 bg-white p-4 pb-[max(1rem,env(safe-area-inset-bottom))] dark:border-slate-700 dark:bg-slate-950 sm:p-6">
+          <div className={MODAL_FOOTER_GRID}>
+            <button type="button" onClick={onClose} className={MODAL_FOOTER_CANCEL}>
               Cancel
             </button>
             <button
               type="button"
               onClick={handleCreate}
               disabled={saving || !palletNum.trim() || !palletStoreId.trim() || !isUuidString(palletStoreId.trim())}
-              className={BTN_PRIMARY}
+              className={MODAL_FOOTER_SUBMIT}
             >
               {saving ? <Loader2 className="h-5 w-5 animate-spin" /> : <Plus className="h-5 w-5" />}
-              {saving ? "Creating…" : "Create Pallet"}
+              {saving ? "Creating…" : "Create"}
             </button>
           </div>
         </div>
@@ -6103,7 +6287,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
         {rows.length === 0 && (
           <p className="py-10 text-center text-sm text-slate-400">
             {items.length === 0 && !hasActiveFilters
-              ? "No items yet. Scan a return to get started."
+              ? "No return items yet. Scan or add an item to get started."
               : "No records match your filters."}
           </p>
         )}
@@ -6332,7 +6516,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
         {rows.length === 0 && (
           <p className="py-10 text-center text-sm text-slate-400">
             {packages.length === 0 && !hasActiveFilters
-              ? "No packages yet. Create a package to receive returns."
+              ? "No data."
               : "No packages match your filters."}
           </p>
         )}
@@ -6624,7 +6808,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
         {rows.length === 0 && (
           <p className="py-10 text-center text-sm text-slate-400">
             {pallets.length === 0 && !hasActiveFilters
-              ? "No pallets yet. Create a pallet to start a batch."
+              ? "No data."
               : "No pallets match your filters."}
           </p>
         )}

@@ -101,6 +101,7 @@ export default function ReturnsPage() {
   const openPackages = useMemo(() => packages.filter((p) => p.status === "open"), [packages]);
   const openPallets  = useMemo(() => pallets.filter((p)  => p.status === "open"), [pallets]);
 
+  /** Tab counts and Items table use this array only — loaded via `listReturns()` (no mock / no fixed length). */
   const visibleReturns = returns;
 
   // ── Mutations ────────────────────────────────────────────────────────────────
@@ -358,7 +359,6 @@ export default function ReturnsPage() {
           aiLabelEnabled={orgSettings.is_ai_label_ocr_enabled}
           onSoftPackageWarning={() => showToast("Warning: This item is not on the package's expected list.", "warning")}
           onToast={showToast}
-          onLinkedPackageUpdated={updatePackage_}
           onNavigateToPackage={(id) => {
             const p = packages.find((x) => x.id === id);
             if (p) {
