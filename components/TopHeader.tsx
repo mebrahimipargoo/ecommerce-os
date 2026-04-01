@@ -8,11 +8,13 @@
 import React from "react";
 import { Bell, ChevronDown, Menu, Search, ShieldCheck, Sparkles, User } from "lucide-react";
 import { ThemeToggle } from "./ThemeToggle";
+import { useDebugMode } from "./DebugModeContext";
 import { useGlobalSearch } from "./GlobalSearchContext";
 import { useUserRole } from "./UserRoleContext";
 
 export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
   const { query, setQuery } = useGlobalSearch();
+  const { debugMode } = useDebugMode();
   const { role, toggleRole, actorName } = useUserRole();
   const profileInitial = actorName.trim().charAt(0).toUpperCase() || "M";
 
@@ -58,10 +60,11 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
       </div>
 
       <div className="ml-auto flex shrink-0 items-center gap-1.5 sm:gap-2">
+        {debugMode && (
         <button
           type="button"
           onClick={toggleRole}
-          title={`Viewing as ${role === "super_admin" ? "Super Admin" : role === "admin" ? "Admin" : "Operator"} — click to rotate`}
+          title={`[Debug] Viewing as ${role === "super_admin" ? "Super Admin" : role === "admin" ? "Admin" : "Operator"} — click to rotate`}
           className={[
             "hidden h-9 items-center gap-1.5 rounded-full border px-3 text-xs font-semibold transition sm:flex",
             role === "super_admin"
@@ -79,6 +82,7 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
             <><User className="h-3.5 w-3.5" />Operator</>
           )}
         </button>
+        )}
 
         <ThemeToggle />
         <button

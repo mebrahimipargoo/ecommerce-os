@@ -5,6 +5,7 @@ import React, {
 } from "react";
 import { getCoreSettings } from "../app/settings/workspace-settings-actions";
 import { normalizeTenantLogoUrl } from "../lib/tenant-logo-url";
+import { useUserRole } from "./UserRoleContext";
 
 export type BrandingContextValue = {
   companyName: string;
@@ -17,6 +18,7 @@ export type BrandingContextValue = {
 const BrandingContext = createContext<BrandingContextValue | null>(null);
 
 export function BrandingProvider({ children }: { children: React.ReactNode }) {
+  const { organizationId } = useUserRole();
   const [companyName, setCompanyName] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
   const [loading, setLoading] = useState(true);
@@ -24,7 +26,7 @@ export function BrandingProvider({ children }: { children: React.ReactNode }) {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const cfg = await getCoreSettings();
+      const cfg = await getCoreSettings(organizationId ?? undefined);
       const name =
         (typeof cfg.company_name === "string" && cfg.company_name.trim()) ||
         (typeof cfg.workspace_name === "string" && String(cfg.workspace_name).trim()) ||
@@ -41,7 +43,7 @@ export function BrandingProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [organizationId]);
 
   useEffect(() => {
     void refresh();

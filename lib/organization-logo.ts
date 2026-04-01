@@ -6,13 +6,15 @@ import { resolveOrganizationId } from "./organization";
 /**
  * Reads tenant logo URL from organization_settings (canonical for UI / PDFs).
  */
-export async function getOrganizationLogoUrlFromDb(): Promise<string> {
-  const organizationId = resolveOrganizationId();
+export async function getOrganizationLogoUrlFromDb(organizationId?: string): Promise<string> {
+  const org = organizationId?.trim() && organizationId.trim().length > 0
+    ? organizationId.trim()
+    : resolveOrganizationId();
   try {
     const { data, error } = await supabaseServer
       .from("organization_settings")
       .select("logo_url")
-      .eq("organization_id", organizationId)
+      .eq("organization_id", org)
       .maybeSingle();
     if (error || !data) return "";
     const u = (data as { logo_url?: string | null }).logo_url;

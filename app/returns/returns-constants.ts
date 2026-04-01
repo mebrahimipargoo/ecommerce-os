@@ -18,7 +18,7 @@ export const RETURN_SELECT = "*,stores(name,platform)";
  * Avoids PostgREST edge cases where `*` plus embeds can fan out duplicate parent rows.
  */
 export const RETURN_LIST_SELECT =
-  "id, organization_id, lpn, rma_number, marketplace, item_name, " +
+  "id, organization_id, lpn, rma_number, marketplace, marketplace_id, item_name, " +
   "asin, fnsku, sku, product_identifier, " +
   "conditions, status, notes, photo_evidence, " +
   "expiration_date, batch_number, store_id, pallet_id, package_id, " +

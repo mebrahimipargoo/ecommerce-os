@@ -2,8 +2,6 @@ import Link from "next/link";
 import { Search, Package2, Boxes, RotateCcw, Send, DollarSign } from "lucide-react";
 import { getDashboardSnapshot } from "./returns/actions";
 
-const DEFAULT_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001";
-
 function formatUsdSafe(n: number): string {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
@@ -14,7 +12,7 @@ function formatUsdSafe(n: number): string {
 }
 
 export default async function Page() {
-  const snapRes = await getDashboardSnapshot(DEFAULT_ORGANIZATION_ID);
+  const snapRes = await getDashboardSnapshot();
   const snap = snapRes.ok ? snapRes.data : null;
   const fetchError = snapRes.ok ? null : snapRes.error ?? "Failed to load dashboard.";
 

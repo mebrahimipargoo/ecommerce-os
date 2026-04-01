@@ -740,6 +740,30 @@ export function SortButton({ field, label, sortField, sortAsc, onSort }: {
 }
 
 /** Display label for `returns.marketplace` (Source column / filters). */
+function resolveReturnMarketplaceIconUrl(
+  r: ReturnRecord,
+  platformIconBySlug: Record<string, string | null | undefined>,
+): string | null {
+  const fromEmb = r.marketplaces?.icon_url?.trim();
+  if (fromEmb) return fromEmb;
+  const slug = (r.marketplace ?? "").trim().toLowerCase();
+  const fromMap = platformIconBySlug[slug] ?? null;
+  const t = (fromMap ?? "").trim();
+  return t || null;
+}
+
+function MarketplaceIconCell({ r, platformIconBySlug = {} }: {
+  r: ReturnRecord;
+  platformIconBySlug?: Record<string, string | null | undefined>;
+}) {
+  const url = resolveReturnMarketplaceIconUrl(r, platformIconBySlug);
+  if (!url) return <span className="text-xs text-slate-400">—</span>;
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img src={url} alt="" className="mx-auto h-5 w-5 object-contain" loading="lazy" title={r.marketplaces?.name ?? r.marketplace} />
+  );
+}
+
 function formatMarketplaceSource(marketplace: string): string {
   const m = marketplace?.toLowerCase();
   if (m && (MARKETPLACES as readonly string[]).includes(m)) return MP_LABELS[m as Marketplace];
@@ -1184,11 +1208,11 @@ export function BulkActionsBar({ count, onDelete, onMove, onAssignPallet, onClea
 
 // ─── BulkMoveModal ─────────────────────────────────────────────────────────────
 
-export function BulkMoveModal({ selectedIds, packages: allPkgs, pallets: allPlts, returns: allReturns = [], actor, onClose, onMoved }: {
+export function BulkMoveModal({ selectedIds, packages: allPkgs, pallets: allPlts, returns: allReturns = [], actor, actorProfileId = null, onClose, onMoved }: {
   selectedIds: string[]; packages: PackageRecord[]; pallets: PalletRecord[];
   /** Live per-package counts (same as Packages table ITEMS column). */
   returns?: ReturnRecord[];
-  actor: string; onClose: () => void;
+  actor: string; actorProfileId?: string | null; onClose: () => void;
   onMoved: (updated: ReturnRecord[], failed: number) => void;
 }) {
   const [targetPkgId, setTargetPkgId] = useState("");
@@ -1228,7 +1252,7 @@ export function BulkMoveModal({ selectedIds, packages: allPkgs, pallets: allPlts
     }
     setMoving(true); setError("");
     const results = await Promise.all(
-      selectedIds.map((id) => updateReturn(id, { package_id: targetPkgId || undefined, pallet_id: targetPltId || undefined }, actor))
+      selectedIds.map((id) => updateReturn(id, { package_id: targetPkgId || undefined, pallet_id: targetPltId || undefined }, actor, actorProfileId))
     );
     setMoving(false);
     const succeeded = results.filter((r) => r.ok).map((r) => r.data!);
@@ -1264,9 +1288,9 @@ export function BulkMoveModal({ selectedIds, packages: allPkgs, pallets: allPlts
 
 // ─── BulkAssignPackagesModal (packages → pallet) ────────────────────────────────
 
-export function BulkAssignPackagesModal({ selectedIds, pallets: allPlts, actor, onClose, onDone }: {
+export function BulkAssignPackagesModal({ selectedIds, pallets: allPlts, actor, actorProfileId = null, onClose, onDone }: {
   selectedIds: string[]; pallets: PalletRecord[];
-  actor: string; onClose: () => void;
+  actor: string; actorProfileId?: string | null; onClose: () => void;
   onDone: (updated: PackageRecord[], failed: number) => void;
 }) {
   const [targetPalletId, setTargetPalletId] = useState("");
@@ -1286,7 +1310,7 @@ export function BulkAssignPackagesModal({ selectedIds, pallets: allPlts, actor, 
     setAssigning(true); setError("");
     const palletId = raw || null;
     const results = await Promise.all(
-      selectedIds.map((id) => updatePackage(id, { pallet_id: palletId }, actor)),
+      selectedIds.map((id) => updatePackage(id, { pallet_id: palletId }, actor, actorProfileId)),
     );
     setAssigning(false);
     const succeeded = results.filter((r) => r.ok && r.data).map((r) => r.data!);
@@ -1515,8 +1539,9 @@ export function ClaimEvidencePhotoGrid({
 
 // ─── Items Sub-Table (inside Package Drawer) ────────────────────────────────────
 
-function ItemsSubTable({ items, role, actor, onItemClick, onItemDeleted, showToast }: {
+function ItemsSubTable({ items, role, actor, actorProfileId = null, onItemClick, onItemDeleted, showToast }: {
   items: ReturnRecord[]; role: UserRole; actor: string;
+  actorProfileId?: string | null;
   onItemClick: (r: ReturnRecord) => void;
   onItemDeleted: (id: string) => void;
   showToast: (msg: string, kind?: ToastKind) => void;
@@ -1575,7 +1600,7 @@ function ItemsSubTable({ items, role, actor, onItemClick, onItemDeleted, showToa
                       <RowActionMenu
                         onView={() => onItemClick(r)}
                         onDelete={canDelete(role) ? async () => {
-                          const res = await deleteReturn(r.id, actor);
+                          const res = await deleteReturn(r.id, actor, actorProfileId);
                           if (res.ok) onItemDeleted(r.id);
                           else {
                             console.error("[PackageItemsSubTable] deleteReturn failed:", res.error);
@@ -1646,8 +1671,9 @@ function PackagesSubTable({ palletId, packages, returns: returnsForCount = [], o
 
 // ─── Item Drawer Content ───────────────────────────────────────────────────────
 
-export function ItemDrawerContent({ record, role, actor, packages, pallets, onUpdated, onDeleted, startInEditMode = false, sessionPhotos, onToast }: {
+export function ItemDrawerContent({ record, role, actor, actorProfileId = null, packages, pallets, onUpdated, onDeleted, startInEditMode = false, sessionPhotos, onToast }: {
   record: ReturnRecord; role: UserRole; actor: string;
+  actorProfileId?: string | null;
   packages: PackageRecord[]; pallets: PalletRecord[];
   onUpdated: (r: ReturnRecord) => void; onDeleted: (id: string) => void;
   startInEditMode?: boolean;
@@ -1858,7 +1884,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
       store_id: editStoreId.trim() || null,
       marketplace: pickedStore ? platformToMarketplace(pickedStore.platform) : record.marketplace,
       package_id: editPackageId.trim() || null,
-    }, actor);
+    }, actor, actorProfileId);
     setSaving(false);
     if (res.ok && res.data) { onUpdated(res.data); setEditing(false); setEditNewPhotos({}); }
     else setErr(res.error ?? "Save failed.");
@@ -1867,7 +1893,7 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
   async function handleDelete() {
     setDeleting(true);
     try {
-      const res = await deleteReturn(record.id, actor);
+      const res = await deleteReturn(record.id, actor, actorProfileId);
       if (res.ok) {
         onDeleted(record.id);
       } else {
@@ -2448,9 +2474,9 @@ export function ItemDrawerContent({ record, role, actor, packages, pallets, onUp
 
 // ─── Assign Existing Item Modal ────────────────────────────────────────────────
 
-function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssigned, onClose }: {
+function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, actorProfileId = null, onAssigned, onClose }: {
   pkg: PackageRecord; allReturns: ReturnRecord[]; currentItems: ReturnRecord[];
-  actor: string; onAssigned: (updated: ReturnRecord, prevPackageId: string | null) => void; onClose: () => void;
+  actor: string; actorProfileId?: string | null; onAssigned: (updated: ReturnRecord, prevPackageId: string | null) => void; onClose: () => void;
 }) {
   const [search,    setSearch]    = useState("");
   const [selected,  setSelected]  = useState<ReturnRecord | null>(null);
@@ -2471,7 +2497,7 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, onAssig
     const prevPackageId = item.package_id ?? null;
     setAssigning(true);
     setAssignErr("");
-    const res = await updateReturn(item.id, { package_id: pkg.id }, actor);
+    const res = await updateReturn(item.id, { package_id: pkg.id }, actor, actorProfileId);
     setAssigning(false);
     if (res.ok && res.data) {
       onAssigned(res.data, prevPackageId);
@@ -2547,8 +2573,9 @@ function dedupeReturnsRowsLocal(rows: unknown[] | null | undefined): ReturnRecor
   return out;
 }
 
-export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = [], allReturns = [], onClose, onPackageUpdated, onItemAdded, onPackageDeleted, onOpenItem, onOpenPallet, onReturnAssigned, onReturnRemoved, showToast }: {
+export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId = null, openPallets = [], allReturns = [], onClose, onPackageUpdated, onItemAdded, onPackageDeleted, onOpenItem, onOpenPallet, onReturnAssigned, onReturnRemoved, showToast }: {
   pkg: PackageRecord; role: UserRole; actor: string;
+  actorProfileId?: string | null;
   openPallets?: PalletRecord[];
   /** Full returns list from page state — used for the "Assign Existing Item" flow. */
   allReturns?: ReturnRecord[];
@@ -2759,6 +2786,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
           photo_evidence: mergeEntityPhotoEvidence(pkg.photo_evidence, [publicUrl]) ?? undefined,
         },
         actor,
+        actorProfileId,
       );
       if (res.ok && res.data) {
         setPkg(res.data);
@@ -2802,7 +2830,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
       order_id:             editOrderId.trim() || null,
       pallet_id:            editPalletId.trim() || null,
       photo_evidence: mergedPe ?? null,
-    }, actor);
+    }, actor, actorProfileId);
     setSaving(false);
     if (res.ok && res.data) { setPkg(res.data); onPackageUpdated(res.data); setEditing(false); }
     else setSaveErr(res.error ?? "Save failed.");
@@ -2810,7 +2838,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
 
   async function handleClose(discNote?: string) {
     setClosing(true);
-    const res = await closePackage(pkg.id, { discrepancyNote: discNote, actor });
+    const res = await closePackage(pkg.id, { discrepancyNote: discNote, actor, actorProfileId });
     setClosing(false);
     if (res.ok) { setPkg((p) => ({ ...p, status: res.status! })); onPackageUpdated({ ...pkg, status: res.status! }); showToast(res.status === "suspicious" ? "Package flagged — discrepancy recorded." : "Package closed.", res.status === "suspicious" ? "warning" : "success"); setDiscOpen(false); }
     else showToast(res.error ?? "Failed.", "error");
@@ -2970,6 +2998,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
                         expected_item_count: 0,
                       },
                       actor,
+                      actorProfileId,
                     );
                     if (res.ok && res.data) {
                       setPkg(res.data);
@@ -3152,7 +3181,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
               <button
                 type="button"
                 onClick={async () => {
-                  const r = await deletePackage(pkg.id, actor);
+                  const r = await deletePackage(pkg.id, actor, actorProfileId);
                   if (r.ok) {
                     onPackageDeleted(pkg.id);
                     onClose();
@@ -3175,6 +3204,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
           allReturns={allReturns}
           currentItems={displayItems}
           actor={actor}
+          actorProfileId={actorProfileId}
           onAssigned={(updated, prevPackageId) => {
             onReturnAssigned?.(updated, prevPackageId);
             showToast(`✓ Item assigned to ${pkg.package_number}`);
@@ -3292,7 +3322,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
       {/* Items sub-table */}
       <div>
         <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-400">Items ({displayItems.length})</p>
-        <ItemsSubTable items={displayItems} role={role} actor={actor} onItemClick={onOpenItem} onItemDeleted={handleItemDeleted} showToast={showToast} />
+        <ItemsSubTable items={displayItems} role={role} actor={actor} actorProfileId={actorProfileId} onItemClick={onOpenItem} onItemDeleted={handleItemDeleted} showToast={showToast} />
       </div>
 
       {wizardOpen && (() => {
@@ -3329,8 +3359,9 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, openPallets = 
 
 // ─── Pallet Drawer Content ─────────────────────────────────────────────────────
 
-export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_ORGANIZATION_ID, packages, allReturns = [], onClose, onPalletUpdated, onPalletDeleted, onOpenPackage, showToast }: {
+export function PalletDrawerContent({ pallet, role, actor, actorProfileId = null, organizationId = MVP_ORGANIZATION_ID, packages, allReturns = [], onClose, onPalletUpdated, onPalletDeleted, onOpenPackage, showToast }: {
   pallet: PalletRecord; role: UserRole; actor: string;
+  actorProfileId?: string | null;
   /** Workspace org for storage paths and `updatePallet` scoping. */
   organizationId?: string;
   packages: PackageRecord[];
@@ -3360,7 +3391,7 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
   }, [pallet]);
 
   async function handleClose() {
-    const res = await updatePalletStatus(plt.id, "closed", actor);
+    const res = await updatePalletStatus(plt.id, "closed", actor, actorProfileId);
     if (res.ok) { setPlt((p) => ({ ...p, status: "closed" })); onPalletUpdated({ ...plt, status: "closed" }); showToast("Pallet closed."); }
     else showToast(res.error ?? "Failed.", "error");
   }
@@ -3376,6 +3407,7 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
       },
       actor,
       orgId,
+      actorProfileId,
     );
     setEditSaving(false);
     if (res.ok && res.data) {
@@ -3400,6 +3432,7 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
         { bol_photo_url: url },
         actor,
         orgId,
+        actorProfileId,
       );
       if (res.ok && res.data) {
         setPlt(res.data);
@@ -3427,6 +3460,7 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
         { photo_url: url },
         actor,
         orgId,
+        actorProfileId,
       );
       if (res.ok && res.data) {
         setPlt(res.data);
@@ -3504,7 +3538,7 @@ export function PalletDrawerContent({ pallet, role, actor, organizationId = MVP_
           <button
             type="button"
             onClick={async () => {
-              const r = await deletePallet(plt.id, actor);
+              const r = await deletePallet(plt.id, actor, actorProfileId);
               if (r.ok) {
                 onPalletDeleted(plt.id);
                 onClose();
@@ -4912,7 +4946,7 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
 
 // ─── Single Item Wizard Modal ──────────────────────────────────────────────────
 
-export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, existingReturns = [], onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast, onNavigateToPackage, onNavigateToPallet, organizationId = MVP_ORGANIZATION_ID }: {
+export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages, openPallets, existingReturns = [], onCreatePackage, onCreatePallet, inheritedContext, aiLabelEnabled = false, onSoftPackageWarning, onToast, onNavigateToPackage, onNavigateToPallet, organizationId = MVP_ORGANIZATION_ID, actorProfileId = null }: {
   onClose: () => void;
   /** Called with the saved record AND the in-session photo files for gallery display. */
   onSuccess: (r: ReturnRecord, photos: Record<string, File[]>) => void;
@@ -4929,6 +4963,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
   onNavigateToPallet?: (palletId: string) => void;
   /** Workspace org for `returns.organization_id` / claim_submissions (defaults to MVP seed). */
   organizationId?: string;
+  actorProfileId?: string | null;
 }) {
   const workspaceOrgId = useMemo(() => {
     const raw = (organizationId ?? "").trim();
@@ -5268,6 +5303,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
 
       const res = await insertReturn({
         organization_id: workspaceOrgId,
+        actor_profile_id: actorProfileId,
         lpn: state.lpn || undefined,
         marketplace: marketplaceResolved,
         item_name: state.item_name,
@@ -5413,11 +5449,16 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
 
 // ─── Create Package Modal ──────────────────────────────────────────────────────
 
-export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiPackingSlipEnabled = false, organizationId = MVP_ORGANIZATION_ID }: {
+export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiPackingSlipEnabled = false, organizationId = MVP_ORGANIZATION_ID, actorProfileId = null }: {
   onClose: () => void; onCreated: (p: PackageRecord) => void; actor: string; openPallets: PalletRecord[];
   aiPackingSlipEnabled?: boolean;
   organizationId?: string;
+  actorProfileId?: string | null;
 }) {
+  const pkgOrgId = useMemo(() => {
+    const raw = (organizationId ?? "").trim();
+    return isUuidString(raw) ? raw : MVP_ORGANIZATION_ID;
+  }, [organizationId]);
   const [pkgNum, setPkgNum] = useState(generatePackageNumber());
   const [tracking, setTracking] = useState(""); const [carrier, setCarrier] = useState(""); const [expected, setExpected] = useState(""); const [palletId, setPalletId] = useState("");
   const [rmaNumber, setRmaNumber] = useState("");
@@ -5504,7 +5545,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
         .from("pallets")
         .select("store_id")
         .eq("id", palletId)
-        .eq("organization_id", MVP_ORGANIZATION_ID)
+        .eq("organization_id", pkgOrgId)
         .maybeSingle();
       if (cancelled) return;
       if (data?.store_id) {
@@ -5515,7 +5556,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
       }
     })();
     return () => { cancelled = true; };
-  }, [palletId, openPallets]);
+  }, [palletId, openPallets, pkgOrgId]);
 
   // ── Physical hardware scanner — attached only to the tracking # input ───────
   const { onKeyDown: trackingKeyDown } = usePhysicalScanner({
@@ -5658,7 +5699,8 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
           ? (struct as Record<string, unknown>)
           : undefined;
       const res = await createPackage({
-        organization_id: organizationId,
+        organization_id: pkgOrgId,
+        actor_profile_id: actorProfileId,
         package_number: pkgNum.trim(),
         tracking_number: tracking.trim() || undefined,
         carrier_name: carrier || undefined,
@@ -6008,11 +6050,16 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
 
 // ─── Create Pallet Modal ───────────────────────────────────────────────────────
 
-export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled = false, organizationId = MVP_ORGANIZATION_ID }: {
+export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled = false, organizationId = MVP_ORGANIZATION_ID, actorProfileId = null }: {
   onClose: () => void; onCreated: (p: PalletRecord) => void; actor: string;
   aiManifestEnabled?: boolean;
   organizationId?: string;
+  actorProfileId?: string | null;
 }) {
+  const pltOrgId = useMemo(() => {
+    const raw = (organizationId ?? "").trim();
+    return isUuidString(raw) ? raw : MVP_ORGANIZATION_ID;
+  }, [organizationId]);
   const [palletNum, setPalletNum] = useState(generatePalletNumber()); const [notes, setNotes] = useState(""); const [file, setFile] = useState<File | null>(null);
   const [ocrLoad, setOcrLoad] = useState(false); const [ocrResult, setOcrResult] = useState<{ pallet_number: string; total_items: number; confidence: number } | null>(null);
   const [saving, setSaving] = useState(false); const [error, setError] = useState("");
@@ -6047,9 +6094,10 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
     setSaving(true); setError("");
     try {
       let manifestPhotoUrl: string | undefined;
-      if (file) manifestPhotoUrl = await uploadToStorage(file, "pallets/manifest", organizationId);
+      if (file) manifestPhotoUrl = await uploadToStorage(file, "pallets/manifest", pltOrgId);
       const res = await createPallet({
-        organization_id: organizationId,
+        organization_id: pltOrgId,
+        actor_profile_id: actorProfileId,
         pallet_number: palletNum.trim(),
         photo_url: palletPhotoUrls[0]?.trim() || null,
         bol_photo_url: bolUrls[0]?.trim() || null,
@@ -6178,9 +6226,14 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
 
 // ─── Items Data Table ──────────────────────────────────────────────────────────
 
-export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSettings, onRowClick, onRowEdit, onBulkDeleted, onBulkMoved, onNewItem, externalSearch = "", onToast, returnsTotalInDb = null }: {
+export function ItemsDataTable({ items, packages, pallets, role, actor, actorProfileId = null, showCompanyColumn = false, organizationLabelById = {}, platformIconBySlug = {}, fefoSettings, onRowClick, onRowEdit, onBulkDeleted, onBulkMoved, onNewItem, externalSearch = "", onToast, returnsTotalInDb = null }: {
   items: ReturnRecord[]; packages: PackageRecord[]; pallets: PalletRecord[];
   role: UserRole; actor: string;
+  actorProfileId?: string | null;
+  showCompanyColumn?: boolean;
+  organizationLabelById?: Record<string, string>;
+  /** Slug → icon URL from `marketplaces` (fallback when `marketplace_id` is unset). */
+  platformIconBySlug?: Record<string, string | null | undefined>;
   fefoSettings?: { fefo_critical_days: number; fefo_warning_days: number };
   onRowClick: (r: ReturnRecord) => void; onRowEdit: (r: ReturnRecord) => void;
   onBulkDeleted: (ids: string[]) => void;
@@ -6250,7 +6303,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
     setBulkDeleting(true);
     const ids = [...selectedIds];
     try {
-      const res = await bulkDeleteReturns(ids, actor);
+      const res = await bulkDeleteReturns(ids, actor, actorProfileId);
       if (!res.ok) {
         console.error("[ItemsDataTable] bulkDeleteReturns failed:", res.error);
         onToast?.(res.error ?? "Could not delete items. Nothing was removed.", "error");
@@ -6295,7 +6348,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
 
       <div className="w-full overflow-x-auto rounded-2xl border border-border">
         <div className="w-full min-w-0">
-          <table className="w-full min-w-[1400px] text-sm">
+          <table className="w-full min-w-[1460px] text-sm">
             <thead>
               <tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900">
                 <th className={TH_CHK} onClick={(e) => e.stopPropagation()}>
@@ -6303,6 +6356,10 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                     <input type="checkbox" checked={allSelected} onChange={(e) => setSelectedIds(e.target.checked ? new Set(filtered.map((r) => r.id)) : new Set())} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                   </div>
                 </th>
+                {showCompanyColumn && (
+                  <th className="hidden px-4 py-3 text-left md:table-cell text-xs font-semibold uppercase tracking-wide text-slate-500">Company</th>
+                )}
+                <th className="w-12 px-2 py-3 text-center text-xs font-semibold uppercase tracking-wide text-slate-500" title="Marketplace">MP</th>
                 <th className="px-4 py-3 text-left"><SortButton field="item_name" label="Identifiers" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="tracking_effective" label="Tracking" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="lpn" label="LPN" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
@@ -6332,6 +6389,14 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                       <div className={CHK_FLEX}>
                         <input type="checkbox" checked={selectedIds.has(r.id)} onChange={(e) => { const s = new Set(selectedIds); e.target.checked ? s.add(r.id) : s.delete(r.id); setSelectedIds(s); }} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                       </div>
+                    </td>
+                    {showCompanyColumn && (
+                      <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[r.organization_id] ?? r.organization_id}>
+                        {organizationLabelById[r.organization_id] ?? `${r.organization_id.slice(0, 8)}…`}
+                      </td>
+                    )}
+                    <td className="w-12 px-2 py-3 align-middle">
+                      <MarketplaceIconCell r={r} platformIconBySlug={platformIconBySlug} />
                     </td>
                     <td className="px-4 py-3 min-w-[200px]">
                       <ReturnIdentifiersColumn
@@ -6399,7 +6464,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
                         onEdit={() => onRowEdit(r)}
                         onDelete={canDelete(role) ? async () => {
                           if (!window.confirm("Delete this return? This cannot be undone.")) return;
-                          const res = await deleteReturn(r.id, actor);
+                          const res = await deleteReturn(r.id, actor, actorProfileId);
                           if (res.ok) onBulkDeleted([r.id]);
                           else {
                             console.error("[ItemsDataTable] deleteReturn failed:", res.error);
@@ -6426,7 +6491,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
       {total > 1 && <div className="flex items-center justify-between text-sm text-slate-500"><p>Page {page} of {total} · {filtered.length} items</p><div className="flex gap-2"><button disabled={page<=1} onClick={() => setPage((p)=>p-1)} className="flex h-9 items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800">← Prev</button><button disabled={page>=total} onClick={() => setPage((p)=>p+1)} className="flex h-9 items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-40 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800">Next →</button></div></div>}
 
       {showBulkMove && (
-        <BulkMoveModal selectedIds={[...selectedIds]} packages={packages} pallets={pallets} returns={items} actor={actor} onClose={() => setShowBulkMove(false)}
+        <BulkMoveModal selectedIds={[...selectedIds]} packages={packages} pallets={pallets} returns={items} actor={actor} actorProfileId={actorProfileId} onClose={() => setShowBulkMove(false)}
           onMoved={(updated, failed) => { onBulkMoved(updated); setSelectedIds(new Set()); setShowBulkMove(false); if (failed > 0) window.alert(`${failed} item(s) failed to move.`); }}
         />
       )}
@@ -6436,9 +6501,12 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, fefoSett
 
 // ─── Packages Data Table ───────────────────────────────────────────────────────
 
-export function PackagesDataTable({ packages, returns: allReturns = [], pallets = [], role, actor, onRowClick, onRowEdit, onBulkDeleted, onBulkPackagesUpdated, onNewPackage, externalSearch = "", onToast }: {
+export function PackagesDataTable({ packages, returns: allReturns = [], pallets = [], role, actor, actorProfileId = null, showCompanyColumn = false, organizationLabelById = {}, onRowClick, onRowEdit, onBulkDeleted, onBulkPackagesUpdated, onNewPackage, externalSearch = "", onToast }: {
   packages: PackageRecord[]; returns?: ReturnRecord[]; pallets?: PalletRecord[];
   role: UserRole; actor: string;
+  actorProfileId?: string | null;
+  showCompanyColumn?: boolean;
+  organizationLabelById?: Record<string, string>;
   onRowClick: (p: PackageRecord) => void; onRowEdit: (p: PackageRecord) => void;
   onBulkDeleted: (ids: string[]) => void;
   /** Called after bulk assign to pallet so parent state stays in sync with DB */
@@ -6504,7 +6572,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
     setBulkDeleting(true);
     const ids = [...selectedIds];
     try {
-      const results = await Promise.all(ids.map((id) => deletePackage(id, actor)));
+      const results = await Promise.all(ids.map((id) => deletePackage(id, actor, actorProfileId)));
       const failed = ids.filter((_, i) => !results[i].ok);
       const succeeded = ids.filter((_, i) => results[i].ok);
       if (failed.length) {
@@ -6556,6 +6624,9 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                     <input type="checkbox" checked={allSelected} onChange={(e) => setSelectedIds(e.target.checked ? new Set(filtered.map((p) => p.id)) : new Set())} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                   </div>
                 </th>
+                {showCompanyColumn && (
+                  <th className="hidden px-4 py-3 text-left md:table-cell text-xs font-semibold uppercase tracking-wide text-slate-500">Company</th>
+                )}
                 <th className="px-4 py-3 text-left"><SortButton field="package_number" label="Package #" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="store_name" label="Store" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left sm:table-cell"><SortButton field="carrier_tracking" label="Carrier / Tracking" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
@@ -6585,6 +6656,11 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                           <input type="checkbox" checked={selectedIds.has(p.id)} onChange={(e) => { const s = new Set(selectedIds); e.target.checked ? s.add(p.id) : s.delete(p.id); setSelectedIds(s); }} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                         </div>
                       </td>
+                      {showCompanyColumn && (
+                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
+                          {organizationLabelById[p.organization_id] ?? `${p.organization_id.slice(0, 8)}…`}
+                        </td>
+                      )}
                       <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                         <div className="flex items-center gap-1.5 font-mono text-xs font-bold text-foreground">
                           <span>{p.package_number}</span>
@@ -6621,13 +6697,13 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                       <td className="px-3 py-3">
                         <RowActionMenu
                           onView={() => onRowClick(p)} onEdit={() => onRowEdit(p)}
-                          onDelete={canDelete(role) ? async () => { if (!window.confirm("Delete this package?")) return; const r = await deletePackage(p.id, actor); if (r.ok) onBulkDeleted([p.id]); } : undefined}
+                          onDelete={canDelete(role) ? async () => { if (!window.confirm("Delete this package?")) return; const r = await deletePackage(p.id, actor, actorProfileId); if (r.ok) onBulkDeleted([p.id]); } : undefined}
                         />
                       </td>
                     </tr>
                     {isExpanded && (
                       <tr className="bg-violet-50/40 dark:bg-violet-950/10">
-                        <td colSpan={10} className="px-6 py-3">
+                        <td colSpan={showCompanyColumn ? 11 : 10} className="px-6 py-3">
                           {pkgItems.length === 0
                             ? <p className="py-2 text-center text-xs text-slate-400">No items scanned for this package yet.</p>
                             : (
@@ -6694,6 +6770,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
           selectedIds={[...selectedIds]}
           pallets={pallets}
           actor={actor}
+          actorProfileId={actorProfileId}
           onClose={() => setShowBulkPallet(false)}
           onDone={(updated, failed) => {
             if (onBulkPackagesUpdated && updated.length) onBulkPackagesUpdated(updated);
@@ -6709,8 +6786,11 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
 
 // ─── Pallets Data Table ────────────────────────────────────────────────────────
 
-export function PalletsDataTable({ pallets, packages: allPackages = [], returns: allReturns = [], role, actor, onRowClick, onRowEdit, onBulkDeleted, onNewPallet, externalSearch = "", onToast }: {
+export function PalletsDataTable({ pallets, packages: allPackages = [], returns: allReturns = [], role, actor, actorProfileId = null, showCompanyColumn = false, organizationLabelById = {}, onRowClick, onRowEdit, onBulkDeleted, onNewPallet, externalSearch = "", onToast }: {
   pallets: PalletRecord[]; packages?: PackageRecord[]; returns?: ReturnRecord[]; role: UserRole; actor: string;
+  actorProfileId?: string | null;
+  showCompanyColumn?: boolean;
+  organizationLabelById?: Record<string, string>;
   onRowClick: (p: PalletRecord) => void; onRowEdit: (p: PalletRecord) => void;
   onBulkDeleted: (ids: string[]) => void; onNewPallet: () => void;
   externalSearch?: string;
@@ -6774,7 +6854,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
     setBulkDeleting(true);
     const ids = [...selectedIds];
     try {
-      const results = await Promise.all(ids.map((id) => deletePallet(id, actor)));
+      const results = await Promise.all(ids.map((id) => deletePallet(id, actor, actorProfileId)));
       const failed = ids.filter((_, i) => !results[i].ok);
       const succeeded = ids.filter((_, i) => results[i].ok);
       if (failed.length) {
@@ -6817,6 +6897,9 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                     <input type="checkbox" checked={allSelected} onChange={(e) => setSelectedIds(e.target.checked ? new Set(filtered.map((p) => p.id)) : new Set())} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                   </div>
                 </th>
+                {showCompanyColumn && (
+                  <th className="hidden px-4 py-3 text-left md:table-cell text-xs font-semibold uppercase tracking-wide text-slate-500">Company</th>
+                )}
                 <th className="px-4 py-3 text-left"><SortButton field="pallet_number" label="Pallet #" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="hidden px-4 py-3 text-left md:table-cell"><SortButton field="store_name" label="Store" sortField={sortField} sortAsc={sortAsc} onSort={handleSort} /></th>
                 <th className="px-4 py-3 text-left">
@@ -6849,6 +6932,11 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                           <input type="checkbox" checked={selectedIds.has(p.id)} onChange={(e) => { const s = new Set(selectedIds); e.target.checked ? s.add(p.id) : s.delete(p.id); setSelectedIds(s); }} className="h-4 w-4 cursor-pointer rounded border-slate-300 text-sky-500 focus:ring-sky-400" />
                         </div>
                       </td>
+                      {showCompanyColumn && (
+                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
+                          {organizationLabelById[p.organization_id] ?? `${p.organization_id.slice(0, 8)}…`}
+                        </td>
+                      )}
                       <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                         <div className="flex items-center gap-1.5 font-mono text-xs font-bold text-foreground">
                           <span>{p.pallet_number}</span>
@@ -6869,13 +6957,13 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                       <td className="px-3 py-3">
                         <RowActionMenu
                           onView={() => onRowClick(p)} onEdit={() => onRowEdit(p)}
-                          onDelete={canDelete(role) ? async () => { if (!window.confirm("Delete this pallet?")) return; const r = await deletePallet(p.id, actor); if (r.ok) onBulkDeleted([p.id]); } : undefined}
+                          onDelete={canDelete(role) ? async () => { if (!window.confirm("Delete this pallet?")) return; const r = await deletePallet(p.id, actor, actorProfileId); if (r.ok) onBulkDeleted([p.id]); } : undefined}
                         />
                       </td>
                     </tr>
                     {isExpanded && (
                       <tr className="bg-slate-50/70 dark:bg-slate-900/50">
-                        <td colSpan={9} className="px-6 py-3">
+                        <td colSpan={showCompanyColumn ? 10 : 9} className="px-6 py-3">
                           {pltPackages.length === 0
                             ? <p className="py-2 text-center text-xs text-slate-400">No packages linked to this pallet yet.</p>
                             : (

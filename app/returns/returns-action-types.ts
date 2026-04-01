@@ -36,6 +36,8 @@ export type PalletInsertPayload = {
   manifest_photo_url?: string | null;
   store_id?: string;
   notes?: string; organization_id?: string; created_by?: string;
+  /** Resolves tenant + super-admin target org on the server */
+  actor_profile_id?: string | null;
 };
 
 export type PalletUpdatePayload = Partial<Pick<
@@ -86,6 +88,7 @@ export type PackageInsertPayload = {
   photo_closed_url?: string | null;
   manifest_photo_url?: string | null;
   photo_evidence?: Record<string, unknown> | null;
+  actor_profile_id?: string | null;
 };
 
 export type PackageUpdatePayload = Partial<Pick<
@@ -113,6 +116,7 @@ export type ReturnInsertPayload = {
   customer_id?: string | null;
   claim_evidence_selected_urls?: string[] | null;
   organization_id?: string; created_by?: string;
+  actor_profile_id?: string | null;
 };
 
 export type ReturnRecord = {
@@ -120,7 +124,11 @@ export type ReturnRecord = {
   lpn: string | null;
   inherited_tracking_number?: string | null;
   inherited_carrier?: string | null;
-  marketplace: string; item_name: string;
+  marketplace: string;
+  /** FK to global `marketplaces` for channel icon (optional). */
+  marketplace_id?: string | null;
+  marketplaces?: { icon_url?: string | null; slug?: string; name?: string } | null;
+  item_name: string;
   asin?: string | null;
   fnsku?: string | null;
   sku?: string | null;

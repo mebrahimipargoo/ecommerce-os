@@ -46,22 +46,43 @@ export async function getWorkspaceSettings(): Promise<WorkspaceSettings> {
 
 /**
  * Returns the core_settings (white-label / tenant branding). Always succeeds.
+ * Pass `organizationId` to resolve the logo for that tenant (sidebar multi-tenant branding).
  */
-export async function getCoreSettings(): Promise<CoreSettings> {
+export async function getCoreSettings(organizationId?: string): Promise<CoreSettings> {
   const ws = await getWorkspaceSettings();
   const merged = {
     ...DEFAULT_CORE_SETTINGS,
     ...(ws.core_settings as CoreSettings),
   };
-  const orgLogo = await getOrganizationLogoUrlFromDb();
+  const orgLogo = await getOrganizationLogoUrlFromDb(organizationId);
+  let labelFromOrg = "";
+  if (organizationId?.trim()) {
+    try {
+      const { data: osRow } = await supabaseServer
+        .from("organization_settings")
+        .select("company_display_name")
+        .eq("organization_id", organizationId.trim())
+        .maybeSingle();
+      const dn = (osRow as { company_display_name?: string | null } | null)?.company_display_name;
+      labelFromOrg = typeof dn === "string" ? dn.trim() : "";
+    } catch {
+      labelFromOrg = "";
+    }
+  }
   const rawLogo =
     orgLogo ||
     (typeof merged.company_logo_url === "string" && merged.company_logo_url) ||
     (typeof merged.logo_url === "string" && merged.logo_url) ||
     "";
   const logo = normalizeTenantLogoUrl(rawLogo);
+  const companyName =
+    labelFromOrg ||
+    (typeof merged.company_name === "string" && merged.company_name.trim()) ||
+    (typeof merged.workspace_name === "string" && String(merged.workspace_name).trim()) ||
+    "";
   return {
     ...merged,
+    company_name: companyName,
     company_logo_url: logo,
     logo_url: logo,
   };

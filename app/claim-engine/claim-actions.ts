@@ -143,12 +143,13 @@ export async function getClaimDetail(
 
     let pallet: PalletRecord | null = null;
     let pkg: PackageRecord | null = null;
+    const tenantOpts = { actorProfileId: null as string | null, filterOrganizationId: organizationId };
     if (palletId) {
-      const pr = await listPallets(organizationId);
+      const pr = await listPallets(tenantOpts);
       if (pr.ok) pallet = pr.data.find((p) => p.id === palletId) ?? null;
     }
     if (packageId) {
-      const pk = await listPackages(organizationId);
+      const pk = await listPackages(tenantOpts);
       if (pk.ok) pkg = pk.data.find((p) => p.id === packageId) ?? null;
     }
 
@@ -203,12 +204,13 @@ export async function getClaimDetailForReturn(
     const packageId = returnRow.package_id ?? null;
     let pallet: PalletRecord | null = null;
     let pkg: PackageRecord | null = null;
+    const tenantOpts = { actorProfileId: null as string | null, filterOrganizationId: organizationId };
     if (palletId) {
-      const pr = await listPallets(organizationId);
+      const pr = await listPallets(tenantOpts);
       if (pr.ok) pallet = pr.data.find((p) => p.id === palletId) ?? null;
     }
     if (packageId) {
-      const pk = await listPackages(organizationId);
+      const pk = await listPackages(tenantOpts);
       if (pk.ok) pkg = pk.data.find((p) => p.id === packageId) ?? null;
     }
 

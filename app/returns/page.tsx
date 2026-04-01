@@ -13,6 +13,12 @@ import {
   type InventoryModuleConfig,
 } from "../settings/workspace-settings-types";
 import { resolveOrganizationId } from "../../lib/organization";
+import { isUuidString } from "../../lib/uuid";
+import {
+  listWorkspaceOrganizationsForAdmin,
+  type WorkspaceOrganizationOption,
+} from "../session/tenant-actions";
+import { listPlatformMarketplaceIcons } from "../admin/platform-actions";
 import {
   DEFAULT_ORG_SETTINGS,
   type DrawerContent, type WizardInheritedContext,
@@ -44,7 +50,39 @@ export default function ReturnsPage() {
 
   // ── UI State ────────────────────────────────────────────────────────────────
   const [activeTab, setActiveTab] = useState<ActiveTab>("items");
-  const { role, actorName: actor } = useUserRole();
+  const { role, actorName: actor, actorUserId, organizationId: userOrgId } = useUserRole();
+  /** Super Admin: empty string = all tenants on lists */
+  const [superAdminListFilter, setSuperAdminListFilter] = useState("");
+  /** Super Admin: org id for new returns / packages / pallets */
+  const [superAdminCreateOrg, setSuperAdminCreateOrg] = useState<string>("");
+  const [companyOptions, setCompanyOptions] = useState<WorkspaceOrganizationOption[]>([]);
+  const [platformIconBySlug, setPlatformIconBySlug] = useState<Record<string, string>>({});
+
+  const tenantQuery = useMemo(() => {
+    const filterOrg =
+      role === "super_admin"
+        ? (() => {
+            const t = superAdminListFilter.trim();
+            return t && isUuidString(t) ? t : undefined;
+          })()
+        : undefined;
+    return { actorProfileId: actorUserId, filterOrganizationId: filterOrg };
+  }, [actorUserId, role, superAdminListFilter]);
+
+  const organizationLabelById = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const o of companyOptions) {
+      m[o.organization_id] = o.display_name;
+    }
+    return m;
+  }, [companyOptions]);
+
+  const effectiveWriteOrgId =
+    role === "super_admin"
+      ? (superAdminCreateOrg.trim() && isUuidString(superAdminCreateOrg.trim())
+          ? superAdminCreateOrg.trim()
+          : userOrgId ?? resolveOrganizationId())
+      : (userOrgId ?? resolveOrganizationId());
 
   // ── Drawer Stack ─────────────────────────────────────────────────────────────
   // Stack allows drilling down: Pallet → Package → Item and going back.
@@ -66,6 +104,29 @@ export default function ReturnsPage() {
   const { toasts, show: showToast } = useToast();
   const { query: globalSearchQuery } = useGlobalSearch();
 
+  useEffect(() => {
+    if (role !== "super_admin") return;
+    let cancelled = false;
+    void listWorkspaceOrganizationsForAdmin().then((res) => {
+      if (!cancelled && res.ok) setCompanyOptions(res.rows);
+    });
+    return () => { cancelled = true; };
+  }, [role]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void listPlatformMarketplaceIcons().then((res) => {
+      if (!cancelled && res.ok) setPlatformIconBySlug(res.bySlug);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (userOrgId && !superAdminCreateOrg.trim()) {
+      setSuperAdminCreateOrg(userOrgId);
+    }
+  }, [userOrgId, superAdminCreateOrg]);
+
   // ── Data Loading ─────────────────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
@@ -73,8 +134,14 @@ export default function ReturnsPage() {
       setLoading(true);
       setFetchErrors([]);
       try {
+        const settingsOrg = userOrgId ?? resolveOrganizationId();
         const [r, p, pl, settings, fefo, retCount] = await Promise.all([
-          listReturns(), listPackages(), listPallets(), getOrgSettings(), getFefoSettings(), countReturns(),
+          listReturns(tenantQuery),
+          listPackages(tenantQuery),
+          listPallets(tenantQuery),
+          getOrgSettings(settingsOrg),
+          getFefoSettings(),
+          countReturns(tenantQuery),
         ]);
         if (cancelled) return;
         const errs: string[] = [];
@@ -99,7 +166,7 @@ export default function ReturnsPage() {
     }
     void load();
     return () => { cancelled = true; };
-  }, []);
+  }, [tenantQuery, userOrgId]);
 
   // ── Derived helpers ──────────────────────────────────────────────────────────
   const openPackages = useMemo(() => packages.filter((p) => p.status === "open"), [packages]);
@@ -226,11 +293,40 @@ export default function ReturnsPage() {
     <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col">
       {/* Top Bar */}
       {/* Page title row — global TopHeader (theme/profile) is rendered by AppShell above */}
-      <header className="sticky top-0 z-[100] flex items-center gap-3 border-b border-border bg-card/90 px-4 py-3 backdrop-blur-sm">
-        <div className="flex-1">
+      <header className="sticky top-0 z-[100] flex flex-wrap items-center gap-3 border-b border-border bg-card/90 px-4 py-3 backdrop-blur-sm">
+        <div className="min-w-0 flex-1">
           <h1 className="font-bold text-foreground">Returns & Logistics</h1>
-          <p className="text-xs text-slate-400">FBA Reimbursement ERP · role toggle in top-bar</p>
+          <p className="text-xs text-slate-400">FBA Reimbursement ERP · tenant-scoped data</p>
         </div>
+        {role === "super_admin" && companyOptions.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+              <span className="whitespace-nowrap">Company filter</span>
+              <select
+                value={superAdminListFilter}
+                onChange={(e) => setSuperAdminListFilter(e.target.value)}
+                className="h-9 min-w-[160px] rounded-lg border border-border bg-background px-2 text-xs font-semibold text-foreground"
+              >
+                <option value="">All companies</option>
+                {companyOptions.map((o) => (
+                  <option key={o.organization_id} value={o.organization_id}>{o.display_name}</option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+              <span className="whitespace-nowrap">Create as</span>
+              <select
+                value={superAdminCreateOrg}
+                onChange={(e) => setSuperAdminCreateOrg(e.target.value)}
+                className="h-9 min-w-[160px] rounded-lg border border-border bg-background px-2 text-xs font-semibold text-foreground"
+              >
+                {companyOptions.map((o) => (
+                  <option key={o.organization_id} value={o.organization_id}>{o.display_name}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+        )}
       </header>
 
       {/* Tab Bar */}
@@ -285,6 +381,10 @@ export default function ReturnsPage() {
                   pallets={pallets}
                   role={role}
                   actor={actor}
+                  actorProfileId={actorUserId}
+                  showCompanyColumn={role === "super_admin"}
+                  organizationLabelById={organizationLabelById}
+                  platformIconBySlug={platformIconBySlug}
                   fefoSettings={fefoSettings}
                   externalSearch={globalSearchQuery}
                   onToast={showToast}
@@ -307,6 +407,9 @@ export default function ReturnsPage() {
                   pallets={pallets}
                   role={role}
                   actor={actor}
+                  actorProfileId={actorUserId}
+                  showCompanyColumn={role === "super_admin"}
+                  organizationLabelById={organizationLabelById}
                   externalSearch={globalSearchQuery}
                   onToast={showToast}
                   onRowClick={(p) => openDrawer({ type: "package", record: p })}
@@ -327,6 +430,9 @@ export default function ReturnsPage() {
                   returns={visibleReturns}
                   role={role}
                   actor={actor}
+                  actorProfileId={actorUserId}
+                  showCompanyColumn={role === "super_admin"}
+                  organizationLabelById={organizationLabelById}
                   externalSearch={globalSearchQuery}
                   onToast={showToast}
                   onRowClick={(p) => openDrawer({ type: "pallet", record: p })}
@@ -353,6 +459,7 @@ export default function ReturnsPage() {
             record={activeDrawer.record}
             role={role}
             actor={actor}
+            actorProfileId={actorUserId}
             packages={packages}
             pallets={pallets}
             sessionPhotos={sessionPhotos.get(activeDrawer.record.id)}
@@ -367,6 +474,7 @@ export default function ReturnsPage() {
             pkg={activeDrawer.record}
             role={role}
             actor={actor}
+            actorProfileId={actorUserId}
             openPallets={openPallets}
             allReturns={visibleReturns}
             onClose={closeDrawer}
@@ -386,7 +494,8 @@ export default function ReturnsPage() {
             pallet={activeDrawer.record}
             role={role}
             actor={actor}
-            organizationId={resolveOrganizationId()}
+            actorProfileId={actorUserId}
+            organizationId={activeDrawer.record.organization_id}
             packages={packages}
             allReturns={visibleReturns}
             onClose={closeDrawer}
@@ -404,7 +513,8 @@ export default function ReturnsPage() {
           onClose={() => { setWizardOpen(false); setWizardInherited(undefined); }}
           onSuccess={(r, photos) => { addReturn(r, photos); }}
           actor={actor}
-          organizationId={resolveOrganizationId()}
+          organizationId={effectiveWriteOrgId}
+          actorProfileId={actorUserId}
           openPackages={openPackages}
           openPallets={openPallets}
           existingReturns={visibleReturns}
@@ -440,7 +550,8 @@ export default function ReturnsPage() {
           onClose={() => setCreatePackageOpen(false)}
           onCreated={(p) => { addPackage(p); setCreatePackageOpen(false); showToast(`Package ${p.package_number} created.`); }}
           actor={actor}
-          organizationId={resolveOrganizationId()}
+          organizationId={effectiveWriteOrgId}
+          actorProfileId={actorUserId}
           openPallets={openPallets}
           aiPackingSlipEnabled={orgSettings.is_ai_packing_slip_ocr_enabled}
         />
@@ -451,7 +562,8 @@ export default function ReturnsPage() {
           onClose={() => setCreatePalletOpen(false)}
           onCreated={(p) => { addPallet(p); setCreatePalletOpen(false); showToast(`Pallet ${p.pallet_number} created.`); }}
           actor={actor}
-          organizationId={resolveOrganizationId()}
+          organizationId={effectiveWriteOrgId}
+          actorProfileId={actorUserId}
           aiManifestEnabled={orgSettings.is_ai_packing_slip_ocr_enabled}
         />
       )}

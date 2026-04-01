@@ -21,7 +21,7 @@ import {
   FileText,
   LayoutDashboard, Menu,
   PanelLeftClose, PanelLeftOpen,
-  RotateCcw, Settings, ShieldAlert, Users, X,
+  RotateCcw, Settings, Shield, ShieldAlert, Users, X,
 } from "lucide-react";
 import { TopHeader } from "./TopHeader";
 import { BrandingProvider, useBranding } from "./BrandingContext";
@@ -74,9 +74,11 @@ const CLS = {
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   return (
-    <BrandingProvider>
-      <AppShellInner>{children}</AppShellInner>
-    </BrandingProvider>
+    <UserRoleProvider>
+      <BrandingProvider>
+        <AppShellInner>{children}</AppShellInner>
+      </BrandingProvider>
+    </UserRoleProvider>
   );
 }
 
@@ -289,6 +291,21 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             </div>
           </div>
         )}
+
+        {role === "super_admin" && (
+          <div className="mb-4">
+            {showSection
+              ? <p className={CLS.section}>Platform</p>
+              : <div className="mb-2 mx-3 h-px bg-border" />
+            }
+            <div className="space-y-0.5">
+              <NavLink
+                item={{ label: "Admin Settings", icon: Shield, href: "/admin/settings" }}
+                alwaysFull={alwaysFull}
+              />
+            </div>
+          </div>
+        )}
       </>
     );
   }
@@ -333,7 +350,6 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   );
 
   return (
-    <UserRoleProvider>
     <GlobalSearchProvider>
     <MobileMenuCtx.Provider value={{ openMobileMenu: () => setMobileOpen(true) }}>
       <div className="flex min-h-screen bg-background">
@@ -397,6 +413,5 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
       </div>
     </MobileMenuCtx.Provider>
     </GlobalSearchProvider>
-    </UserRoleProvider>
   );
 }
