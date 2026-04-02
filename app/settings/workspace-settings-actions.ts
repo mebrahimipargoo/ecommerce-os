@@ -61,7 +61,7 @@ export async function getCoreSettings(organizationId?: string): Promise<CoreSett
       const { data: osRow } = await supabaseServer
         .from("organization_settings")
         .select("company_display_name")
-        .eq("organization_id", organizationId.trim())
+        .eq("company_id", organizationId.trim())
         .maybeSingle();
       const dn = (osRow as { company_display_name?: string | null } | null)?.company_display_name;
       labelFromOrg = typeof dn === "string" ? dn.trim() : "";

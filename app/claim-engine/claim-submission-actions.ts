@@ -18,6 +18,10 @@ import {
   CLAIM_SUBMISSIONS_TABLE,
   CLAIM_SUBMISSIONS_WITH_RETURNS_EMBED,
 } from "./claim-submissions-constants";
+import {
+  appendClaimHistoryTimelineEntry,
+  resolveProfileDisplayName,
+} from "./claim-history-timeline-actions";
 
 const DEFAULT_ORG = "00000000-0000-0000-0000-000000000001";
 const BUCKET = "claim-reports";
@@ -35,7 +39,7 @@ export type ClaimSubmissionStatus =
 
 export type ClaimSubmissionListRow = {
   id: string;
-  organization_id: string;
+  company_id: string;
   return_id: string;
   store_id: string | null;
   report_url: string | null;
@@ -71,14 +75,29 @@ async function signedUrlForPath(path: string | null): Promise<string | null> {
 export async function approveClaimSubmission(
   submissionId: string,
   organizationId: string = DEFAULT_ORG,
+  actorUserId?: string | null,
 ): Promise<{ ok: boolean; error?: string }> {
   try {
     const { error } = await supabaseServer
       .from(CLAIM_SUBMISSIONS_TABLE)
       .update({ status: "accepted" })
       .eq("id", submissionId)
-      .eq("organization_id", organizationId);
+      .eq("company_id", organizationId);
     if (error) throw new Error(error.message);
+
+    const actorLabel = await resolveProfileDisplayName(actorUserId ?? null);
+    const log = await appendClaimHistoryTimelineEntry({
+      claimId: submissionId,
+      companyId: organizationId,
+      action: "Claim approved (status set to accepted)",
+      details: { new_status: "accepted" },
+      statusAtTime: "accepted",
+      actorLabel,
+    });
+    if (!log.ok) {
+      console.warn("[claim history]", log.error);
+    }
+
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Approve failed." };
@@ -92,9 +111,9 @@ export async function generateDailyClaimReports(
     const { data: readyRows, error: rErr } = await supabaseServer
       .from("returns")
       .select(
-        "id, organization_id, store_id, estimated_value, marketplace, conditions, order_id, package_id, expiration_date, batch_number, notes, stores(platform)",
+        "id, company_id, store_id, estimated_value, marketplace, conditions, order_id, package_id, expiration_date, batch_number, notes, stores(platform)",
       )
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .eq("status", "ready_for_claim")
       .is("deleted_at", null);
 
@@ -109,7 +128,7 @@ export async function generateDailyClaimReports(
     for (const ret of rows) {
       const r = ret as {
         id: string;
-        organization_id?: string;
+        company_id?: string;
         store_id?: string | null;
         estimated_value?: unknown;
         marketplace?: string | null;
@@ -125,7 +144,7 @@ export async function generateDailyClaimReports(
       if (!shouldAutoEnqueueAmazonClaimSubmission(r.marketplace, r.conditions ?? [], storePlat)) continue;
 
       const returnId = r.id;
-      const rawOrg = String(r.organization_id ?? organizationId ?? "").trim();
+      const rawOrg = String(r.company_id ?? organizationId ?? "").trim();
       const orgId = isUuidString(rawOrg) ? rawOrg : resolveOrganizationId();
       const ev = r.estimated_value;
       const n = Number(ev);
@@ -149,7 +168,7 @@ export async function generateDailyClaimReports(
 
       const { error: upErr } = await supabaseServer.from(CLAIM_SUBMISSIONS_TABLE).upsert(
         {
-          organization_id: orgId,
+          company_id: orgId,
           [CLAIM_SUBMISSION_RETURN_ID_COLUMN]: returnId,
           store_id: storeIdResolved,
           report_url: null,
@@ -214,7 +233,7 @@ export async function listClaimSubmissions(
       const ret = returnRowFromSubmissionEmbed(r);
       rows.push({
         id: r.id as string,
-        organization_id: r.organization_id as string,
+        company_id: r.company_id as string,
         return_id: rid,
         store_id: (r.store_id as string | null) ?? null,
         report_url: path,
@@ -262,6 +281,7 @@ export async function markClaimSubmissionManualSubmit(
   submissionId: string,
   marketplaceCaseId: string,
   organizationId: string = DEFAULT_ORG,
+  actorUserId?: string | null,
 ): Promise<{ ok: boolean; error?: string }> {
   const id = marketplaceCaseId.trim();
   if (!id) return { ok: false, error: "Marketplace case ID is required." };
@@ -273,8 +293,22 @@ export async function markClaimSubmissionManualSubmit(
         submission_id: id,
       })
       .eq("id", submissionId)
-      .eq("organization_id", organizationId);
+      .eq("company_id", organizationId);
     if (error) throw new Error(error.message);
+
+    const actorLabel = await resolveProfileDisplayName(actorUserId ?? null);
+    const log = await appendClaimHistoryTimelineEntry({
+      claimId: submissionId,
+      companyId: organizationId,
+      action: "Marked as submitted with marketplace case ID",
+      details: { new_status: "submitted", marketplace_case_id: id },
+      statusAtTime: "submitted",
+      actorLabel,
+    });
+    if (!log.ok) {
+      console.warn("[claim history]", log.error);
+    }
+
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Update failed." };
@@ -288,6 +322,7 @@ export async function markClaimSubmissionManualSubmit(
 export async function bulkSubmitClaimsToMarketplace(
   organizationId: string = DEFAULT_ORG,
   selectedSubmissionIds?: string[] | null,
+  actorUserId?: string | null,
 ): Promise<{ ok: boolean; count?: number; error?: string }> {
   const HISTORY_TABLE = "claim_history_logs";
   try {
@@ -297,7 +332,7 @@ export async function bulkSubmitClaimsToMarketplace(
       const { data, error } = await supabaseServer
         .from(CLAIM_SUBMISSIONS_TABLE)
         .select("id")
-        .eq("organization_id", organizationId)
+        .eq("company_id", organizationId)
         .in("id", selectedSubmissionIds)
         .eq("status", "ready_to_send");
       if (error) throw new Error(error.message);
@@ -306,7 +341,7 @@ export async function bulkSubmitClaimsToMarketplace(
       const { data, error } = await supabaseServer
         .from(CLAIM_SUBMISSIONS_TABLE)
         .select("id")
-        .eq("organization_id", organizationId)
+        .eq("company_id", organizationId)
         .eq("status", "ready_to_send");
       if (error) throw new Error(error.message);
       targetIds = (data ?? []).map((r) => r.id as string);
@@ -320,13 +355,19 @@ export async function bulkSubmitClaimsToMarketplace(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .update({ status: "submitted" })
       .in("id", targetIds)
-      .eq("organization_id", organizationId);
+      .eq("company_id", organizationId);
     if (upErr) throw new Error(upErr.message);
 
     const msg = "Batch submission initiated by Admin.";
+    const actorLabel = await resolveProfileDisplayName(actorUserId ?? null);
     const logRows = targetIds.map((submission_id) => ({
-      organization_id: organizationId,
+      company_id: organizationId,
       submission_id,
+      claim_id: submission_id,
+      company_id: organizationId,
+      action: msg,
+      details: { batch: true, source: "bulk_submit_to_marketplace" },
+      actor_label: actorLabel,
       actor: "human_admin" as const,
       message_content: msg,
       attachments: {},

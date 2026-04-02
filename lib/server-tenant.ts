@@ -4,14 +4,15 @@ import { supabaseServer } from "./supabase-server";
 import { resolveOrganizationId } from "./organization";
 import { isUuidString } from "./uuid";
 
-/** Workspace user directory (`profiles`). Roles: super_admin | admin | operator */
+/** Workspace user directory (`public.profiles`). Roles: super_admin | admin | operator */
 export type TenantProfileRow = {
   id: string;
-  organization_id: string;
+  company_id: string;
   full_name: string;
-  email: string;
   role: string;
   photo_url: string | null;
+  /** Email is stored in auth.users, not profiles — may be absent on legacy rows. */
+  email?: string;
 };
 
 export type TenantListScope =
@@ -37,11 +38,19 @@ export async function loadTenantProfile(
   if (!id || !isUuidString(id)) return null;
   const { data, error } = await supabaseServer
     .from("profiles")
-    .select("id, organization_id, full_name, email, role, photo_url")
+    .select("id, company_id, full_name, name, role, photo_url")
     .eq("id", id)
     .maybeSingle();
   if (error || !data) return null;
-  return data as TenantProfileRow;
+  const row = data as Record<string, unknown>;
+  const cid = row.company_id;
+  return {
+    id: String(row.id),
+    company_id: typeof cid === "string" && cid.trim() ? cid : "",
+    full_name: String(row.full_name ?? row.name ?? "").trim(),
+    role: String(row.role ?? "operator"),
+    photo_url: row.photo_url != null ? String(row.photo_url) : null,
+  };
 }
 
 export function isSuperAdminRole(role: string | null | undefined): boolean {
@@ -70,7 +79,7 @@ export async function resolveTenantListScope(
     if (forcedOk) return { mode: "single", organizationId: forcedOk };
     return { mode: "all" };
   }
-  return { mode: "single", organizationId: profile.organization_id };
+  return { mode: "single", organizationId: profile.company_id };
 }
 
 /**
@@ -88,13 +97,13 @@ export async function resolveWriteOrganizationId(
     return reqOk ?? resolveOrganizationId();
   }
   if (isSuperAdminRole(profile.role)) {
-    return reqOk ?? profile.organization_id;
+    return reqOk ?? profile.company_id;
   }
-  return profile.organization_id;
+  return profile.company_id;
 }
 
 /**
- * Ensures a row’s `organization_id` is visible to the actor (for updates targeting an existing row).
+ * Ensures a row’s `company_id` is visible to the actor (for updates targeting an existing row).
  */
 export async function assertRowOrgAccess(
   actorProfileId: string | null | undefined,

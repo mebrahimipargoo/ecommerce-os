@@ -72,11 +72,14 @@ function buildReportName(sub: Record<string, unknown>, ret: Record<string, unkno
 async function loadProfileNames(ids: string[]): Promise<Map<string, string>> {
   const uuids = [...new Set(ids.map((x) => x.trim()).filter(isUuidString))];
   if (uuids.length === 0) return new Map();
-  const { data, error } = await supabaseServer.from("profiles").select("id, full_name").in("id", uuids);
+  const { data, error } = await supabaseServer
+    .from("profiles")
+    .select("id, full_name, name")
+    .in("id", uuids);
   if (error || !data) return new Map();
   const m = new Map<string, string>();
-  for (const row of data as { id: string; full_name?: string | null }[]) {
-    const name = (row.full_name ?? "").trim();
+  for (const row of data as { id: string; full_name?: string | null; name?: string | null }[]) {
+    const name = (row.full_name ?? row.name ?? "").trim();
     if (row.id && name) m.set(row.id, name);
   }
   return m;
@@ -106,7 +109,7 @@ export async function listClaimReportHistory(
     let q = supabaseServer
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select(CLAIM_SUBMISSIONS_WITH_RETURNS_EMBED)
-      .eq("organization_id", orgId)
+      .eq("company_id", orgId)
       .not("report_url", "is", null)
       .neq("report_url", "")
       .order("created_at", { ascending: false })

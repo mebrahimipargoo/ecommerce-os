@@ -16,11 +16,13 @@ export async function resolveActorProfileId(
   async function verifyInOrg(id: string): Promise<boolean> {
     const { data, error } = await supabaseServer
       .from("profiles")
-      .select("id")
-      .eq("organization_id", orgId)
+      .select("id, company_id")
       .eq("id", id)
       .maybeSingle();
-    return !error && !!data?.id;
+    if (error || !data?.id) return false;
+    const row = data as { company_id?: string | null };
+    const tenant = (row.company_id ?? "").trim();
+    return tenant === orgId;
   }
 
   const raw = explicitUserId?.trim();
@@ -31,7 +33,7 @@ export async function resolveActorProfileId(
   const { data: superAdmin } = await supabaseServer
     .from("profiles")
     .select("id")
-    .eq("organization_id", orgId)
+    .eq("company_id", orgId)
     .eq("role", "super_admin")
     .order("created_at", { ascending: true })
     .limit(1)
@@ -44,7 +46,7 @@ export async function resolveActorProfileId(
   const { data: admin } = await supabaseServer
     .from("profiles")
     .select("id")
-    .eq("organization_id", orgId)
+    .eq("company_id", orgId)
     .eq("role", "admin")
     .order("created_at", { ascending: true })
     .limit(1)
@@ -57,7 +59,7 @@ export async function resolveActorProfileId(
   const { data: first } = await supabaseServer
     .from("profiles")
     .select("id")
-    .eq("organization_id", orgId)
+    .eq("company_id", orgId)
     .order("created_at", { ascending: true })
     .limit(1)
     .maybeSingle();

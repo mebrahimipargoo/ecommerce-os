@@ -284,7 +284,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             }
             <div className="space-y-0.5">
               <NavLink
-                item={{ label: "Imports", icon: Database, href: "/settings/imports" }}
+                item={{ label: "Imports", icon: Database, href: "/imports" }}
                 alwaysFull={alwaysFull}
               />
               <SidebarDebugToggle collapsed={sidebarCollapsed} />

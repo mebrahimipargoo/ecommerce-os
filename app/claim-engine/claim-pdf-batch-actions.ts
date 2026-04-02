@@ -45,7 +45,7 @@ export async function prepareClaimEnginePdfPages(
       const { data, error } = await supabaseServer
         .from(CLAIM_SUBMISSIONS_TABLE)
         .select("id")
-        .eq("organization_id", organizationId)
+        .eq("company_id", organizationId)
         .in("id", selectedSubmissionIds);
       if (error) throw new Error(error.message);
       ids = (data ?? []).map((r) => r.id as string);
@@ -54,7 +54,7 @@ export async function prepareClaimEnginePdfPages(
       const { data, error } = await supabaseServer
         .from(CLAIM_SUBMISSIONS_TABLE)
         .select("id")
-        .eq("organization_id", organizationId)
+        .eq("company_id", organizationId)
         .eq("status", "ready_to_send")
         .order("created_at", { ascending: true });
       if (error) throw new Error(error.message);

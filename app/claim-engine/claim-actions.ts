@@ -9,6 +9,10 @@ import { resolveInitialClaimAmountUsd, resolveClaimAmountFromReturnSync } from "
 import { ClaimObject } from "./claim-object";
 import { CLAIM_SUBMISSION_RETURN_ID_COLUMN, CLAIM_SUBMISSIONS_TABLE } from "./claim-submissions-constants";
 import type { ClaimRecord } from "./claim-types";
+import {
+  appendClaimHistoryTimelineEntry,
+  resolveProfileDisplayName,
+} from "./claim-history-timeline-actions";
 
 export type { ClaimRecord } from "./claim-types";
 
@@ -43,6 +47,7 @@ export async function bulkUpdateClaimsStatus(
   ids: string[],
   status: string,
   organizationId: string = DEFAULT_ORG,
+  actorUserId?: string | null,
 ): Promise<{ ok: boolean; error?: string }> {
   if (ids.length === 0) return { ok: true };
   try {
@@ -51,8 +56,23 @@ export async function bulkUpdateClaimsStatus(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .update({ status: dbStatus })
       .in("id", ids)
-      .eq("organization_id", organizationId);
+      .eq("company_id", organizationId);
     if (error) throw new Error(error.message);
+
+    const actorLabel = await resolveProfileDisplayName(actorUserId ?? null);
+    for (const id of ids) {
+      const log = await appendClaimHistoryTimelineEntry({
+        claimId: id,
+        companyId: organizationId,
+        action: `Status changed to ${dbStatus}`,
+        details: { new_status: dbStatus, source: "bulk_update" },
+        statusAtTime: dbStatus,
+        actorLabel,
+      });
+      if (!log.ok) {
+        console.warn("[claim history]", log.error);
+      }
+    }
     return { ok: true };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Bulk update failed." };
@@ -74,7 +94,7 @@ export async function updateClaimFields(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select("source_payload")
       .eq("id", id)
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .maybeSingle();
     if (fetchErr) throw new Error(fetchErr.message);
     if (!row) return { ok: false, error: "Claim not found." };
@@ -95,7 +115,7 @@ export async function updateClaimFields(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .update(updateRow)
       .eq("id", id)
-      .eq("organization_id", organizationId);
+      .eq("company_id", organizationId);
     if (error) throw new Error(error.message);
     return { ok: true };
   } catch (e) {
@@ -119,7 +139,7 @@ export async function getClaimDetail(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select("*")
       .eq("id", claimId)
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .single();
     if (cErr) throw new Error(cErr.message);
     const sub = subRaw as Record<string, unknown>;
@@ -181,7 +201,7 @@ export async function getClaimDetailForReturn(
       .from("returns")
       .select(RETURN_SELECT)
       .eq("id", returnId)
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .maybeSingle();
     if (rErr) throw new Error(rErr.message);
     if (!retRaw) return { ok: false, error: "Return not found." };
@@ -191,7 +211,7 @@ export async function getClaimDetailForReturn(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select("*")
       .eq(CLAIM_SUBMISSION_RETURN_ID_COLUMN, returnId)
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();

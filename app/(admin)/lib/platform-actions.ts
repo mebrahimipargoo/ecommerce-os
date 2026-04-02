@@ -1,7 +1,7 @@
 "use server";
 
-import { supabaseServer } from "../../lib/supabase-server";
-import { loadTenantProfile, isSuperAdminRole } from "../../lib/server-tenant";
+import { supabaseServer } from "../../../lib/supabase-server";
+import { loadTenantProfile, isSuperAdminRole } from "../../../lib/server-tenant";
 
 export type PlatformMarketplaceRow = {
   id: string;
@@ -39,7 +39,7 @@ export async function listPlatformMarketplaces(
   }
 }
 
-/** Public read for Returns icons — any authenticated server caller may use (small global catalog). */
+/** Public read for Returns icons ΓÇö any authenticated server caller may use (small global catalog). */
 export async function listPlatformMarketplaceIcons(): Promise<{
   ok: boolean;
   bySlug: Record<string, string>;

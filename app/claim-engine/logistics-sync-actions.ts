@@ -27,7 +27,7 @@ export async function getClaimQueueSyncStatus(
     const { data: retRows, error: rErr } = await supabaseServer
       .from("returns")
       .select("id, marketplace, conditions, stores(platform)")
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .eq("status", "ready_for_claim")
       .is("deleted_at", null)
       .limit(5000);
@@ -49,7 +49,7 @@ export async function getClaimQueueSyncStatus(
     const { data: subRows, error: sErr } = await supabaseServer
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select(CLAIM_SUBMISSION_RETURN_ID_COLUMN)
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .eq("status", "ready_to_send")
       .in(CLAIM_SUBMISSION_RETURN_ID_COLUMN, readyIds);
     if (sErr) throw new Error(sErr.message);

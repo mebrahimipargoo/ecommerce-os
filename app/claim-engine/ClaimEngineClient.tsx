@@ -43,6 +43,7 @@ import type { CoreSettings } from "../settings/workspace-settings-types";
 import type { ClaimEvidenceKey } from "./claim-evidence-settings";
 import type { PalletRecord, PackageRecord } from "../returns/returns-action-types";
 import { DatabaseTag } from "../../components/DatabaseTag";
+import { useUserRole } from "../../components/UserRoleContext";
 import { ReturnIdentifiersColumn } from "../../components/ReturnIdentifiersColumn";
 import { InlineCopy, StatusBadge } from "../returns/_components";
 import type { ClaimRecord } from "./claim-actions";
@@ -221,6 +222,7 @@ export function ClaimEngineClient({
   defaultClaimEvidence: Record<ClaimEvidenceKey, boolean>;
 }) {
   const router = useRouter();
+  const { actorUserId } = useUserRole();
   const [claims, setClaims] = useState<ClaimRecord[]>(initialClaims);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [modalClaim, setModalClaim] = useState<ClaimRecord | null>(null);
@@ -380,7 +382,7 @@ export function ClaimEngineClient({
     const id = window.prompt("Marketplace case / claim ID (e.g. Amazon or Walmart):", row.submission_id ?? "");
     if (id === null) return;
     setQueueBusyId(row.id);
-    const res = await markClaimSubmissionManualSubmit(row.id, id, organizationId);
+    const res = await markClaimSubmissionManualSubmit(row.id, id, organizationId, actorUserId);
     setQueueBusyId(null);
     if (res.ok) {
       showToast("Marked as submitted.", "success");
@@ -391,7 +393,7 @@ export function ClaimEngineClient({
   async function handleBulkMarketplace() {
     setBulkSubmitBusy(true);
     const ids = selectedIds.size > 0 ? [...selectedIds] : null;
-    const res = await bulkSubmitClaimsToMarketplace(organizationId, ids);
+    const res = await bulkSubmitClaimsToMarketplace(organizationId, ids, actorUserId);
     setBulkSubmitBusy(false);
     if (res.ok && res.count != null) {
       showToast(`Submitted ${res.count} claim(s) to marketplace workflow.`, "success");
@@ -454,7 +456,7 @@ export function ClaimEngineClient({
     if (ids.length === 0) return;
     if (!window.confirm(`Cancel ${ids.length} claim(s)?`)) return;
     setBulkBusy(true);
-    const res = await bulkUpdateClaimsStatus(ids, "cancelled", organizationId);
+    const res = await bulkUpdateClaimsStatus(ids, "cancelled", organizationId, actorUserId);
     setBulkBusy(false);
     if (res.ok) {
       setClaims((prev) =>
@@ -533,7 +535,7 @@ export function ClaimEngineClient({
   async function handleApproveClaim(claim: ClaimRecord) {
     if (claim.status === "accepted") return;
     setApproveBusyId(claim.id);
-    const res = await approveClaimSubmission(claim.id, organizationId);
+    const res = await approveClaimSubmission(claim.id, organizationId, actorUserId);
     setApproveBusyId(null);
     if (res.ok) {
       setClaims((prev) =>
@@ -609,8 +611,8 @@ export function ClaimEngineClient({
       <ClaimHistoryModal
         open={historySubmissionId !== null}
         onClose={() => setHistorySubmissionId(null)}
-        submissionId={historySubmissionId}
-        organizationId={organizationId}
+        claimId={historySubmissionId}
+        companyId={organizationId}
       />
 
       <header className="flex h-16 flex-col gap-2 border-b border-slate-200 bg-white/80 px-4 backdrop-blur-xl dark:border-slate-800 dark:bg-slate-950/70 sm:flex-row sm:items-center sm:justify-between sm:gap-4 md:px-6">
@@ -818,7 +820,7 @@ export function ClaimEngineClient({
           )}
 
           <section className="relative w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
-            <DatabaseTag table="claims" />
+            <DatabaseTag table="claim_submissions" />
             <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
               <div>
                 <p className="text-xs font-semibold tracking-tight text-slate-900 dark:text-slate-50">Marketplace investigations</p>
@@ -925,6 +927,7 @@ export function ClaimEngineClient({
                           onToggle={claimsSf.toggleSort}
                         />
                         <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">History</th>
+                        <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Details</th>
                         <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Actions</th>
                       </tr>
                     </thead>
@@ -933,7 +936,7 @@ export function ClaimEngineClient({
                         <tr
                           key={claim.id}
                           className="cursor-pointer transition hover:bg-accent/40"
-                          onClick={() => setModalClaim(claim)}
+                          onClick={() => setHistorySubmissionId(claim.id)}
                         >
                           <td
                             className="w-10 px-2 py-3"
@@ -1007,6 +1010,15 @@ export function ClaimEngineClient({
                           <td className="px-4 py-3 align-top" onClick={(e) => e.stopPropagation()}>
                             <button
                               type="button"
+                              onClick={() => setModalClaim(claim)}
+                              className="inline-flex items-center gap-1 rounded-lg border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] font-semibold text-sky-900 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-100"
+                            >
+                              Details
+                            </button>
+                          </td>
+                          <td className="px-4 py-3 align-top" onClick={(e) => e.stopPropagation()}>
+                            <button
+                              type="button"
                               disabled={approveBusyId === claim.id || claim.status === "accepted"}
                               onClick={() => void handleApproveClaim(claim)}
                               className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-900 disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100"
@@ -1029,7 +1041,9 @@ export function ClaimEngineClient({
                   {displayClaims.map((claim) => (
                     <div
                       key={claim.id}
-                      className="rounded-xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/50"
+                      className="cursor-pointer rounded-xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/50"
+                      onClick={() => setHistorySubmissionId(claim.id)}
+                      role="presentation"
                     >
                       <p className="text-sm font-semibold text-slate-900 dark:text-slate-50">
                         {claim.item_name?.trim() || "Claim"}
@@ -1038,7 +1052,7 @@ export function ClaimEngineClient({
                         {formatCurrency(Number(claim.amount) || 0)} ·{" "}
                         <span className="font-medium text-slate-700 dark:text-slate-300">{claim.status}</span>
                       </p>
-                      <div className="mt-3 flex flex-wrap gap-2">
+                      <div className="mt-3 flex flex-wrap gap-2" onClick={(e) => e.stopPropagation()}>
                         <button
                           type="button"
                           disabled={approveBusyId === claim.id || claim.status === "accepted"}
@@ -1254,6 +1268,14 @@ export function ClaimEngineClient({
                           <MessageSquare className="h-3.5 w-3.5" />
                           Investigate
                         </Link>
+                        <button
+                          type="button"
+                          onClick={() => setHistorySubmissionId(row.id)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                        >
+                          <HistoryIcon className="h-3.5 w-3.5" />
+                          History
+                        </button>
                         <button
                           type="button"
                           disabled={queueBusyId === row.id || !row.report_url}

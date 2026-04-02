@@ -14,7 +14,7 @@ export async function getOrganizationLogoUrlFromDb(organizationId?: string): Pro
     const { data, error } = await supabaseServer
       .from("organization_settings")
       .select("logo_url")
-      .eq("organization_id", org)
+      .eq("company_id", org)
       .maybeSingle();
     if (error || !data) return "";
     const u = (data as { logo_url?: string | null }).logo_url;
@@ -35,7 +35,7 @@ export async function upsertOrganizationLogoUrl(
     const { data: existing } = await supabaseServer
       .from("organization_settings")
       .select("is_ai_label_ocr_enabled, is_ai_packing_slip_ocr_enabled, default_claim_evidence")
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .maybeSingle();
 
     const ex = existing as {
@@ -45,7 +45,7 @@ export async function upsertOrganizationLogoUrl(
     } | null;
 
     const row = {
-      organization_id: organizationId,
+      company_id: organizationId,
       is_ai_label_ocr_enabled: ex?.is_ai_label_ocr_enabled ?? false,
       is_ai_packing_slip_ocr_enabled: ex?.is_ai_packing_slip_ocr_enabled ?? false,
       default_claim_evidence: ex?.default_claim_evidence ?? {},
@@ -53,7 +53,7 @@ export async function upsertOrganizationLogoUrl(
     };
 
     const { error: upsertErr } = await supabaseServer.from("organization_settings").upsert(row, {
-      onConflict: "organization_id",
+      onConflict: "company_id",
     });
     if (upsertErr) return { ok: false, error: upsertErr.message };
     return { ok: true };

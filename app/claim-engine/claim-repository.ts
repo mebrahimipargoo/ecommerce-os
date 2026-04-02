@@ -109,7 +109,7 @@ export function mapSubmissionToClaimRecord(
 
   return {
     id: sub.id as string,
-    organization_id: sub.organization_id as string,
+    company_id: sub.company_id as string,
     amount,
     reimbursement_amount,
     status: String(sub.status ?? "draft"),
@@ -139,7 +139,7 @@ export async function fetchClaimSubmissionsWithReturns(
     const { data: subs, error } = await supabaseServer
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select(CLAIM_SUBMISSIONS_WITH_RETURNS_EMBED)
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .order("created_at", { ascending: false })
       .limit(limit);
 

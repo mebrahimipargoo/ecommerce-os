@@ -30,7 +30,7 @@ export class ClaimObject {
     const requested = this.requestedAmountUsd;
     return {
       id: `synthetic-return:${r.id}`,
-      organization_id: organizationId,
+      company_id: organizationId,
       amount: requested,
       reimbursement_amount: this.recoveredAmountUsd,
       status: "pending",

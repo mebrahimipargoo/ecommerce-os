@@ -10,7 +10,7 @@ export async function getOrganizationDefaultStoreId(): Promise<string | null> {
     const { data, error } = await supabaseServer
       .from("organization_settings")
       .select("default_store_id")
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .maybeSingle();
     if (error || !data) return null;
     const id = (data as { default_store_id?: string | null }).default_store_id;
@@ -36,7 +36,7 @@ export async function saveOrganizationDefaultStoreId(
         .from("stores")
         .select("id")
         .eq("id", finalId)
-        .eq("organization_id", organizationId)
+        .eq("company_id", organizationId)
         .maybeSingle();
       if (storeErr || !store) {
         return { ok: false, error: "Store not found in this workspace." };
@@ -45,8 +45,8 @@ export async function saveOrganizationDefaultStoreId(
 
     const { data: existing, error: selErr } = await supabaseServer
       .from("organization_settings")
-      .select("organization_id")
-      .eq("organization_id", organizationId)
+      .select("company_id")
+      .eq("company_id", organizationId)
       .maybeSingle();
 
     if (selErr) return { ok: false, error: selErr.message };
@@ -55,11 +55,11 @@ export async function saveOrganizationDefaultStoreId(
       const { error: updErr } = await supabaseServer
         .from("organization_settings")
         .update({ default_store_id: finalId })
-        .eq("organization_id", organizationId);
+        .eq("company_id", organizationId);
       if (updErr) return { ok: false, error: updErr.message };
     } else {
       const { error: insErr } = await supabaseServer.from("organization_settings").insert({
-        organization_id: organizationId,
+        company_id: organizationId,
         is_ai_label_ocr_enabled: false,
         is_ai_packing_slip_ocr_enabled: false,
         default_claim_evidence: {},

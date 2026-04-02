@@ -18,7 +18,7 @@ import {
   listWorkspaceOrganizationsForAdmin,
   type WorkspaceOrganizationOption,
 } from "../session/tenant-actions";
-import { listPlatformMarketplaceIcons } from "../admin/platform-actions";
+import { listPlatformMarketplaceIcons } from "../(admin)/lib/platform-actions";
 import {
   DEFAULT_ORG_SETTINGS,
   type DrawerContent, type WizardInheritedContext,
@@ -72,7 +72,7 @@ export default function ReturnsPage() {
   const organizationLabelById = useMemo(() => {
     const m: Record<string, string> = {};
     for (const o of companyOptions) {
-      m[o.organization_id] = o.display_name;
+      m[o.company_id] = o.display_name;
     }
     return m;
   }, [companyOptions]);
@@ -309,7 +309,7 @@ export default function ReturnsPage() {
               >
                 <option value="">All companies</option>
                 {companyOptions.map((o) => (
-                  <option key={o.organization_id} value={o.organization_id}>{o.display_name}</option>
+                  <option key={o.company_id} value={o.company_id}>{o.display_name}</option>
                 ))}
               </select>
             </label>
@@ -321,7 +321,7 @@ export default function ReturnsPage() {
                 className="h-9 min-w-[160px] rounded-lg border border-border bg-background px-2 text-xs font-semibold text-foreground"
               >
                 {companyOptions.map((o) => (
-                  <option key={o.organization_id} value={o.organization_id}>{o.display_name}</option>
+                  <option key={o.company_id} value={o.company_id}>{o.display_name}</option>
                 ))}
               </select>
             </label>
@@ -495,7 +495,7 @@ export default function ReturnsPage() {
             role={role}
             actor={actor}
             actorProfileId={actorUserId}
-            organizationId={activeDrawer.record.organization_id}
+            organizationId={activeDrawer.record.company_id}
             packages={packages}
             allReturns={visibleReturns}
             onClose={closeDrawer}

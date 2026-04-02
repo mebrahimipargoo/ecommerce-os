@@ -15,7 +15,7 @@ export async function getOrganizationClaimEvidenceDefaults(
     const { data, error } = await supabaseServer
       .from("organization_settings")
       .select("default_claim_evidence")
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .maybeSingle();
     if (error || !data) return mergeDefaultClaimEvidence(null);
     const raw = (data as { default_claim_evidence?: DefaultClaimEvidence | null }).default_claim_evidence;
@@ -34,11 +34,11 @@ export async function saveOrganizationClaimEvidenceDefaults(
     const { data: existing } = await supabaseServer
       .from("organization_settings")
       .select("is_ai_label_ocr_enabled, is_ai_packing_slip_ocr_enabled")
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .maybeSingle();
 
     const row = {
-      organization_id: organizationId,
+      company_id: organizationId,
       is_ai_label_ocr_enabled: (existing as { is_ai_label_ocr_enabled?: boolean } | null)?.is_ai_label_ocr_enabled ?? false,
       is_ai_packing_slip_ocr_enabled:
         (existing as { is_ai_packing_slip_ocr_enabled?: boolean } | null)?.is_ai_packing_slip_ocr_enabled ?? false,
@@ -46,7 +46,7 @@ export async function saveOrganizationClaimEvidenceDefaults(
     };
 
     const { error: upsertErr } = await supabaseServer.from("organization_settings").upsert(row, {
-      onConflict: "organization_id",
+      onConflict: "company_id",
     });
     if (upsertErr) return { ok: false, error: upsertErr.message };
     return { ok: true };

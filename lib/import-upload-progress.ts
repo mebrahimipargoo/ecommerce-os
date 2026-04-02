@@ -25,7 +25,7 @@ export async function updateUploadAfterChunk(input: {
     .from("raw_report_uploads")
     .select("id, metadata")
     .eq("id", input.uploadId)
-    .eq("organization_id", orgId)
+    .eq("company_id", orgId)
     .maybeSingle();
 
   if (fetchErr || !row) return { ok: false, error: fetchErr?.message ?? "Upload not found." };
@@ -68,7 +68,7 @@ export async function updateUploadAfterChunk(input: {
       status: "uploading",
     })
     .eq("id", input.uploadId)
-    .eq("organization_id", orgId);
+    .eq("company_id", orgId);
 
   if (error) return { ok: false, error: error.message };
   return { ok: true };

@@ -38,7 +38,7 @@ async function audit(
   detail?: Record<string, unknown>,
 ): Promise<void> {
   await supabaseServer.from("raw_report_import_audit").insert({
-    organization_id: orgId,
+    company_id: orgId,
     user_profile_id: userId,
     action,
     entity_id: entityId,
@@ -60,9 +60,9 @@ export async function POST(req: Request): Promise<Response> {
 
     const { data: row, error: fetchErr } = await supabaseServer
       .from("raw_report_uploads")
-      .select("id, organization_id, metadata, status, report_type, column_mapping, file_name")
+      .select("id, company_id, metadata, status, report_type, column_mapping, file_name")
       .eq("id", uploadId)
-      .eq("organization_id", orgId)
+      .eq("company_id", orgId)
       .maybeSingle();
 
     if (fetchErr || !row) {
@@ -137,7 +137,7 @@ export async function POST(req: Request): Promise<Response> {
         updated_at: new Date().toISOString(),
       })
       .eq("id", uploadId)
-      .eq("organization_id", orgId)
+      .eq("company_id", orgId)
       .eq("status", "pending")
       .select("id");
 
@@ -176,7 +176,7 @@ export async function POST(req: Request): Promise<Response> {
         .from("raw_report_uploads")
         .select("metadata")
         .eq("id", uploadId)
-        .eq("organization_id", orgId)
+        .eq("company_id", orgId)
         .maybeSingle();
       await supabaseServer
         .from("raw_report_uploads")
@@ -188,7 +188,7 @@ export async function POST(req: Request): Promise<Response> {
           updated_at: new Date().toISOString(),
         })
         .eq("id", uploadId)
-        .eq("organization_id", orgId);
+        .eq("company_id", orgId);
     };
 
     const flushBatch = async (rows: Record<string, unknown>[]) => {
@@ -198,7 +198,7 @@ export async function POST(req: Request): Promise<Response> {
 
       if (withLpn.length > 0) {
         const { error: upErr } = await supabaseServer.from("returns").upsert(withLpn, {
-          onConflict: "organization_id,lpn",
+          onConflict: "company_id,lpn",
         });
         if (upErr) throw new Error(upErr.message);
       }
@@ -218,7 +218,7 @@ export async function POST(req: Request): Promise<Response> {
 
         const statusDerived = deriveImportStatus(mapped.conditions);
         const insertRow: Record<string, unknown> = {
-          organization_id: orgId,
+          company_id: orgId,
           marketplace: "amazon",
           item_name: mapped.item_name,
           order_id: mapped.order_id,
@@ -254,7 +254,7 @@ export async function POST(req: Request): Promise<Response> {
               .from("raw_report_uploads")
               .select("metadata")
               .eq("id", uploadId)
-              .eq("organization_id", orgId)
+              .eq("company_id", orgId)
               .maybeSingle();
 
             await supabaseServer
@@ -269,7 +269,7 @@ export async function POST(req: Request): Promise<Response> {
                 updated_at: new Date().toISOString(),
               })
               .eq("id", uploadId)
-              .eq("organization_id", orgId);
+              .eq("company_id", orgId);
 
             await audit(orgId, null, "import.process_completed", uploadId, {
               rowsInserted: processed,
@@ -292,7 +292,7 @@ export async function POST(req: Request): Promise<Response> {
         .from("raw_report_uploads")
         .select("metadata")
         .eq("id", uploadIdForFail)
-        .eq("organization_id", orgId)
+        .eq("company_id", orgId)
         .maybeSingle();
       await supabaseServer
         .from("raw_report_uploads")
@@ -305,7 +305,7 @@ export async function POST(req: Request): Promise<Response> {
           updated_at: new Date().toISOString(),
         })
         .eq("id", uploadIdForFail)
-        .eq("organization_id", orgId);
+        .eq("company_id", orgId);
       await audit(orgId, null, "import.process_failed", uploadIdForFail, { message });
     }
     return NextResponse.json({ ok: false, error: message }, { status: 500 });

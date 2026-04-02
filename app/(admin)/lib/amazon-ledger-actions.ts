@@ -1,9 +1,9 @@
 "use server";
 
-import { supabaseServer } from "../../lib/supabase-server";
-import { resolveWriteOrganizationId } from "../../lib/server-tenant";
-import { isUuidString } from "../../lib/uuid";
-import { guessLedgerSnapshotDate } from "../../lib/csv-parse-basic";
+import { supabaseServer } from "../../../lib/supabase-server";
+import { resolveWriteOrganizationId } from "../../../lib/server-tenant";
+import { isUuidString } from "../../../lib/uuid";
+import { guessLedgerSnapshotDate } from "../../../lib/csv-parse-basic";
 
 export { guessLedgerSnapshotDate };
 
@@ -11,7 +11,7 @@ const CHUNK = 500;
 
 export type AmazonLedgerStagingRow = {
   id: string;
-  organization_id: string;
+  company_id: string;
   snapshot_date: string | null;
   raw_row: Record<string, unknown>;
   created_at: string;
@@ -19,7 +19,7 @@ export type AmazonLedgerStagingRow = {
 
 /**
  * Deletes staging rows older than retention window for this tenant.
- * Uses snapshot_date when present, else created_at::date (Neda: always scope by organization_id).
+ * Uses snapshot_date when present, else created_at::date (Neda: always scope by company_id).
  */
 export async function purgeAmazonLedgerStagingRetention(payload: {
   actorProfileId: string | null | undefined;
@@ -43,7 +43,7 @@ export async function purgeAmazonLedgerStagingRetention(payload: {
     const { error: e1 } = await supabaseServer
       .from("amazon_ledger_staging")
       .delete()
-      .eq("organization_id", orgId)
+      .eq("company_id", orgId)
       .not("snapshot_date", "is", null)
       .lt("snapshot_date", cutoffStr);
     if (e1) throw new Error(e1.message);
@@ -51,7 +51,7 @@ export async function purgeAmazonLedgerStagingRetention(payload: {
     const { error: e2 } = await supabaseServer
       .from("amazon_ledger_staging")
       .delete()
-      .eq("organization_id", orgId)
+      .eq("company_id", orgId)
       .is("snapshot_date", null)
       .lt("created_at", cutoffIso);
     if (e2) throw new Error(e2.message);
@@ -90,7 +90,7 @@ export async function deleteAmazonLedgerStagingByDateRange(payload: {
     const { error, count } = await supabaseServer
       .from("amazon_ledger_staging")
       .delete({ count: "exact" })
-      .eq("organization_id", orgId)
+      .eq("company_id", orgId)
       .gte("snapshot_date", start)
       .lte("snapshot_date", end);
 
@@ -128,7 +128,7 @@ export async function insertAmazonLedgerStagingBatch(payload: {
     if (slice.length === 0) return { ok: true, inserted: 0 };
 
     const insertRows = slice.map((r) => ({
-      organization_id: orgId,
+      company_id: orgId,
       snapshot_date: guessLedgerSnapshotDate(r),
       raw_row: r as unknown as Record<string, unknown>,
     }));
@@ -168,7 +168,7 @@ export async function deleteAmazonLedgerStorageFile(payload: {
   }
 }
 
-/** All ledger reads must filter by organization_id (tenant isolation). */
+/** All ledger reads must filter by company_id (tenant isolation). */
 export async function listAmazonLedgerStaging(payload: {
   actorProfileId: string | null | undefined;
   requestedOrganizationId?: string | null;
@@ -184,8 +184,8 @@ export async function listAmazonLedgerStaging(payload: {
     const lim = Math.min(10_000, Math.max(1, payload.limit ?? 500));
     const { data, error } = await supabaseServer
       .from("amazon_ledger_staging")
-      .select("id, organization_id, snapshot_date, raw_row, created_at")
-      .eq("organization_id", orgId)
+      .select("id, company_id, snapshot_date, raw_row, created_at")
+      .eq("company_id", orgId)
       .order("created_at", { ascending: false })
       .limit(lim);
     if (error) throw new Error(error.message);

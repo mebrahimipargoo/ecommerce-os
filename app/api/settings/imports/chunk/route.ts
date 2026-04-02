@@ -62,9 +62,9 @@ export async function POST(req: Request): Promise<Response> {
     const orgId = resolveOrganizationId();
     const { data: row, error: fetchErr } = await supabaseServer
       .from("raw_report_uploads")
-      .select("id, organization_id, metadata")
+      .select("id, company_id, metadata")
       .eq("id", uploadId)
-      .eq("organization_id", orgId)
+      .eq("company_id", orgId)
       .maybeSingle();
 
     const prefix = parseRawReportMetadata(row?.metadata).storagePrefix?.trim() ?? "";

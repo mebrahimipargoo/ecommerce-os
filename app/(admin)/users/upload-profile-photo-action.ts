@@ -1,8 +1,8 @@
 "use server";
 
-import { supabaseServer } from "../../lib/supabase-server";
-import { resolveOrganizationId } from "../../lib/organization";
-import { isUuidString } from "../../lib/uuid";
+import { supabaseServer } from "../../../lib/supabase-server";
+import { resolveOrganizationId } from "../../../lib/organization";
+import { isUuidString } from "../../../lib/uuid";
 import { updateUserProfile } from "./users-actions";
 
 const BUCKET = "profiles";

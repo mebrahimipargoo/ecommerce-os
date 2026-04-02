@@ -3,7 +3,7 @@
  */
 export type ClaimRecord = {
   id: string;
-  organization_id: string;
+  company_id: string;
   amount: number;
   /** Actual reimbursement when accepted — migration 20260331_returns_estimated_value_reimbursement.sql */
   reimbursement_amount?: number | null;

@@ -20,13 +20,13 @@ export async function verifyOrganizationApiKey(
   try {
     const { data, error } = await supabaseServer
       .from("organization_api_keys")
-      .select("id, organization_id")
+      .select("id, company_id")
       .eq("api_key", digest)
       .maybeSingle();
     if (error || !data) return { ok: false };
     return {
       ok: true,
-      organizationId: data.organization_id as string,
+      organizationId: data.company_id as string,
       keyId: data.id as string,
     };
   } catch {

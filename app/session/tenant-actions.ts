@@ -20,7 +20,7 @@ export async function fetchUserProfileById(
 }
 
 export type WorkspaceOrganizationOption = {
-  organization_id: string;
+  company_id: string;
   display_name: string;
 };
 
@@ -37,10 +37,10 @@ export async function listWorkspaceOrganizationsForAdmin(): Promise<
     if (error) {
       return { ok: false, error: error.message };
     }
-    const rows = (data ?? []) as { organization_id: string; display_name: string }[];
+    const rows = (data ?? []) as { company_id: string; display_name: string }[];
     const out: WorkspaceOrganizationOption[] = rows.map((r) => ({
-      organization_id: String(r.organization_id),
-      display_name: String(r.display_name ?? r.organization_id),
+      company_id: String(r.company_id),
+      display_name: String(r.display_name ?? r.company_id),
     }));
     out.sort((a, b) => a.display_name.localeCompare(b.display_name));
     return { ok: true, rows: out };

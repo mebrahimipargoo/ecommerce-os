@@ -100,7 +100,7 @@ type StoreRecord = {
   provider: string;
   nickname: string;
   display_id?: string;
-  organization_id: string;
+  company_id: string;
   role_required: string;
   created_at: string;
 };

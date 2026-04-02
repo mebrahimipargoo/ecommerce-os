@@ -9,7 +9,7 @@ export async function getOrganizationDebugMode(): Promise<boolean> {
     const { data, error } = await supabaseServer
       .from("organization_settings")
       .select("debug_mode")
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .maybeSingle();
     if (error || !data) return false;
     return Boolean((data as { debug_mode?: boolean }).debug_mode);
@@ -25,8 +25,8 @@ export async function saveOrganizationDebugMode(
   try {
     const { data: existing, error: selErr } = await supabaseServer
       .from("organization_settings")
-      .select("organization_id")
-      .eq("organization_id", organizationId)
+      .select("company_id")
+      .eq("company_id", organizationId)
       .maybeSingle();
 
     if (selErr) return { ok: false, error: selErr.message };
@@ -35,11 +35,11 @@ export async function saveOrganizationDebugMode(
       const { error: updErr } = await supabaseServer
         .from("organization_settings")
         .update({ debug_mode: enabled })
-        .eq("organization_id", organizationId);
+        .eq("company_id", organizationId);
       if (updErr) return { ok: false, error: updErr.message };
     } else {
       const { error: insErr } = await supabaseServer.from("organization_settings").insert({
-        organization_id: organizationId,
+        company_id: organizationId,
         is_ai_label_ocr_enabled: false,
         is_ai_packing_slip_ocr_enabled: false,
         default_claim_evidence: {},

@@ -1,0 +1,332 @@
+"use client";
+
+import React, { useCallback, useRef, useState } from "react";
+import { FileText, Loader2, UploadCloud, X } from "lucide-react";
+import { isAdminRole, useUserRole } from "../../../components/UserRoleContext";
+import { REPORT_TYPE_SPECS } from "../../../lib/csv-import-mapping";
+import { RAW_REPORT_TYPE_ORDER, type RawReportType } from "../../../lib/raw-report-types";
+import {
+  createRawReportUploadSession,
+  finalizeRawReportUpload,
+} from "./import-actions";
+
+const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Compute a quick 32-char pseudo-hash (SHA-256 first 64 KB, truncated) for dedup. */
+async function quickHash(file: File): Promise<string> {
+  const slice = await file.slice(0, 65536).arrayBuffer();
+  const buf = await crypto.subtle.digest("SHA-256", slice);
+  return Array.from(new Uint8Array(buf).slice(0, 16))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function getFileExtension(name: string): string {
+  return name.split(".").pop()?.toLowerCase() ?? "csv";
+}
+
+type Phase = "idle" | "uploading" | "processing" | "done" | "error";
+
+type RawReportUploaderProps = {
+  /** Called when upload + processing completes so the history panel can refresh. */
+  onUploadComplete?: () => void;
+};
+
+export function RawReportUploader({ onUploadComplete }: RawReportUploaderProps) {
+  const { role, actorUserId } = useUserRole();
+  const [reportType, setReportType] = useState<RawReportType>("fba_customer_returns");
+  const [file, setFile] = useState<File | null>(null);
+  const [phase, setPhase] = useState<Phase>("idle");
+  const [uploadPct, setUploadPct] = useState(0);
+  const [processPct, setProcessPct] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef(false);
+
+  const reset = useCallback(() => {
+    setFile(null);
+    setPhase("idle");
+    setUploadPct(0);
+    setProcessPct(0);
+    setErr(null);
+    abortRef.current = false;
+  }, []);
+
+  function acceptFile(f: File) {
+    const ext = getFileExtension(f.name);
+    if (!["csv", "txt", "xlsx", "xls"].includes(ext)) {
+      setErr("Only .csv, .txt, .xlsx, and .xls files are supported.");
+      return;
+    }
+    setFile(f);
+    setErr(null);
+    setPhase("idle");
+    setUploadPct(0);
+    setProcessPct(0);
+  }
+
+  function handleDragOver(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragging(true);
+  }
+  function handleDragLeave() {
+    setIsDragging(false);
+  }
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setIsDragging(false);
+    const f = e.dataTransfer.files?.[0];
+    if (f) acceptFile(f);
+  }
+
+  async function startUpload() {
+    if (!file || phase === "uploading" || phase === "processing") return;
+    abortRef.current = false;
+    setPhase("uploading");
+    setErr(null);
+    setUploadPct(0);
+    setProcessPct(0);
+
+    try {
+      const ext = getFileExtension(file.name);
+      const totalBytes = file.size;
+      const totalParts = Math.max(1, Math.ceil(totalBytes / CHUNK_SIZE));
+      const md5Hash = await quickHash(file);
+
+      const session = await createRawReportUploadSession({
+        fileName: file.name,
+        totalBytes,
+        reportType,
+        md5Hash,
+        fileExtension: ext,
+        fileSizeBytes: totalBytes,
+        uploadChunksCount: totalParts,
+        actorUserId,
+      });
+
+      if (!session.ok) throw new Error(session.error);
+      const uploadId = session.id;
+
+      // Send chunks sequentially
+      for (let i = 0; i < totalParts; i++) {
+        if (abortRef.current) throw new Error("Upload cancelled.");
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, totalBytes);
+        const chunk = file.slice(start, end);
+
+        const form = new FormData();
+        form.append("upload_id", uploadId);
+        form.append("part_index", String(i));
+        form.append("total_parts", String(totalParts));
+        form.append("total_bytes", String(totalBytes));
+        form.append("file_extension", ext);
+        if (actorUserId) form.append("actor_user_id", actorUserId);
+        form.append("file", chunk);
+
+        const res = await fetch("/api/settings/imports/chunk", { method: "POST", body: form });
+        const json = (await res.json()) as { ok?: boolean; error?: string };
+        if (!res.ok || !json.ok) throw new Error(json.error ?? "Chunk upload failed.");
+
+        setUploadPct(Math.round(((i + 1) / totalParts) * 100));
+      }
+
+      await finalizeRawReportUpload({ uploadId, actorUserId });
+      setUploadPct(100);
+
+      // Trigger processing
+      setPhase("processing");
+      setProcessPct(5);
+
+      const processRes = await fetch("/api/settings/imports/process", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_id: uploadId }),
+      });
+      const processJson = (await processRes.json()) as { ok?: boolean; error?: string; rowsProcessed?: number };
+
+      if (!processRes.ok || !processJson.ok) {
+        setProcessPct(0);
+        throw new Error(processJson.error ?? "Processing failed.");
+      }
+
+      setProcessPct(100);
+      setPhase("done");
+      onUploadComplete?.();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Upload failed.");
+      setPhase("error");
+    }
+  }
+
+  if (!isAdminRole(role)) return null;
+
+  return (
+    <div className="rounded-xl border border-border bg-card shadow-sm">
+      {/* Header */}
+      <div className="border-b border-border px-5 py-3">
+        <p className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+          Raw Report Uploads
+        </p>
+      </div>
+
+      <div className="space-y-5 px-5 py-5">
+        {/* Type selector */}
+        <div>
+          <label className="mb-1.5 block text-xs font-medium text-foreground">
+            Default type for new uploads
+          </label>
+          <select
+            value={reportType}
+            onChange={(e) => setReportType(e.target.value as RawReportType)}
+            disabled={phase === "uploading" || phase === "processing"}
+            className="h-9 max-w-[min(100%,28rem)] rounded-lg border border-border bg-background px-2 text-sm text-foreground shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+          >
+            {RAW_REPORT_TYPE_ORDER.map((v) => {
+              const s = REPORT_TYPE_SPECS[v];
+              return (
+                <option key={v} value={v}>
+                  {s.shortLabel} ({s.description})
+                </option>
+              );
+            })}
+          </select>
+        </div>
+
+        {/* Drop zone */}
+        {(phase === "idle" || phase === "error") && (
+          <div
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            onClick={() => fileInputRef.current?.click()}
+            className={[
+              "flex cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed px-6 py-10 text-center transition-colors",
+              isDragging
+                ? "border-sky-400 bg-sky-50/60 dark:border-sky-600 dark:bg-sky-950/20"
+                : file
+                  ? "border-emerald-300 bg-emerald-50/40 dark:border-emerald-700 dark:bg-emerald-950/20"
+                  : "border-border bg-muted/20 hover:border-primary/40 hover:bg-muted/40",
+            ].join(" ")}
+          >
+            <UploadCloud
+              className={`h-8 w-8 ${file ? "text-emerald-500" : "text-muted-foreground"}`}
+            />
+            {file ? (
+              <>
+                <div className="flex items-center gap-2">
+                  <FileText className="h-4 w-4 text-emerald-600" />
+                  <span className="text-sm font-semibold text-emerald-700 dark:text-emerald-300">
+                    {file.name}
+                  </span>
+                </div>
+                <span className="text-xs text-muted-foreground">{formatBytes(file.size)}</span>
+                <span className="text-xs text-muted-foreground">Click or drop a different file to replace</span>
+              </>
+            ) : (
+              <>
+                <p className="text-sm font-medium text-foreground">Drag &amp; drop a file here</p>
+                <p className="text-xs text-muted-foreground">
+                  or click to browse · .csv, .txt, .xlsx · 40MB parts · very large files supported
+                </p>
+              </>
+            )}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.txt,.xlsx,.xls,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (f) acceptFile(f);
+              }}
+            />
+          </div>
+        )}
+
+        {/* In-progress file bar */}
+        {file && (phase === "uploading" || phase === "processing" || phase === "done") && (
+          <div className="flex items-center gap-3 rounded-xl border border-border bg-muted/30 px-4 py-2.5">
+            <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
+            <p className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{file.name}</p>
+            <span className="text-xs text-muted-foreground">{formatBytes(file.size)}</span>
+          </div>
+        )}
+
+        {/* Progress bars */}
+        <div className="max-w-3xl space-y-2">
+          <div className="flex items-center justify-between text-xs font-medium text-foreground/70">
+            <span>Upload progress</span>
+            <span>{uploadPct}%</span>
+          </div>
+          <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-blue-600 transition-[width] duration-300 ease-out dark:bg-blue-500"
+              style={{ width: `${Math.min(100, uploadPct)}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between text-xs font-medium text-foreground/70">
+            <span>Processing status</span>
+            <span>{processPct}%</span>
+          </div>
+          <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-blue-500/90 transition-[width] duration-300 ease-out dark:bg-blue-400/90"
+              style={{ width: `${Math.min(100, processPct)}%` }}
+            />
+          </div>
+        </div>
+
+        {/* Error */}
+        {err && (
+          <div className="flex items-start gap-2 rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            <X className="mt-0.5 h-4 w-4 shrink-0" />
+            {err}
+          </div>
+        )}
+
+        {/* Action buttons */}
+        <div className="flex flex-wrap items-center gap-3">
+          {(phase === "idle" || phase === "error") && file && (
+            <button
+              type="button"
+              onClick={() => void startUpload()}
+              className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground shadow transition hover:bg-primary/90"
+            >
+              <UploadCloud className="h-4 w-4" />
+              Upload &amp; Process
+            </button>
+          )}
+          {(phase === "uploading" || phase === "processing") && (
+            <div className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin text-sky-500" />
+              {phase === "uploading" ? "Uploading…" : "Processing…"}
+            </div>
+          )}
+          {(phase === "done" || phase === "error" || (phase === "idle" && file)) && (
+            <button
+              type="button"
+              onClick={reset}
+              className="inline-flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition hover:bg-accent"
+            >
+              {phase === "done" ? "Upload another" : "Reset"}
+            </button>
+          )}
+        </div>
+
+        {phase === "done" && (
+          <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">
+            ✓ Upload complete — history updated below.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}

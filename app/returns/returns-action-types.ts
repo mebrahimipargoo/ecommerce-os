@@ -12,7 +12,7 @@ export interface OrgSettings {
 export type PalletStatus = "open" | "closed" | "submitted";
 
 export type PalletRecord = {
-  id: string; organization_id: string;
+  id: string; company_id: string;
   pallet_number: string;
   tracking_number?: string | null;
   /** Primary pallet overview image (media bucket). */
@@ -35,7 +35,7 @@ export type PalletInsertPayload = {
   bol_photo_url?: string | null;
   manifest_photo_url?: string | null;
   store_id?: string;
-  notes?: string; organization_id?: string; created_by?: string;
+  notes?: string; company_id?: string; created_by?: string;
   /** Resolves tenant + super-admin target org on the server */
   actor_profile_id?: string | null;
 };
@@ -51,7 +51,7 @@ export type PackageStatus = "open" | "closed" | "suspicious" | "submitted";
 export type ExpectedItem = { sku: string; expected_qty: number; description?: string };
 
 export type PackageRecord = {
-  id: string; organization_id: string;
+  id: string; company_id: string;
   package_number: string; tracking_number: string | null;
   carrier_name: string | null;
   rma_number?: string | null;
@@ -79,7 +79,7 @@ export type PackageRecord = {
 export type PackageInsertPayload = {
   package_number: string; tracking_number?: string;
   carrier_name?: string; rma_number?: string; expected_item_count?: number;
-  pallet_id?: string; store_id?: string; organization_id?: string; created_by?: string;
+  pallet_id?: string; store_id?: string; company_id?: string; created_by?: string;
   manifest_url?: string;
   order_id?: string | null;
   photo_url?: string | null;
@@ -115,12 +115,12 @@ export type ReturnInsertPayload = {
   order_id?: string | null;
   customer_id?: string | null;
   claim_evidence_selected_urls?: string[] | null;
-  organization_id?: string; created_by?: string;
+  company_id?: string; created_by?: string;
   actor_profile_id?: string | null;
 };
 
 export type ReturnRecord = {
-  id: string; organization_id: string;
+  id: string; company_id: string;
   lpn: string | null;
   inherited_tracking_number?: string | null;
   inherited_carrier?: string | null;
@@ -159,7 +159,7 @@ export type ReturnUpdatePayload = Partial<Pick<
 >>;
 
 export type AuditLogRecord = {
-  id: string; organization_id: string;
+  id: string; company_id: string;
   return_id: string | null; pallet_id: string | null;
   action: string; field: string | null;
   old_value: string | null; new_value: string | null;

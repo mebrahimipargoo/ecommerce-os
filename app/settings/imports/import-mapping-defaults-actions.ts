@@ -12,7 +12,7 @@ export async function getImportMappingDefaults(): Promise<MappingDefaults> {
     const { data, error } = await supabaseServer
       .from("organization_settings")
       .select("import_mapping_defaults")
-      .eq("organization_id", organizationId)
+      .eq("company_id", organizationId)
       .maybeSingle();
     if (error || !data) return {};
     const raw = (data as { import_mapping_defaults?: unknown }).import_mapping_defaults;
@@ -36,8 +36,8 @@ export async function mergeImportMappingDefault(
 
     const { data: existing, error: selErr } = await supabaseServer
       .from("organization_settings")
-      .select("organization_id")
-      .eq("organization_id", organizationId)
+      .select("company_id")
+      .eq("company_id", organizationId)
       .maybeSingle();
 
     if (selErr) return { ok: false, error: selErr.message };
@@ -46,11 +46,11 @@ export async function mergeImportMappingDefault(
       const { error: updErr } = await supabaseServer
         .from("organization_settings")
         .update({ import_mapping_defaults: next })
-        .eq("organization_id", organizationId);
+        .eq("company_id", organizationId);
       if (updErr) return { ok: false, error: updErr.message };
     } else {
       const { error: insErr } = await supabaseServer.from("organization_settings").insert({
-        organization_id: organizationId,
+        company_id: organizationId,
         is_ai_label_ocr_enabled: false,
         is_ai_packing_slip_ocr_enabled: false,
         default_claim_evidence: {},

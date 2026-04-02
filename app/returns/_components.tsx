@@ -2164,7 +2164,7 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
                   }
                   setItemPhotoUploading(true);
                   try {
-                    const url = await uploadToStorage(files[files.length - 1], "evidence/wizard", record.organization_id);
+                    const url = await uploadToStorage(files[files.length - 1], "evidence/wizard", record.company_id);
                     setEditPhotoItemUrl(url);
                     setItemEditFiles([]);
                   } catch {
@@ -2213,7 +2213,7 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
                       if (!last) return;
                       setExpiryPhotoUploading(true);
                       try {
-                        const url = await uploadToStorage(last, "evidence/wizard", record.organization_id);
+                        const url = await uploadToStorage(last, "evidence/wizard", record.company_id);
                         setEditPhotoExpiryUrl(url);
                         setExpiryEditFiles([]);
                       } catch {
@@ -2706,7 +2706,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
           : "packages/claim_return_label";
     setUploading(true);
     try {
-      const publicUrl = await uploadToStorage(f, folder, pkg.organization_id);
+      const publicUrl = await uploadToStorage(f, folder, pkg.company_id);
       setUrl(publicUrl);
     } catch {
       setSaveErr("Photo upload failed. Try again.");
@@ -2772,7 +2772,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
     setEditManifestOcrRunning(true);
     setEditManifestErr("");
     try {
-      const publicUrl = await uploadToStorage(file, "packages/manifest", pkg.organization_id);
+      const publicUrl = await uploadToStorage(file, "packages/manifest", pkg.company_id);
       const items = await mockManifestLineItems(file);
       if (items.length === 0) {
         setEditManifestErr("No items detected on the packing slip — try a clearer photo.");
@@ -3332,7 +3332,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
             onClose={() => setWizardOpen(false)}
             onSuccess={(r) => { handleItemAdded(r); }}
             actor={actor}
-            organizationId={pkg.organization_id}
+            organizationId={pkg.company_id}
             openPackages={[pkgWithExpected]}
             openPallets={openPallets}
             existingReturns={allReturns}
@@ -3760,7 +3760,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, existi
         .from("packages")
         .select("store_id")
         .eq("id", pkgId)
-        .eq("organization_id", MVP_ORGANIZATION_ID)
+        .eq("company_id", MVP_ORGANIZATION_ID)
         .maybeSingle();
       if (cancelled) return;
       if (data?.store_id) {
@@ -4687,7 +4687,7 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
     if (fromDb) {
       return {
         id: pkgKey,
-        organization_id: "",
+        company_id: "",
         package_number: "",
         tracking_number: null,
         carrier_name: null,
@@ -4961,7 +4961,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
   onToast?: (msg: string, kind?: ToastKind) => void;
   onNavigateToPackage?: (packageId: string) => void;
   onNavigateToPallet?: (palletId: string) => void;
-  /** Workspace org for `returns.organization_id` / claim_submissions (defaults to MVP seed). */
+  /** Workspace org for `returns.company_id` / claim_submissions (defaults to MVP seed). */
   organizationId?: string;
   actorProfileId?: string | null;
 }) {
@@ -5036,7 +5036,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
         .from("pallets")
         .select("photo_url, bol_photo_url, manifest_photo_url")
         .eq("id", pid)
-        .eq("organization_id", workspaceOrgId)
+        .eq("company_id", workspaceOrgId)
         .maybeSingle()
         .then(({ data }) => {
           if (cancelled) return;
@@ -5062,7 +5062,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
       .from("packages")
       .select("order_id, pallet_id, photo_opened_url, photo_return_label_url, photo_closed_url, photo_url")
       .eq("id", pkgKey)
-      .eq("organization_id", workspaceOrgId)
+      .eq("company_id", workspaceOrgId)
       .maybeSingle()
       .then(({ data }) => {
         if (cancelled) return;
@@ -5147,7 +5147,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
     if (meta) {
       return {
         id,
-        organization_id: workspaceOrgId,
+        company_id: workspaceOrgId,
         package_number: "",
         tracking_number: null,
         carrier_name: null,
@@ -5302,7 +5302,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
         (storeRow ? platformToMarketplace(storeRow.platform) : "amazon");
 
       const res = await insertReturn({
-        organization_id: workspaceOrgId,
+        company_id: workspaceOrgId,
         actor_profile_id: actorProfileId,
         lpn: state.lpn || undefined,
         marketplace: marketplaceResolved,
@@ -5545,7 +5545,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
         .from("pallets")
         .select("store_id")
         .eq("id", palletId)
-        .eq("organization_id", pkgOrgId)
+        .eq("company_id", pkgOrgId)
         .maybeSingle();
       if (cancelled) return;
       if (data?.store_id) {
@@ -5699,7 +5699,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
           ? (struct as Record<string, unknown>)
           : undefined;
       const res = await createPackage({
-        organization_id: pkgOrgId,
+        company_id: pkgOrgId,
         actor_profile_id: actorProfileId,
         package_number: pkgNum.trim(),
         tracking_number: tracking.trim() || undefined,
@@ -6096,7 +6096,7 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
       let manifestPhotoUrl: string | undefined;
       if (file) manifestPhotoUrl = await uploadToStorage(file, "pallets/manifest", pltOrgId);
       const res = await createPallet({
-        organization_id: pltOrgId,
+        company_id: pltOrgId,
         actor_profile_id: actorProfileId,
         pallet_number: palletNum.trim(),
         photo_url: palletPhotoUrls[0]?.trim() || null,
@@ -6391,8 +6391,8 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, actorPro
                       </div>
                     </td>
                     {showCompanyColumn && (
-                      <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[r.organization_id] ?? r.organization_id}>
-                        {organizationLabelById[r.organization_id] ?? `${r.organization_id.slice(0, 8)}…`}
+                      <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[r.company_id] ?? r.company_id}>
+                        {organizationLabelById[r.company_id] ?? `${r.company_id.slice(0, 8)}…`}
                       </td>
                     )}
                     <td className="w-12 px-2 py-3 align-middle">
@@ -6657,8 +6657,8 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                         </div>
                       </td>
                       {showCompanyColumn && (
-                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
-                          {organizationLabelById[p.organization_id] ?? `${p.organization_id.slice(0, 8)}…`}
+                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.company_id] ?? p.company_id}>
+                          {organizationLabelById[p.company_id] ?? `${p.company_id.slice(0, 8)}…`}
                         </td>
                       )}
                       <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
@@ -6933,8 +6933,8 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                         </div>
                       </td>
                       {showCompanyColumn && (
-                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
-                          {organizationLabelById[p.organization_id] ?? `${p.organization_id.slice(0, 8)}…`}
+                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.company_id] ?? p.company_id}>
+                          {organizationLabelById[p.company_id] ?? `${p.company_id.slice(0, 8)}…`}
                         </td>
                       )}
                       <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
