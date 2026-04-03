@@ -1,12 +1,17 @@
 import "server-only";
 
 import { mergeUploadMetadata } from "./raw-report-upload-metadata";
-import { resolveOrganizationId } from "./organization";
 import { supabaseServer } from "./supabase-server";
 import { isUuidString } from "./uuid";
 
 /**
  * Chunk progress: merge into `metadata` JSONB (upload_progress, uploaded_bytes, total_bytes).
+ *
+ * Organization resolution: read `organization_id` from the stored row itself instead of
+ * relying on the env-var default.  This is safe because the service-role client bypasses
+ * RLS, so a plain `eq("id", uploadId)` fetch is sufficient.  Using the row's own org
+ * for the subsequent UPDATE ensures the WHERE clause always matches, regardless of which
+ * tenant created the session.
  */
 export async function updateUploadAfterChunk(input: {
   uploadId: string;
@@ -16,19 +21,20 @@ export async function updateUploadAfterChunk(input: {
   totalBytes: number;
   actorUserId?: string | null;
 }): Promise<{ ok: boolean; error?: string }> {
-  void input.actorUserId;
-
   if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
 
-  const orgId = resolveOrganizationId();
+  // Fetch by primary-key only — service-role bypasses RLS, org filter not needed here.
   const { data: row, error: fetchErr } = await supabaseServer
     .from("raw_report_uploads")
-    .select("id, metadata")
+    .select("id, organization_id, metadata")
     .eq("id", input.uploadId)
-    .eq("company_id", orgId)
     .maybeSingle();
 
   if (fetchErr || !row) return { ok: false, error: fetchErr?.message ?? "Upload not found." };
+
+  // Use the organization_id that was set when the session was created.
+  const orgId = String((row as { organization_id?: unknown }).organization_id ?? "").trim();
+  if (!isUuidString(orgId)) return { ok: false, error: "Upload row has invalid organization_id." };
 
   const pct = Math.min(
     100,
@@ -68,8 +74,23 @@ export async function updateUploadAfterChunk(input: {
       status: "uploading",
     })
     .eq("id", input.uploadId)
-    .eq("company_id", orgId);
+    .eq("organization_id", orgId);
 
   if (error) return { ok: false, error: error.message };
+
+  // Mirror progress into the dedicated real-time table so the UI progress bars
+  // move in sync without polling raw_report_uploads metadata.
+  await supabaseServer.from("file_processing_status").upsert(
+    {
+      upload_id: input.uploadId,
+      organization_id: orgId,
+      status: "uploading",
+      upload_pct: pct,
+      process_pct: 0,
+      processed_rows: 0,
+    },
+    { onConflict: "upload_id" },
+  );
+
   return { ok: true };
 }

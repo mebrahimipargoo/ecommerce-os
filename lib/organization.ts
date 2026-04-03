@@ -9,7 +9,7 @@ export const FALLBACK_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001";
 export function resolveOrganizationId(): string {
   const fromEnv =
     (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_ORGANIZATION_ID) ||
-    (typeof process !== "undefined" && process.env?.company_id);
+    (typeof process !== "undefined" && process.env?.ORGANIZATION_ID);
   if (typeof fromEnv === "string" && fromEnv.trim().length > 0) {
     const t = fromEnv.trim();
     if (isUuidString(t)) return t;

@@ -3,6 +3,9 @@
  * Do not rely on legacy columns (total_bytes, upload_progress, storage_prefix, etc.).
  */
 
+/** Client ledger sessions — must live outside `"use server"` modules (only async exports allowed there). */
+export const AMAZON_LEDGER_UPLOAD_SOURCE = "amazon_ledger_uploader" as const;
+
 export type RawReportUploadMetadata = {
   total_bytes?: number;
   storage_prefix?: string;
@@ -22,6 +25,12 @@ export type RawReportUploadMetadata = {
   total_parts?: number;
   /** Optional error detail for failed uploads (stored in metadata only — no error_log column) */
   error_message?: string;
+  /** Amazon Inventory Ledger: single object path under `raw-reports` bucket */
+  ledger_storage_path?: string;
+  /** Target `stores.id` for ledger uploads (tenant scope remains `organization_id` on the row) */
+  ledger_store_id?: string;
+  /** e.g. `amazon_ledger_uploader` — distinguishes client-only ledger sessions */
+  source?: string;
 };
 
 function num(v: unknown, fallback = 0): number {

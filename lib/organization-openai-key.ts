@@ -11,7 +11,7 @@ export async function getOrganizationOpenAIApiKey(organizationId: string): Promi
     const { data } = await supabaseServer
       .from("organization_settings")
       .select("credentials")
-      .eq("company_id", organizationId)
+      .eq("organization_id", organizationId)
       .maybeSingle();
     const creds = (data?.credentials as Record<string, unknown> | null) ?? {};
     const key = typeof creds.openai_api_key === "string" ? creds.openai_api_key.trim() : "";

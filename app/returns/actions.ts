@@ -55,11 +55,22 @@ import type {
 
 const DEFAULT_ORG = resolveOrganizationId();
 
+/** Ensures new nullable columns never surface as `undefined` to the client. */
+function normalizeReturnRecordFromRow(raw: unknown): ReturnRecord {
+  const base = raw as Record<string, unknown>;
+  const r = raw as ReturnRecord;
+  return {
+    ...r,
+    marketplace: String((base.marketplace as string | undefined) ?? ""),
+    rma_number: (r.rma_number as string | null | undefined) ?? null,
+  };
+}
+
 /** Collapse duplicate rows (same `id`) from PostgREST embed fan-out; keep newest-first by `created_at`. */
 function dedupeReturnsById(rows: unknown[] | null | undefined): ReturnRecord[] {
   const map = new Map<string, ReturnRecord>();
   for (const raw of rows ?? []) {
-    const r = raw as ReturnRecord;
+    const r = normalizeReturnRecordFromRow(raw);
     if (r?.id && typeof r.id === "string" && !map.has(r.id)) {
       map.set(r.id, r);
     }
@@ -136,8 +147,8 @@ export async function getOrgSettings(orgId = resolveOrganizationId()): Promise<O
     const { data, error } = await supabaseServer
       .from("organization_settings")
       .select("is_ai_label_ocr_enabled, is_ai_packing_slip_ocr_enabled")
-      .eq("company_id", orgId)
-      .single();
+      .eq("organization_id", orgId)
+      .maybeSingle();
     if (error) return FALLBACK_ORG_SETTINGS;
     return data ?? FALLBACK_ORG_SETTINGS;
   } catch {
@@ -246,7 +257,7 @@ export async function resolveClaimSubmissionStoreId(
   const { data: amazon } = await supabaseServer
     .from("stores")
     .select("id")
-    .eq("company_id", organizationId)
+    .eq("organization_id", organizationId)
     .eq("is_active", true)
     .ilike("platform", "amazon")
     .limit(1)
@@ -255,7 +266,7 @@ export async function resolveClaimSubmissionStoreId(
   const { data: anyStore } = await supabaseServer
     .from("stores")
     .select("id")
-    .eq("company_id", organizationId)
+    .eq("organization_id", organizationId)
     .eq("is_active", true)
     .limit(1)
     .maybeSingle();
@@ -285,7 +296,7 @@ async function upsertClaimSubmissionForReadyReturn(opts: {
     opts.returnHint,
   );
   const row = {
-    company_id: organizationId,
+    organization_id: organizationId,
     [CLAIM_SUBMISSION_RETURN_ID_COLUMN]: rid,
     store_id: storeId,
     status: "ready_to_send" as const,
@@ -304,7 +315,7 @@ async function upsertClaimSubmissionForReadyReturn(opts: {
     const { error } = await supabaseServer
       .from(CLAIM_SUBMISSIONS_TABLE)
       .update({
-        company_id: row.company_id,
+        organization_id: row.organization_id,
         store_id: row.store_id,
         status: row.status,
         claim_amount: row.claim_amount,
@@ -327,7 +338,7 @@ async function logReturnAudit(opts: {
   field?: string; oldValue?: string; newValue?: string; actor: string;
 }) {
   await supabaseServer.from("return_audit_log").insert({
-    company_id: opts.organizationId, return_id: opts.returnId ?? null,
+    organization_id: opts.organizationId, return_id: opts.returnId ?? null,
     pallet_id: opts.palletId ?? null, action: opts.action,
     field: opts.field ?? null, old_value: opts.oldValue ?? null,
     new_value: opts.newValue ?? null, actor: opts.actor,
@@ -340,7 +351,7 @@ async function logPalletAudit(opts: {
   field?: string; oldValue?: string; newValue?: string; actor: string;
 }) {
   await supabaseServer.from("pallet_audit_log").insert({
-    company_id: opts.organizationId, pallet_id: opts.palletId ?? null,
+    organization_id: opts.organizationId, pallet_id: opts.palletId ?? null,
     action: opts.action, field: opts.field ?? null,
     old_value: opts.oldValue ?? null, new_value: opts.newValue ?? null, actor: opts.actor,
   });
@@ -352,7 +363,7 @@ async function logPackageAudit(opts: {
   field?: string; oldValue?: string; newValue?: string; actor: string;
 }) {
   await supabaseServer.from("package_audit_log").insert({
-    company_id: opts.organizationId, package_id: opts.packageId ?? null,
+    organization_id: opts.organizationId, package_id: opts.packageId ?? null,
     action: opts.action, field: opts.field ?? null,
     old_value: opts.oldValue ?? null, new_value: opts.newValue ?? null, actor: opts.actor,
   }).then(() => null);
@@ -382,11 +393,22 @@ function parseManifestData(raw: unknown): ExpectedItem[] | null | undefined {
 function normalizePackageRow(row: Record<string, unknown>): PackageRecord {
   const base = row as PackageRecord;
   const md = parseManifestData(row.manifest_data);
-  return md !== undefined ? { ...base, manifest_data: md } : base;
+  const next: PackageRecord = {
+    ...base,
+    rma_number: (base.rma_number as string | null | undefined) ?? null,
+    carrier_name: (base.carrier_name as string | null | undefined) ?? null,
+    tracking_number: (base.tracking_number as string | null | undefined) ?? null,
+  };
+  return md !== undefined ? { ...next, manifest_data: md } : next;
 }
 
 function normalizePalletRow(row: Record<string, unknown>): PalletRecord {
-  return row as PalletRecord;
+  const base = row as PalletRecord;
+  return {
+    ...base,
+    notes: (base.notes as string | null | undefined) ?? null,
+    tracking_number: (base.tracking_number as string | null | undefined) ?? null,
+  };
 }
 
 // ─── Pallet Actions ───────────────────────────────────────────────────────────
@@ -397,15 +419,15 @@ export async function createPallet(
   try {
     const orgId = await resolveWriteOrganizationId(
       payload.actor_profile_id,
-      payload.company_id,
+      payload.organization_id,
     );
     const actor = payload.created_by      ?? DEFAULT_ACTOR;
     const insertRow: Record<string, unknown> = {
-      company_id: orgId,
+      organization_id: orgId,
       pallet_number: payload.pallet_number.trim(),
       notes: payload.notes?.trim() || null,
       status: "open",
-      created_by: resolveActorUserId(payload.created_by),
+      created_by: uuidFkOrNull(payload.actor_profile_id ?? null, "created_by") ?? resolveActorUserId(payload.created_by),
     };
     if (payload.photo_url !== undefined) insertRow.photo_url = String(payload.photo_url ?? "").trim() || null;
     if (payload.bol_photo_url !== undefined) insertRow.bol_photo_url = String(payload.bol_photo_url ?? "").trim() || null;
@@ -434,7 +456,7 @@ export async function listPallets(
     let q = supabaseServer.from("pallets").select(PALLET_LIST_SELECT)
       .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(200);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { data, error } = await q;
     if (error) {
       console.error("[listPallets] Supabase error:", error.message, "| code:", error.code);
@@ -458,7 +480,7 @@ export async function listOpenPallets(
       .eq("status", "open")
       .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(50);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { data, error } = await q;
     if (error) throw new Error(error.message);
     const rows = (data ?? []) as unknown as Record<string, unknown>[];
@@ -479,8 +501,8 @@ export async function updatePalletStatus(
     if (!id) throw new Error("Invalid pallet id.");
     const scope = await resolveTenantListScope({ actorProfileId });
     let q = supabaseServer.from("pallets")
-      .update({ status, updated_by: resolveActorUserId(actor) }).eq("id", id);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+      .update({ status, updated_by: uuidFkOrNull(actorProfileId ?? null, "updated_by") ?? resolveActorUserId(actor) }).eq("id", id);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { error } = await q;
     if (error) throw new Error(error.message);
     void logPalletAudit({
@@ -510,7 +532,7 @@ export async function updatePallet(
     const org = await resolveWriteOrganizationId(actorProfileId, organizationId);
     const row: Record<string, unknown> = {
       ...omitUndefined(updates as Record<string, unknown>),
-      updated_by: resolveActorUserId(actor),
+      updated_by: uuidFkOrNull(actorProfileId ?? null, "updated_by") ?? resolveActorUserId(actor),
     };
     delete row.created_by;
     delete row.photo_evidence;
@@ -523,7 +545,7 @@ export async function updatePallet(
     const { data, error } = await supabaseServer.from("pallets")
       .update(row)
       .eq("id", id)
-      .eq("company_id", org)
+      .eq("organization_id", org)
       .select(PALLET_MUTATION_SELECT)
       .single();
     if (error) throw new Error(error.message);
@@ -556,7 +578,7 @@ export async function deletePallet(
       actor: actor ?? DEFAULT_ACTOR,
     });
     let q = supabaseServer.from("pallets").delete().eq("id", id);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { error } = await q;
     if (error) throw new Error(error.message);
     return { ok: true };
@@ -573,14 +595,14 @@ export async function createPackage(
   try {
     const orgId = await resolveWriteOrganizationId(
       payload.actor_profile_id,
-      payload.company_id,
+      payload.organization_id,
     );
     const actor = payload.created_by      ?? DEFAULT_ACTOR;
     const expected_item_count = coerceNonNegativeInt(payload.expected_item_count, 0);
     const palletIdFk = uuidFkOrNull(payload.pallet_id ?? null, "pallet_id");
     const storeIdFk = uuidFkOrNull(payload.store_id ?? null, "store_id");
     const insertRow: Record<string, unknown> = {
-      company_id:     orgId,
+      organization_id:     orgId,
       package_number:      payload.package_number.trim(),
       tracking_number:     payload.tracking_number?.trim() || null,
       carrier_name:        payload.carrier_name?.trim() || null,
@@ -589,7 +611,7 @@ export async function createPackage(
       pallet_id:           palletIdFk,
       manifest_url:        payload.manifest_url ?? null,
       status:              "open",
-      created_by:       resolveActorUserId(payload.created_by),
+      created_by: uuidFkOrNull(payload.actor_profile_id ?? null, "created_by") ?? resolveActorUserId(payload.created_by),
     };
     if (storeIdFk) insertRow.store_id = storeIdFk;
     if (payload.photo_evidence != null) insertRow.photo_evidence = payload.photo_evidence;
@@ -633,6 +655,7 @@ export async function updatePackage(
     delete safeUpdates.updated_by;
     const payload = omitUndefined({
       ...safeUpdates,
+      updated_by: uuidFkOrNull(actorProfileId ?? null, "updated_by") ?? resolveActorUserId(actor),
     } as Record<string, unknown>);
     delete payload.created_by;
     if ("pallet_id" in payload) payload.pallet_id = uuidOrNull(payload.pallet_id as string);
@@ -648,7 +671,7 @@ export async function updatePackage(
     let q = supabaseServer.from("packages")
       .update(payload)
       .eq("id", pkgId);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { data, error } = await q.select(PACKAGE_MUTATION_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
     const row = normalizePackageRow(data as unknown as Record<string, unknown>);
@@ -657,12 +680,12 @@ export async function updatePackage(
       let syncQ = supabaseServer.from("returns")
         .update({ pallet_id: row.pallet_id })
         .eq("package_id", pkgId);
-      if (scope.mode === "single") syncQ = syncQ.eq("company_id", scope.organizationId);
+      if (scope.mode === "single") syncQ = syncQ.eq("organization_id", scope.organizationId);
       const { error: syncErr } = await syncQ;
       if (syncErr) console.error("[updatePackage] sync returns.pallet_id:", syncErr.message);
     }
     void logPackageAudit({
-      organizationId: row.company_id ?? DEFAULT_ORG,
+      organizationId: row.organization_id ?? DEFAULT_ORG,
       packageId: pkgId,
       action: "updated",
       actor: actor ?? DEFAULT_ACTOR,
@@ -681,7 +704,7 @@ export async function listPackages(
     let q = supabaseServer.from("packages").select(PACKAGE_LIST_SELECT)
       .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(200);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { data, error } = await q;
     if (error) {
       console.error("[listPackages] Supabase error:", error.message, "| code:", error.code);
@@ -705,7 +728,7 @@ export async function listOpenPackages(
       .eq("status", "open")
       .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(50);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { data, error } = await q;
     if (error) throw new Error(error.message);
     const rows = (data ?? []) as unknown as Record<string, unknown>[];
@@ -725,7 +748,7 @@ export async function listReturnsByPackage(
     const scope = await resolveTenantListScope(tenant);
     let q = supabaseServer.from("returns").select(RETURN_LIST_SELECT)
       .eq("package_id", id).is("deleted_at", null).order("created_at", { ascending: false });
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { data, error } = await q;
     if (error) throw new Error(error.message);
     return { ok: true, data: dedupeReturnsById(data ?? []) };
@@ -744,10 +767,10 @@ export async function closePackage(
     const actor = opts?.actor ?? DEFAULT_ACTOR;
     const scope = await resolveTenantListScope({ actorProfileId: opts?.actorProfileId });
     const { data: pkg, error: fetchErr } = await supabaseServer.from("packages")
-      .select("expected_item_count,actual_item_count,company_id")
+      .select("expected_item_count,actual_item_count,organization_id")
       .eq("id", id).single();
     if (fetchErr) throw new Error(fetchErr.message);
-    if (scope.mode === "single" && pkg.company_id !== scope.organizationId) {
+    if (scope.mode === "single" && pkg.organization_id !== scope.organizationId) {
       throw new Error("Forbidden: package belongs to another organization.");
     }
     const hasDiscrepancy = (pkg.expected_item_count > 0 && pkg.expected_item_count !== pkg.actual_item_count) || !!opts?.discrepancyNote;
@@ -755,10 +778,10 @@ export async function closePackage(
     let q = supabaseServer.from("packages")
       .update({ status: newStatus, discrepancy_note: opts?.discrepancyNote ?? null, updated_by: resolveActorUserId(actor) })
       .eq("id", id);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { error } = await q;
     if (error) throw new Error(error.message);
-    void logPackageAudit({ organizationId: pkg.company_id ?? DEFAULT_ORG, packageId: id, action: "status_changed", field: "status", newValue: newStatus, actor });
+    void logPackageAudit({ organizationId: pkg.organization_id ?? DEFAULT_ORG, packageId: id, action: "status_changed", field: "status", newValue: newStatus, actor });
     return { ok: true, status: newStatus };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Failed to close package." };
@@ -781,7 +804,7 @@ export async function deletePackage(
       actor: actor ?? DEFAULT_ACTOR,
     });
     let q = supabaseServer.from("packages").delete().eq("id", id);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { error } = await q;
     if (error) throw new Error(error.message);
     return { ok: true };
@@ -798,7 +821,7 @@ export async function insertReturn(
   try {
     const orgId = await resolveWriteOrganizationId(
       payload.actor_profile_id,
-      payload.company_id,
+      payload.organization_id,
     );
     const packageIdFk = uuidFkOrNull(payload.package_id ?? null, "package_id");
     /** Status / claims use `returns.photo_evidence` only — do not read packages.photo_evidence here. */
@@ -834,8 +857,9 @@ export async function insertReturn(
       (amazonOrderFromPayload || orderFromPackage || "").trim() || null;
 
     const insertRow: Record<string, unknown> = {
-      company_id: orgId,
+      organization_id: orgId,
       lpn:             payload.lpn?.trim() || null,
+      rma_number:      payload.rma_number?.trim() || null,
       marketplace:     payload.marketplace,
       item_name:       payload.item_name.trim(),
       conditions:      payload.conditions,
@@ -846,7 +870,7 @@ export async function insertReturn(
       pallet_id:       effectivePalletId,
       package_id:      packageIdFk,
       status,
-      created_by:   resolveActorUserId(payload.created_by),
+      created_by: uuidFkOrNull(payload.actor_profile_id ?? null, "created_by") ?? resolveActorUserId(payload.created_by),
       store_id:        resolvedStoreId,
     };
     // Post-migration columns — only written once their migrations are applied
@@ -859,7 +883,7 @@ export async function insertReturn(
       .insert(insertRow).select(RETURN_SELECT).single();
 
     if (error) throw new Error(parseDuplicateError(error.message));
-    const rec = data as unknown as ReturnRecord;
+    const rec = normalizeReturnRecordFromRow(data);
 
     if (status === "ready_for_claim") {
       let storePlat: string | null | undefined;
@@ -935,7 +959,7 @@ export async function updateReturn(
       .single();
     if (loadErr || !existing) throw new Error(loadErr?.message ?? "Return not found.");
     const ex = existing as unknown as ReturnRecord;
-    await assertRowOrgAccess(actorProfileId, ex.company_id);
+    await assertRowOrgAccess(actorProfileId, ex.organization_id);
 
     const safeUpdates = { ...(updates as Record<string, unknown>) };
     delete safeUpdates.updated_by;
@@ -967,6 +991,10 @@ export async function updateReturn(
     if ("pallet_id" in updates) {
       patch.pallet_id = uuidOrNull(updates.pallet_id as string);
     }
+    if ("rma_number" in updates) {
+      const v = updates.rma_number;
+      patch.rma_number = v === null || v === undefined ? null : String(v).trim() || null;
+    }
 
     const nextPackageId =
       updates.package_id !== undefined
@@ -981,7 +1009,7 @@ export async function updateReturn(
       const sid = String(patch.store_id).trim();
       if (sid && !isUuidString(sid)) {
         patch.store_id = await resolveClaimSubmissionStoreId(
-          resolveOrganizationIdForWrite(ex.company_id),
+          resolveOrganizationIdForWrite(ex.organization_id),
           null,
           { package_id: nextPackageId },
         );
@@ -997,15 +1025,18 @@ export async function updateReturn(
         if (pl && isUuidString(pl)) patch.pallet_id = pl;
       }
     }
-    const clean = omitUndefined(patch);
+    const clean = omitUndefined({
+      ...patch,
+      updated_by: uuidFkOrNull(actorProfileId ?? null, "updated_by") ?? resolveActorUserId(actor),
+    });
     const scope = await resolveTenantListScope({ actorProfileId });
     let uq = supabaseServer.from("returns")
       .update(clean)
       .eq("id", rid);
-    if (scope.mode === "single") uq = uq.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") uq = uq.eq("organization_id", scope.organizationId);
     const { data, error } = await uq.select(RETURN_SELECT).single();
     if (error) throw new Error(parseDuplicateError(error.message));
-    const rec = data as unknown as ReturnRecord;
+    const rec = normalizeReturnRecordFromRow(data);
 
     if (rec.status === "ready_for_claim") {
       const storePlat = storePlatformFromEmbed(rec.stores);
@@ -1027,7 +1058,7 @@ export async function updateReturn(
           { selectedEvidenceUrls: null },
         );
         const { error: subErr } = await upsertClaimSubmissionForReadyReturn({
-          organizationId: rec.company_id,
+          organizationId: rec.organization_id,
           returnId: rec.id,
           storeId: rec.store_id,
           claimAmount,
@@ -1059,7 +1090,7 @@ export async function deleteReturn(
       actor: actor ?? DEFAULT_ACTOR,
     });
     let q = supabaseServer.from("returns").delete().eq("id", returnId);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { error } = await q;
     if (error) throw new Error(error.message);
     return { ok: true };
@@ -1090,7 +1121,7 @@ export async function bulkDeleteReturns(
       });
     }
     let q = supabaseServer.from("returns").delete().in("id", validIds);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { error } = await q;
     if (error) {
       console.error("[bulkDeleteReturns] Supabase error:", error.message, "| code:", error.code);
@@ -1114,7 +1145,7 @@ export async function countReturns(
       .from("returns")
       .select("id", { count: "exact", head: true })
       .is("deleted_at", null);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { count, error } = await q;
     if (error) {
       console.error("[countReturns] Supabase error:", error.message, "| code:", error.code);
@@ -1140,7 +1171,7 @@ export async function listClaimPipelineReturns(
       .is("deleted_at", null)
       .order("created_at", { ascending: false })
       .limit(200);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { data, error } = await q;
     if (error) throw new Error(error.message);
     return { ok: true, data: dedupeReturnsById(data ?? []) };
@@ -1157,7 +1188,7 @@ export async function listReturns(
     let q = supabaseServer.from("returns").select(RETURN_LIST_SELECT)
       .is("deleted_at", null)
       .order("created_at", { ascending: false }).limit(200);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { data, error } = await q;
     if (error) {
       console.error("[listReturns] Supabase error:", error.message, "| code:", error.code, "| details:", error.details);
@@ -1179,7 +1210,7 @@ export async function listReturnsByPallet(
     const scope = await resolveTenantListScope(tenant);
     let q = supabaseServer.from("returns").select(RETURN_LIST_SELECT)
       .eq("pallet_id", palletId).is("deleted_at", null).order("created_at", { ascending: false });
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { data, error } = await q;
     if (error) throw new Error(error.message);
     return { ok: true, data: dedupeReturnsById(data ?? []) };
@@ -1196,7 +1227,7 @@ export async function listAuditLog(
     const scope = await resolveTenantListScope(tenant);
     let q = supabaseServer.from("return_audit_log").select("*")
       .order("created_at", { ascending: false }).limit(limit);
-    if (scope.mode === "single") q = q.eq("company_id", scope.organizationId);
+    if (scope.mode === "single") q = q.eq("organization_id", scope.organizationId);
     const { data, error } = await q;
     if (error) throw new Error(error.message);
     return { ok: true, data: (data ?? []) as AuditLogRecord[] };
@@ -1224,11 +1255,11 @@ export async function getDashboardSnapshot(
       .eq("status", "ready_to_send");
     let qEst = supabaseServer.from("returns").select("estimated_value").is("deleted_at", null).limit(10000);
     if (scope.mode === "single") {
-      qReturnsToday = qReturnsToday.eq("company_id", scope.organizationId);
-      qPallets = qPallets.eq("company_id", scope.organizationId);
-      qPackages = qPackages.eq("company_id", scope.organizationId);
-      qClaims = qClaims.eq("company_id", scope.organizationId);
-      qEst = qEst.eq("company_id", scope.organizationId);
+      qReturnsToday = qReturnsToday.eq("organization_id", scope.organizationId);
+      qPallets = qPallets.eq("organization_id", scope.organizationId);
+      qPackages = qPackages.eq("organization_id", scope.organizationId);
+      qClaims = qClaims.eq("organization_id", scope.organizationId);
+      qEst = qEst.eq("organization_id", scope.organizationId);
     }
     const [
       { count: returnsToday, error: e1 },
@@ -1285,9 +1316,9 @@ export async function getReturnsAnalyticsData(
     let qPkg = supabaseServer.from("packages").select("id,carrier_name").limit(500);
     let qPlt = supabaseServer.from("pallets").select("id").limit(500);
     if (scope.mode === "single") {
-      qRet = qRet.eq("company_id", scope.organizationId);
-      qPkg = qPkg.eq("company_id", scope.organizationId);
-      qPlt = qPlt.eq("company_id", scope.organizationId);
+      qRet = qRet.eq("organization_id", scope.organizationId);
+      qPkg = qPkg.eq("organization_id", scope.organizationId);
+      qPlt = qPlt.eq("organization_id", scope.organizationId);
     }
     const [{ data: retRows, error: e1 }, { data: pkgRows, error: e2 }, { data: pltRows, error: e3 }] = await Promise.all([
       qRet,
@@ -1333,13 +1364,30 @@ export async function getReturnsAnalyticsData(
       avgProcessingHours = hrs.reduce((a, b) => a + b, 0) / hrs.length;
     }
 
-    const operatorCounts = new Map<string, number>();
+    // Resolve operator UUIDs to display names via profiles.
+    const rawOperatorCounts = new Map<string, number>();
     for (const r of returns) {
       const op = r.created_by?.trim() || "Unknown";
-      operatorCounts.set(op, (operatorCounts.get(op) ?? 0) + 1);
+      rawOperatorCounts.set(op, (rawOperatorCounts.get(op) ?? 0) + 1);
     }
-    const operatorStats = [...operatorCounts.entries()]
-      .map(([operator, count]) => ({ operator, count }))
+    const profileIds = [...rawOperatorCounts.keys()].filter(
+      (id) => id !== "Unknown" && isUuidString(id),
+    );
+    const nameById = new Map<string, string>();
+    if (profileIds.length > 0) {
+      const { data: profRows } = await supabaseServer
+        .from("profiles")
+        .select("id, full_name")
+        .in("id", profileIds);
+      for (const p of (profRows ?? []) as { id?: string; full_name?: string | null }[]) {
+        if (p.id) nameById.set(p.id, (p.full_name?.trim() || "").slice(0, 40) || p.id.slice(0, 8));
+      }
+    }
+    const operatorStats = [...rawOperatorCounts.entries()]
+      .map(([id, count]) => ({
+        operator: nameById.get(id) ?? (id === "Unknown" ? "Unknown" : id.slice(0, 8)),
+        count,
+      }))
       .sort((a, b) => b.count - a.count)
       .slice(0, 10);
 

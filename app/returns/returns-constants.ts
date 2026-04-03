@@ -18,7 +18,7 @@ export const RETURN_SELECT = "*,stores(name,platform)";
  * Avoids PostgREST edge cases where `*` plus embeds can fan out duplicate parent rows.
  */
 export const RETURN_LIST_SELECT =
-  "id, company_id, lpn, rma_number, marketplace, item_name, " +
+  "id, organization_id, lpn, rma_number, marketplace, item_name, " +
   "asin, fnsku, sku, product_identifier, " +
   "conditions, status, notes, photo_evidence, " +
   "expiration_date, batch_number, store_id, pallet_id, package_id, " +
@@ -37,7 +37,7 @@ export const RETURNS_EMBED_SELECTOR = RETURN_SELECT;
  * `photo_evidence` is loaded on demand in the package drawer when needed.
  */
 export const PACKAGE_LIST_SELECT =
-  "id, company_id, package_number, tracking_number, carrier_name, rma_number, " +
+  "id, organization_id, package_number, tracking_number, carrier_name, rma_number, " +
   "expected_item_count, actual_item_count, pallet_id, status, discrepancy_note, " +
   "store_id, order_id, created_at, updated_at, created_by, updated_by, " +
   "photo_url, photo_return_label_url, photo_opened_url, photo_closed_url, " +
@@ -52,9 +52,11 @@ export const PACKAGE_MUTATION_SELECT = PACKAGE_LIST_SELECT.replace(
 
 /**
  * `pallets` list rows — explicit columns; omit `photo_evidence` JSONB from list queries for performance.
+ * Includes carrier_name and amazon_order_id for Pallet → Package → Item auto-fill inheritance.
  */
 export const PALLET_LIST_SELECT =
-  "id, company_id, pallet_number, tracking_number, notes, status, item_count, " +
+  "id, organization_id, pallet_number, tracking_number, notes, status, item_count, " +
+  "carrier_name, amazon_order_id, " +
   "created_at, updated_at, created_by, updated_by, store_id, " +
   "photo_url, bol_photo_url, manifest_photo_url, deleted_at, " +
   "stores(name,platform)";

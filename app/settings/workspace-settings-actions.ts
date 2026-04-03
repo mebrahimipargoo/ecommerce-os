@@ -6,6 +6,8 @@ import {
 } from "../../lib/organization-logo";
 import { normalizeTenantLogoUrl } from "../../lib/tenant-logo-url";
 import { supabaseServer } from "../../lib/supabase-server";
+import type { TenantWriteContext } from "../../lib/server-tenant";
+import { isUuidString } from "../../lib/uuid";
 import {
   DEFAULT_CLAIM_AGENT_CONFIG,
   DEFAULT_CORE_SETTINGS,
@@ -29,8 +31,9 @@ export async function getWorkspaceSettings(): Promise<WorkspaceSettings> {
     const { data, error } = await supabaseServer
       .from("workspace_settings")
       .select("id, core_settings, module_configs")
+      .order("id", { ascending: true })
       .limit(1)
-      .single();
+      .maybeSingle();
 
     if (error || !data) return DEFAULT_WORKSPACE_SETTINGS;
 
@@ -46,22 +49,22 @@ export async function getWorkspaceSettings(): Promise<WorkspaceSettings> {
 
 /**
  * Returns the core_settings (white-label / tenant branding). Always succeeds.
- * Pass `organizationId` to resolve the logo for that tenant (sidebar multi-tenant branding).
+ * Pass `companyId` to resolve the logo for that tenant (sidebar multi-tenant branding).
  */
-export async function getCoreSettings(organizationId?: string): Promise<CoreSettings> {
+export async function getCoreSettings(companyId?: string): Promise<CoreSettings> {
   const ws = await getWorkspaceSettings();
   const merged = {
     ...DEFAULT_CORE_SETTINGS,
     ...(ws.core_settings as CoreSettings),
   };
-  const orgLogo = await getOrganizationLogoUrlFromDb(organizationId);
+  const orgLogo = await getOrganizationLogoUrlFromDb(companyId);
   let labelFromOrg = "";
-  if (organizationId?.trim()) {
+  if (companyId?.trim()) {
     try {
       const { data: osRow } = await supabaseServer
         .from("organization_settings")
         .select("company_display_name")
-        .eq("company_id", organizationId.trim())
+        .eq("organization_id", companyId.trim())
         .maybeSingle();
       const dn = (osRow as { company_display_name?: string | null } | null)?.company_display_name;
       labelFromOrg = typeof dn === "string" ? dn.trim() : "";
@@ -187,6 +190,7 @@ export async function saveInventoryFefoSettings(
  */
 export async function saveCoreSettings(
   data: Partial<CoreSettings>,
+  tenant?: TenantWriteContext | null,
 ): Promise<{ ok: boolean; error?: string }> {
   try {
     const hasLogoPatch =
@@ -197,7 +201,7 @@ export async function saveCoreSettings(
         (typeof data.company_logo_url === "string" ? data.company_logo_url : "") ||
         (typeof data.logo_url === "string" ? data.logo_url : "") ||
         "";
-      const orgRes = await upsertOrganizationLogoUrl(raw.trim() || null);
+      const orgRes = await upsertOrganizationLogoUrl(raw.trim() || null, tenant);
       if (!orgRes.ok) return { ok: false, error: orgRes.error };
     }
 
@@ -225,6 +229,20 @@ export async function saveCoreSettings(
         .from("workspace_settings")
         .insert({ core_settings: newCoreSettings, module_configs: newModuleConfigs });
       if (error) return { ok: false, error: error.message };
+    }
+
+    // Keep organization_settings.company_display_name in sync so that
+    // getCoreSettings(organizationId) reads back the name the user just typed,
+    // and dropdowns across the app show the correct label instead of a raw UUID.
+    const newName = typeof data.company_name === "string" ? data.company_name.trim() : "";
+    const orgId = tenant?.organizationId?.trim() ?? "";
+    if (newName && orgId && isUuidString(orgId)) {
+      await supabaseServer
+        .from("organization_settings")
+        .upsert(
+          { organization_id: orgId, company_display_name: newName },
+          { onConflict: "organization_id" },
+        );
     }
 
     return { ok: true };

@@ -109,7 +109,7 @@ export async function listClaimReportHistory(
     let q = supabaseServer
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select(CLAIM_SUBMISSIONS_WITH_RETURNS_EMBED)
-      .eq("company_id", orgId)
+      .eq("organization_id", orgId)
       .not("report_url", "is", null)
       .neq("report_url", "")
       .order("created_at", { ascending: false })

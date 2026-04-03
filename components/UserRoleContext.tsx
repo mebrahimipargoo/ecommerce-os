@@ -11,32 +11,61 @@ import {
 import { isUuidString } from "../lib/uuid";
 import { useDebugMode } from "./DebugModeContext";
 
-export type UserRole = "operator" | "admin" | "super_admin";
+// ─── 5-Tier Role Hierarchy ───────────────────────────────────────────────────
+//  Ordered from lowest privilege → highest privilege.
+//  This order is used by useRbacPermissions for isAtLeast() comparisons.
 
-const LS_WORKSPACE_COMPANY = "workspace_selected_company_id";
+export type UserRole =
+  | "operator"         // warehouse worker — WMS tools only
+  | "employee"         // office worker — ops modules, no settings/users/imports
+  | "admin"            // org-level admin — full org access + settings + users
+  | "system_employee"  // internal platform staff — multi-org read + limited write
+  | "super_admin";     // platform owner — unrestricted access
+
+export const ROLE_HIERARCHY: UserRole[] = [
+  "operator",
+  "employee",
+  "admin",
+  "system_employee",
+  "super_admin",
+];
+
+const LS_WORKSPACE_ORGANIZATION = "workspace_selected_organization_id";
+
+// ─── Context Shape ────────────────────────────────────────────────────────────
 
 type UserRoleContextValue = {
   role: UserRole;
   actorName: string;
   /** Resolved workspace user profile id (`profiles.id`) for audit trails and tenant bootstrap */
   actorUserId: string | null;
-  /** Home company from profile (`profiles.company_id`) */
-  homeCompanyId: string | null;
-  /** Tenant scope for logistics data — effective company UUID (super_admin may override via workspace picker) */
+  /** Home organization from profile (`profiles.organization_id`) */
+  homeOrganizationId: string | null;
+  /** Tenant scope for logistics data — effective `organization_id` (super_admin may override via workspace picker) */
   organizationId: string | null;
   profileLoading: boolean;
   profileError: string | null;
-  /** super_admin: companies for header switcher */
-  workspaceCompanies: WorkspaceOrganizationOption[];
-  /** super_admin: persist selected company (also in localStorage) */
-  setWorkspaceCompanyId: (id: string) => void;
-  /** Debug only: cycle operator → admin → super_admin */
+  /** GBAC foundation: group/team slugs from `profiles.team_groups` JSONB */
+  teamGroups: string[];
+  /** super_admin: organizations for header switcher */
+  workspaceOrganizations: WorkspaceOrganizationOption[];
+  /** super_admin: persist selected organization (also in localStorage) */
+  setWorkspaceOrganizationId: (id: string) => void;
+  /** Dev-mode only: directly set a mocked role (null = revert to real profile role) */
+  setDebugRole: (role: UserRole | null) => void;
+  /** Dev-mode only: cycle through all 5 roles in hierarchy order */
   toggleRole: () => void;
   refreshProfile: () => Promise<void>;
 };
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * True for roles that have organization-admin privileges.
+ * Used by AdminWorkspaceGate and admin route guards.
+ */
 export function isAdminRole(role: UserRole): boolean {
-  return role === "admin" || role === "super_admin";
+  return role === "admin" || role === "system_employee" || role === "super_admin";
 }
 
 function readActorUserId(): string | null {
@@ -49,30 +78,36 @@ function readActorUserId(): string | null {
 
 function readStoredWorkspaceCompanyId(): string | null {
   if (typeof window === "undefined") return null;
-  const t = window.localStorage.getItem(LS_WORKSPACE_COMPANY)?.trim();
+  const t = window.localStorage.getItem(LS_WORKSPACE_ORGANIZATION)?.trim();
   return t && isUuidString(t) ? t : null;
 }
 
 function normalizeRole(raw: string | null | undefined): UserRole {
   const r = (raw ?? "").trim().toLowerCase();
-  if (r === "super_admin") return "super_admin";
-  if (r === "admin") return "admin";
+  if (r === "super_admin")     return "super_admin";
+  if (r === "system_employee") return "system_employee";
+  if (r === "admin")           return "admin";
+  if (r === "employee")        return "employee";
   return "operator";
 }
+
+// ─── Provider ─────────────────────────────────────────────────────────────────
 
 const UserRoleContext = createContext<UserRoleContextValue | null>(null);
 
 export function UserRoleProvider({ children }: { children: React.ReactNode }) {
-  const { debugMode } = useDebugMode();
-  const [profileRole, setProfileRole] = useState<UserRole>("operator");
-  const [debugRole, setDebugRole] = useState<UserRole | null>(null);
-  const [actorUserId, setActorUserId] = useState<string | null>(null);
-  const [homeCompanyId, setHomeCompanyId] = useState<string | null>(null);
-  const [superAdminCompanyOverride, setSuperAdminCompanyOverride] = useState<string | null>(null);
-  const [workspaceCompanies, setWorkspaceCompanies] = useState<WorkspaceOrganizationOption[]>([]);
-  const [actorName, setActorName] = useState("Operator");
-  const [profileLoading, setProfileLoading] = useState(true);
-  const [profileError, setProfileError] = useState<string | null>(null);
+  const { debugMode, setDebugMode } = useDebugMode();
+
+  const [profileRole, setProfileRole]               = useState<UserRole>("operator");
+  const [debugRole,   setDebugRoleState]            = useState<UserRole | null>(null);
+  const [actorUserId, setActorUserId]               = useState<string | null>(null);
+  const [homeOrganizationId, setHomeOrganizationId] = useState<string | null>(null);
+  const [teamGroups,  setTeamGroups]                = useState<string[]>([]);
+  const [superAdminOrganizationOverride, setSuperAdminOrganizationOverride] = useState<string | null>(null);
+  const [workspaceOrganizations, setWorkspaceOrganizations] = useState<WorkspaceOrganizationOption[]>([]);
+  const [actorName,       setActorName]       = useState("Operator");
+  const [profileLoading,  setProfileLoading]  = useState(true);
+  const [profileError,    setProfileError]    = useState<string | null>(null);
 
   const loadProfile = useCallback(async () => {
     setProfileLoading(true);
@@ -82,11 +117,12 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
     if (!id) {
       setProfileRole("admin");
       setActorName("Operator");
+      setTeamGroups([]);
       const fallback =
         process.env.NEXT_PUBLIC_ORGANIZATION_ID?.trim() ||
         "00000000-0000-0000-0000-000000000001";
-      setHomeCompanyId(isUuidString(fallback) ? fallback : "00000000-0000-0000-0000-000000000001");
-      setSuperAdminCompanyOverride(null);
+      setHomeOrganizationId(isUuidString(fallback) ? fallback : "00000000-0000-0000-0000-000000000001");
+      setSuperAdminOrganizationOverride(null);
       setProfileLoading(false);
       return;
     }
@@ -100,92 +136,97 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
     const nr = normalizeRole(p.role);
     setProfileRole(nr);
     setActorName((p.full_name ?? "").trim() || p.email || "User");
-    const cid = (p.company_id ?? "").trim();
-    setHomeCompanyId(cid && isUuidString(cid) ? cid : null);
+    setTeamGroups(p.team_groups ?? []);
+    const cid = (p.organization_id ?? "").trim();
+    setHomeOrganizationId(cid && isUuidString(cid) ? cid : null);
 
-    if (nr === "super_admin") {
+    if (nr === "super_admin" || nr === "system_employee") {
       const stored = readStoredWorkspaceCompanyId();
-      const pick = stored && isUuidString(stored) ? stored : cid;
-      setSuperAdminCompanyOverride(pick && isUuidString(pick) ? pick : null);
+      const pick   = stored && isUuidString(stored) ? stored : cid;
+      setSuperAdminOrganizationOverride(pick && isUuidString(pick) ? pick : null);
       void listWorkspaceOrganizationsForAdmin().then((orgRes) => {
         if (!orgRes.ok) return;
         const rows = [...orgRes.rows];
-        const ids = new Set(rows.map((r) => r.company_id));
+        const ids  = new Set(rows.map((r) => r.organization_id));
         if (cid && isUuidString(cid) && !ids.has(cid)) {
-          rows.push({ company_id: cid, display_name: "Your workspace" });
+          rows.push({ organization_id: cid, display_name: "Your workspace" });
         }
         rows.sort((a, b) => a.display_name.localeCompare(b.display_name));
-        setWorkspaceCompanies(rows);
+        setWorkspaceOrganizations(rows);
       });
     } else {
-      setSuperAdminCompanyOverride(null);
-      setWorkspaceCompanies([]);
+      setSuperAdminOrganizationOverride(null);
+      setWorkspaceOrganizations([]);
     }
     setProfileLoading(false);
   }, []);
 
-  useEffect(() => {
-    void loadProfile();
-  }, [loadProfile]);
+  useEffect(() => { void loadProfile(); }, [loadProfile]);
 
+  // Reset debug role when debug mode is turned off
   useEffect(() => {
-    if (!debugMode) setDebugRole(null);
+    if (!debugMode) setDebugRoleState(null);
   }, [debugMode]);
 
+  // Effective role: debug override wins when debug mode is active
   const role = useMemo((): UserRole => {
     if (debugMode && debugRole !== null) return debugRole;
     return profileRole;
   }, [debugMode, debugRole, profileRole]);
 
-  const setWorkspaceCompanyId = useCallback((id: string) => {
+  const setWorkspaceOrganizationId = useCallback((id: string) => {
     const t = id.trim();
     if (!isUuidString(t)) return;
-    setSuperAdminCompanyOverride(t);
+    setSuperAdminOrganizationOverride(t);
     if (typeof window !== "undefined") {
-      window.localStorage.setItem(LS_WORKSPACE_COMPANY, t);
+      window.localStorage.setItem(LS_WORKSPACE_ORGANIZATION, t);
     }
   }, []);
 
   const organizationId = useMemo((): string | null => {
-    if (role === "super_admin") {
-      return superAdminCompanyOverride ?? homeCompanyId;
+    if (role === "super_admin" || role === "system_employee") {
+      return superAdminOrganizationOverride ?? homeOrganizationId;
     }
-    return homeCompanyId;
-  }, [role, superAdminCompanyOverride, homeCompanyId]);
+    return homeOrganizationId;
+  }, [role, superAdminOrganizationOverride, homeOrganizationId]);
+
+  /** Dev-mode: directly set any of the 5 tiers (null = revert to real role).
+   *  Auto-enables debug mode if it is not already on. */
+  const setDebugRole = useCallback((r: UserRole | null) => {
+    if (!debugMode) setDebugMode(true);
+    setDebugRoleState(r);
+  }, [debugMode, setDebugMode]);
+
+  /** Dev-mode: cycle through all 5 roles in hierarchy order. Auto-enables debug mode. */
+  const toggleRole = useCallback(() => {
+    if (!debugMode) setDebugMode(true);
+    setDebugRoleState((prev) => {
+      const cur = prev ?? profileRole;
+      const idx = ROLE_HIERARCHY.indexOf(cur);
+      return ROLE_HIERARCHY[(idx + 1) % ROLE_HIERARCHY.length];
+    });
+  }, [debugMode, setDebugMode, profileRole]);
 
   const value = useMemo(
     () => ({
       role,
       actorName,
       actorUserId,
-      homeCompanyId,
+      homeOrganizationId,
       organizationId,
       profileLoading,
       profileError,
-      workspaceCompanies,
-      setWorkspaceCompanyId,
-      toggleRole: () => {
-        if (!debugMode) return;
-        setDebugRole((prev) => {
-          const cur = prev ?? profileRole;
-          return cur === "operator" ? "admin" : cur === "admin" ? "super_admin" : "operator";
-        });
-      },
+      teamGroups,
+      workspaceOrganizations,
+      setWorkspaceOrganizationId,
+      setDebugRole,
+      toggleRole,
       refreshProfile: loadProfile,
     }),
     [
-      role,
-      actorName,
-      actorUserId,
-      homeCompanyId,
-      organizationId,
-      profileLoading,
-      profileError,
-      workspaceCompanies,
-      setWorkspaceCompanyId,
-      loadProfile,
-      debugMode,
-      profileRole,
+      role, actorName, actorUserId, homeOrganizationId, organizationId,
+      profileLoading, profileError, teamGroups, workspaceOrganizations,
+      setWorkspaceOrganizationId, setDebugRole, toggleRole, loadProfile,
     ],
   );
 
@@ -201,12 +242,14 @@ export function useUserRole(): UserRoleContextValue {
       role: "admin",
       actorName: "Operator",
       actorUserId: null,
-      homeCompanyId: null,
+      homeOrganizationId: null,
       organizationId: null,
       profileLoading: false,
       profileError: null,
-      workspaceCompanies: [],
-      setWorkspaceCompanyId: () => {},
+      teamGroups: [],
+      workspaceOrganizations: [],
+      setWorkspaceOrganizationId: () => {},
+      setDebugRole: () => {},
       toggleRole: () => {},
       refreshProfile: async () => {},
     };

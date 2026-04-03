@@ -20,7 +20,7 @@ export default async function ClaimEnginePage() {
     listStores(),
     listClaimSubmissions(DEFAULT_ORGANIZATION_ID),
     getClaimEngineKpis(DEFAULT_ORGANIZATION_ID),
-    getOrganizationClaimEvidenceDefaults(DEFAULT_ORGANIZATION_ID),
+    getOrganizationClaimEvidenceDefaults({ organizationId: DEFAULT_ORGANIZATION_ID }),
   ]);
 
   const stores =

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   ArrowLeft, BadgeCheck, BarChart3, Building2, CheckCircle2, CreditCard, Cpu, Crown,
@@ -52,6 +52,8 @@ import {
 } from "../../lib/openai-settings";
 import { useBranding } from "../../components/BrandingContext";
 import { isAdminRole, useUserRole } from "../../components/UserRoleContext";
+import { FALLBACK_ORGANIZATION_ID } from "../../lib/organization";
+import { isUuidString } from "../../lib/uuid";
 import { DatabaseTag } from "../../components/DatabaseTag";
 import type { AdapterProviderKey } from "../../lib/adapters";
 import {
@@ -59,6 +61,7 @@ import {
   updateMarketplace, testConnection, deleteStore, updateStore,
   getMarketplaceCredentialsForEdit,
   testMarketplaceCredentials,
+  type RbacContext,
   type StorePublicRow,
 } from "./adapters/actions";
 import { getClaimQueueSyncStatus, syncClaimQueueNow } from "../claim-engine/logistics-sync-actions";
@@ -100,7 +103,7 @@ type StoreRecord = {
   provider: string;
   nickname: string;
   display_id?: string;
-  company_id: string;
+  organization_id: string;
   role_required: string;
   created_at: string;
 };
@@ -345,8 +348,25 @@ function UsageMeter({
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 export default function SettingsPage() {
-  const { role } = useUserRole();
+  const { role, organizationId, actorUserId } = useUserRole();
   const { refresh: refreshBranding } = useBranding();
+
+  const tenantCtx = useMemo(
+    () => ({ actorProfileId: actorUserId, organizationId }),
+    [actorUserId, organizationId],
+  );
+
+  const settingsRbac = useMemo((): RbacContext => {
+    const cid =
+      organizationId?.trim() && isUuidString(organizationId.trim())
+        ? organizationId.trim()
+        : FALLBACK_ORGANIZATION_ID;
+    return {
+      organization_id: cid,
+      /** Settings route is admin-only; adapter RBAC hierarchy uses admin/editor/viewer. */
+      user_role: "admin",
+    };
+  }, [organizationId]);
 
   const [activeTab, setActiveTab] = useState<TabId>("general");
   const [mounted,   setMounted]   = useState(false);
@@ -465,7 +485,7 @@ export default function SettingsPage() {
   useEffect(() => {
     if (!mounted) return;
     let cancelled = false;
-    void getOrganizationDefaultStoreId().then((serverId) => {
+    void getOrganizationDefaultStoreId(tenantCtx).then((serverId) => {
       if (cancelled) return;
       if (serverId) {
         setDefaultStoreId(serverId);
@@ -477,7 +497,7 @@ export default function SettingsPage() {
     return () => {
       cancelled = true;
     };
-  }, [mounted]);
+  }, [mounted, tenantCtx]);
 
   // ── Load core_settings (white-label) from DB ──────────────────────────────
   useEffect(() => {
@@ -485,7 +505,7 @@ export default function SettingsPage() {
     async function loadCoreSettings() {
       setCoreSettingsLoading(true);
       try {
-        const cfg = await getCoreSettings();
+        const cfg = await getCoreSettings(organizationId ?? undefined);
         setCompanyName(cfg.company_name ?? "");
         setCompanyLogoUrl(cfg.company_logo_url ?? "");
       } finally {
@@ -493,7 +513,7 @@ export default function SettingsPage() {
       }
     }
     loadCoreSettings();
-  }, [mounted]);
+  }, [mounted, organizationId]);
 
   // ── Load FEFO settings from DB ─────────────────────────────────────────────
   useEffect(() => {
@@ -554,7 +574,7 @@ export default function SettingsPage() {
     if (!mounted || activeTab !== "claim_engine") return;
     let cancelled = false;
     setClaimEvidenceLoading(true);
-    getOrganizationClaimEvidenceDefaults()
+    getOrganizationClaimEvidenceDefaults(tenantCtx)
       .then((r) => {
         if (cancelled) return;
         setClaimEvidenceLocal(r);
@@ -565,14 +585,14 @@ export default function SettingsPage() {
     return () => {
       cancelled = true;
     };
-  }, [mounted, activeTab]);
+  }, [mounted, activeTab, tenantCtx]);
 
   // ── Load connected marketplace credentials ─────────────────────────────────
   useEffect(() => {
     if (!mounted) return;
     let cancelled = false;
     setStoresLoading(true);
-    listMarketplaces()
+    listMarketplaces(settingsRbac)
       .then((res) => {
         if (cancelled) return;
         if (res.ok && res.data) setConnections(res.data as StoreRecord[]);
@@ -580,14 +600,14 @@ export default function SettingsPage() {
       .catch(() => {})
       .finally(() => { if (!cancelled) setStoresLoading(false); });
     return () => { cancelled = true; };
-  }, [mounted]);
+  }, [mounted, settingsRbac]);
 
   // ── Load stores (stores table) for Default Store selector ─────────────────
   useEffect(() => {
     if (!mounted) return;
     let cancelled = false;
     setStoresListLoading(true);
-    listStores()
+    listStores(settingsRbac)
       .then((res) => {
         if (cancelled) return;
         if (res.ok && res.data) setStoresList(res.data);
@@ -595,7 +615,7 @@ export default function SettingsPage() {
       .catch(() => {})
       .finally(() => { if (!cancelled) setStoresListLoading(false); });
     return () => { cancelled = true; };
-  }, [mounted]);
+  }, [mounted, settingsRbac]);
 
   function showToast(msg: string, ok: boolean) {
     setToast({ msg, ok });
@@ -609,7 +629,7 @@ export default function SettingsPage() {
   // ── General save ───────────────────────────────────────────────────────────
   async function handleSaveGeneral(e: React.FormEvent) {
     e.preventDefault();
-    const res = await saveOrganizationDefaultStoreId(defaultStoreId.trim() || null);
+    const res = await saveOrganizationDefaultStoreId(defaultStoreId.trim() || null, tenantCtx);
     if (!res.ok) {
       showToast(res.error ?? "Failed to save default store.", false);
       return;
@@ -628,10 +648,12 @@ export default function SettingsPage() {
     try {
       const fd = new FormData();
       fd.append("file", file);
+      if (actorUserId) fd.append("actor_profile_id", actorUserId);
+      if (organizationId?.trim()) fd.append("organization_id", organizationId.trim());
       const res = await uploadOrganizationLogoAction(fd);
       if (!res.ok) throw new Error(res.error ?? "Logo upload failed.");
       setCompanyLogoUrl(res.publicUrl);
-      const nameRes = await saveCoreSettings({ company_name: companyName.trim() });
+      const nameRes = await saveCoreSettings({ company_name: companyName.trim() }, tenantCtx);
       if (!nameRes.ok) throw new Error(nameRes.error ?? "Failed to save workspace name.");
       void refreshBranding();
       showToast("Logo uploaded and saved.", true);
@@ -651,7 +673,7 @@ export default function SettingsPage() {
       company_name:     companyName.trim(),
       company_logo_url: url,
       logo_url:         url,
-    });
+    }, tenantCtx);
     setCoreSettingsSaving(false);
     if (!res.ok) {
       showToast(res.error ?? "Failed to save white-label settings.", false);
@@ -901,7 +923,7 @@ export default function SettingsPage() {
     (Object.keys(CLAIM_EVIDENCE_KEY_LABELS) as ClaimEvidenceKey[]).forEach((k) => {
       patch[k] = claimEvidenceLocal[k];
     });
-    const res = await saveOrganizationClaimEvidenceDefaults(patch);
+    const res = await saveOrganizationClaimEvidenceDefaults(patch, tenantCtx);
     setClaimEvidenceSaving(false);
     if (!res.ok) {
       showToast(res.error ?? "Failed to save evidence defaults.", false);
@@ -978,7 +1000,7 @@ export default function SettingsPage() {
       return;
     }
     setStoreModalTestLoading(true);
-    const res = await testMarketplaceCredentials(provider as AdapterProviderKey, creds);
+    const res = await testMarketplaceCredentials(provider as AdapterProviderKey, creds, settingsRbac);
     setStoreModalTestLoading(false);
     showToast(
       res.ok ? "Connection verified successfully ✓" : (res.error ?? "Connection test failed."),
@@ -1008,7 +1030,7 @@ export default function SettingsPage() {
     if (store.marketplace_id) {
       setStoreModalCredLoading(true);
       try {
-        const res = await getMarketplaceCredentialsForEdit(store.marketplace_id);
+        const res = await getMarketplaceCredentialsForEdit(store.marketplace_id, settingsRbac);
         if (res.ok && res.data) {
           if (store.platform === "amazon") {
             setNewStoreCredentials({
@@ -1051,7 +1073,7 @@ export default function SettingsPage() {
     const provider = PLATFORM_TO_PROVIDER[newStorePlatform];
 
     if (editingStoreId) {
-      const res = await updateStore(editingStoreId, { name: newStoreName });
+      const res = await updateStore(editingStoreId, { name: newStoreName }, settingsRbac);
       if (!res.ok) {
         setAddStoreSaving(false);
         showToast(res.error ?? "Failed to update store.", false);
@@ -1061,7 +1083,7 @@ export default function SettingsPage() {
       if (Object.keys(creds).length > 0 && provider) {
         const existingStore = storesList.find((s) => s.id === editingStoreId);
         if (existingStore?.marketplace_id) {
-          const mpRes = await updateMarketplace(existingStore.marketplace_id, { credentials: creds });
+          const mpRes = await updateMarketplace(existingStore.marketplace_id, { credentials: creds }, settingsRbac);
           if (!mpRes.ok) {
             setAddStoreSaving(false);
             showToast(mpRes.error ?? "Failed to update API credentials.", false);
@@ -1072,13 +1094,13 @@ export default function SettingsPage() {
             provider: provider as Parameters<typeof insertMarketplace>[0]["provider"],
             nickname: newStoreName.trim(),
             credentials: creds,
-          });
+          }, settingsRbac);
           if (!mpRes.ok || !mpRes.data?.id) {
             setAddStoreSaving(false);
             showToast(mpRes.error ?? "Failed to save API credentials.", false);
             return;
           }
-          const linkRes = await updateStore(editingStoreId, { marketplace_id: mpRes.data.id });
+          const linkRes = await updateStore(editingStoreId, { marketplace_id: mpRes.data.id }, settingsRbac);
           if (!linkRes.ok) {
             setAddStoreSaving(false);
             showToast(linkRes.error ?? "Failed to link credentials to store.", false);
@@ -1087,7 +1109,7 @@ export default function SettingsPage() {
         }
       }
 
-      const refreshed = await listStores();
+      const refreshed = await listStores(settingsRbac);
       if (refreshed.ok && refreshed.data) setStoresList(refreshed.data);
       setAddStoreSaving(false);
       closeAddStoreModal();
@@ -1099,7 +1121,7 @@ export default function SettingsPage() {
           provider: provider as Parameters<typeof insertMarketplace>[0]["provider"],
           nickname: newStoreName.trim(),
           credentials: creds,
-        });
+        }, settingsRbac);
         if (!mpRes.ok) {
           setAddStoreSaving(false);
           showToast(mpRes.error ?? "Failed to save API credentials.", false);
@@ -1113,11 +1135,11 @@ export default function SettingsPage() {
         platform: newStorePlatform,
         region: newStoreRegion,
         marketplace_id,
-      });
+      }, settingsRbac);
       setAddStoreSaving(false);
       if (!res.ok) { showToast(res.error ?? "Failed to create store.", false); return; }
 
-      const refreshed = await listStores();
+      const refreshed = await listStores(settingsRbac);
       if (refreshed.ok && refreshed.data) setStoresList(refreshed.data);
       setNewStoreName("");
       setNewStorePlatform("amazon");
@@ -1134,14 +1156,14 @@ export default function SettingsPage() {
   async function handleDeleteStore(store: StorePublicRow) {
     if (!window.confirm(`Delete "${store.name}"? This cannot be undone.`)) return;
     setDeletingStoreId(store.id);
-    const res = await deleteStore(store.id);
+    const res = await deleteStore(store.id, settingsRbac);
     setDeletingStoreId(null);
     if (!res.ok) { showToast(res.error ?? "Failed to delete store.", false); return; }
     setStoresList((prev) => prev.filter((s) => s.id !== store.id));
     if (defaultStoreId === store.id) {
       setDefaultStoreId("");
       setDefaultStoreIdInStorage("");
-      void saveOrganizationDefaultStoreId(null);
+      void saveOrganizationDefaultStoreId(null, tenantCtx);
     }
     showToast(`Store "${store.name}" deleted.`, true);
   }
@@ -1152,7 +1174,7 @@ export default function SettingsPage() {
       return;
     }
     setStoreTestStatus((prev) => ({ ...prev, [store.id]: "testing" }));
-    const res = await testConnection(store.marketplace_id);
+    const res = await testConnection(store.marketplace_id, settingsRbac);
     setStoreTestStatus((prev) => ({ ...prev, [store.id]: res.ok ? "ok" : "error" }));
     showToast(
       res.ok ? "Connection verified successfully ✓" : (res.error ?? "Connection test failed."),

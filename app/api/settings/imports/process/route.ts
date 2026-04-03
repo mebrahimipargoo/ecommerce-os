@@ -1,7 +1,6 @@
 import csv from "csv-parser";
 import { NextResponse } from "next/server";
 
-import { resolveOrganizationId } from "../../../../../lib/organization";
 import { createConcatenatedPartsReadable } from "../../../../../lib/import-raw-report-stream";
 import {
   deriveImportStatus,
@@ -38,7 +37,7 @@ async function audit(
   detail?: Record<string, unknown>,
 ): Promise<void> {
   await supabaseServer.from("raw_report_import_audit").insert({
-    company_id: orgId,
+    organization_id: orgId,
     user_profile_id: userId,
     action,
     entity_id: entityId,
@@ -48,7 +47,7 @@ async function audit(
 
 export async function POST(req: Request): Promise<Response> {
   let uploadIdForFail: string | null = null;
-  const orgId = resolveOrganizationId();
+  let orgId = "";
 
   try {
     const body = (await req.json()) as Body;
@@ -60,18 +59,33 @@ export async function POST(req: Request): Promise<Response> {
 
     const { data: row, error: fetchErr } = await supabaseServer
       .from("raw_report_uploads")
-      .select("id, company_id, metadata, status, report_type, column_mapping, file_name")
+      .select("id, organization_id, metadata, status, report_type, column_mapping, file_name")
       .eq("id", uploadId)
-      .eq("company_id", orgId)
       .maybeSingle();
 
     if (fetchErr || !row) {
       return NextResponse.json({ ok: false, error: "Upload session not found." }, { status: 404 });
     }
 
+    orgId = String((row as { organization_id?: unknown }).organization_id ?? "").trim();
+    if (!isUuidString(orgId)) {
+      return NextResponse.json({ ok: false, error: "Invalid upload row (organization_id)." }, { status: 500 });
+    }
+
     const meta = (row as { metadata?: unknown }).metadata;
     const parsed = parseRawReportMetadata(meta);
     const metaObj = meta && typeof meta === "object" && !Array.isArray(meta) ? (meta as Record<string, unknown>) : {};
+
+    if (metaObj.source === "amazon_ledger_uploader") {
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "This session is for the Amazon Inventory Ledger uploader. Use “Process to Database” on the Ledger card, not History.",
+        },
+        { status: 409 },
+      );
+    }
 
     if (parsed.uploadProgress < 100) {
       return NextResponse.json(
@@ -137,7 +151,7 @@ export async function POST(req: Request): Promise<Response> {
         updated_at: new Date().toISOString(),
       })
       .eq("id", uploadId)
-      .eq("company_id", orgId)
+      .eq("organization_id", orgId)
       .eq("status", "pending")
       .select("id");
 
@@ -155,6 +169,21 @@ export async function POST(req: Request): Promise<Response> {
       fileName: (row as { file_name?: string }).file_name,
       totalParts,
     });
+
+    // Initialise / reset the dedicated real-time progress row for this run.
+    await supabaseServer.from("file_processing_status").upsert(
+      {
+        upload_id: uploadId,
+        organization_id: orgId,
+        status: "processing",
+        upload_pct: 100,
+        process_pct: 0,
+        total_rows: estimatedRows ?? null,
+        processed_rows: 0,
+        error_message: null,
+      },
+      { onConflict: "upload_id" },
+    );
 
     const source = createConcatenatedPartsReadable(supabaseServer, storagePrefix, totalParts);
     const parser = csv({
@@ -176,7 +205,7 @@ export async function POST(req: Request): Promise<Response> {
         .from("raw_report_uploads")
         .select("metadata")
         .eq("id", uploadId)
-        .eq("company_id", orgId)
+        .eq("organization_id", orgId)
         .maybeSingle();
       await supabaseServer
         .from("raw_report_uploads")
@@ -188,7 +217,21 @@ export async function POST(req: Request): Promise<Response> {
           updated_at: new Date().toISOString(),
         })
         .eq("id", uploadId)
-        .eq("company_id", orgId);
+        .eq("organization_id", orgId);
+
+      // Keep the slim real-time table in sync so Realtime payloads stay tiny.
+      await supabaseServer.from("file_processing_status").upsert(
+        {
+          upload_id: uploadId,
+          organization_id: orgId,
+          status: "processing",
+          upload_pct: 100,
+          process_pct: pct,
+          processed_rows: processed,
+          ...(estimatedRows != null ? { total_rows: estimatedRows } : {}),
+        },
+        { onConflict: "upload_id" },
+      );
     };
 
     const flushBatch = async (rows: Record<string, unknown>[]) => {
@@ -198,7 +241,7 @@ export async function POST(req: Request): Promise<Response> {
 
       if (withLpn.length > 0) {
         const { error: upErr } = await supabaseServer.from("returns").upsert(withLpn, {
-          onConflict: "company_id,lpn",
+          onConflict: "organization_id,lpn",
         });
         if (upErr) throw new Error(upErr.message);
       }
@@ -218,7 +261,7 @@ export async function POST(req: Request): Promise<Response> {
 
         const statusDerived = deriveImportStatus(mapped.conditions);
         const insertRow: Record<string, unknown> = {
-          company_id: orgId,
+          organization_id: orgId,
           marketplace: "amazon",
           item_name: mapped.item_name,
           order_id: mapped.order_id,
@@ -254,7 +297,7 @@ export async function POST(req: Request): Promise<Response> {
               .from("raw_report_uploads")
               .select("metadata")
               .eq("id", uploadId)
-              .eq("company_id", orgId)
+              .eq("organization_id", orgId)
               .maybeSingle();
 
             await supabaseServer
@@ -269,7 +312,22 @@ export async function POST(req: Request): Promise<Response> {
                 updated_at: new Date().toISOString(),
               })
               .eq("id", uploadId)
-              .eq("company_id", orgId);
+              .eq("organization_id", orgId);
+
+            // Mark real-time progress row as complete.
+            await supabaseServer.from("file_processing_status").upsert(
+              {
+                upload_id: uploadId,
+                organization_id: orgId,
+                status: "complete",
+                upload_pct: 100,
+                process_pct: 100,
+                processed_rows: processed,
+                ...(estimatedRows != null ? { total_rows: estimatedRows } : {}),
+                error_message: null,
+              },
+              { onConflict: "upload_id" },
+            );
 
             await audit(orgId, null, "import.process_completed", uploadId, {
               rowsInserted: processed,
@@ -288,25 +346,49 @@ export async function POST(req: Request): Promise<Response> {
   } catch (e) {
     const message = e instanceof Error ? e.message : "Processing failed.";
     if (uploadIdForFail && isUuidString(uploadIdForFail)) {
-      const { data: prevRow } = await supabaseServer
-        .from("raw_report_uploads")
-        .select("metadata")
-        .eq("id", uploadIdForFail)
-        .eq("company_id", orgId)
-        .maybeSingle();
-      await supabaseServer
-        .from("raw_report_uploads")
-        .update({
-          status: "failed",
-          metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
+      let failOrgId = orgId;
+      if (!isUuidString(failOrgId)) {
+        const { data: r } = await supabaseServer
+          .from("raw_report_uploads")
+          .select("organization_id")
+          .eq("id", uploadIdForFail)
+          .maybeSingle();
+        failOrgId = String((r as { organization_id?: unknown } | null)?.organization_id ?? "").trim();
+      }
+      if (isUuidString(failOrgId)) {
+        const { data: prevRow } = await supabaseServer
+          .from("raw_report_uploads")
+          .select("metadata")
+          .eq("id", uploadIdForFail)
+          .eq("organization_id", failOrgId)
+          .maybeSingle();
+        await supabaseServer
+          .from("raw_report_uploads")
+          .update({
+            status: "failed",
+            metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
+              error_message: message,
+              process_progress: 0,
+            }),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", uploadIdForFail)
+          .eq("organization_id", failOrgId);
+
+        await supabaseServer.from("file_processing_status").upsert(
+          {
+            upload_id: uploadIdForFail,
+            organization_id: failOrgId,
+            status: "failed",
+            upload_pct: 100,
+            process_pct: 0,
             error_message: message,
-            process_progress: 0,
-          }),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", uploadIdForFail)
-        .eq("company_id", orgId);
-      await audit(orgId, null, "import.process_failed", uploadIdForFail, { message });
+          },
+          { onConflict: "upload_id" },
+        );
+
+        await audit(failOrgId, null, "import.process_failed", uploadIdForFail, { message });
+      }
     }
     return NextResponse.json({ ok: false, error: message }, { status: 500 });
   }

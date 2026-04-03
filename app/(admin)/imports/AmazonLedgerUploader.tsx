@@ -10,9 +10,11 @@ import {
   Upload,
   UploadCloud,
 } from "lucide-react";
+import { useDebugMode } from "../../../components/DebugModeContext";
 import { isAdminRole, useUserRole } from "../../../components/UserRoleContext";
 import { isUuidString } from "../../../lib/uuid";
 import {
+  createLedgerStorageSignedUploadUrl,
   deleteAmazonLedgerStagingByDateRange,
   deleteAmazonLedgerStorageFile,
   insertAmazonLedgerStagingBatch,
@@ -20,12 +22,9 @@ import {
 } from "../lib/amazon-ledger-actions";
 import { guessLedgerSnapshotDate, parseCsvToRecords } from "../../../lib/csv-parse-basic";
 import { supabase } from "../../../src/lib/supabase";
-import {
-  listCompaniesForImports,
-  saveHomeCompanyForProfile,
-  type CompanyOption,
-} from "./companies-actions";
 import { DB_TABLES } from "../lib/constants";
+import { getImportLedgerActorUserId } from "./import-actions";
+import { listStores } from "../../settings/adapters/actions";
 
 const RAW_REPORTS_BUCKET = "raw-reports";
 
@@ -59,6 +58,25 @@ function computeLedgerDateBounds(records: Record<string, string>[]): { min: stri
   return { min, max };
 }
 
+/** Storage upload uses the browser session JWT; prefer session (+ refresh) over getUser() (avoids false “not authenticated” in dev). */
+async function getBrowserSessionUserId(): Promise<string | null> {
+  const extractUid = (id: string | undefined | null) =>
+    id && isUuidString(id) ? id : null;
+
+  const { data: sessionData } = await supabase.auth.getSession();
+  const fromSession = extractUid(sessionData.session?.user?.id);
+  if (fromSession) return fromSession;
+
+  const { data: refreshData } = await supabase.auth.refreshSession();
+  const fromRefresh = extractUid(refreshData.session?.user?.id);
+  if (fromRefresh) return fromRefresh;
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  return extractUid(user?.id);
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -83,16 +101,22 @@ type LedgerProgress = {
 };
 
 type AmazonLedgerUploaderProps = {
-  /** Fired when “Target company” resolves so History can scope by `company_id`. */
+  /** Fired when “Target company” resolves so History can scope by `organization_id`. */
   onTargetCompanyChange?: (companyId: string) => void;
+  /** Optional: e.g. bump import history when a ledger run completes. */
+  onLedgerSessionUpdated?: () => void;
 };
 
-export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUploaderProps = {}) {
-  const { role, actorUserId, organizationId, homeCompanyId, refreshProfile } = useUserRole();
+export function AmazonLedgerUploader({
+  onTargetCompanyChange,
+  onLedgerSessionUpdated,
+}: AmazonLedgerUploaderProps = {}) {
+  const { debugMode } = useDebugMode();
+  const { role, actorUserId } = useUserRole();
 
   const [ledgerRetentionDays, setLedgerRetentionDays] = useState(60);
   const [ledgerRetentionEnabled, setLedgerRetentionEnabled] = useState(true);
-  const [companyOptions, setCompanyOptions] = useState<CompanyOption[]>([]);
+  const [companyOptions, setCompanyOptions] = useState<{ id: string; name: string; platform: string }[]>([]);
   const [ledgerTargetOrg, setLedgerTargetOrg] = useState("");
   const [ledgerStartDate, setLedgerStartDate] = useState("");
   const [ledgerEndDate, setLedgerEndDate] = useState("");
@@ -119,15 +143,15 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
     (Boolean(ledgerStartDate.trim() && ledgerEndDate.trim()) &&
       ledgerStartDate.trim() <= ledgerEndDate.trim());
 
-  const companyReady =
-    isUuidString(ledgerTargetOrg.trim()) &&
-    companyOptions.some((c) => c.id === ledgerTargetOrg.trim());
+  const companyReady = Boolean(ledgerTargetOrg.trim());
 
   const canStartUpload =
     ledgerPhase === "file-ready" &&
-    dateRangeReady &&
+    ledgerFile !== null &&
     companyReady &&
-    ledgerFile !== null;
+    (importFullFileNoDateFilter || (Boolean(ledgerStartDate.trim()) && Boolean(ledgerEndDate.trim())));
+
+  const isButtonDisabled = !ledgerFile || !ledgerTargetOrg || (!importFullFileNoDateFilter && (!ledgerStartDate || !ledgerEndDate));
 
   useEffect(() => {
     void supabase.auth.getUser().then(({ data: { user } }) => {
@@ -143,52 +167,25 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
   }, []);
 
   useEffect(() => {
-    if (!isAdminRole(role)) return;
     let cancelled = false;
-    void listCompaniesForImports().then((res) => {
-      if (cancelled || !res.ok) return;
-      setCompanyOptions(res.rows);
-      setLedgerTargetOrg((prev) => {
-        const p = prev.trim();
-        if (p && res.rows.some((r) => r.id === p)) return p;
-        if (organizationId && res.rows.some((r) => r.id === organizationId)) {
-          return organizationId;
-        }
-        if (homeCompanyId && res.rows.some((r) => r.id === homeCompanyId)) {
-          return homeCompanyId;
-        }
-        return "";
-      });
+    void listStores().then((result) => {
+      if (cancelled || !result.ok || !result.data) return;
+      const stores = result.data
+        .filter((s) => s.is_active !== false)
+        .map((s) => ({ id: s.id, name: s.name, platform: s.platform }));
+      setCompanyOptions(stores);
     });
-    return () => {
-      cancelled = true;
-    };
-  }, [role, organizationId, homeCompanyId]);
-
-  useEffect(() => {
-    if (organizationId && !ledgerTargetOrg.trim()) {
-      setLedgerTargetOrg(organizationId);
-    }
-  }, [organizationId, ledgerTargetOrg]);
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     const id = ledgerTargetOrg.trim();
     if (id && isUuidString(id)) onTargetCompanyChange?.(id);
   }, [ledgerTargetOrg, onTargetCompanyChange]);
 
-  async function handleTargetCompanyChange(nextRaw: string) {
-    const nextId = nextRaw.trim();
-    setLedgerTargetOrg(nextId);
+  function handleTargetCompanyChange(nextRaw: string) {
+    setLedgerTargetOrg(nextRaw.trim());
     setLedgerErr(null);
-    if (homeCompanyId) return;
-    const aid = actorUserId ?? sessionUserId;
-    if (!aid || !isUuidString(nextId)) return;
-    const res = await saveHomeCompanyForProfile(aid, nextId);
-    if (res.ok) {
-      void refreshProfile();
-    } else {
-      setLedgerErr(res.error);
-    }
   }
 
   function acceptFile(file: File) {
@@ -236,11 +233,23 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
   async function handleStartUpload() {
     if (!canStartUpload || !ledgerFile) return;
 
-    const { data: authData, error: authErr } = await supabase.auth.getUser();
-    if (authErr || !authData.user?.id) {
+    let uid = effectiveActorId;
+    if (!uid) {
+      uid = await getBrowserSessionUserId();
+      if (uid) setSessionUserId(uid);
+    }
+    if (!uid) {
+      const serverActor = await getImportLedgerActorUserId();
+      if (serverActor.ok) {
+        uid = serverActor.actorUserId;
+        setSessionUserId(uid);
+      }
+    }
+    if (!uid) {
       setLedgerErr("Not authenticated. Sign in again.");
       return;
     }
+    setSessionUserId(uid);
 
     const orgId = ledgerTargetOrg.trim();
     if (!isUuidString(orgId)) {
@@ -254,18 +263,28 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
     try {
       const ext = ledgerFile.name.split(".").pop() ?? "csv";
       const ts = Date.now();
-      const path = `amazon-ledger/${orgId}/${ts}.${ext}`;
+      const storagePath = `amazon-ledger/${orgId}/${ts}.${ext}`;
 
-      const { error: upErr } = await supabase.storage.from(RAW_REPORTS_BUCKET).upload(path, ledgerFile, {
-        upsert: true,
-        contentType: ledgerFile.type || "text/csv",
+      // Generate a signed upload URL server-side (service-role key bypasses
+      // storage RLS) so the browser anon client can upload without needing
+      // its own bucket policy permission.
+      const signedRes = await createLedgerStorageSignedUploadUrl({
+        actorProfileId: uid,
+        path: storagePath,
       });
-
-      if (upErr) {
-        throw new Error(upErr.message);
+      if (!signedRes.ok || !signedRes.token) {
+        throw new Error(signedRes.error ?? "Failed to prepare upload URL.");
       }
 
-      setStoragePath(path);
+      const { error: upErr } = await supabase.storage
+        .from(RAW_REPORTS_BUCKET)
+        .uploadToSignedUrl(storagePath, signedRes.token, ledgerFile, {
+          contentType: ledgerFile.type || "text/csv",
+        });
+
+      if (upErr) throw new Error(upErr.message);
+
+      setStoragePath(storagePath);
       setLedgerPhase("storage-ready");
     } catch (e) {
       setLedgerPhase("file-ready");
@@ -275,7 +294,19 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
 
   async function handleProcessToDb() {
     if (!ledgerFile || ledgerPhase !== "storage-ready") return;
-    if (!effectiveActorId) {
+    let actor = effectiveActorId;
+    if (!actor) {
+      actor = await getBrowserSessionUserId();
+      if (actor) setSessionUserId(actor);
+    }
+    if (!actor) {
+      const serverActor = await getImportLedgerActorUserId();
+      if (serverActor.ok) {
+        actor = serverActor.actorUserId;
+        setSessionUserId(actor);
+      }
+    }
+    if (!actor) {
       setLedgerErr("Not authenticated. Sign in again.");
       return;
     }
@@ -356,6 +387,7 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
             : p,
         );
         setLedgerPhase("done");
+        onLedgerSessionUpdated?.();
         return;
       }
 
@@ -384,7 +416,7 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
           p ? { ...p, message: "Removing existing rows for this date range…" } : p,
         );
         const del = await deleteAmazonLedgerStagingByDateRange({
-          actorProfileId: effectiveActorId,
+          actorProfileId: actor,
           requestedOrganizationId: requestedOrg,
           startDate: dedupStart,
           endDate: dedupEnd,
@@ -401,7 +433,7 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
           p ? { ...p, message: "Purging rows outside retention window…" } : p,
         );
         const purge = await purgeAmazonLedgerStagingRetention({
-          actorProfileId: effectiveActorId,
+          actorProfileId: actor,
           requestedOrganizationId: requestedOrg,
           retentionDays: ledgerRetentionDays,
         });
@@ -426,7 +458,7 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
 
         const batch = filtered.slice(i, i + LEDGER_CHUNK);
         const res = await insertAmazonLedgerStagingBatch({
-          actorProfileId: effectiveActorId,
+          actorProfileId: actor,
           requestedOrganizationId: requestedOrg,
           rows: batch,
         });
@@ -450,6 +482,7 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
 
       setLedgerProgress((p) => (p ? { ...p, pct: 100, imported, message: doneMsg } : p));
       setLedgerPhase("done");
+      onLedgerSessionUpdated?.();
     } catch (e) {
       setLedgerErr(e instanceof Error ? e.message : "Processing failed.");
       setLedgerPhase("storage-ready");
@@ -461,11 +494,24 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
   }
 
   async function handleDeleteFile() {
-    if (!storagePath || !effectiveActorId) return;
+    if (!storagePath) return;
+    let actor = effectiveActorId;
+    if (!actor) {
+      actor = await getBrowserSessionUserId();
+      if (actor) setSessionUserId(actor);
+    }
+    if (!actor) {
+      const serverActor = await getImportLedgerActorUserId();
+      if (serverActor.ok) {
+        actor = serverActor.actorUserId;
+        setSessionUserId(actor);
+      }
+    }
+    if (!actor) return;
     if (!window.confirm("Remove this CSV from Storage and reset the uploader?")) return;
 
     const res = await deleteAmazonLedgerStorageFile({
-      actorProfileId: effectiveActorId,
+      actorProfileId: actor,
       storagePath,
     });
 
@@ -514,7 +560,11 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
       </h2>
       <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
         Two-step process: upload the raw CSV to Storage, then process rows into{" "}
-        <code className="rounded bg-slate-100 px-1 dark:bg-slate-800">{DB_TABLES.amazonLedgerStaging}</code>{" "}
+        {debugMode ? (
+          <code className="rounded bg-slate-100 px-1 dark:bg-slate-800">{DB_TABLES.amazonLedgerStaging}</code>
+        ) : (
+          <span className="font-medium text-slate-600 dark:text-slate-300">the ledger staging area</span>
+        )}{" "}
         in chunks of {LEDGER_CHUNK}. Never modifies returns.
       </p>
 
@@ -607,34 +657,29 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
         ) : null}
       </div>
 
-      {/* Target company (required; saves to profile when yours was unset) */}
+      {/* Target store */}
       <label className="mt-4 block text-xs font-medium text-slate-600 dark:text-slate-400">
-        Target company <span className="text-red-500">*</span>
-        {!homeCompanyId && (
-          <span className="ml-2 font-normal text-amber-600 dark:text-amber-400">
-            Your profile has no company yet — choose one to attach it to your account.
-          </span>
-        )}
+        Target store <span className="text-red-500">*</span>
         <select
           value={ledgerTargetOrg}
-          onChange={(e) => void handleTargetCompanyChange(e.target.value)}
+          onChange={(e) => handleTargetCompanyChange(e.target.value)}
           required
           disabled={ledgerPhase === "uploading" || ledgerPhase === "processing"}
           className="mt-1 w-full max-w-md rounded-lg border border-slate-200 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 disabled:opacity-50"
         >
           <option value="" disabled>
-            {companyOptions.length === 0 ? "Loading companies…" : "Select a company…"}
+            {companyOptions.length === 0 ? "Loading stores…" : "Select a store…"}
           </option>
           {companyOptions.map((o) => (
             <option key={o.id} value={o.id}>
-              {o.display_name}
+              {o.name} ({o.platform})
             </option>
           ))}
         </select>
       </label>
       {!companyReady && companyOptions.length > 0 && (
         <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
-          Select a target company before uploading.
+          Select a target store before uploading.
         </p>
       )}
 
@@ -766,16 +811,14 @@ export function AmazonLedgerUploader({ onTargetCompanyChange }: AmazonLedgerUplo
           <button
             type="button"
             onClick={() => void handleStartUpload()}
-            disabled={!canStartUpload}
+            disabled={isButtonDisabled}
             title={
-              !dateRangeReady
-                ? importFullFileNoDateFilter
-                  ? "Confirm import mode"
-                  : "Set both Start Date and End Date first"
+              !ledgerFile
+                ? "Select a file first"
                 : !companyReady
-                  ? "Select a target company"
-                  : !ledgerFile
-                    ? "Select a file first"
+                  ? "Select a target store"
+                  : !importFullFileNoDateFilter && (!ledgerStartDate.trim() || !ledgerEndDate.trim())
+                    ? "Set both Start Date and End Date first"
                     : undefined
             }
             className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-40"

@@ -2,16 +2,14 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Check, FileSpreadsheet, Loader2, Trash2 } from "lucide-react";
-import {
-  deleteRawReportUpload,
-  listRawReportUploads,
-  updateRawReportType,
-  type RawReportUploadRow,
-} from "./import-actions";
+import { AMAZON_LEDGER_UPLOAD_SOURCE } from "../../../lib/raw-report-upload-metadata";
+import type { RawReportUploadRow } from "../../../lib/raw-report-upload-row";
+import { deleteRawReportUpload, listRawReportUploads, updateRawReportType } from "./import-actions";
 import { useUserRole } from "../../../components/UserRoleContext";
 import type { RawReportType } from "../../../lib/raw-report-types";
 import { REPORT_TYPE_SPECS } from "../../../lib/csv-import-mapping";
 import { RAW_REPORT_TYPE_ORDER } from "../../../lib/raw-report-types";
+import { useDebugMode } from "../../../components/DebugModeContext";
 import { DatabaseTag } from "../../../components/DatabaseTag";
 
 function statusLabel(status: string, uploadProgress?: number): string {
@@ -47,12 +45,13 @@ function coerceReportType(v: string): RawReportType {
 }
 
 type RawReportImportsPanelProps = {
-  /** Matches ledger “Target company”; list is filtered by `raw_report_uploads.company_id`. */
-  companyId: string | null;
+  /** Matches ledger target store / tenant for the import list. */
+  organizationId: string | null;
 };
 
-/** History + actions for `raw_report_uploads`. Scoped to the selected company from Amazon Inventory Ledger. */
-export function RawReportImportsPanel({ companyId }: RawReportImportsPanelProps) {
+/** Import history and row actions; scoped to the company selected in Amazon Inventory Ledger. */
+export function RawReportImportsPanel({ organizationId }: RawReportImportsPanelProps) {
+  const { debugMode } = useDebugMode();
   const { actorUserId } = useUserRole();
   const [rows, setRows] = useState<RawReportUploadRow[]>([]);
   const [loadErr, setLoadErr] = useState<string | null>(null);
@@ -64,7 +63,7 @@ export function RawReportImportsPanel({ companyId }: RawReportImportsPanelProps)
   const reportTypeOverrideRef = useRef<Map<string, string>>(new Map());
 
   const refresh = useCallback(async () => {
-    const res = await listRawReportUploads({ companyId, actorUserId });
+    const res = await listRawReportUploads({ organizationId, actorUserId });
     if (res.ok) {
       const override = reportTypeOverrideRef.current;
       setRows(
@@ -83,7 +82,7 @@ export function RawReportImportsPanel({ companyId }: RawReportImportsPanelProps)
     } else {
       setLoadErr(res.error);
     }
-  }, [companyId, actorUserId]);
+  }, [organizationId, actorUserId]);
 
   useEffect(() => {
     void refresh();
@@ -166,16 +165,22 @@ export function RawReportImportsPanel({ companyId }: RawReportImportsPanelProps)
           <h2 className="text-sm font-semibold text-foreground">History</h2>
         </div>
         <p className="mb-4 max-w-2xl text-xs text-muted-foreground">
-          Raw report sessions from <code className="rounded bg-muted px-1 text-[11px]">raw_report_uploads</code>.
-          Use <strong>Amazon Inventory Ledger</strong> above for CSV → staging; other pipelines may appear here when
-          used.
+          <span className="text-foreground/90">
+            Import history for the selected store appears below. Use <strong>Amazon Inventory Ledger</strong> above
+            to load CSV data into the staging area; other import pipelines may list here when you use them.
+          </span>
+          {debugMode ? (
+            <span className="mt-2 block font-mono text-[10px] text-muted-foreground/90">
+              Dev: table <code className="rounded bg-muted px-1">raw_report_uploads</code>
+            </span>
+          ) : null}
         </p>
         <div className="relative overflow-x-auto rounded-xl border border-border bg-card shadow-sm">
           <DatabaseTag table="raw_report_uploads" />
           <table className="w-full min-w-[960px] border-collapse text-left text-sm">
             <thead>
               <tr className="border-b border-border bg-muted/40 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                <th className="px-4 py-3">File name</th>
+                <th className="px-4 py-3">Import</th>
                 <th className="px-4 py-3">Type</th>
                 <th className="px-4 py-3">Uploaded by</th>
                 <th className="px-4 py-3">Date</th>
@@ -194,10 +199,23 @@ export function RawReportImportsPanel({ companyId }: RawReportImportsPanelProps)
               )}
               {rows.map((r) => {
                 const rt = coerceReportType(r.report_type);
+                const metaObj =
+                  r.metadata && typeof r.metadata === "object" && !Array.isArray(r.metadata)
+                    ? (r.metadata as Record<string, unknown>)
+                    : null;
+                const isLedgerClientUpload = metaObj?.source === AMAZON_LEDGER_UPLOAD_SOURCE;
                 return (
                   <tr key={r.id} className="border-b border-border last:border-0">
-                    <td className="max-w-[220px] truncate px-4 py-3 font-medium text-foreground" title={r.file_name}>
-                      {r.file_name}
+                    <td className="px-4 py-3">
+                      <div
+                        className="flex max-w-[140px] items-center gap-2"
+                        title={`${r.id}\n${r.file_name}`}
+                      >
+                        <FileSpreadsheet className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden />
+                        <span className="truncate font-mono text-xs text-muted-foreground">
+                          {r.id.slice(0, 2)}…
+                        </span>
+                      </div>
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">
@@ -289,7 +307,7 @@ export function RawReportImportsPanel({ companyId }: RawReportImportsPanelProps)
                     </td>
                     <td className="px-4 py-3 text-right">
                       <div className="inline-flex flex-wrap items-center justify-end gap-2">
-                        {r.status === "pending" && r.upload_progress >= 100 ? (
+                        {r.status === "pending" && r.upload_progress >= 100 && !isLedgerClientUpload ? (
                           <button
                             type="button"
                             disabled={processingIds.has(r.id)}

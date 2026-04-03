@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 
-import { resolveOrganizationId } from "../../../../../lib/organization";
 import { updateUploadAfterChunk } from "../../../../../lib/import-upload-progress";
 import { parseRawReportMetadata } from "../../../../../lib/raw-report-upload-metadata";
 import { supabaseServer } from "../../../../../lib/supabase-server";
@@ -59,16 +58,17 @@ export async function POST(req: Request): Promise<Response> {
       return NextResponse.json({ ok: false, error: "Missing chunk." }, { status: 400 });
     }
 
-    const orgId = resolveOrganizationId();
+    // Fetch by primary key only — service-role bypasses RLS so no org filter is needed.
+    // The org is read from the stored row and used only for logging.
     const { data: row, error: fetchErr } = await supabaseServer
       .from("raw_report_uploads")
-      .select("id, company_id, metadata")
+      .select("id, organization_id, metadata")
       .eq("id", uploadId)
-      .eq("company_id", orgId)
       .maybeSingle();
 
     const prefix = parseRawReportMetadata(row?.metadata).storagePrefix?.trim() ?? "";
     if (fetchErr || !prefix) {
+      const orgId = String((row as { organization_id?: unknown } | null)?.organization_id ?? "");
       console.error("[imports/chunk] session not found", {
         uploadId,
         orgId,
@@ -77,6 +77,7 @@ export async function POST(req: Request): Promise<Response> {
       return NextResponse.json({ ok: false, error: "Upload session not found." }, { status: 404 });
     }
 
+    const orgId = String((row as { organization_id?: unknown }).organization_id ?? "");
     console.info("[imports/chunk] received", {
       uploadId,
       partIndex,

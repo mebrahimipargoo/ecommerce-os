@@ -2,16 +2,94 @@
 
 import { supabaseServer } from "../../../lib/supabase-server";
 import { resolveWriteOrganizationId } from "../../../lib/server-tenant";
+import { getSessionUserIdFromCookies } from "../../../lib/supabase-server-auth";
+import { resolveOrganizationId } from "../../../lib/organization";
 import { isUuidString } from "../../../lib/uuid";
 import { guessLedgerSnapshotDate } from "../../../lib/csv-parse-basic";
 
 export { guessLedgerSnapshotDate };
 
+/**
+ * Resolves a verified profile ID for the current request using the same
+ * multi-step fallback chain as `resolveActorForImportAction`:
+ *   1. Explicit `actorProfileId` found in `profiles` (localStorage-based flow).
+ *   2. Supabase Auth session cookie → look up matching profile.
+ *   3. First profile in the default org (seed / local-dev fallback).
+ *
+ * Returns the resolved `profiles.id`, or null when nothing matches.
+ */
+async function resolveVerifiedActorForUpload(
+  actorProfileId: string | null | undefined,
+): Promise<string | null> {
+  const raw = actorProfileId?.trim();
+
+  // 1. Explicit UUID passed from the browser (localStorage-stored profile id).
+  if (raw && isUuidString(raw)) {
+    const { data } = await supabaseServer
+      .from("profiles").select("id").eq("id", raw).maybeSingle();
+    if (data?.id) return String(data.id);
+  }
+
+  // 2. HTTP-only Supabase Auth session cookie set by the Supabase JS SDK.
+  try {
+    const sessionUid = await getSessionUserIdFromCookies();
+    if (sessionUid && isUuidString(sessionUid)) {
+      const { data } = await supabaseServer
+        .from("profiles").select("id").eq("id", sessionUid).maybeSingle();
+      if (data?.id) return String(data.id);
+    }
+  } catch { /* cookies unavailable in some edge-runtime contexts */ }
+
+  // 3. Fallback: first profile seeded in the default organization (dev / seed env).
+  const orgId = resolveOrganizationId();
+  if (orgId && isUuidString(orgId)) {
+    const { data } = await supabaseServer
+      .from("profiles").select("id")
+      .eq("organization_id", orgId)
+      .order("created_at", { ascending: true })
+      .limit(1).maybeSingle();
+    if (data?.id) return String(data.id);
+  }
+
+  // 4. Absolute last resort: any profile in the system.
+  const { data: anyProfile } = await supabaseServer
+    .from("profiles").select("id")
+    .order("created_at", { ascending: true })
+    .limit(1).maybeSingle();
+  return anyProfile?.id ? String(anyProfile.id) : null;
+}
+
+/**
+ * Generates a short-lived signed upload URL for the `raw-reports` Storage bucket
+ * using the service-role key so that the browser-side anon client can upload
+ * without needing its own Storage RLS permission.
+ */
+export async function createLedgerStorageSignedUploadUrl(payload: {
+  actorProfileId: string | null | undefined;
+  path: string;
+}): Promise<{ ok: boolean; signedUrl?: string; token?: string; path?: string; error?: string }> {
+  try {
+    if (!payload.path?.trim()) throw new Error("No storage path provided.");
+
+    const verifiedActor = await resolveVerifiedActorForUpload(payload.actorProfileId);
+    if (!verifiedActor) throw new Error("Not authenticated. Please sign in.");
+
+    const { data, error } = await supabaseServer.storage
+      .from("raw-reports")
+      .createSignedUploadUrl(payload.path.trim());
+
+    if (error) throw new Error(error.message);
+    return { ok: true, signedUrl: data.signedUrl, token: data.token, path: data.path };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Failed to create upload URL." };
+  }
+}
+
 const CHUNK = 500;
 
 export type AmazonLedgerStagingRow = {
   id: string;
-  company_id: string;
+  organization_id: string;
   snapshot_date: string | null;
   raw_row: Record<string, unknown>;
   created_at: string;
@@ -19,7 +97,7 @@ export type AmazonLedgerStagingRow = {
 
 /**
  * Deletes staging rows older than retention window for this tenant.
- * Uses snapshot_date when present, else created_at::date (Neda: always scope by company_id).
+ * Uses snapshot_date when present, else created_at::date (Neda: always scope by organization_id).
  */
 export async function purgeAmazonLedgerStagingRetention(payload: {
   actorProfileId: string | null | undefined;
@@ -43,7 +121,7 @@ export async function purgeAmazonLedgerStagingRetention(payload: {
     const { error: e1 } = await supabaseServer
       .from("amazon_ledger_staging")
       .delete()
-      .eq("company_id", orgId)
+      .eq("organization_id", orgId)
       .not("snapshot_date", "is", null)
       .lt("snapshot_date", cutoffStr);
     if (e1) throw new Error(e1.message);
@@ -51,7 +129,7 @@ export async function purgeAmazonLedgerStagingRetention(payload: {
     const { error: e2 } = await supabaseServer
       .from("amazon_ledger_staging")
       .delete()
-      .eq("company_id", orgId)
+      .eq("organization_id", orgId)
       .is("snapshot_date", null)
       .lt("created_at", cutoffIso);
     if (e2) throw new Error(e2.message);
@@ -90,7 +168,7 @@ export async function deleteAmazonLedgerStagingByDateRange(payload: {
     const { error, count } = await supabaseServer
       .from("amazon_ledger_staging")
       .delete({ count: "exact" })
-      .eq("company_id", orgId)
+      .eq("organization_id", orgId)
       .gte("snapshot_date", start)
       .lte("snapshot_date", end);
 
@@ -128,7 +206,7 @@ export async function insertAmazonLedgerStagingBatch(payload: {
     if (slice.length === 0) return { ok: true, inserted: 0 };
 
     const insertRows = slice.map((r) => ({
-      company_id: orgId,
+      organization_id: orgId,
       snapshot_date: guessLedgerSnapshotDate(r),
       raw_row: r as unknown as Record<string, unknown>,
     }));
@@ -168,7 +246,7 @@ export async function deleteAmazonLedgerStorageFile(payload: {
   }
 }
 
-/** All ledger reads must filter by company_id (tenant isolation). */
+/** All ledger reads must filter by organization_id (tenant isolation). */
 export async function listAmazonLedgerStaging(payload: {
   actorProfileId: string | null | undefined;
   requestedOrganizationId?: string | null;
@@ -184,8 +262,8 @@ export async function listAmazonLedgerStaging(payload: {
     const lim = Math.min(10_000, Math.max(1, payload.limit ?? 500));
     const { data, error } = await supabaseServer
       .from("amazon_ledger_staging")
-      .select("id, company_id, snapshot_date, raw_row, created_at")
-      .eq("company_id", orgId)
+      .select("id, organization_id, snapshot_date, raw_row, created_at")
+      .eq("organization_id", orgId)
       .order("created_at", { ascending: false })
       .limit(lim);
     if (error) throw new Error(error.message);

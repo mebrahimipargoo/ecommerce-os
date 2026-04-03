@@ -5,7 +5,7 @@ import Link from "next/link";
 import {
   ArrowLeft, ImageIcon, Loader2, Pencil, Plus, Save, Trash2, UserRound, X,
 } from "lucide-react";
-import { isAdminRole, useUserRole } from "../../../components/UserRoleContext";
+import { isAdminRole, useUserRole, type UserRole } from "../../../components/UserRoleContext";
 import { UserProfileAvatar } from "./UserProfileAvatar";
 import {
   createUserProfile,
@@ -13,9 +13,10 @@ import {
   getTenantCompanyIdForUsersPage,
   listUserProfiles,
   updateUserProfile,
-  type ProfileRow,
 } from "./users-actions";
-import { listCompaniesForImports, type CompanyOption } from "../imports/companies-actions";
+import type { ProfileRow } from "./users-types";
+import type { CompanyOption } from "../../../lib/imports-types";
+import { listCompaniesForImports } from "../imports/companies-actions";
 import { uploadUserProfilePhotoAction } from "./upload-profile-photo-action";
 
 const INPUT =
@@ -29,7 +30,7 @@ const BTN_SECONDARY =
 type Toast = { msg: string; ok: boolean } | null;
 
 export default function UsersPage() {
-  const { role } = useUserRole();
+  const { role, actorUserId } = useUserRole();
   const [rows, setRows] = useState<ProfileRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<Toast>(null);
@@ -38,7 +39,7 @@ export default function UsersPage() {
   const [saving, setSaving] = useState(false);
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
-  const [userRole, setUserRole] = useState<"admin" | "operator">("operator");
+  const [userRole, setUserRole] = useState<UserRole>("operator");
   const [photoUploading, setPhotoUploading] = useState(false);
   const [pendingPhoto, setPendingPhoto] = useState<File | null>(null);
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
@@ -71,7 +72,7 @@ export default function UsersPage() {
     void (async () => {
       const [tid, coRes] = await Promise.all([
         getTenantCompanyIdForUsersPage(),
-        listCompaniesForImports(),
+        listCompaniesForImports(actorUserId),
       ]);
       if (cancelled) return;
       setTenantDefaultCompanyId(tid);
@@ -84,7 +85,7 @@ export default function UsersPage() {
     return () => {
       cancelled = true;
     };
-  }, [role]);
+  }, [role, actorUserId]);
 
   function openCreate() {
     setEditing(null);
@@ -102,7 +103,8 @@ export default function UsersPage() {
     setEditing(row);
     setFullName(row.full_name ?? "");
     setEmail(row.email);
-    setUserRole(row.role === "admin" ? "admin" : "operator");
+    const VALID: UserRole[] = ["super_admin", "system_employee", "admin", "employee", "operator"];
+    setUserRole(VALID.includes(row.role as UserRole) ? (row.role as UserRole) : "operator");
     setModalOpen(true);
   }
 
@@ -150,7 +152,7 @@ export default function UsersPage() {
           full_name: fullName,
           email,
           role: userRole,
-          company_id: createCompanyId.trim(),
+          organization_id: createCompanyId.trim(),
         });
         if (!res.ok) throw new Error(res.error ?? "Create failed.");
         if (pendingPhoto) {
@@ -259,6 +261,7 @@ export default function UsersPage() {
                 <tr className="border-b border-border bg-muted/40 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                   <th className="px-4 py-3">User</th>
                   <th className="px-4 py-3">Email</th>
+                  <th className="px-4 py-3">Company</th>
                   <th className="px-4 py-3">Role</th>
                   <th className="px-4 py-3 text-right">Actions</th>
                 </tr>
@@ -272,7 +275,10 @@ export default function UsersPage() {
                         <span className="font-medium">{row.full_name || "—"}</span>
                       </div>
                     </td>
-                    <td className="px-4 py-3 text-muted-foreground">{row.email}</td>
+                    <td className="px-4 py-3 text-muted-foreground">{row.email || "—"}</td>
+                    <td className="px-4 py-3 text-muted-foreground">
+                      {row.company_name ?? "—"}
+                    </td>
                     <td className="px-4 py-3 capitalize">{row.role}</td>
                     <td className="px-4 py-3 text-right">
                       <div className="flex justify-end gap-1">
@@ -412,7 +418,7 @@ export default function UsersPage() {
                     )}
                   </select>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    Saved to <code className="rounded bg-muted px-1 text-[11px]">profiles.company_id</code>.
+                    Saved to <code className="rounded bg-muted px-1 text-[11px]">profiles.organization_id</code>.
                   </p>
                 </div>
               ) : null}
@@ -422,11 +428,17 @@ export default function UsersPage() {
                   id="role"
                   className={INPUT}
                   value={userRole}
-                  onChange={(e) => setUserRole(e.target.value as "admin" | "operator")}
+                  onChange={(e) => setUserRole(e.target.value as UserRole)}
                 >
-                  <option value="operator">Operator</option>
-                  <option value="admin">Admin</option>
+                  <option value="operator">Operator — Warehouse / WMS only</option>
+                  <option value="employee">Employee — Office staff (no Settings/Users)</option>
+                  <option value="admin">Admin — Company boss (full org access)</option>
+                  <option value="system_employee">System Employee — SaaS staff (multi-org)</option>
+                  <option value="super_admin">Super Admin — God mode (platform owner)</option>
                 </select>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Role controls which modules and sections this user can access.
+                </p>
               </div>
               <div className="flex justify-end gap-2 pt-2">
                 <button type="button" className={BTN_SECONDARY} onClick={closeModal}>

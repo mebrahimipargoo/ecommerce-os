@@ -11,7 +11,7 @@ function bucketForFolder(folder: MediaUploadFolder): StorageBucketName {
 
 /**
  * Uploads a File via a Server Action (service role) and returns the public URL.
- * Passes `company_id` so Storage paths and RLS policies can scope by tenant.
+ * Passes `organization_id` so Storage paths and RLS policies can scope by tenant.
  * Packing slips / manifest scans use the `manifests` bucket; all other paths use `media`.
  */
 export async function uploadToStorage(
@@ -23,7 +23,7 @@ export async function uploadToStorage(
   fd.append("file", file);
   fd.append("folder", folder);
   fd.append("bucket", bucketForFolder(folder));
-  fd.append("company_id", organizationId ?? resolveOrganizationId());
+  fd.append("organization_id", organizationId ?? resolveOrganizationId());
   const res = await uploadMediaFileAction(fd);
   if (!res.ok) throw new Error(res.error);
   return res.publicUrl;
@@ -39,7 +39,7 @@ export async function uploadToMedia(
   fd.append("file", file);
   fd.append("folder", folder);
   fd.append("bucket", "media");
-  fd.append("company_id", organizationId ?? resolveOrganizationId());
+  fd.append("organization_id", organizationId ?? resolveOrganizationId());
   const res = await uploadMediaFileAction(fd);
   if (!res.ok) throw new Error(res.error);
   return res.publicUrl;

@@ -31,19 +31,19 @@ function DetailsBlock({ details }: { details: Record<string, unknown> | null }) 
 }
 
 /**
- * Right-side sheet with a vertical timeline for `claim_history_logs` (scoped by company_id).
+ * Right-side sheet with a vertical timeline for `claim_history_logs` (scoped by organization_id).
  */
 export function ClaimHistoryModal({
   open,
   onClose,
   claimId,
-  companyId,
+  organizationId,
 }: {
   open: boolean;
   onClose: () => void;
   claimId: string | null;
-  /** Tenant scope — same as `profiles.company_id` / organization UUID string. */
-  companyId: string;
+  /** Tenant scope — same as `profiles.organization_id` / organization UUID string. */
+  organizationId: string;
 }) {
   const [logs, setLogs] = useState<ClaimTimelineRow[]>([]);
   const [loading, setLoading] = useState(false);
@@ -58,7 +58,7 @@ export function ClaimHistoryModal({
     let cancelled = false;
     setLoading(true);
     setErr(null);
-    void getClaimTimelineLogs(claimId, companyId).then((r) => {
+    void getClaimTimelineLogs(claimId, organizationId).then((r) => {
       if (cancelled) return;
       setLoading(false);
       if (r.ok) setLogs(r.rows);
@@ -67,7 +67,7 @@ export function ClaimHistoryModal({
     return () => {
       cancelled = true;
     };
-  }, [open, claimId, companyId]);
+  }, [open, claimId, organizationId]);
 
   if (!open || !claimId) return null;
 

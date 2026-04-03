@@ -48,6 +48,7 @@ import {
 } from "../../lib/entity-photo-evidence";
 import { fetchProductFromAmazon } from "../../lib/api/amazon-mock";
 import { operatorDisplayLabel } from "../../lib/operator-display";
+import { useProfileNames } from "../../hooks/useProfileNames";
 import {
   getReturnPhotoEvidenceUrls,
   mergeReturnPhotoEvidence,
@@ -622,6 +623,8 @@ export type WizardState = {
   wizard_pkg_return_label_url: string;
   /** Connected store UUID — links this item to a specific store account. */
   store_id: string;
+  /** Optional seller RMA — persisted on `returns.rma_number`. */
+  rma_number: string;
   /** Optional Amazon order ID — stored on `returns.order_id` and `claim_submissions.source_payload.amazon_order_id`. */
   amazon_order_id: string;
   /** Product catalog lookup — when `unknown`, Step 1 allows Next without a resolved ASIN/UPC (manual item name). */
@@ -639,6 +642,7 @@ export const EMPTY_WIZARD: WizardState = {
   evidence_gallery_urls: [],
   wizard_outer_box_url: "", wizard_opened_box_url: "", wizard_pkg_return_label_url: "",
   store_id: "",
+  rma_number: "",
   amazon_order_id: "",
   catalog_resolution: "idle",
 };
@@ -928,6 +932,7 @@ function sortKeyItem(
   field: string,
   pkgMap: Map<string, PackageRecord>,
   pltMap: Map<string, PalletRecord>,
+  nameMap?: Record<string, string>,
 ): string | number {
   const linkedPkg = r.package_id ? pkgMap.get(r.package_id) : undefined;
   const linkedPlt = r.pallet_id ? pltMap.get(r.pallet_id) : undefined;
@@ -937,6 +942,7 @@ function sortKeyItem(
     case "inherited_tracking_number":
     case "tracking_effective": return trackEff.toLowerCase();
     case "lpn": return (r.lpn ?? "").toLowerCase();
+    case "rma_number": return (r.rma_number ?? "").toLowerCase();
     case "marketplace":
     case "store_name": return (r.stores?.name ?? r.marketplace ?? "").toLowerCase();
     case "item_name": return r.item_name.toLowerCase();
@@ -948,14 +954,14 @@ function sortKeyItem(
       return `${linkedPkg.package_number}\0${pltPart}`.toLowerCase();
     }
     case "expiration_date": return r.expiration_date ? r.expiration_date : "\uffff";
-    case "created_by": return operatorDisplayLabel(r).toLowerCase();
+    case "created_by": return operatorDisplayLabel(r, nameMap).toLowerCase();
     case "created_at": return new Date(r.created_at).getTime();
     default:
       return String((r as unknown as Record<string, unknown>)[field] ?? "").toLowerCase();
   }
 }
 
-function sortKeyPackage(p: PackageRecord, field: string): string | number {
+function sortKeyPackage(p: PackageRecord, field: string, nameMap?: Record<string, string>): string | number {
   switch (field) {
     case "package_number": return p.package_number.toLowerCase();
     case "carrier_name": return (p.carrier_name ?? "").toLowerCase();
@@ -966,7 +972,7 @@ function sortKeyPackage(p: PackageRecord, field: string): string | number {
     case "pkg_items_sort": return p.actual_item_count * 1_000_000 + p.expected_item_count;
     case "status": return p.status.toLowerCase();
     case "store_name": return (p.stores?.name ?? "").toLowerCase();
-    case "created_by": return operatorDisplayLabel(p).toLowerCase();
+    case "created_by": return operatorDisplayLabel(p, nameMap).toLowerCase();
     case "created_at": return new Date(p.created_at).getTime();
     default: return String((p as unknown as Record<string, unknown>)[field] ?? "").toLowerCase();
   }
@@ -974,14 +980,14 @@ function sortKeyPackage(p: PackageRecord, field: string): string | number {
 
 type PalletSortRow = PalletRecord & { _rollupPkgs: number; _rollupItems: number };
 
-function sortKeyPallet(p: PalletSortRow, field: string): string | number {
+function sortKeyPallet(p: PalletSortRow, field: string, nameMap?: Record<string, string>): string | number {
   switch (field) {
     case "pallet_number": return p.pallet_number.toLowerCase();
     case "rollup_pkgs": return p._rollupPkgs;
     case "rollup_items": return p._rollupItems;
     case "status": return p.status.toLowerCase();
     case "store_name": return (p.stores?.name ?? "").toLowerCase();
-    case "created_by": return operatorDisplayLabel(p).toLowerCase();
+    case "created_by": return operatorDisplayLabel(p, nameMap).toLowerCase();
     case "created_at": return new Date(p.created_at).getTime();
     default: return String((p as unknown as Record<string, unknown>)[field] ?? "").toLowerCase();
   }
@@ -1552,7 +1558,7 @@ function ItemsSubTable({ items, role, actor, actorProfileId = null, onItemClick,
     let d = [...items];
     if (search) {
       const q = search.toLowerCase();
-      d = d.filter((r) => [r.lpn ?? "", r.item_name, r.asin ?? "", r.fnsku ?? "", r.sku ?? "", r.id].some((v) => v.toLowerCase().includes(q)));
+      d = d.filter((r) => [r.lpn ?? "", r.rma_number ?? "", r.item_name, r.asin ?? "", r.fnsku ?? "", r.sku ?? "", r.id].some((v) => String(v).toLowerCase().includes(q)));
     }
     if (statusF) d = d.filter((r) => r.status === statusF);
     return d;
@@ -1686,7 +1692,10 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
   const [confirmDel, setConfirmDel] = useState(false);
   const [deleting,   setDeleting]   = useState(false);
   const [err,        setErr]        = useState("");
+  /** Resolve created_by UUID → full name (no UUID shown in UI). */
+  const itemOperatorNames = useProfileNames([record.created_by, record.updated_by]);
   const [editLpn,    setEditLpn]    = useState(record.lpn ?? "");
+  const [editRmaNumber, setEditRmaNumber] = useState(record.rma_number ?? "");
   const [editProductId, setEditProductId] = useState(record.asin ?? record.fnsku ?? record.sku ?? "");
   const [editAsin,   setEditAsin]   = useState(record.asin ?? "");
   const [editFnsku,  setEditFnsku]  = useState(record.fnsku ?? "");
@@ -1737,6 +1746,7 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
 
   useEffect(() => {
     setEditLpn(record.lpn ?? "");
+    setEditRmaNumber(record.rma_number ?? "");
     setEditProductId(record.asin ?? record.fnsku ?? record.sku ?? "");
     setEditAsin(record.asin ?? "");
     setEditFnsku(record.fnsku ?? "");
@@ -1754,7 +1764,7 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
     setItemEditFiles([]);
     setEditCatalogStatus("idle");
     setEditCatalogPreview(null);
-  }, [record.id, record.lpn, record.asin, record.fnsku, record.sku, record.store_id, record.package_id, record.item_name, record.notes, record.order_id, record.photo_evidence, record.expiration_date]);
+  }, [record.id, record.lpn, record.rma_number, record.asin, record.fnsku, record.sku, record.store_id, record.package_id, record.item_name, record.notes, record.order_id, record.photo_evidence, record.expiration_date]);
 
   async function handleEditBarcodeLookup(barcode: string) {
     if (!barcode.trim()) { setEditCatalogStatus("idle"); return; }
@@ -1873,6 +1883,7 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
     const pickedStore = itemStoresList.find((s) => s.id === editStoreId);
     const res = await updateReturn(record.id, {
       lpn: editLpn || undefined,
+      rma_number: editRmaNumber.trim() || null,
       item_name: editItem,
       notes: editNotes || undefined,
       order_id: isLooseItem ? (editOrderId.trim() || null) : null,
@@ -2038,6 +2049,16 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
           {!editPackageId && (
             <div><label className={LABEL}>LPN <span className="text-xs font-normal text-slate-400">(optional)</span></label><input className={INPUT} value={editLpn} onChange={(e) => setEditLpn(e.target.value)} placeholder="Orphan label scan…" /></div>
           )}
+          <div>
+            <label className={LABEL}>RMA # <span className="text-xs font-normal text-slate-400">(optional — this item)</span></label>
+            <input
+              className={`${INPUT} font-mono`}
+              value={editRmaNumber}
+              onChange={(e) => setEditRmaNumber(e.target.value)}
+              placeholder="Seller authorization…"
+              autoComplete="off"
+            />
+          </div>
           <div><label className={LABEL}>Item Name <span className="text-rose-500">*</span></label><input className={INPUT} value={editItem} onChange={(e) => setEditItem(e.target.value)} /></div>
 
           {/* ── Expiry Date (FEFO) ──────────────────────────────────────────── */}
@@ -2164,7 +2185,7 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
                   }
                   setItemPhotoUploading(true);
                   try {
-                    const url = await uploadToStorage(files[files.length - 1], "evidence/wizard", record.company_id);
+                    const url = await uploadToStorage(files[files.length - 1], "evidence/wizard", record.organization_id);
                     setEditPhotoItemUrl(url);
                     setItemEditFiles([]);
                   } catch {
@@ -2213,7 +2234,7 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
                       if (!last) return;
                       setExpiryPhotoUploading(true);
                       try {
-                        const url = await uploadToStorage(last, "evidence/wizard", record.company_id);
+                        const url = await uploadToStorage(last, "evidence/wizard", record.organization_id);
                         setEditPhotoExpiryUrl(url);
                         setExpiryEditFiles([]);
                       } catch {
@@ -2261,6 +2282,7 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
               onClick={() => {
                 setEditing(false);
                 setEditLpn(record.lpn ?? "");
+                setEditRmaNumber(record.rma_number ?? "");
                 setEditProductId(record.asin ?? record.fnsku ?? record.sku ?? "");
                 setEditAsin(record.asin ?? "");
                 setEditFnsku(record.fnsku ?? "");
@@ -2343,6 +2365,15 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
                   <p className="font-mono font-bold text-foreground">{record.lpn}</p>
                 </div>
                 <InlineCopy value={record.lpn} label="LPN" onToast={onToast} />
+              </div>
+            )}
+            {(record.rma_number?.trim() ?? "") !== "" && (
+              <div className="group flex flex-wrap items-center gap-2">
+                <div>
+                  <p className="text-xs text-slate-400">RMA #</p>
+                  <p className="font-mono font-bold text-foreground">{record.rma_number}</p>
+                </div>
+                <InlineCopy value={record.rma_number ?? ""} label="RMA #" onToast={onToast} />
               </div>
             )}
             {record.expiration_date && (
@@ -2446,7 +2477,7 @@ export function ItemDrawerContent({ record, role, actor, actorProfileId = null, 
           )}
           {record.notes && <p className="rounded-xl bg-slate-50 p-3 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300">{record.notes}</p>}
           <div className="rounded-2xl border border-slate-100 bg-slate-50/50 p-4 dark:border-slate-800 dark:bg-slate-900/50 grid grid-cols-2 gap-3 text-xs">
-            <div><p className="text-slate-400">By</p><p className="font-semibold capitalize text-slate-700 dark:text-slate-300">{operatorDisplayLabel(record)}</p></div>
+            <div><p className="text-slate-400">By</p><p className="font-semibold capitalize text-slate-700 dark:text-slate-300">{record.created_by && isUuidString(record.created_by.trim()) ? (itemOperatorNames[record.created_by.trim()] ?? operatorDisplayLabel(record)) : operatorDisplayLabel(record)}</p></div>
             <div><p className="text-slate-400">Date</p><p className="font-semibold text-slate-700 dark:text-slate-300">{fmt(record.created_at)}</p></div>
           </div>
           <div className="flex flex-wrap justify-end gap-3 border-t border-slate-200 pt-4 dark:border-slate-800">
@@ -2565,7 +2596,12 @@ function AssignExistingItemModal({ pkg, allReturns, currentItems, actor, actorPr
 function dedupeReturnsRowsLocal(rows: unknown[] | null | undefined): ReturnRecord[] {
   const map = new Map<string, ReturnRecord>();
   for (const raw of rows ?? []) {
-    const r = raw as ReturnRecord;
+    const r0 = raw as ReturnRecord;
+    const r = {
+      ...r0,
+      marketplace: r0.marketplace ?? "",
+      rma_number: r0.rma_number ?? null,
+    };
     if (r?.id && typeof r.id === "string" && !map.has(r.id)) map.set(r.id, r);
   }
   const out = [...map.values()];
@@ -2598,6 +2634,8 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
   const [assignOpen, setAssignOpen] = useState(false);
   const [closing,    setClosing]    = useState(false);
   const [editing,    setEditing]    = useState(false);
+  /** Resolve created_by / updated_by UUIDs to human-readable names. */
+  const pkgOperatorNames = useProfileNames([pkg.created_by, pkg.updated_by]);
   const [editCarrier,   setEditCarrier]   = useState(initPkg.carrier_name ?? "");
   const [editTracking,  setEditTracking]  = useState(initPkg.tracking_number ?? "");
   const [editRmaNumber, setEditRmaNumber] = useState(initPkg.rma_number ?? "");
@@ -2706,7 +2744,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
           : "packages/claim_return_label";
     setUploading(true);
     try {
-      const publicUrl = await uploadToStorage(f, folder, pkg.company_id);
+      const publicUrl = await uploadToStorage(f, folder, pkg.organization_id);
       setUrl(publicUrl);
     } catch {
       setSaveErr("Photo upload failed. Try again.");
@@ -2772,7 +2810,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
     setEditManifestOcrRunning(true);
     setEditManifestErr("");
     try {
-      const publicUrl = await uploadToStorage(file, "packages/manifest", pkg.company_id);
+      const publicUrl = await uploadToStorage(file, "packages/manifest", pkg.organization_id);
       const items = await mockManifestLineItems(file);
       if (items.length === 0) {
         setEditManifestErr("No items detected on the packing slip — try a clearer photo.");
@@ -3106,7 +3144,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
               </div>
             </div>
           )}
-          <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{operatorDisplayLabel(pkg)}</p></div>
+          <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{pkg.created_by && isUuidString(pkg.created_by.trim()) ? (pkgOperatorNames[pkg.created_by.trim()] ?? operatorDisplayLabel(pkg)) : operatorDisplayLabel(pkg)}</p></div>
           <div><p className="text-xs text-slate-400">Created</p><p className="font-semibold text-foreground">{fmt(pkg.created_at)}</p></div>
           {pkg.order_id?.trim() && (
             <div className="col-span-2">
@@ -3332,7 +3370,7 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
             onClose={() => setWizardOpen(false)}
             onSuccess={(r) => { handleItemAdded(r); }}
             actor={actor}
-            organizationId={pkg.company_id}
+            organizationId={pkg.organization_id}
             openPackages={[pkgWithExpected]}
             openPallets={openPallets}
             existingReturns={allReturns}
@@ -3382,6 +3420,9 @@ export function PalletDrawerContent({ pallet, role, actor, actorProfileId = null
   const [editSaving, setEditSaving] = useState(false);
   const [bolUploading, setBolUploading] = useState(false);
   const [generalPhotoUploading, setGeneralPhotoUploading] = useState(false);
+
+  /** Resolve created_by / updated_by UUIDs to human-readable names (no UUID shown in UI). */
+  const palletOperatorNames = useProfileNames([plt.created_by, plt.updated_by]);
 
   useEffect(() => {
     setPlt(pallet);
@@ -3483,7 +3524,14 @@ export function PalletDrawerContent({ pallet, role, actor, actorProfileId = null
       </div>
       <div className="grid grid-cols-2 gap-3 text-sm">
         <div><p className="text-xs text-slate-400">Total Items</p><p className="text-3xl font-extrabold text-foreground">{plt.item_count}</p></div>
-        <div><p className="text-xs text-slate-400">Operator</p><p className="font-semibold capitalize text-foreground">{operatorDisplayLabel(plt)}</p></div>
+        <div>
+          <p className="text-xs text-slate-400">Operator</p>
+          <p className="font-semibold text-foreground">
+            {plt.created_by && isUuidString(plt.created_by.trim())
+              ? (palletOperatorNames[plt.created_by.trim()] ?? operatorDisplayLabel(plt))
+              : operatorDisplayLabel(plt)}
+          </p>
+        </div>
         <div><p className="text-xs text-slate-400">Created</p><p className="font-semibold">{fmt(plt.created_at)}</p></div>
         <div><p className="text-xs text-slate-400">Updated</p><p className="font-semibold">{fmt(plt.updated_at)}</p></div>
       </div>
@@ -3760,7 +3808,6 @@ export function WizardStep1({ state, setState, openPackages, openPallets, existi
         .from("packages")
         .select("store_id")
         .eq("id", pkgId)
-        .eq("company_id", MVP_ORGANIZATION_ID)
         .maybeSingle();
       if (cancelled) return;
       if (data?.store_id) {
@@ -3773,6 +3820,41 @@ export function WizardStep1({ state, setState, openPackages, openPallets, existi
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.package_link_id, inherited?.packageId, openPackages]);
+
+  // ── Package → Item: inherit rma_number and amazon_order_id ──────────────
+  // Only auto-fills when the target field is still empty (operator-typed values
+  // are never overwritten — no disabled or locking applied).
+  useEffect(() => {
+    const pkgId = (state.package_link_id || inherited?.packageId)?.trim();
+    if (!pkgId || !isUuidString(pkgId)) return;
+
+    let cancelled = false;
+
+    // 1. Resolve from in-memory package list first
+    const local = openPackages.find((p) => p.id === pkgId);
+    if (local) {
+      if (local.rma_number && !state.rma_number)      up("rma_number",      local.rma_number);
+      if (local.order_id   && !state.amazon_order_id) up("amazon_order_id", local.order_id);
+      return;
+    }
+
+    // 2. Fallback: fetch from DB (covers packages not in the local list)
+    void supabaseBrowser
+      .from("packages")
+      .select("rma_number, order_id")
+      .eq("id", pkgId)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (cancelled) return;
+        if (data?.rma_number && !state.rma_number)
+          up("rma_number", data.rma_number as string);
+        if (data?.order_id && !state.amazon_order_id)
+          up("amazon_order_id", data.order_id as string);
+      });
+
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.package_link_id, inherited?.packageId]);
 
   // Keep `returns.marketplace` aligned with the selected Store (fixes Next disabled when only store is set).
   useEffect(() => {
@@ -4142,6 +4224,17 @@ export function WizardStep1({ state, setState, openPackages, openPallets, existi
         </p>
       )}
       <div>
+        <label className={LABEL}>RMA # <span className="text-xs font-normal text-slate-400">(optional — stored on this item)</span></label>
+        <input
+          type="text"
+          className={`${INPUT} font-mono`}
+          placeholder="Seller authorization…"
+          value={state.rma_number}
+          onChange={(e) => up("rma_number", e.target.value)}
+          autoComplete="off"
+        />
+      </div>
+      <div>
         <label className={LABEL}>
           Store <span className="text-rose-500">*</span>
           {storeInherited && (
@@ -4163,7 +4256,6 @@ export function WizardStep1({ state, setState, openPackages, openPallets, existi
             }));
             setStoreInherited(false);
           }}
-          disabled={storeInherited}
         >
           <option value="">— Select Store —</option>
           {connectedStores.map((s) => (
@@ -4174,7 +4266,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, existi
         </select>
         {storeInherited && (
           <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
-            🔒 Locked — store is inherited from the linked package.
+            ↳ Auto-filled from package — override if needed.
           </p>
         )}
         {connectedStores.length === 0 && (
@@ -4687,7 +4779,7 @@ export function WizardStep3({ state, conditions, packages, pallets, inherited, o
     if (fromDb) {
       return {
         id: pkgKey,
-        company_id: "",
+        organization_id: "",
         package_number: "",
         tracking_number: null,
         carrier_name: null,
@@ -4961,7 +5053,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
   onToast?: (msg: string, kind?: ToastKind) => void;
   onNavigateToPackage?: (packageId: string) => void;
   onNavigateToPallet?: (palletId: string) => void;
-  /** Workspace org for `returns.company_id` / claim_submissions (defaults to MVP seed). */
+  /** Workspace org for `returns.organization_id` / claim_submissions (defaults to MVP seed). */
   organizationId?: string;
   actorProfileId?: string | null;
 }) {
@@ -5036,7 +5128,6 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
         .from("pallets")
         .select("photo_url, bol_photo_url, manifest_photo_url")
         .eq("id", pid)
-        .eq("company_id", workspaceOrgId)
         .maybeSingle()
         .then(({ data }) => {
           if (cancelled) return;
@@ -5062,7 +5153,6 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
       .from("packages")
       .select("order_id, pallet_id, photo_opened_url, photo_return_label_url, photo_closed_url, photo_url")
       .eq("id", pkgKey)
-      .eq("company_id", workspaceOrgId)
       .maybeSingle()
       .then(({ data }) => {
         if (cancelled) return;
@@ -5147,7 +5237,7 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
     if (meta) {
       return {
         id,
-        company_id: workspaceOrgId,
+        organization_id: workspaceOrgId,
         package_number: "",
         tracking_number: null,
         carrier_name: null,
@@ -5302,9 +5392,10 @@ export function SingleItemWizardModal({ onClose, onSuccess, actor, openPackages,
         (storeRow ? platformToMarketplace(storeRow.platform) : "amazon");
 
       const res = await insertReturn({
-        company_id: workspaceOrgId,
+        organization_id: workspaceOrgId,
         actor_profile_id: actorProfileId,
         lpn: state.lpn || undefined,
+        rma_number: state.rma_number.trim() || undefined,
         marketplace: marketplaceResolved,
         item_name: state.item_name,
         conditions,
@@ -5491,20 +5582,50 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
     tracking: p.tracking_number ?? undefined,
   }));
 
-  // ── Auto-fill carrier from the pallet's existing packages ─────────────────
+  // ── Pallet → Package: inherit carrier_name and amazon_order_id ───────────
+  // Priority: pallet.carrier_name  →  sibling package carrier  →  keep current value
+  // Priority: pallet.amazon_order_id  →  keep current value
+  // CRITICAL: fields are NOT locked — operators may override freely.
   useEffect(() => {
-    if (!palletId?.trim() || !isUuidString(palletId.trim())) return;
-    supabaseBrowser
-      .from("packages")
-      .select("carrier_name")
-      .eq("pallet_id", palletId)
-      .not("carrier_name", "is", null)
-      .order("created_at", { ascending: false })
-      .limit(1)
+    const pid = palletId?.trim();
+    if (!pid || !isUuidString(pid)) return;
+
+    let cancelled = false;
+
+    // 1. Resolve from in-memory pallet list first (zero network cost)
+    const localPallet = openPallets.find((p) => p.id === pid);
+    if (localPallet?.carrier_name)    setCarrier(localPallet.carrier_name);
+    if (localPallet?.amazon_order_id) setAmazonOrderId(localPallet.amazon_order_id);
+
+    // 2. Always confirm from DB (covers pallets not yet in the local list)
+    void supabaseBrowser
+      .from("pallets")
+      .select("carrier_name, amazon_order_id")
+      .eq("id", pid)
       .maybeSingle()
-      .then(({ data }) => {
-        if (data?.carrier_name) setCarrier(data.carrier_name as string);
+      .then(({ data: plt }) => {
+        if (cancelled) return;
+        if (plt?.carrier_name)    setCarrier(plt.carrier_name as string);
+        if (plt?.amazon_order_id) setAmazonOrderId(plt.amazon_order_id as string);
+
+        // 3. Fallback for carrier: if pallet has no carrier_name, check sibling packages
+        if (!plt?.carrier_name) {
+          void supabaseBrowser
+            .from("packages")
+            .select("carrier_name")
+            .eq("pallet_id", pid)
+            .not("carrier_name", "is", null)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle()
+            .then(({ data: pkg }) => {
+              if (!cancelled && pkg?.carrier_name) setCarrier(pkg.carrier_name as string);
+            });
+        }
       });
+
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [palletId]);
 
   // ── Store state (Package form) ─────────────────────────────────────────────
@@ -5545,7 +5666,6 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
         .from("pallets")
         .select("store_id")
         .eq("id", palletId)
-        .eq("company_id", pkgOrgId)
         .maybeSingle();
       if (cancelled) return;
       if (data?.store_id) {
@@ -5699,7 +5819,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
           ? (struct as Record<string, unknown>)
           : undefined;
       const res = await createPackage({
-        company_id: pkgOrgId,
+        organization_id: pkgOrgId,
         actor_profile_id: actorProfileId,
         package_number: pkgNum.trim(),
         tracking_number: tracking.trim() || undefined,
@@ -5750,6 +5870,17 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
           </div>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6 space-y-5">
+          {/* ── Link to Pallet — TOP of form for fast batch scanning ────────────── */}
+          <ComboboxField
+            label="Link to Pallet"
+            hint="(optional)"
+            icon={Boxes}
+            options={palletOptions}
+            value={palletId}
+            onChange={setPalletId}
+            onClear={() => setPalletId("")}
+            placeholder="Search pallets…"
+          />
           {aiPackingSlipEnabled && (
             <>
               <div className="flex items-center gap-2 mb-1">
@@ -5817,7 +5948,6 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
             <p className="mt-1 text-[11px] text-slate-400">Linked return items inherit this for claims.</p>
           </div>
           <div><label className={LABEL}>Expected Items</label><input type="number" min="0" className={INPUT} placeholder="0" value={expected} onChange={(e) => setExpected(e.target.value)} /></div>
-          <ComboboxField label="Link to Pallet" hint="(optional)" icon={Boxes} options={palletOptions} value={palletId} onChange={setPalletId} onClear={() => setPalletId("")} placeholder="Search pallets…" />
 
           <div>
             <label className={LABEL}>
@@ -5832,7 +5962,6 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
               className={INPUT}
               value={pkgStoreId}
               onChange={(e) => { setPkgStoreId(e.target.value); setPkgStoreInherited(false); }}
-              disabled={pkgStoreInherited}
             >
               <option value="">— Select Store —</option>
               {pkgStoresList.map((s) => (
@@ -5841,7 +5970,7 @@ export function CreatePackageModal({ onClose, onCreated, actor, openPallets, aiP
             </select>
             {pkgStoreInherited && (
               <p className="mt-1 text-[11px] text-emerald-600 dark:text-emerald-400">
-                🔒 Locked — store is inherited from the selected pallet.
+                ↳ Auto-filled from pallet — override if needed.
               </p>
             )}
             {pkgStoresList.length === 0 && (
@@ -6065,6 +6194,9 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
   const [saving, setSaving] = useState(false); const [error, setError] = useState("");
   const [palletPhotoUrls, setPalletPhotoUrls] = useState<string[]>([]);
   const [bolUrls, setBolUrls] = useState<string[]>([]);
+  /** Carrier and Amazon order ID — auto-inherited by child Package forms on creation. */
+  const [palletCarrier, setPalletCarrier] = useState("");
+  const [palletAmazonOrderId, setPalletAmazonOrderId] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
 
   // ── Store state (Pallet form — top of hierarchy) ──────────────────────────
@@ -6096,7 +6228,7 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
       let manifestPhotoUrl: string | undefined;
       if (file) manifestPhotoUrl = await uploadToStorage(file, "pallets/manifest", pltOrgId);
       const res = await createPallet({
-        company_id: pltOrgId,
+        organization_id: pltOrgId,
         actor_profile_id: actorProfileId,
         pallet_number: palletNum.trim(),
         photo_url: palletPhotoUrls[0]?.trim() || null,
@@ -6105,6 +6237,8 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
         store_id: palletStoreId,
         notes,
         created_by: actor,
+        carrier_name:    palletCarrier.trim()         || null,
+        amazon_order_id: palletAmazonOrderId.trim()   || null,
       });
       setSaving(false);
       if (res.ok && res.data) onCreated(res.data); else setError(res.error ?? "Failed.");
@@ -6156,6 +6290,39 @@ export function CreatePalletModal({ onClose, onCreated, actor, aiManifestEnabled
               />
             </div>
           </div>
+          {/* ── Carrier + Amazon Order ID (inherited by child packages) ── */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className={LABEL}>
+                <Truck className="mb-0.5 inline h-3.5 w-3.5 opacity-70" /> Carrier
+                <span className="ml-1 text-[10px] font-normal text-slate-400">(optional)</span>
+              </label>
+              <select
+                className={INPUT}
+                value={palletCarrier}
+                onChange={(e) => setPalletCarrier(e.target.value)}
+              >
+                <option value="">Select…</option>
+                {CARRIERS.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+              <p className="mt-1 text-[10px] text-slate-400">Auto-fills child Package forms.</p>
+            </div>
+            <div>
+              <label className={LABEL}>
+                Amazon Order ID
+                <span className="ml-1 text-[10px] font-normal text-slate-400">(optional)</span>
+              </label>
+              <input
+                type="text"
+                className={INPUT}
+                value={palletAmazonOrderId}
+                onChange={(e) => setPalletAmazonOrderId(e.target.value)}
+                placeholder="114-XXXXXXX-XXXXXXX"
+              />
+              <p className="mt-1 text-[10px] text-slate-400">Inherits to packages &amp; items.</p>
+            </div>
+          </div>
+
           <div className="rounded-2xl border border-amber-200 bg-amber-50/80 p-4 space-y-3 dark:border-amber-800/40 dark:bg-amber-950/20">
             <div className="flex items-center gap-2">
               <FileText className="h-4 w-4 text-amber-700 dark:text-amber-400" />
@@ -6260,6 +6427,13 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, actorPro
   const pkgMap = useMemo(() => new Map(packages.map((p) => [p.id, p])), [packages]);
   const pltMap = useMemo(() => new Map(pallets.map((p) => [p.id, p])), [pallets]);
 
+  // Resolve all created_by UUIDs to human-readable names for the Operator column.
+  const allItemCreatorIds = useMemo(
+    () => items.map((r) => r.created_by).filter((id): id is string => !!id),
+    [items],
+  );
+  const itemTableOperatorNames = useProfileNames(allItemCreatorIds);
+
   function handleSort(f: string) { if (sortField === f) setSortAsc((a) => !a); else { setSortField(f); setSortAsc(false); } setPage(1); }
 
   const filtered = useMemo(() => {
@@ -6268,12 +6442,14 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, actorPro
     if (q) {
       d = d.filter((r) => {
         const pkg = r.package_id ? pkgMap.get(r.package_id) : null;
+        const plt = r.pallet_id ? pltMap.get(r.pallet_id) : null;
         const blob = [
-          r.id, r.lpn, r.item_name, r.marketplace,
+          r.id, r.lpn, r.rma_number, r.item_name, r.marketplace,
           formatMarketplaceSource(r.marketplace),
           r.inherited_tracking_number ?? "",
           r.asin ?? "", r.fnsku ?? "", r.sku ?? "",
-          pkg?.tracking_number ?? "", pkg?.package_number ?? "",
+          pkg?.tracking_number ?? "", pkg?.package_number ?? "", pkg?.carrier_name ?? "", pkg?.rma_number ?? "",
+          plt?.tracking_number ?? "", plt?.pallet_number ?? "",
         ].join(" ").toLowerCase();
         return blob.includes(q);
       });
@@ -6284,13 +6460,13 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, actorPro
     if (dateTo)   d = d.filter((r) => r.created_at <= dateTo + "T23:59:59.999Z");
     d.sort((a, b) =>
       compareSortKeys(
-        sortKeyItem(a, sortField, pkgMap, pltMap),
-        sortKeyItem(b, sortField, pkgMap, pltMap),
+        sortKeyItem(a, sortField, pkgMap, pltMap, itemTableOperatorNames),
+        sortKeyItem(b, sortField, pkgMap, pltMap, itemTableOperatorNames),
         sortAsc,
       ),
     );
     return d;
-  }, [items, search, externalSearch, statusF, marketF, dateFrom, dateTo, sortField, sortAsc, pkgMap, pltMap]);
+  }, [items, search, externalSearch, statusF, marketF, dateFrom, dateTo, sortField, sortAsc, pkgMap, pltMap, itemTableOperatorNames]);
 
   const hasActiveFilters = !!(externalSearch.trim() || search || statusF || marketF || dateFrom || dateTo);
 
@@ -6391,8 +6567,8 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, actorPro
                       </div>
                     </td>
                     {showCompanyColumn && (
-                      <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[r.company_id] ?? r.company_id}>
-                        {organizationLabelById[r.company_id] ?? `${r.company_id.slice(0, 8)}…`}
+                      <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[r.organization_id] ?? r.organization_id}>
+                        {organizationLabelById[r.organization_id] ?? `${r.organization_id.slice(0, 8)}…`}
                       </td>
                     )}
                     <td className="w-12 px-2 py-3 align-middle">
@@ -6456,7 +6632,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, actorPro
                         ? <span className="inline-flex items-center gap-1 rounded-full bg-sky-100 px-2 py-0.5 font-mono text-[10px] font-bold text-sky-700 dark:bg-sky-900/40 dark:text-sky-300">📦 {linkedPkg.package_number}{linkedPlt ? ` › ${linkedPlt.pallet_number}` : ""}</span>
                         : <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">⚠ Orphaned / Loose</span>}
                     </td>
-                    <td className="hidden px-4 py-3 xl:table-cell text-xs text-slate-400">{operatorDisplayLabel(r)}</td>
+                    <td className="hidden px-4 py-3 xl:table-cell text-xs text-slate-400">{operatorDisplayLabel(r, itemTableOperatorNames)}</td>
                     <td className="hidden px-4 py-3 text-xs text-slate-400 lg:table-cell">{fmt(r.created_at)}</td>
                     <td className="px-3 py-3">
                       <RowActionMenu
@@ -6534,6 +6710,13 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
     return m;
   }, [allReturns]);
 
+  // Resolve created_by UUIDs → display names for the Operator column.
+  const allPkgCreatorIds = useMemo(
+    () => packages.map((p) => p.created_by).filter((id): id is string => !!id),
+    [packages],
+  );
+  const pkgTableOperatorNames = useProfileNames(allPkgCreatorIds);
+
   function toggleExpand(id: string, e: React.MouseEvent) { e.stopPropagation(); setExpandedIds((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; }); }
 
   function handleSort(f: string) { if (sortField === f) setSortAsc((a) => !a); else { setSortField(f); setSortAsc(false); } setPage(1); }
@@ -6554,10 +6737,10 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
         const cb = assignedByPackage.get(b.id) ?? 0;
         return compareSortKeys(ca * 1_000_000 + a.expected_item_count, cb * 1_000_000 + b.expected_item_count, sortAsc);
       }
-      return compareSortKeys(sortKeyPackage(a, sortField), sortKeyPackage(b, sortField), sortAsc);
+      return compareSortKeys(sortKeyPackage(a, sortField, pkgTableOperatorNames), sortKeyPackage(b, sortField, pkgTableOperatorNames), sortAsc);
     });
     return d;
-  }, [packages, search, externalSearch, statusF, carrierF, dateFrom, dateTo, sortField, sortAsc, assignedByPackage]);
+  }, [packages, search, externalSearch, statusF, carrierF, dateFrom, dateTo, sortField, sortAsc, assignedByPackage, pkgTableOperatorNames]);
 
   const hasActiveFilters = !!(externalSearch.trim() || search || statusF || carrierF || dateFrom || dateTo);
 
@@ -6657,8 +6840,8 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                         </div>
                       </td>
                       {showCompanyColumn && (
-                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.company_id] ?? p.company_id}>
-                          {organizationLabelById[p.company_id] ?? `${p.company_id.slice(0, 8)}…`}
+                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
+                          {organizationLabelById[p.organization_id] ?? `${p.organization_id.slice(0, 8)}…`}
                         </td>
                       )}
                       <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
@@ -6692,7 +6875,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                       </td>
                       <td className="px-4 py-3"><div className="flex items-center gap-2"><span className="text-sm font-bold text-slate-700 dark:text-slate-300">{assignedCount}/{p.expected_item_count > 0 ? p.expected_item_count : "?"}</span>{pct !== null && <div className="hidden h-1.5 w-12 overflow-hidden rounded-full bg-muted sm:block"><div className={`h-full rounded-full ${pct >= 100 ? "bg-emerald-500" : "bg-sky-500"}`} style={{ width: `${pct}%` }} /></div>}</div></td>
                       <td className="px-4 py-3"><PkgStatusBadge status={p.status} /></td>
-                      <td className="hidden px-4 py-3 text-xs capitalize text-slate-400 md:table-cell">{operatorDisplayLabel(p)}</td>
+                      <td className="hidden px-4 py-3 text-xs capitalize text-slate-400 md:table-cell">{operatorDisplayLabel(p, pkgTableOperatorNames)}</td>
                       <td className="hidden px-4 py-3 text-xs text-slate-400 md:table-cell">{fmt(p.created_at)}</td>
                       <td className="px-3 py-3">
                         <RowActionMenu
@@ -6739,7 +6922,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                                         </td>
                                         <td className="px-3 py-2"><div className="flex flex-wrap gap-1">{r.conditions.slice(0,2).map((c) => <ConditionBadge key={c} value={c} />)}</div></td>
                                         <td className="px-3 py-2"><StatusBadge status={r.status} /></td>
-                                        <td className="px-3 py-2 capitalize text-slate-400">{operatorDisplayLabel(r)}</td>
+                                        <td className="px-3 py-2 capitalize text-slate-400">{operatorDisplayLabel(r, pkgTableOperatorNames)}</td>
                                       </tr>
                                     ))}
                                   </tbody>
@@ -6807,6 +6990,13 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
   const [nestedPkgExpandedIds, setNestedPkgExpandedIds] = useState<Set<string>>(new Set());
   const PER = 25;
 
+  // Resolve created_by UUIDs → display names for the Operator column.
+  const allPltCreatorIds = useMemo(
+    () => pallets.map((p) => p.created_by).filter((id): id is string => !!id),
+    [pallets],
+  );
+  const pltTableOperatorNames = useProfileNames(allPltCreatorIds);
+
   function toggleExpand(id: string, e: React.MouseEvent) { e.stopPropagation(); setExpandedIds((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; }); }
 
   function toggleNestedPkgExpand(pkgId: string, e: React.MouseEvent) {
@@ -6837,10 +7027,10 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
     if (dateFrom) d = d.filter((p) => p.created_at >= dateFrom);
     if (dateTo)   d = d.filter((p) => p.created_at <= dateTo + "T23:59:59.999Z");
     d.sort((a, b) =>
-      compareSortKeys(sortKeyPallet(a, sortField), sortKeyPallet(b, sortField), sortAsc),
+      compareSortKeys(sortKeyPallet(a, sortField, pltTableOperatorNames), sortKeyPallet(b, sortField, pltTableOperatorNames), sortAsc),
     );
     return d;
-  }, [pallets, allPackages, allReturns, search, externalSearch, statusF, dateFrom, dateTo, sortField, sortAsc]);
+  }, [pallets, allPackages, allReturns, search, externalSearch, statusF, dateFrom, dateTo, sortField, sortAsc, pltTableOperatorNames]);
 
   const hasActiveFilters = !!(externalSearch.trim() || search || statusF || dateFrom || dateTo);
 
@@ -6933,8 +7123,8 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                         </div>
                       </td>
                       {showCompanyColumn && (
-                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.company_id] ?? p.company_id}>
-                          {organizationLabelById[p.company_id] ?? `${p.company_id.slice(0, 8)}…`}
+                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
+                          {organizationLabelById[p.organization_id] ?? `${p.organization_id.slice(0, 8)}…`}
                         </td>
                       )}
                       <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
@@ -6952,7 +7142,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                       </td>
                       <td className="px-4 py-3"><span className="font-bold text-slate-700 dark:text-slate-300">{p._rollupPkgs}</span><span className="mx-1 text-slate-300 dark:text-slate-600">pkgs</span><span className="font-bold text-slate-500">{p._rollupItems}</span><span className="ml-1 text-slate-300 dark:text-slate-600">items</span></td>
                       <td className="px-4 py-3"><PalletStatusBadge status={p.status} /></td>
-                      <td className="hidden px-4 py-3 text-xs capitalize text-slate-400 md:table-cell">{operatorDisplayLabel(p)}</td>
+                      <td className="hidden px-4 py-3 text-xs capitalize text-slate-400 md:table-cell">{operatorDisplayLabel(p, pltTableOperatorNames)}</td>
                       <td className="hidden px-4 py-3 text-xs text-slate-400 lg:table-cell">{fmt(p.created_at)}</td>
                       <td className="px-3 py-3">
                         <RowActionMenu
@@ -7014,7 +7204,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                                               </div>
                                             </td>
                                             <td className="px-3 py-2"><PkgStatusBadge status={pk.status} /></td>
-                                            <td className="px-3 py-2 capitalize text-slate-400">{operatorDisplayLabel(pk)}</td>
+                                            <td className="px-3 py-2 capitalize text-slate-400">{operatorDisplayLabel(pk, pltTableOperatorNames)}</td>
                                           </tr>
                                           {nestedOpen && (
                                             <tr className="bg-slate-100/60 dark:bg-slate-900/40">
@@ -7054,7 +7244,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                                                               </td>
                                                               <td className="px-2 py-1.5"><div className="flex flex-wrap gap-1">{r.conditions.slice(0, 2).map((c) => <ConditionBadge key={c} value={c} />)}</div></td>
                                                               <td className="px-2 py-1.5"><StatusBadge status={r.status} /></td>
-                                                              <td className="px-2 py-1.5 capitalize text-slate-400">{operatorDisplayLabel(r)}</td>
+                                                              <td className="px-2 py-1.5 capitalize text-slate-400">{operatorDisplayLabel(r, pltTableOperatorNames)}</td>
                                                             </tr>
                                                           ))}
                                                         </tbody>

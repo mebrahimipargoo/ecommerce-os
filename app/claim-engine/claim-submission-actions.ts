@@ -39,7 +39,7 @@ export type ClaimSubmissionStatus =
 
 export type ClaimSubmissionListRow = {
   id: string;
-  company_id: string;
+  organization_id: string;
   return_id: string;
   store_id: string | null;
   report_url: string | null;
@@ -82,13 +82,13 @@ export async function approveClaimSubmission(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .update({ status: "accepted" })
       .eq("id", submissionId)
-      .eq("company_id", organizationId);
+      .eq("organization_id", organizationId);
     if (error) throw new Error(error.message);
 
     const actorLabel = await resolveProfileDisplayName(actorUserId ?? null);
     const log = await appendClaimHistoryTimelineEntry({
       claimId: submissionId,
-      companyId: organizationId,
+      organizationId,
       action: "Claim approved (status set to accepted)",
       details: { new_status: "accepted" },
       statusAtTime: "accepted",
@@ -111,9 +111,9 @@ export async function generateDailyClaimReports(
     const { data: readyRows, error: rErr } = await supabaseServer
       .from("returns")
       .select(
-        "id, company_id, store_id, estimated_value, marketplace, conditions, order_id, package_id, expiration_date, batch_number, notes, stores(platform)",
+        "id, organization_id, store_id, estimated_value, marketplace, conditions, order_id, package_id, expiration_date, batch_number, notes, stores(platform)",
       )
-      .eq("company_id", organizationId)
+      .eq("organization_id", organizationId)
       .eq("status", "ready_for_claim")
       .is("deleted_at", null);
 
@@ -128,7 +128,7 @@ export async function generateDailyClaimReports(
     for (const ret of rows) {
       const r = ret as {
         id: string;
-        company_id?: string;
+        organization_id?: string;
         store_id?: string | null;
         estimated_value?: unknown;
         marketplace?: string | null;
@@ -144,7 +144,7 @@ export async function generateDailyClaimReports(
       if (!shouldAutoEnqueueAmazonClaimSubmission(r.marketplace, r.conditions ?? [], storePlat)) continue;
 
       const returnId = r.id;
-      const rawOrg = String(r.company_id ?? organizationId ?? "").trim();
+      const rawOrg = String(r.organization_id ?? organizationId ?? "").trim();
       const orgId = isUuidString(rawOrg) ? rawOrg : resolveOrganizationId();
       const ev = r.estimated_value;
       const n = Number(ev);
@@ -168,7 +168,7 @@ export async function generateDailyClaimReports(
 
       const { error: upErr } = await supabaseServer.from(CLAIM_SUBMISSIONS_TABLE).upsert(
         {
-          company_id: orgId,
+          organization_id: orgId,
           [CLAIM_SUBMISSION_RETURN_ID_COLUMN]: returnId,
           store_id: storeIdResolved,
           report_url: null,
@@ -233,7 +233,7 @@ export async function listClaimSubmissions(
       const ret = returnRowFromSubmissionEmbed(r);
       rows.push({
         id: r.id as string,
-        company_id: r.company_id as string,
+        organization_id: r.organization_id as string,
         return_id: rid,
         store_id: (r.store_id as string | null) ?? null,
         report_url: path,
@@ -293,13 +293,13 @@ export async function markClaimSubmissionManualSubmit(
         submission_id: id,
       })
       .eq("id", submissionId)
-      .eq("company_id", organizationId);
+      .eq("organization_id", organizationId);
     if (error) throw new Error(error.message);
 
     const actorLabel = await resolveProfileDisplayName(actorUserId ?? null);
     const log = await appendClaimHistoryTimelineEntry({
       claimId: submissionId,
-      companyId: organizationId,
+      organizationId,
       action: "Marked as submitted with marketplace case ID",
       details: { new_status: "submitted", marketplace_case_id: id },
       statusAtTime: "submitted",
@@ -332,7 +332,7 @@ export async function bulkSubmitClaimsToMarketplace(
       const { data, error } = await supabaseServer
         .from(CLAIM_SUBMISSIONS_TABLE)
         .select("id")
-        .eq("company_id", organizationId)
+        .eq("organization_id", organizationId)
         .in("id", selectedSubmissionIds)
         .eq("status", "ready_to_send");
       if (error) throw new Error(error.message);
@@ -341,7 +341,7 @@ export async function bulkSubmitClaimsToMarketplace(
       const { data, error } = await supabaseServer
         .from(CLAIM_SUBMISSIONS_TABLE)
         .select("id")
-        .eq("company_id", organizationId)
+        .eq("organization_id", organizationId)
         .eq("status", "ready_to_send");
       if (error) throw new Error(error.message);
       targetIds = (data ?? []).map((r) => r.id as string);
@@ -355,16 +355,15 @@ export async function bulkSubmitClaimsToMarketplace(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .update({ status: "submitted" })
       .in("id", targetIds)
-      .eq("company_id", organizationId);
+      .eq("organization_id", organizationId);
     if (upErr) throw new Error(upErr.message);
 
     const msg = "Batch submission initiated by Admin.";
     const actorLabel = await resolveProfileDisplayName(actorUserId ?? null);
     const logRows = targetIds.map((submission_id) => ({
-      company_id: organizationId,
+      organization_id: organizationId,
       submission_id,
       claim_id: submission_id,
-      company_id: organizationId,
       action: msg,
       details: { batch: true, source: "bulk_submit_to_marketplace" },
       actor_label: actorLabel,

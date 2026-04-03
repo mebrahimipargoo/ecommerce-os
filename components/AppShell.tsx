@@ -6,6 +6,7 @@
  * ─ Desktop  : Persistent collapsible sidebar + TopHeader (theme/profile live ONLY here).
  * ─ Mobile   : TopHeader (hamburger + logo + theme + profile) + drawer for nav.
  *
+ * Sidebar visibility is driven entirely by useRbacPermissions (no role comparisons here).
  * Content column: TopHeader (shrink-0) + scrollable main (flex-1 min-h-0 overflow-auto).
  */
 
@@ -17,20 +18,20 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   ChevronDown, ChevronRight,
-  Database,
-  FileText,
-  LayoutDashboard, Menu,
+  Database, FileText,
+  LayoutDashboard,
   PanelLeftClose, PanelLeftOpen,
-  RotateCcw, Settings, Shield, ShieldAlert, Users, X,
+  RotateCcw, ScanLine, Settings, Shield, ShieldAlert, Users, X,
 } from "lucide-react";
 import { TopHeader } from "./TopHeader";
 import { BrandingProvider, useBranding } from "./BrandingContext";
 import { BrandLogoImage } from "./BrandLogoImage";
 import { GlobalSearchProvider } from "./GlobalSearchContext";
-import { isAdminRole, UserRoleProvider, useUserRole } from "./UserRoleContext";
+import { UserRoleProvider } from "./UserRoleContext";
 import { SidebarDebugToggle } from "./SidebarDebugToggle";
+import { useRbacPermissions } from "../hooks/useRbacPermissions";
 
-// ─── Nav Definition ────────────────────────────────────────────────────────────
+// ─── Nav Definitions ──────────────────────────────────────────────────────────
 
 type NavChild   = { label: string; href: string; disabled?: boolean; badge?: string };
 type NavItemDef = {
@@ -40,29 +41,43 @@ type NavItemDef = {
 };
 type NavSection = { id: string; label: string; items: NavItemDef[] };
 
-const NAV: NavSection[] = [
-  {
-    id: "ops",
-    label: "Operations",
-    items: [
-      { label: "Dashboard",          icon: LayoutDashboard, href: "/" },
-      { label: "Returns Processing", icon: RotateCcw,       href: "/returns" },
-      { label: "Claim Engine",       icon: ShieldAlert,     href: "/claim-engine" },
-      { label: "Report history",     icon: FileText,        href: "/claim-engine/report-history" },
-    ],
-  },
-  {
-    id: "sys",
-    label: "System",
-    items: [
-      { label: "Users",    icon: Users,    href: "/users" },
-      { label: "Settings", icon: Settings, href: "/settings" },
-    ],
-  },
-];
+/** Full operational nav — filtered per role in SidebarBody */
+const OPS_NAV: NavSection = {
+  id: "ops",
+  label: "Operations",
+  items: [
+    { label: "Dashboard",          icon: LayoutDashboard, href: "/" },
+    { label: "Returns Processing", icon: RotateCcw,       href: "/returns" },
+    { label: "Claim Engine",       icon: ShieldAlert,     href: "/claim-engine" },
+    { label: "Report History",     icon: FileText,        href: "/claim-engine/report-history" },
+  ],
+};
+
+/** System nav — visible to admin+ */
+const SYS_NAV: NavSection = {
+  id: "sys",
+  label: "System",
+  items: [
+    { label: "Users",    icon: Users,    href: "/users" },
+    { label: "Settings", icon: Settings, href: "/settings" },
+  ],
+};
+
+/** WMS nav — shown to all; the ONLY section visible to operators */
+const WMS_NAV: NavSection = {
+  id: "wms",
+  label: "WMS",
+  items: [
+    { label: "Scan Item", icon: ScanLine, href: "/returns", badge: "WMS" },
+  ],
+};
+
+// ─── Shell context (mobile menu trigger) ──────────────────────────────────────
 
 const MobileMenuCtx = createContext<{ openMobileMenu: () => void }>({ openMobileMenu: () => {} });
 export const useAppShell = () => useContext(MobileMenuCtx);
+
+// ─── Shared CSS classes ───────────────────────────────────────────────────────
 
 const CLS = {
   linkActive: "bg-sky-50 text-sky-700 dark:bg-sky-950/60 dark:text-sky-300",
@@ -71,6 +86,8 @@ const CLS = {
   linkBase:   "group relative flex min-h-[40px] w-full items-center gap-3 rounded-xl px-3 py-2 text-sm font-medium transition-all",
   section:    "mb-1 px-3 text-[10px] font-semibold uppercase tracking-widest text-muted-foreground/60",
 };
+
+// ─── AppShell root ────────────────────────────────────────────────────────────
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   return (
@@ -81,6 +98,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     </UserRoleProvider>
   );
 }
+
+// ─── Inner shell (has access to context) ─────────────────────────────────────
 
 function AppShellInner({ children }: { children: React.ReactNode }) {
   const [collapsed,  setCollapsed]  = useState(false);
@@ -110,11 +129,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     if (!href || href === "#") return false;
     const path = pathname.endsWith("/") && pathname.length > 1 ? pathname.slice(0, -1) : pathname;
     if (href === "/") return path === "/";
-    // Settings hub is only active on the exact /settings page, not deeper routes like /settings/imports
-    if (href === "/settings") {
-      return path === "/settings";
-    }
-    // Claim Engine vs Report history share a prefix — use exact match for the parent, not startsWith("/claim-engine").
+    if (href === "/settings") return path === "/settings";
     if (href === "/claim-engine") {
       return path === "/claim-engine" || path.startsWith("/claim-engine/investigation");
     }
@@ -126,7 +141,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const auto: Record<string, boolean> = {};
-    NAV.forEach((sec) => {
+    [OPS_NAV, SYS_NAV, WMS_NAV].forEach((sec) => {
       sec.items.forEach((item) => {
         if (item.children?.some((c) => isActive(c.href))) {
           auto[`${sec.id}-${item.label}`] = true;
@@ -139,6 +154,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
 
   const closeMenu = () => setMobileOpen(false);
 
+  // ── NavLink ────────────────────────────────────────────────────────────────
   function NavLink({ item, child = false, alwaysFull = false }: {
     item: NavItemDef | NavChild;
     child?:      boolean;
@@ -196,6 +212,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     );
   }
 
+  // ── AccordionItem ─────────────────────────────────────────────────────────
   function AccordionItem({ item, sectionId, alwaysFull = false }: {
     item: NavItemDef; sectionId: string; alwaysFull?: boolean;
   }) {
@@ -247,52 +264,93 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     );
   }
 
+  // ── SidebarBody ───────────────────────────────────────────────────────────
+  // All visibility logic is delegated to useRbacPermissions — zero role
+  // comparisons inside this component.
   function SidebarBody({
     alwaysFull = false,
     collapsed: sidebarCollapsed,
   }: {
     alwaysFull?: boolean;
-    /** Narrow sidebar mode (desktop collapsed). Mobile drawer should pass false. */
     collapsed: boolean;
   }) {
-    const { role } = useUserRole();
+    const perms = useRbacPermissions();
     const showSection = alwaysFull || !sidebarCollapsed;
-    const visibleNav = NAV.filter((sec) => sec.id !== "sys" || isAdminRole(role));
+
+    function Section({ sec }: { sec: NavSection }) {
+      return (
+        <div className="mb-4">
+          {showSection
+            ? <p className={CLS.section}>{sec.label}</p>
+            : <div className="mb-2 mx-3 h-px bg-border" />
+          }
+          <div className="space-y-0.5">
+            {sec.items.map((item) =>
+              item.children?.length
+                ? <AccordionItem key={item.label} item={item} sectionId={sec.id} alwaysFull={alwaysFull} />
+                : <NavLink       key={item.label} item={item} alwaysFull={alwaysFull} />
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── OPERATOR: WMS-only view ──────────────────────────────────────────────
+    if (perms.isWmsOnly) {
+      return <Section sec={WMS_NAV} />;
+    }
+
+    // ── NON-OPERATOR: build nav sections dynamically ─────────────────────────
+
+    // Operations — filter items the role can see
+    const opsItems = OPS_NAV.items.filter((item) => {
+      if (item.href === "/")                           return perms.canSeeDashboard;
+      if (item.href === "/returns")                    return perms.canSeeReturns;
+      if (item.href === "/claim-engine")               return perms.canSeeClaimEngine;
+      if (item.href === "/claim-engine/report-history") return perms.canSeeReportHistory;
+      return true;
+    });
+
+    // System — filter items the role can see
+    const sysItems = SYS_NAV.items.filter((item) => {
+      if (item.href === "/users")    return perms.canSeeUsers;
+      if (item.href === "/settings") return perms.canSeeSettings;
+      return true;
+    });
+
     return (
       <>
-        {visibleNav.map((sec) => (
-          <div key={sec.id} className="mb-4">
-            {showSection
-              ? <p className={CLS.section}>{sec.label}</p>
-              : <div className="mb-2 mx-3 h-px bg-border" />
-            }
-            <div className="space-y-0.5">
-              {sec.items.map((item) =>
-                item.children?.length
-                  ? <AccordionItem key={item.label} item={item} sectionId={sec.id} alwaysFull={alwaysFull} />
-                  : <NavLink       key={item.label} item={item} alwaysFull={alwaysFull} />
-              )}
-            </div>
-          </div>
-        ))}
+        {/* Operations */}
+        {opsItems.length > 0 && (
+          <Section sec={{ ...OPS_NAV, items: opsItems }} />
+        )}
 
-        {isAdminRole(role) && (
+        {/* System (admin+) */}
+        {sysItems.length > 0 && (
+          <Section sec={{ ...SYS_NAV, items: sysItems }} />
+        )}
+
+        {/* System Admin panel — Imports + Debug toggle (admin+) */}
+        {perms.canSeeSystemAdmin && (
           <div className="mb-4">
             {showSection
               ? <p className={CLS.section}>System Admin</p>
               : <div className="mb-2 mx-3 h-px bg-border" />
             }
             <div className="space-y-0.5">
-              <NavLink
-                item={{ label: "Imports", icon: Database, href: "/imports" }}
-                alwaysFull={alwaysFull}
-              />
+              {perms.canSeeImports && (
+                <NavLink
+                  item={{ label: "Imports", icon: Database, href: "/imports" }}
+                  alwaysFull={alwaysFull}
+                />
+              )}
               <SidebarDebugToggle collapsed={sidebarCollapsed} />
             </div>
           </div>
         )}
 
-        {role === "super_admin" && (
+        {/* Platform (super_admin only) */}
+        {perms.canSeePlatformAdmin && (
           <div className="mb-4">
             {showSection
               ? <p className={CLS.section}>Platform</p>
@@ -310,6 +368,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     );
   }
 
+  // ── Mobile drawer ─────────────────────────────────────────────────────────
   const mobileDrawer = (
     <>
       <div
@@ -349,69 +408,69 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     </>
   );
 
+  // ── Full layout ───────────────────────────────────────────────────────────
   return (
     <GlobalSearchProvider>
-    <MobileMenuCtx.Provider value={{ openMobileMenu: () => setMobileOpen(true) }}>
-      <div className="flex min-h-screen bg-background">
+      <MobileMenuCtx.Provider value={{ openMobileMenu: () => setMobileOpen(true) }}>
+        <div className="flex min-h-screen bg-background">
 
-        {/* Desktop sidebar — navigation only (no theme / profile) */}
-        <aside
-          className={[
-            "sticky top-0 hidden h-screen flex-col overflow-hidden",
-            "border-r border-sidebar-border bg-sidebar",
-            "transition-[width] duration-300 ease-in-out md:flex",
-            collapsed ? "w-16" : "w-60",
-          ].join(" ")}
-        >
-          <div className={[
-            "flex h-14 shrink-0 items-center border-b border-sidebar-border px-4 min-w-0 overflow-hidden",
-            collapsed ? "justify-center" : "gap-2.5",
-          ].join(" ")}>
-            <BrandLogoImage />
-            {!collapsed && (
-              <div className="min-w-0">
-                <p className="truncate text-sm font-bold text-sidebar-foreground">
-                  {brandName || "E-commerce OS"}
-                </p>
-                <p className="text-[10px] text-muted-foreground">Returns ERP</p>
-              </div>
-            )}
+          {/* Desktop sidebar */}
+          <aside
+            className={[
+              "sticky top-0 hidden h-screen flex-col overflow-hidden",
+              "border-r border-sidebar-border bg-sidebar",
+              "transition-[width] duration-300 ease-in-out md:flex",
+              collapsed ? "w-16" : "w-60",
+            ].join(" ")}
+          >
+            <div className={[
+              "flex h-14 shrink-0 items-center border-b border-sidebar-border px-4 min-w-0 overflow-hidden",
+              collapsed ? "justify-center" : "gap-2.5",
+            ].join(" ")}>
+              <BrandLogoImage />
+              {!collapsed && (
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-bold text-sidebar-foreground">
+                    {brandName || "E-commerce OS"}
+                  </p>
+                  <p className="text-[10px] text-muted-foreground">Returns ERP</p>
+                </div>
+              )}
+            </div>
+
+            <nav className="flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
+              <SidebarBody collapsed={collapsed} />
+            </nav>
+
+            <div className="shrink-0 border-t border-sidebar-border p-2">
+              <button
+                type="button"
+                onClick={toggleCollapsed}
+                title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+                className={[
+                  CLS.linkBase, CLS.linkIdle,
+                  collapsed ? "justify-center" : "",
+                ].join(" ")}
+              >
+                {collapsed
+                  ? <PanelLeftOpen  className="h-5 w-5 shrink-0" />
+                  : <PanelLeftClose className="h-5 w-5 shrink-0" />}
+                {!collapsed && <span>Collapse</span>}
+              </button>
+            </div>
+          </aside>
+
+          {/* Main column */}
+          <div className="flex min-h-0 min-w-0 w-full flex-1 flex-col">
+            <TopHeader onMenuClick={() => setMobileOpen(true)} />
+            <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col overflow-auto">
+              {children}
+            </div>
           </div>
 
-          <nav className="flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
-            <SidebarBody collapsed={collapsed} />
-          </nav>
-
-          <div className="shrink-0 border-t border-sidebar-border p-2">
-            <button
-              type="button"
-              onClick={toggleCollapsed}
-              title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-              className={[
-                CLS.linkBase, CLS.linkIdle,
-                collapsed ? "justify-center" : "",
-              ].join(" ")}
-            >
-              {collapsed
-                ? <PanelLeftOpen  className="h-5 w-5 shrink-0" />
-                : <PanelLeftClose className="h-5 w-5 shrink-0" />}
-              {!collapsed && <span>Collapse</span>}
-            </button>
-          </div>
-        </aside>
-
-        {/* Main column: global header + scrollable page content */}
-        <div className="flex min-h-0 min-w-0 w-full flex-1 flex-col">
-          <TopHeader onMenuClick={() => setMobileOpen(true)} />
-
-          <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col overflow-auto">
-            {children}
-          </div>
+          {mobileOpen && mounted && createPortal(mobileDrawer, document.body)}
         </div>
-
-        {mobileOpen && mounted && createPortal(mobileDrawer, document.body)}
-      </div>
-    </MobileMenuCtx.Provider>
+      </MobileMenuCtx.Provider>
     </GlobalSearchProvider>
   );
 }

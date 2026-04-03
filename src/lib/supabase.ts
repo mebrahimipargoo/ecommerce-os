@@ -9,8 +9,6 @@ if (!supabaseUrl || !supabaseAnonKey) {
   );
 }
 
-export const supabase: SupabaseClient = createClient(
-  supabaseUrl,
-  supabaseAnonKey
-);
+/** See `@/types/database.types` for `returns` / `packages` / `pallets` row shapes. */
+export const supabase: SupabaseClient = createClient(supabaseUrl, supabaseAnonKey);
 

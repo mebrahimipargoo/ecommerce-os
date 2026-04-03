@@ -8,7 +8,7 @@ import { isUuidString } from "../../lib/uuid";
 
 export type OrganizationApiKeyRow = {
   id: string;
-  company_id: string;
+  organization_id: string;
   name: string;
   role: string;
   /** SHA-256 hex digest at rest — UI masks this; never the live secret. */
@@ -35,7 +35,7 @@ export async function createOrganizationApiKey(input: {
     const { data, error } = await supabaseServer
       .from("organization_api_keys")
       .insert({
-        company_id: orgId,
+        organization_id: orgId,
         name,
         role,
         api_key: keyDigest,
@@ -58,8 +58,8 @@ export async function listOrganizationApiKeys(): Promise<
   try {
     const { data, error } = await supabaseServer
       .from("organization_api_keys")
-      .select("id, company_id, name, role, api_key, created_at")
-      .eq("company_id", orgId)
+      .select("id, organization_id, name, role, api_key, created_at")
+      .eq("organization_id", orgId)
       .order("created_at", { ascending: false });
 
     if (error) return { ok: false, error: error.message };
@@ -79,7 +79,7 @@ export async function revokeOrganizationApiKey(
       .from("organization_api_keys")
       .delete()
       .eq("id", id)
-      .eq("company_id", orgId);
+      .eq("organization_id", orgId);
     if (error) return { ok: false, error: error.message };
     return { ok: true };
   } catch (e) {

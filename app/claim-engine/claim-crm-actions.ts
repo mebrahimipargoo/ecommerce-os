@@ -19,7 +19,7 @@ export type ClaimHistoryMessageKind =
 
 export type ClaimHistoryLogRow = {
   id: string;
-  company_id: string;
+  organization_id: string;
   submission_id: string;
   actor: ClaimHistoryActor;
   message_content: string;
@@ -55,7 +55,7 @@ export async function getClaimEngineKpis(
     const { data, error } = await supabaseServer
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select("status, claim_amount, reimbursement_amount")
-      .eq("company_id", organizationId);
+      .eq("organization_id", organizationId);
 
     if (error) throw new Error(error.message);
     const rows = data ?? [];
@@ -135,7 +135,7 @@ export async function getClaimHistoryLogsForSubmission(
       .from(CLAIM_HISTORY_TABLE)
       .select("*")
       .eq("submission_id", submissionId)
-      .eq("company_id", organizationId)
+      .eq("organization_id", organizationId)
       .order("created_at", { ascending: true });
 
     if (error) throw new Error(error.message);
@@ -144,7 +144,7 @@ export async function getClaimHistoryLogsForSubmission(
       const r = row as Record<string, unknown>;
       return {
         id: r.id as string,
-        company_id: r.company_id as string,
+        organization_id: r.organization_id as string,
         submission_id: r.submission_id as string,
         actor: r.actor as ClaimHistoryActor,
         message_content: r.message_content as string,
@@ -174,7 +174,7 @@ export async function getClaimInvestigationPayload(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select("*")
       .eq("id", submissionId)
-      .eq("company_id", organizationId)
+      .eq("organization_id", organizationId)
       .maybeSingle();
 
     if (sErr) throw new Error(sErr.message);
@@ -191,7 +191,7 @@ export async function getClaimInvestigationPayload(
       .from(CLAIM_HISTORY_TABLE)
       .select("*")
       .eq("submission_id", submissionId)
-      .eq("company_id", organizationId)
+      .eq("organization_id", organizationId)
       .order("created_at", { ascending: true });
 
     if (lErr) throw new Error(lErr.message);
@@ -200,7 +200,7 @@ export async function getClaimInvestigationPayload(
       const r = row as Record<string, unknown>;
       return {
         id: r.id as string,
-        company_id: r.company_id as string,
+        organization_id: r.organization_id as string,
         submission_id: r.submission_id as string,
         actor: r.actor as ClaimHistoryActor,
         message_content: r.message_content as string,
@@ -263,7 +263,7 @@ export async function syncMarketplaceStatus(opts: {
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select("id")
       .eq("id", opts.submissionId)
-      .eq("company_id", organizationId)
+      .eq("organization_id", organizationId)
       .maybeSingle();
     if (exErr) throw new Error(exErr.message);
     if (!exists) return { ok: false, error: "Submission not found." };
@@ -271,10 +271,9 @@ export async function syncMarketplaceStatus(opts: {
     for (const log of opts.logs) {
       const msg = log.message_content.trim() || "Update";
       const { error: insErr } = await supabaseServer.from(CLAIM_HISTORY_TABLE).insert({
-        company_id: organizationId,
+        organization_id: organizationId,
         submission_id: opts.submissionId,
         claim_id: opts.submissionId,
-        company_id: organizationId,
         action: msg,
         details: log.attachments ?? {},
         actor_label: log.actor.replace(/_/g, " "),
@@ -295,7 +294,7 @@ export async function syncMarketplaceStatus(opts: {
         success_probability: successProbability,
       })
       .eq("id", opts.submissionId)
-      .eq("company_id", organizationId);
+      .eq("organization_id", organizationId);
 
     if (upErr) throw new Error(upErr.message);
 

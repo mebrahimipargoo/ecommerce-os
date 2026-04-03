@@ -77,7 +77,7 @@ export async function fetchReadyToSendSubmissionsForHtmlPrint(
     const { data: subs, error } = await supabaseServer
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select("*")
-      .eq("company_id", organizationId)
+      .eq("organization_id", organizationId)
       .eq("status", "ready_to_send")
       .order("created_at", { ascending: true });
 
@@ -186,7 +186,7 @@ export async function markClaimSubmissionsPrintedLocally(
       q = q.eq("status", "ready_to_send");
     }
     if (organizationId != null && organizationId !== "") {
-      q = q.eq("company_id", organizationId);
+      q = q.eq("organization_id", organizationId);
     }
     const { data, error } = await q.select("id");
 

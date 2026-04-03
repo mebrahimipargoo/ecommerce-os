@@ -20,12 +20,12 @@ export async function fetchUserProfileById(
 }
 
 export type WorkspaceOrganizationOption = {
-  company_id: string;
+  organization_id: string;
   display_name: string;
 };
 
 /**
- * Companies visible in Super Admin filters (distinct orgs with data or settings).
+ * Organizations visible in Super Admin filters (distinct orgs with data or settings).
  */
 export async function listWorkspaceOrganizationsForAdmin(): Promise<
   { ok: true; rows: WorkspaceOrganizationOption[] } | { ok: false; error: string }
@@ -37,11 +37,20 @@ export async function listWorkspaceOrganizationsForAdmin(): Promise<
     if (error) {
       return { ok: false, error: error.message };
     }
-    const rows = (data ?? []) as { company_id: string; display_name: string }[];
-    const out: WorkspaceOrganizationOption[] = rows.map((r) => ({
-      company_id: String(r.company_id),
-      display_name: String(r.display_name ?? r.company_id),
-    }));
+    const rows = (data ?? []) as {
+      organization_id?: string;
+      display_name?: string;
+    }[];
+    const out: WorkspaceOrganizationOption[] = rows
+      .map((r) => {
+        const id = String(r.organization_id ?? "").trim();
+        const dn =
+          typeof r.display_name === "string" && r.display_name.trim().length > 0
+            ? r.display_name.trim()
+            : "";
+        return { organization_id: id, display_name: dn || id };
+      })
+      .filter((row) => row.organization_id.length > 0);
     out.sort((a, b) => a.display_name.localeCompare(b.display_name));
     return { ok: true, rows: out };
   } catch (e) {

@@ -1,16 +1,19 @@
 "use server";
 
 import { supabaseServer } from "../../../lib/supabase-server";
-import { resolveActorProfileId } from "../../../lib/import-actor";
 import { updateUploadAfterChunk as updateUploadProgressAfterChunk } from "../../../lib/import-upload-progress";
-import { mergeUploadMetadata, parseRawReportMetadata } from "../../../lib/raw-report-upload-metadata";
+import {
+  AMAZON_LEDGER_UPLOAD_SOURCE,
+  mergeUploadMetadata,
+  parseRawReportMetadata,
+  type RawReportUploadMetadata,
+} from "../../../lib/raw-report-upload-metadata";
+import type { RawReportUploadRow } from "../../../lib/raw-report-upload-row";
 import { resolveOrganizationId } from "../../../lib/organization";
 import { resolveWriteOrganizationId } from "../../../lib/server-tenant";
 import type { RawReportType } from "../../../lib/raw-report-types";
 import { isUuidString } from "../../../lib/uuid";
-import { DB_TABLES } from "../lib/constants";
-
-/** Import `RawReportType` from `lib/raw-report-types` in client code — not re-exported here (avoids bundler/runtime issues with `"use server"`). */
+import { DB_TABLES, RAW_REPORTS_BUCKET, RAW_REPORT_UPLOADS_SELECT } from "../lib/constants";
 
 /**
  * Inserts use **only** snake_case keys that match PostgREST / Postgres.
@@ -27,11 +30,44 @@ function serializeColumnMappingJson(
 }
 
 /**
- * Strict column list for `raw_report_uploads` (technical tracking only in `metadata` JSONB).
- * Uploader is `created_by` → `profiles.id` (not `uploaded_by`).
+ * BRUTAL: no cookies / JWT / getUser / getSession — DB profile only (explicit id, else first in org, else any profile).
  */
-const RAW_REPORT_UPLOADS_SELECT =
-  "id, company_id, file_name, report_type, status, column_mapping, metadata, created_at, updated_at, created_by";
+async function resolveActorForImportAction(explicitUserId?: string | null): Promise<string | null> {
+  const raw = explicitUserId?.trim();
+  if (raw && isUuidString(raw)) {
+    const { data } = await supabaseServer
+      .from(DB_TABLES.profiles)
+      .select("id")
+      .eq("id", raw)
+      .maybeSingle();
+    if (data?.id) return String(data.id);
+  }
+  const orgId = resolveOrganizationId();
+  const { data: firstInOrg } = await supabaseServer
+    .from(DB_TABLES.profiles)
+    .select("id")
+    .eq("organization_id", orgId)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (firstInOrg?.id) return String(firstInOrg.id);
+
+  const { data: anyProfile } = await supabaseServer
+    .from(DB_TABLES.profiles)
+    .select("id")
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  return anyProfile?.id ? String(anyProfile.id) : null;
+}
+
+export async function getImportLedgerActorUserId(): Promise<
+  { ok: true; actorUserId: string } | { ok: false }
+> {
+  const id = await resolveActorForImportAction(null);
+  if (!id) return { ok: false };
+  return { ok: true, actorUserId: id };
+}
 
 export async function updateUploadAfterChunk(
   input: Parameters<typeof updateUploadProgressAfterChunk>[0],
@@ -39,46 +75,15 @@ export async function updateUploadAfterChunk(
   return updateUploadProgressAfterChunk(input);
 }
 
-export type RawReportUploadRow = {
-  id: string;
-  company_id: string;
-  file_name: string;
-  /** Current or legacy slug from `raw_report_uploads.report_type`. */
-  report_type: string;
-  /** Parsed from `metadata.storage_prefix`. */
-  storage_prefix: string | null;
-  status: string;
-  /** Parsed from `metadata.upload_progress`. */
-  upload_progress: number;
-  /** Parsed from `metadata.process_progress`. */
-  process_progress: number;
-  /** Parsed from `metadata.uploaded_bytes`. */
-  uploaded_bytes: number;
-  /** Parsed from `metadata.total_bytes`. */
-  total_bytes: number;
-  row_count: number | null;
-  column_mapping: Record<string, string> | null;
-  /** Parsed from `metadata.error_message` only. */
-  errorMessage: string | null;
-  /** Raw JSONB for advanced UI. */
-  metadata: Record<string, unknown> | null;
-  /** FK to `profiles.id` — who created this upload row. */
-  created_by: string | null;
-  created_at: string;
-  updated_at: string;
-  /** Optional client-only label — not resolved from DB joins. */
-  created_by_name?: string | null;
-};
-
 async function audit(
+  orgId: string,
   userId: string | null,
   action: string,
   entityId: string | null,
   detail?: Record<string, unknown>,
 ): Promise<void> {
-  const orgId = resolveOrganizationId();
   await supabaseServer.from("raw_report_import_audit").insert({
-    company_id: orgId,
+    organization_id: orgId,
     user_profile_id: userId,
     action,
     entity_id: entityId,
@@ -89,8 +94,10 @@ async function audit(
 /** True if any prior upload in this org has the same content fingerprint in `metadata.md5_hash`. */
 export async function rawUploadExistsWithMd5Hash(
   md5Hash: string,
+  actorUserId?: string | null,
 ): Promise<{ ok: true; exists: boolean } | { ok: false; error: string }> {
-  const orgId = resolveOrganizationId();
+  const userId = await resolveActorForImportAction(actorUserId);
+  const orgId = await resolveWriteOrganizationId(userId, null);
   const normalized = md5Hash.trim().toLowerCase();
   if (!/^[a-f0-9]{32}$/.test(normalized)) {
     return { ok: false, error: "Invalid MD5 hash." };
@@ -100,7 +107,7 @@ export async function rawUploadExistsWithMd5Hash(
     const { data, error } = await supabaseServer
       .from(DB_TABLES.rawReportUploads)
       .select("id")
-      .eq("company_id", orgId)
+      .eq("organization_id", orgId)
       .contains("metadata", { md5_hash: normalized })
       .limit(1)
       .maybeSingle();
@@ -113,17 +120,17 @@ export async function rawUploadExistsWithMd5Hash(
 }
 
 export async function listRawReportUploads(input?: {
-  /** Effective tenant scope; super_admin may pass the ledger “Target company” id. */
-  companyId?: string | null;
+  /** Effective tenant scope; super_admin may pass the ledger “Target organization” id. */
+  organizationId?: string | null;
   actorUserId?: string | null;
 }): Promise<{ ok: true; rows: RawReportUploadRow[] } | { ok: false; error: string }> {
-  const actorId = await resolveActorProfileId(input?.actorUserId);
-  const orgId = await resolveWriteOrganizationId(actorId, input?.companyId?.trim() || null);
+  const actorId = await resolveActorForImportAction(input?.actorUserId);
+  const orgId = await resolveWriteOrganizationId(actorId, input?.organizationId?.trim() || null);
   try {
     const { data, error } = await supabaseServer
       .from(DB_TABLES.rawReportUploads)
       .select(RAW_REPORT_UPLOADS_SELECT)
-      .eq("company_id", orgId)
+      .eq("organization_id", orgId)
       .order("created_at", { ascending: false })
       .limit(100);
 
@@ -140,7 +147,7 @@ export async function listRawReportUploads(input?: {
           : null;
       return {
         id: String(r.id),
-        company_id: String(r.company_id),
+        organization_id: String(r.organization_id ?? ""),
         file_name: String(r.file_name ?? ""),
         report_type: String(r.report_type ?? ""),
         storage_prefix: meta.storagePrefix,
@@ -214,8 +221,10 @@ export async function createRawReportUploadSession(input: {
 }): Promise<
   { ok: true; id: string; storagePrefix: string } | { ok: false; error: string }
 > {
-  const userId = await resolveActorProfileId(input.actorUserId);
-  const orgId = resolveOrganizationId();
+  const userId = await resolveActorForImportAction(input.actorUserId);
+  // Resolve org from the actor's profile so the row gets the correct tenant even when
+  // the env-var default org differs from the authenticated user's organization.
+  const orgId = await resolveWriteOrganizationId(userId, null);
   const storagePrefix = `${orgId}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
   /** Plain JSON object for `column_mapping` JSONB (PostgREST). */
@@ -243,7 +252,7 @@ export async function createRawReportUploadSession(input: {
   });
 
   const insertRow = {
-    company_id: orgId,
+    organization_id: orgId,
     file_name: input.fileName,
     report_type: input.reportType,
     status: "pending" as const,
@@ -264,11 +273,11 @@ export async function createRawReportUploadSession(input: {
         ok: false,
         error:
           error?.message ??
-          "Insert failed. Check Supabase migration for raw_report_uploads (company_id) and organization_settings.",
+          "Insert failed. Check Supabase migration for raw_report_uploads (organization_id) and organization_settings.",
       };
     }
 
-    await audit(userId, "import.session_created", data.id as string, {
+    await audit(orgId, userId, "import.session_created", data.id as string, {
       fileName: input.fileName,
       totalBytes: input.totalBytes,
       hasMapping: !!column_mapping,
@@ -280,6 +289,154 @@ export async function createRawReportUploadSession(input: {
   }
 }
 
+/**
+ * Creates a `raw_report_uploads` row for the ledger uploader so progress/history use `organization_id`
+ * (via `resolveWriteOrganizationId`) and metadata upload/process percentages.
+ */
+export async function createAmazonLedgerUploadSession(input: {
+  fileName: string;
+  fileSizeBytes: number;
+  storagePath: string;
+  actorUserId?: string | null;
+  /** Tenant scope for `raw_report_uploads.organization_id`. */
+  organization_id?: string | null;
+  requestedOrganizationId?: string | null;
+  /** Target store (`stores.id`); stored in metadata for audit/UI. */
+  store_id?: string | null;
+}): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
+  const userId = await resolveActorForImportAction(input.actorUserId);
+  const requested =
+    (input.organization_id ?? input.requestedOrganizationId)?.trim() ?? null;
+  const orgId = await resolveWriteOrganizationId(userId, requested);
+  if (!isUuidString(orgId)) return { ok: false, error: "Invalid tenant scope." };
+
+  const sid = input.store_id?.trim() ?? "";
+  const metadata = mergeUploadMetadata(null, {
+    total_bytes: input.fileSizeBytes,
+    upload_progress: 0,
+    process_progress: 0,
+    uploaded_bytes: 0,
+    ledger_storage_path: input.storagePath,
+    ...(sid && isUuidString(sid) ? { ledger_store_id: sid } : {}),
+    source: AMAZON_LEDGER_UPLOAD_SOURCE,
+    file_extension: "csv",
+    file_size_bytes: input.fileSizeBytes,
+    upload_chunks_count: 1,
+    total_parts: 1,
+  });
+
+  const insertRow = {
+    organization_id: orgId,
+    file_name: input.fileName,
+    report_type: "inventory_ledger" as const,
+    status: "uploading" as const,
+    column_mapping: null as Record<string, string> | null,
+    metadata,
+    ...(userId ? { created_by: userId } : {}),
+  };
+
+  try {
+    const { data, error } = await supabaseServer
+      .from(DB_TABLES.rawReportUploads)
+      .insert(insertRow)
+      .select("id")
+      .single();
+
+    if (error || !data?.id) {
+      return {
+        ok: false,
+        error: error?.message ?? "Insert failed (ledger session).",
+      };
+    }
+
+    await audit(orgId, userId, "import.ledger_session_created", data.id as string, {
+      fileName: input.fileName,
+      storagePath: input.storagePath,
+    });
+    return { ok: true, id: data.id as string };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Create failed." };
+  }
+}
+
+export async function patchAmazonLedgerUploadSession(input: {
+  uploadId: string;
+  actorUserId?: string | null;
+  organization_id?: string | null;
+  requestedOrganizationId?: string | null;
+  status?: "uploading" | "pending" | "processing" | "complete" | "failed";
+  metadataPatch: Record<string, unknown>;
+}): Promise<
+  { ok: true; upload_progress: number; process_progress: number } | { ok: false; error: string }
+> {
+  const userId = await resolveActorForImportAction(input.actorUserId);
+  const requested =
+    (input.organization_id ?? input.requestedOrganizationId)?.trim() ?? null;
+  const orgId = await resolveWriteOrganizationId(userId, requested);
+  if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
+
+  const { data: row, error: fetchErr } = await supabaseServer
+    .from(DB_TABLES.rawReportUploads)
+    .select("id, metadata")
+    .eq("id", input.uploadId)
+    .eq("organization_id", orgId)
+    .maybeSingle();
+
+  if (fetchErr || !row) return { ok: false, error: fetchErr?.message ?? "Upload not found." };
+
+  const prev = (row as { metadata?: unknown }).metadata;
+  const merged = mergeUploadMetadata(prev, input.metadataPatch as Partial<RawReportUploadMetadata>);
+
+  const updateRow: Record<string, unknown> = {
+    metadata: merged,
+    updated_at: new Date().toISOString(),
+  };
+  if (input.status) updateRow.status = input.status;
+
+  const { error: upErr } = await supabaseServer
+    .from(DB_TABLES.rawReportUploads)
+    .update(updateRow)
+    .eq("id", input.uploadId)
+    .eq("organization_id", orgId);
+
+  if (upErr) return { ok: false, error: upErr.message };
+
+  const parsed = parseRawReportMetadata(merged);
+  return { ok: true, upload_progress: parsed.uploadProgress, process_progress: parsed.processProgress };
+}
+
+export async function getAmazonLedgerUploadProgress(input: {
+  uploadId: string;
+  actorUserId?: string | null;
+  organization_id?: string | null;
+  requestedOrganizationId?: string | null;
+}): Promise<
+  | { ok: true; upload_progress: number; process_progress: number; status: string }
+  | { ok: false; error: string }
+> {
+  const userId = await resolveActorForImportAction(input.actorUserId);
+  const requested =
+    (input.organization_id ?? input.requestedOrganizationId)?.trim() ?? null;
+  const orgId = await resolveWriteOrganizationId(userId, requested);
+  if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
+
+  const { data: row, error } = await supabaseServer
+    .from(DB_TABLES.rawReportUploads)
+    .select("metadata, status")
+    .eq("id", input.uploadId)
+    .eq("organization_id", orgId)
+    .maybeSingle();
+
+  if (error || !row) return { ok: false, error: error?.message ?? "Not found." };
+  const parsed = parseRawReportMetadata((row as { metadata?: unknown }).metadata);
+  return {
+    ok: true,
+    upload_progress: parsed.uploadProgress,
+    process_progress: parsed.processProgress,
+    status: String((row as { status?: unknown }).status ?? ""),
+  };
+}
+
 export async function finalizeRawReportUpload(input: {
   uploadId: string;
   /** Accurate data row count (excluding header; trailing blanks ignored). */
@@ -287,18 +444,19 @@ export async function finalizeRawReportUpload(input: {
   columnMapping?: Record<string, string> | null;
   actorUserId?: string | null;
 }): Promise<{ ok: boolean; error?: string }> {
-  const userId = await resolveActorProfileId(input.actorUserId);
+  const userId = await resolveActorForImportAction(input.actorUserId);
   if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
 
-  const orgId = resolveOrganizationId();
+  // Read org from the stored row so we never rely on the env-var default.
   const { data: row, error: fetchErr } = await supabaseServer
     .from(DB_TABLES.rawReportUploads)
-    .select("id, metadata")
+    .select("id, organization_id, metadata")
     .eq("id", input.uploadId)
-    .eq("company_id", orgId)
     .maybeSingle();
 
   if (fetchErr || !row) return { ok: false, error: fetchErr?.message ?? "Upload not found." };
+  const orgId = String((row as { organization_id?: unknown }).organization_id ?? "").trim();
+  if (!isUuidString(orgId)) return { ok: false, error: "Upload row has invalid organization_id." };
 
   const metadata = mergeUploadMetadata((row as { metadata?: unknown }).metadata, {
     upload_progress: 100,
@@ -316,11 +474,11 @@ export async function finalizeRawReportUpload(input: {
       updated_at: new Date().toISOString(),
     })
     .eq("id", input.uploadId)
-    .eq("company_id", orgId);
+    .eq("organization_id", orgId);
 
   if (error) return { ok: false, error: error.message };
 
-  await audit(userId, "import.upload_finalized", input.uploadId, {
+  await audit(orgId, userId, "import.upload_finalized", input.uploadId, {
     rowCount: input.rowCount ?? null,
   });
   return { ok: true };
@@ -331,32 +489,33 @@ export async function failRawReportUpload(input: {
   message: string;
   actorUserId?: string | null;
 }): Promise<void> {
-  const userId = await resolveActorProfileId(input.actorUserId);
-  const orgId = resolveOrganizationId();
+  const userId = await resolveActorForImportAction(input.actorUserId);
   if (!isUuidString(input.uploadId)) return;
 
   const { data: row } = await supabaseServer
     .from(DB_TABLES.rawReportUploads)
-    .select("metadata")
+    .select("id, organization_id, metadata")
     .eq("id", input.uploadId)
-    .eq("company_id", orgId)
     .maybeSingle();
 
+  const orgId = String((row as { organization_id?: unknown } | null)?.organization_id ?? "").trim();
   const metadata = mergeUploadMetadata((row as { metadata?: unknown } | null)?.metadata, {
     error_message: input.message,
   });
 
-  await supabaseServer
-    .from(DB_TABLES.rawReportUploads)
-    .update({
-      status: "failed",
-      metadata,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", input.uploadId)
-    .eq("company_id", orgId);
+  if (isUuidString(orgId)) {
+    await supabaseServer
+      .from(DB_TABLES.rawReportUploads)
+      .update({
+        status: "failed",
+        metadata,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", input.uploadId)
+      .eq("organization_id", orgId);
 
-  await audit(userId, "import.upload_failed", input.uploadId, { message: input.message });
+    await audit(orgId, userId, "import.upload_failed", input.uploadId, { message: input.message });
+  }
 }
 
 export async function updateRawReportType(input: {
@@ -364,10 +523,10 @@ export async function updateRawReportType(input: {
   reportType: RawReportType;
   actorUserId?: string | null;
 }): Promise<{ ok: boolean; error?: string }> {
-  const userId = await resolveActorProfileId(input.actorUserId);
+  const userId = await resolveActorForImportAction(input.actorUserId);
   if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
 
-  const orgId = resolveOrganizationId();
+  const orgId = await resolveWriteOrganizationId(userId, null);
   const { error } = await supabaseServer
     .from(DB_TABLES.rawReportUploads)
     .update({
@@ -375,11 +534,11 @@ export async function updateRawReportType(input: {
       updated_at: new Date().toISOString(),
     })
     .eq("id", input.uploadId)
-    .eq("company_id", orgId);
+    .eq("organization_id", orgId);
 
   if (error) return { ok: false, error: error.message };
 
-  await audit(userId, "import.report_type_updated", input.uploadId, {
+  await audit(orgId, userId, "import.report_type_updated", input.uploadId, {
     reportType: input.reportType,
   });
   return { ok: true };
@@ -390,10 +549,10 @@ export async function recordColumnMappingDecision(input: {
   mapping: Record<string, string>;
   actorUserId?: string | null;
 }): Promise<{ ok: boolean; error?: string }> {
-  const userId = await resolveActorProfileId(input.actorUserId);
+  const userId = await resolveActorForImportAction(input.actorUserId);
   if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
 
-  const orgId = resolveOrganizationId();
+  const orgId = await resolveWriteOrganizationId(userId, null);
   const { error } = await supabaseServer
     .from(DB_TABLES.rawReportUploads)
     .update({
@@ -401,15 +560,13 @@ export async function recordColumnMappingDecision(input: {
       updated_at: new Date().toISOString(),
     })
     .eq("id", input.uploadId)
-    .eq("company_id", orgId);
+    .eq("organization_id", orgId);
 
   if (error) return { ok: false, error: error.message };
 
-  await audit(userId, "import.mapping_applied", input.uploadId, { keys: Object.keys(input.mapping) });
+  await audit(orgId, userId, "import.mapping_applied", input.uploadId, { keys: Object.keys(input.mapping) });
   return { ok: true };
 }
-
-const RAW_REPORTS_BUCKET = "raw-reports";
 
 async function removeObjectsUnderStoragePrefix(prefix: string): Promise<void> {
   const trimmed = prefix.replace(/\/+$/, "");
@@ -425,18 +582,22 @@ async function removeObjectsUnderStoragePrefix(prefix: string): Promise<void> {
 /** Deletes `raw_report_uploads` row and objects under `metadata.storage_prefix` in Storage. */
 export async function deleteRawReportUpload(
   uploadId: string,
+  actorUserId?: string | null,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   if (!isUuidString(uploadId)) return { ok: false, error: "Invalid upload id." };
-  const orgId = resolveOrganizationId();
+
+  // Fetch by ID only and read org from the row — avoids reliance on env-var default org.
   const { data: row, error: fetchErr } = await supabaseServer
     .from(DB_TABLES.rawReportUploads)
-    .select("metadata")
+    .select("id, organization_id, metadata")
     .eq("id", uploadId)
-    .eq("company_id", orgId)
     .maybeSingle();
   if (fetchErr || !row) {
     return { ok: false, error: fetchErr?.message ?? "Upload not found." };
   }
+  const orgId = String((row as { organization_id?: unknown }).organization_id ?? "").trim();
+  if (!isUuidString(orgId)) return { ok: false, error: "Upload row has invalid organization_id." };
+
   const prefix = parseRawReportMetadata((row as { metadata?: unknown }).metadata).storagePrefix;
   if (prefix) {
     await removeObjectsUnderStoragePrefix(prefix);
@@ -445,7 +606,8 @@ export async function deleteRawReportUpload(
     .from(DB_TABLES.rawReportUploads)
     .delete()
     .eq("id", uploadId)
-    .eq("company_id", orgId);
+    .eq("organization_id", orgId);
   if (delErr) return { ok: false, error: delErr.message };
+  void actorUserId;
   return { ok: true };
 }

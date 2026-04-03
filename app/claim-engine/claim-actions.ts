@@ -35,7 +35,12 @@ function normalizeReturnRow(raw: unknown): ReturnRecord {
   } else {
     stores = null;
   }
-  return { ...r, stores } as ReturnRecord;
+  return {
+    ...r,
+    stores,
+    marketplace: String((r.marketplace as string | undefined) ?? ""),
+    rma_number: (r.rma_number as string | null | undefined) ?? null,
+  } as ReturnRecord;
 }
 
 function mapBulkUiStatusToSubmission(status: string): string {
@@ -56,14 +61,14 @@ export async function bulkUpdateClaimsStatus(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .update({ status: dbStatus })
       .in("id", ids)
-      .eq("company_id", organizationId);
+      .eq("organization_id", organizationId);
     if (error) throw new Error(error.message);
 
     const actorLabel = await resolveProfileDisplayName(actorUserId ?? null);
     for (const id of ids) {
       const log = await appendClaimHistoryTimelineEntry({
         claimId: id,
-        companyId: organizationId,
+        organizationId,
         action: `Status changed to ${dbStatus}`,
         details: { new_status: dbStatus, source: "bulk_update" },
         statusAtTime: dbStatus,
@@ -94,7 +99,7 @@ export async function updateClaimFields(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select("source_payload")
       .eq("id", id)
-      .eq("company_id", organizationId)
+      .eq("organization_id", organizationId)
       .maybeSingle();
     if (fetchErr) throw new Error(fetchErr.message);
     if (!row) return { ok: false, error: "Claim not found." };
@@ -115,7 +120,7 @@ export async function updateClaimFields(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .update(updateRow)
       .eq("id", id)
-      .eq("company_id", organizationId);
+      .eq("organization_id", organizationId);
     if (error) throw new Error(error.message);
     return { ok: true };
   } catch (e) {
@@ -139,9 +144,10 @@ export async function getClaimDetail(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select("*")
       .eq("id", claimId)
-      .eq("company_id", organizationId)
-      .single();
+      .eq("organization_id", organizationId)
+      .maybeSingle();
     if (cErr) throw new Error(cErr.message);
+    if (!subRaw) return { ok: false, error: "Claim not found for this company." };
     const sub = subRaw as Record<string, unknown>;
 
     let returnRow: ReturnRecord | null = null;
@@ -201,7 +207,7 @@ export async function getClaimDetailForReturn(
       .from("returns")
       .select(RETURN_SELECT)
       .eq("id", returnId)
-      .eq("company_id", organizationId)
+      .eq("organization_id", organizationId)
       .maybeSingle();
     if (rErr) throw new Error(rErr.message);
     if (!retRaw) return { ok: false, error: "Return not found." };
@@ -211,7 +217,7 @@ export async function getClaimDetailForReturn(
       .from(CLAIM_SUBMISSIONS_TABLE)
       .select("*")
       .eq(CLAIM_SUBMISSION_RETURN_ID_COLUMN, returnId)
-      .eq("company_id", organizationId)
+      .eq("organization_id", organizationId)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();

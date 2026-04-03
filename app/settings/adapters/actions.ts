@@ -11,12 +11,12 @@ function maskSecret(value: string): string {
   return "•".repeat(8) + t.slice(-4);
 }
 
-const DEFAULT_COMPANY_ID = "00000000-0000-0000-0000-000000000001";
+const DEFAULT_ORGANIZATION_ID = "00000000-0000-0000-0000-000000000001";
 const DEFAULT_ROLE_REQUIRED = "admin";
 
 /** RBAC context - when auth is added, derive from session */
 export type RbacContext = {
-  company_id: string;
+  organization_id: string;
   user_role: string;
 };
 
@@ -25,7 +25,7 @@ type MarketplaceRow = {
   provider: AdapterProviderKey;
   nickname: string;
   credentials: Record<string, string>;
-  company_id: string;
+  organization_id: string;
   role_required: string;
   created_at: string;
 };
@@ -34,7 +34,7 @@ type MarketplaceInsertPayload = {
   provider: AdapterProviderKey;
   nickname: string;
   credentials: Record<string, string>;
-  company_id?: string;
+  organization_id?: string;
   role_required?: string;
 };
 
@@ -49,14 +49,14 @@ type MarketplacePublicRow = {
   nickname: string;
   /** Masked display ID from credentials (e.g. Seller ID) - never send raw credentials */
   display_id?: string;
-  company_id: string;
+  organization_id: string;
   role_required: string;
   created_at: string;
 };
 
 function getRbacContext(ctx?: RbacContext | null): RbacContext {
   return {
-    company_id: ctx?.company_id ?? DEFAULT_COMPANY_ID,
+    organization_id: ctx?.organization_id ?? DEFAULT_ORGANIZATION_ID,
     user_role: ctx?.user_role ?? DEFAULT_ROLE_REQUIRED,
   };
 }
@@ -77,9 +77,9 @@ export async function getMarketplaceCredentialsForEdit(
   try {
     const { data, error } = await supabaseServer
       .from("marketplaces")
-      .select("company_id, role_required, credentials")
+      .select("organization_id, role_required, credentials")
       .eq("id", marketplaceId)
-      .eq("company_id", rbac.company_id)
+      .eq("organization_id", rbac.organization_id)
       .single();
 
     if (error || !data) throw new Error("Connection not found.");
@@ -129,9 +129,9 @@ export async function testConnection(
   try {
     const { data, error } = await supabaseServer
       .from("marketplaces")
-      .select("id, provider, credentials, company_id, role_required")
+      .select("id, provider, credentials, organization_id, role_required")
       .eq("id", connectionId)
-      .eq("company_id", rbac.company_id)
+      .eq("organization_id", rbac.organization_id)
       .single();
 
     if (error) throw new Error(error.message);
@@ -170,9 +170,9 @@ export async function syncClaims(
   try {
     const { data, error } = await supabaseServer
       .from("marketplaces")
-      .select("id, provider, credentials, company_id, role_required")
+      .select("id, provider, credentials, organization_id, role_required")
       .eq("id", connectionId)
-      .eq("company_id", rbac.company_id)
+      .eq("organization_id", rbac.organization_id)
       .single();
 
     if (error) throw new Error(error.message);
@@ -204,7 +204,7 @@ export async function syncClaims(
             ? "evidence_requested"
             : "submitted";
       return {
-        company_id: row.company_id,
+        organization_id: row.organization_id,
         return_id: null,
         claim_amount: Number(c.amount) || 0,
         status,
@@ -249,13 +249,13 @@ export async function insertMarketplace(
       provider: payload.provider,
       nickname: payload.nickname,
       credentials: payload.credentials ?? {},
-      company_id: payload.company_id ?? rbac.company_id,
+      organization_id: payload.organization_id ?? rbac.organization_id,
       role_required: payload.role_required ?? DEFAULT_ROLE_REQUIRED,
     };
     const { data, error } = await supabaseServer
       .from("marketplaces")
       .insert(row)
-      .select("id, provider, nickname, credentials, company_id, role_required, created_at")
+      .select("id, provider, nickname, credentials, organization_id, role_required, created_at")
       .single();
 
     if (error) throw new Error(error.message);
@@ -272,7 +272,7 @@ export async function insertMarketplace(
         provider: inserted.provider,
         nickname: inserted.nickname,
         display_id,
-        company_id: inserted.company_id,
+        organization_id: inserted.organization_id,
         role_required: inserted.role_required,
         created_at: inserted.created_at,
       },
@@ -295,13 +295,13 @@ export async function updateMarketplace(
   try {
     const { data: existing, error: fetchError } = await supabaseServer
       .from("marketplaces")
-      .select("company_id, role_required, credentials")
+      .select("organization_id, role_required, credentials")
       .eq("id", id)
       .single();
 
     if (fetchError || !existing) throw new Error("Connection not found.");
-    const row = existing as { company_id: string; role_required: string; credentials?: Record<string, string> };
-    if (row.company_id !== rbac.company_id) {
+    const row = existing as { organization_id: string; role_required: string; credentials?: Record<string, string> };
+    if (row.organization_id !== rbac.organization_id) {
       throw new Error("Connection not found.");
     }
     if (!canAccess(row.role_required, rbac.user_role)) {
@@ -327,8 +327,8 @@ export async function updateMarketplace(
       .from("marketplaces")
       .update(update)
       .eq("id", id)
-      .eq("company_id", rbac.company_id)
-      .select("id, provider, nickname, credentials, company_id, role_required, created_at")
+      .eq("organization_id", rbac.organization_id)
+      .select("id, provider, nickname, credentials, organization_id, role_required, created_at")
       .single();
 
     if (error) throw new Error(error.message);
@@ -345,7 +345,7 @@ export async function updateMarketplace(
         provider: updated.provider,
         nickname: updated.nickname,
         display_id,
-        company_id: updated.company_id,
+        organization_id: updated.organization_id,
         role_required: updated.role_required,
         created_at: updated.created_at,
       },
@@ -367,13 +367,13 @@ export async function deleteMarketplace(
   try {
     const { data: existing, error: fetchError } = await supabaseServer
       .from("marketplaces")
-      .select("company_id, role_required")
+      .select("organization_id, role_required")
       .eq("id", id)
       .single();
 
     if (fetchError || !existing) throw new Error("Connection not found.");
-    const row = existing as { company_id: string; role_required: string };
-    if (row.company_id !== rbac.company_id) {
+    const row = existing as { organization_id: string; role_required: string };
+    if (row.organization_id !== rbac.organization_id) {
       throw new Error("Connection not found.");
     }
     if (!canAccess(row.role_required, rbac.user_role)) {
@@ -384,7 +384,7 @@ export async function deleteMarketplace(
       .from("marketplaces")
       .delete()
       .eq("id", id)
-      .eq("company_id", rbac.company_id);
+      .eq("organization_id", rbac.organization_id);
 
     if (error) throw new Error(error.message);
     return { ok: true };
@@ -405,7 +405,7 @@ export type StorePublicRow = {
   platform: string;
   is_active: boolean;
   marketplace_id: string | null;
-  company_id: string;
+  organization_id: string;
   created_at: string;
 };
 
@@ -417,25 +417,15 @@ export type StoreInsertPayload = {
 };
 
 export async function listStores(
-  ctx?: RbacContext | null
+  _ctx?: RbacContext | null
 ): Promise<{ ok: boolean; data?: StorePublicRow[]; error?: string }> {
-  const rbac = getRbacContext(ctx);
   try {
     const { data, error } = await supabaseServer
       .from("stores")
-      .select("id, name, platform, is_active, marketplace_id, company_id, created_at")
-      .eq("company_id", rbac.company_id)
+      .select("id, name, platform, is_active, marketplace_id, organization_id, created_at")
       .order("created_at", { ascending: false });
 
-    if (error) {
-      // Fallback: if company_id column missing or no match, return all stores
-      const { data: fallback, error: fbErr } = await supabaseServer
-        .from("stores")
-        .select("id, name, platform, is_active, marketplace_id, created_at")
-        .order("created_at", { ascending: false });
-      if (fbErr) throw new Error(fbErr.message);
-      return { ok: true, data: (fallback ?? []) as StorePublicRow[] };
-    }
+    if (error) throw new Error(error.message);
     return { ok: true, data: (data ?? []) as StorePublicRow[] };
   } catch (error) {
     const message =
@@ -454,7 +444,7 @@ export async function deleteStore(
       .from("stores")
       .delete()
       .eq("id", id)
-      .eq("company_id", rbac.company_id);
+      .eq("organization_id", rbac.organization_id);
 
     if (error) {
       // Fallback without org filter for local dev
@@ -487,8 +477,8 @@ export async function updateStore(
       .from("stores")
       .update(update)
       .eq("id", id)
-      .eq("company_id", rbac.company_id)
-      .select("id, name, platform, is_active, marketplace_id, company_id, created_at")
+      .eq("organization_id", rbac.organization_id)
+      .select("id, name, platform, is_active, marketplace_id, organization_id, created_at")
       .single();
 
     if (error) {
@@ -522,7 +512,7 @@ export async function insertStore(
       name: payload.name.trim(),
       platform: payload.platform,
       is_active: true,
-      company_id: rbac.company_id,
+      organization_id: rbac.organization_id,
     };
     if (payload.region)         row.region         = payload.region;
     if (payload.marketplace_id) row.marketplace_id  = payload.marketplace_id;
@@ -530,7 +520,7 @@ export async function insertStore(
     const { data, error } = await supabaseServer
       .from("stores")
       .insert(row)
-      .select("id, name, platform, is_active, marketplace_id, company_id, created_at")
+      .select("id, name, platform, is_active, marketplace_id, organization_id, created_at")
       .single();
 
     if (error) throw new Error(error.message);
@@ -553,15 +543,15 @@ export async function listMarketplaces(
   try {
     let { data, error } = await supabaseServer
       .from("marketplaces")
-      .select("id, provider, nickname, credentials, company_id, role_required, created_at")
-      .eq("company_id", rbac.company_id)
+      .select("id, provider, nickname, credentials, organization_id, role_required, created_at")
+      .eq("organization_id", rbac.organization_id)
       .order("created_at", { ascending: false });
 
     if (error) {
       // Fallback without org filter
       const fb = await supabaseServer
         .from("marketplaces")
-        .select("id, provider, nickname, credentials, company_id, role_required, created_at")
+        .select("id, provider, nickname, credentials, organization_id, role_required, created_at")
         .order("created_at", { ascending: false });
       if (fb.error) throw new Error(fb.error.message);
       data = fb.data;
@@ -579,7 +569,7 @@ export async function listMarketplaces(
         provider: r.provider,
         nickname: r.nickname,
         display_id,
-        company_id: r.company_id,
+        organization_id: r.organization_id,
         role_required: r.role_required,
         created_at: r.created_at,
       };

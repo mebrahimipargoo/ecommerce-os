@@ -1,7 +1,7 @@
 "use server";
 
+import { resolveTenantOrganizationId, type TenantWriteContext } from "../../lib/server-tenant";
 import { supabaseServer } from "../../lib/supabase-server";
-import { resolveOrganizationId } from "../../lib/organization";
 import {
   mergeDefaultClaimEvidence,
   type ClaimEvidenceKey,
@@ -9,13 +9,14 @@ import {
 } from "../claim-engine/claim-evidence-settings";
 
 export async function getOrganizationClaimEvidenceDefaults(
-  organizationId: string = resolveOrganizationId(),
+  tenant?: TenantWriteContext | null,
 ): Promise<Record<ClaimEvidenceKey, boolean>> {
+  const companyId = await resolveTenantOrganizationId(tenant);
   try {
     const { data, error } = await supabaseServer
       .from("organization_settings")
       .select("default_claim_evidence")
-      .eq("company_id", organizationId)
+      .eq("organization_id", companyId)
       .maybeSingle();
     if (error || !data) return mergeDefaultClaimEvidence(null);
     const raw = (data as { default_claim_evidence?: DefaultClaimEvidence | null }).default_claim_evidence;
@@ -27,18 +28,19 @@ export async function getOrganizationClaimEvidenceDefaults(
 
 export async function saveOrganizationClaimEvidenceDefaults(
   patch: DefaultClaimEvidence,
-  organizationId: string = resolveOrganizationId(),
+  tenant?: TenantWriteContext | null,
 ): Promise<{ ok: boolean; error?: string }> {
+  const companyId = await resolveTenantOrganizationId(tenant);
   try {
     const merged = mergeDefaultClaimEvidence(patch);
     const { data: existing } = await supabaseServer
       .from("organization_settings")
       .select("is_ai_label_ocr_enabled, is_ai_packing_slip_ocr_enabled")
-      .eq("company_id", organizationId)
+      .eq("organization_id", companyId)
       .maybeSingle();
 
     const row = {
-      company_id: organizationId,
+      organization_id: companyId,
       is_ai_label_ocr_enabled: (existing as { is_ai_label_ocr_enabled?: boolean } | null)?.is_ai_label_ocr_enabled ?? false,
       is_ai_packing_slip_ocr_enabled:
         (existing as { is_ai_packing_slip_ocr_enabled?: boolean } | null)?.is_ai_packing_slip_ocr_enabled ?? false,
@@ -46,7 +48,7 @@ export async function saveOrganizationClaimEvidenceDefaults(
     };
 
     const { error: upsertErr } = await supabaseServer.from("organization_settings").upsert(row, {
-      onConflict: "company_id",
+      onConflict: "organization_id",
     });
     if (upsertErr) return { ok: false, error: upsertErr.message };
     return { ok: true };

@@ -34,7 +34,7 @@ export async function uploadMediaFileAction(
       ? (bucketRaw as StorageBucketName)
       : DEFAULT_BUCKET;
 
-  const orgRaw = formData.get("company_id");
+  const orgRaw = formData.get("organization_id");
   const organizationId =
     typeof orgRaw === "string" && orgRaw.trim().length > 0 && isUuidString(orgRaw.trim())
       ? orgRaw.trim()

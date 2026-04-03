@@ -52,7 +52,7 @@ function CompanyFeatureRow({
     setLocalErr(null);
     const res = await saveOrganizationFeatures({
       actorProfileId: actorUserId,
-      organizationId: row.company_id,
+      organizationId: row.organization_id,
       debug_mode: debug,
       is_ai_label_ocr_enabled: labelOcr,
       is_ai_packing_slip_ocr_enabled: packOcr,
@@ -70,7 +70,7 @@ function CompanyFeatureRow({
       <div className="flex flex-wrap items-center gap-2">
         <p className="min-w-0 flex-1 font-medium text-slate-900 dark:text-slate-100">{row.display_name}</p>
         <code className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-          {row.company_id}
+          {row.organization_id}
         </code>
       </div>
       {localErr && (
@@ -240,7 +240,7 @@ export default function AdminSettingsPage() {
           <ul className="mt-2">
             {featureRows.map((r) => (
               <CompanyFeatureRow
-                key={r.company_id}
+                key={r.organization_id}
                 row={r}
                 actorUserId={actorUserId}
                 onSaved={loadFeatures}

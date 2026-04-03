@@ -1,8 +1,8 @@
 "use server";
 
+import { resolveTenantOrganizationId, type TenantWriteContext } from "../../lib/server-tenant";
 import { supabaseServer } from "../../lib/supabase-server";
 import { upsertOrganizationLogoUrl } from "../../lib/organization-logo";
-import { resolveOrganizationId } from "../../lib/organization";
 import { isUuidString } from "../../lib/uuid";
 import { saveCoreSettings } from "./workspace-settings-actions";
 
@@ -49,15 +49,41 @@ export async function uploadOrganizationLogoAction(
     return { ok: false, error: "Unsupported image type. Use PNG, JPEG, WebP, GIF, or SVG." };
   }
 
-  const organizationId = resolveOrganizationId();
-  if (!isUuidString(organizationId)) {
-    return { ok: false, error: "Invalid organization context." };
+  const actorProfileId = String(formData.get("actor_profile_id") ?? "").trim() || null;
+  const companyIdRaw = String(formData.get("organization_id") ?? "").trim() || null;
+  const tenant: TenantWriteContext = {
+    actorProfileId,
+    organizationId: companyIdRaw && isUuidString(companyIdRaw) ? companyIdRaw : null,
+  };
+  const orgId = await resolveTenantOrganizationId(tenant);
+  if (!isUuidString(orgId)) {
+    return {
+      ok: false,
+      error:
+        "You must be assigned to an organization to upload a logo. Contact your administrator.",
+    };
+  }
+
+  // Guard: verify the resolved organization exists in the `organizations` table
+  // before any storage or DB writes. This prevents FK constraint violations on
+  // `organization_settings.organization_id → organizations(id)`.
+  const { data: orgRow } = await supabaseServer
+    .from("organizations")
+    .select("id")
+    .eq("id", orgId)
+    .maybeSingle();
+  if (!orgRow) {
+    return {
+      ok: false,
+      error:
+        "Your account is not linked to a valid organization. Contact your administrator to be assigned to an organization.",
+    };
   }
 
   const ext = file.name.split(".").pop()?.toLowerCase() ?? "png";
   const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-  const pathPrimary = `${organizationId}/${unique}.${ext}`;
-  const pathFallback = `logos/${organizationId}/${unique}.${ext}`;
+  const pathPrimary = `${orgId}/${unique}.${ext}`;
+  const pathFallback = `logos/${orgId}/${unique}.${ext}`;
 
   const buf = Buffer.from(await file.arrayBuffer());
 
@@ -92,12 +118,12 @@ export async function uploadOrganizationLogoAction(
   const { data: urlData } = supabaseServer.storage.from(bucket).getPublicUrl(objectPath);
   const publicUrl = urlData.publicUrl;
 
-  const orgRes = await upsertOrganizationLogoUrl(publicUrl);
+  const orgRes = await upsertOrganizationLogoUrl(publicUrl, tenant);
   if (!orgRes.ok) {
     return { ok: false, error: orgRes.error ?? "Failed to save logo_url on organization_settings." };
   }
 
-  const coreRes = await saveCoreSettings({ company_logo_url: publicUrl, logo_url: publicUrl });
+  const coreRes = await saveCoreSettings({ company_logo_url: publicUrl, logo_url: publicUrl }, tenant);
   if (!coreRes.ok) {
     return { ok: false, error: coreRes.error ?? "Failed to sync workspace branding." };
   }

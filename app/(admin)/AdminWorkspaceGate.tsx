@@ -5,18 +5,15 @@ import { Loader2 } from "lucide-react";
 import { isAdminRole, useUserRole } from "../../components/UserRoleContext";
 import { isUuidString } from "../../lib/uuid";
 import { supabase } from "../../src/lib/supabase";
-import {
-  listCompaniesForImports,
-  saveHomeCompanyForProfile,
-  type CompanyOption,
-} from "./imports/companies-actions";
+import type { CompanyOption } from "../../lib/imports-types";
+import { listCompaniesForImports, saveHomeCompanyForProfile } from "./imports/companies-actions";
 
 /**
  * Syncs `profiles` bootstrap to the signed-in user (`auth.uid()` === `profiles.id`).
- * Blocks admin routes when `company_id` is unset until the user picks a company.
+ * Blocks admin routes when `organization_id` is unset until the user picks a company.
  */
 export function AdminWorkspaceGate({ children }: { children: React.ReactNode }) {
-  const { role, actorUserId, homeCompanyId, profileLoading, refreshProfile } = useUserRole();
+  const { role, actorUserId, homeOrganizationId, profileLoading, refreshProfile } = useUserRole();
   const [syncing, setSyncing] = useState(true);
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [pick, setPick] = useState("");
@@ -48,16 +45,16 @@ export function AdminWorkspaceGate({ children }: { children: React.ReactNode }) 
   useEffect(() => {
     if (!isAdminRole(role)) return;
     let cancelled = false;
-    void listCompaniesForImports().then((res) => {
+    void listCompaniesForImports(actorUserId).then((res) => {
       if (cancelled || !res.ok) return;
       setCompanies(res.rows);
     });
     return () => {
       cancelled = true;
     };
-  }, [role]);
+  }, [role, actorUserId]);
 
-  const needsCompany = isAdminRole(role) && !homeCompanyId && !profileLoading;
+  const needsCompany = isAdminRole(role) && !homeOrganizationId && !profileLoading;
 
   async function handleSaveCompany() {
     const cid = pick.trim();

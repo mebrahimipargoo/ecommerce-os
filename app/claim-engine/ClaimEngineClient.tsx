@@ -612,7 +612,7 @@ export function ClaimEngineClient({
         open={historySubmissionId !== null}
         onClose={() => setHistorySubmissionId(null)}
         claimId={historySubmissionId}
-        companyId={organizationId}
+        organizationId={organizationId}
       />
 
       <header className="flex h-16 flex-col gap-2 border-b border-slate-200 bg-white/80 px-4 backdrop-blur-xl dark:border-slate-800 dark:bg-slate-950/70 sm:flex-row sm:items-center sm:justify-between sm:gap-4 md:px-6">

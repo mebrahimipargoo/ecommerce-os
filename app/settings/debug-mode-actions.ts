@@ -1,15 +1,17 @@
 "use server";
 
+import { resolveTenantOrganizationId, type TenantWriteContext } from "../../lib/server-tenant";
 import { supabaseServer } from "../../lib/supabase-server";
-import { resolveOrganizationId } from "../../lib/organization";
 
-export async function getOrganizationDebugMode(): Promise<boolean> {
-  const organizationId = resolveOrganizationId();
+export async function getOrganizationDebugMode(
+  tenant?: TenantWriteContext | null,
+): Promise<boolean> {
+  const companyId = await resolveTenantOrganizationId(tenant);
   try {
     const { data, error } = await supabaseServer
       .from("organization_settings")
       .select("debug_mode")
-      .eq("company_id", organizationId)
+      .eq("organization_id", companyId)
       .maybeSingle();
     if (error || !data) return false;
     return Boolean((data as { debug_mode?: boolean }).debug_mode);
@@ -20,13 +22,14 @@ export async function getOrganizationDebugMode(): Promise<boolean> {
 
 export async function saveOrganizationDebugMode(
   enabled: boolean,
+  tenant?: TenantWriteContext | null,
 ): Promise<{ ok: boolean; error?: string }> {
-  const organizationId = resolveOrganizationId();
+  const companyId = await resolveTenantOrganizationId(tenant);
   try {
     const { data: existing, error: selErr } = await supabaseServer
       .from("organization_settings")
-      .select("company_id")
-      .eq("company_id", organizationId)
+      .select("organization_id")
+      .eq("organization_id", companyId)
       .maybeSingle();
 
     if (selErr) return { ok: false, error: selErr.message };
@@ -35,11 +38,11 @@ export async function saveOrganizationDebugMode(
       const { error: updErr } = await supabaseServer
         .from("organization_settings")
         .update({ debug_mode: enabled })
-        .eq("company_id", organizationId);
+        .eq("organization_id", companyId);
       if (updErr) return { ok: false, error: updErr.message };
     } else {
       const { error: insErr } = await supabaseServer.from("organization_settings").insert({
-        company_id: organizationId,
+        organization_id: companyId,
         is_ai_label_ocr_enabled: false,
         is_ai_packing_slip_ocr_enabled: false,
         default_claim_evidence: {},

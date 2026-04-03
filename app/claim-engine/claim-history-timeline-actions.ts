@@ -9,7 +9,7 @@ export type ClaimTimelineRow = {
   action: string;
   details: Record<string, unknown> | null;
   actor: string | null;
-  company_id: string | null;
+  organization_id: string | null;
   created_at: string;
   /** Legacy status snapshot when present. */
   status_at_time?: string | null;
@@ -22,28 +22,26 @@ function asDetails(raw: unknown): Record<string, unknown> | null {
 }
 
 /**
- * Loads timeline rows for a claim (submission id). Filters by `company_id` (text)
+ * Loads timeline rows for a claim (submission id). Filters by `organization_id` (text)
  * and `claim_id` / `submission_id` match.
  */
 export async function getClaimTimelineLogs(
   claimId: string,
-  companyId: string,
+  organizationId: string,
 ): Promise<{ ok: true; rows: ClaimTimelineRow[] } | { ok: false; error: string }> {
   if (!isUuidString(claimId)) return { ok: false, error: "Invalid claim id." };
-  const cid = companyId.trim();
-  if (!cid) return { ok: false, error: "company_id is required." };
+  const cid = organizationId.trim();
+  if (!cid) return { ok: false, error: "organization_id is required." };
 
   try {
     const selectCols =
-      "id, claim_id, submission_id, action, details, actor_label, company_id, created_at, status_at_time, message_content, attachments, actor";
-
-    const orFilter = `claim_id.eq.${claimId},submission_id.eq.${claimId}`;
+      "id, claim_id, action, details, actor_label, organization_id, created_at, status_at_time, message_content, attachments, actor";
 
     const { data, error } = await supabaseServer
       .from("claim_history_logs")
       .select(selectCols)
-      .eq("company_id", cid)
-      .or(orFilter)
+      .eq("organization_id", cid)
+      .eq("claim_id", claimId)
       .order("created_at", { ascending: true });
 
     if (error) throw new Error(error.message);
@@ -59,14 +57,14 @@ export async function getClaimTimelineLogs(
         (r.actor_label as string | null)?.trim() ||
         (r.actor != null ? String(r.actor) : null) ||
         null;
-      const claimFk = (r.claim_id as string | null) ?? (r.submission_id as string) ?? claimId;
+      const claimFk = (r.claim_id as string | null) ?? claimId;
       return {
         id: String(r.id),
         claim_id: claimFk,
         action,
         details,
         actor,
-        company_id: (r.company_id as string | null) ?? cid,
+        organization_id: (r.organization_id as string | null) ?? cid,
         created_at: String(r.created_at ?? ""),
         status_at_time: r.status_at_time != null ? String(r.status_at_time) : null,
       };
@@ -100,7 +98,7 @@ export async function resolveProfileDisplayName(profileId: string | null | undef
  */
 export async function appendClaimHistoryTimelineEntry(input: {
   claimId: string;
-  companyId: string;
+  organizationId: string;
   action: string;
   details?: Record<string, unknown> | null;
   statusAtTime: string;
@@ -108,8 +106,8 @@ export async function appendClaimHistoryTimelineEntry(input: {
   actorEnum?: "human_admin" | "agent" | "marketplace_bot";
 }): Promise<{ ok: boolean; error?: string }> {
   if (!isUuidString(input.claimId)) return { ok: false, error: "Invalid claim id." };
-  const companyId = input.companyId.trim();
-  if (!companyId) return { ok: false, error: "company_id is required." };
+  const orgId = input.organizationId.trim();
+  if (!orgId) return { ok: false, error: "organization_id is required." };
 
   const details = input.details ?? {};
   const action = input.action.trim() || "Update";
@@ -118,8 +116,7 @@ export async function appendClaimHistoryTimelineEntry(input: {
 
   try {
     const { error } = await supabaseServer.from("claim_history_logs").insert({
-      company_id: companyId,
-      submission_id: input.claimId,
+      organization_id: orgId,
       claim_id: input.claimId,
       action,
       details,

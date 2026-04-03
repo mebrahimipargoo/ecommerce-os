@@ -1,16 +1,18 @@
 "use server";
 
+import { resolveTenantOrganizationId, type TenantWriteContext } from "../../lib/server-tenant";
 import { supabaseServer } from "../../lib/supabase-server";
-import { resolveOrganizationId } from "../../lib/organization";
 import { isUuidString } from "../../lib/uuid";
 
-export async function getOrganizationDefaultStoreId(): Promise<string | null> {
-  const organizationId = resolveOrganizationId();
+export async function getOrganizationDefaultStoreId(
+  tenant?: TenantWriteContext | null,
+): Promise<string | null> {
+  const companyId = await resolveTenantOrganizationId(tenant);
   try {
     const { data, error } = await supabaseServer
       .from("organization_settings")
       .select("default_store_id")
-      .eq("company_id", organizationId)
+      .eq("organization_id", companyId)
       .maybeSingle();
     if (error || !data) return null;
     const id = (data as { default_store_id?: string | null }).default_store_id;
@@ -22,8 +24,9 @@ export async function getOrganizationDefaultStoreId(): Promise<string | null> {
 
 export async function saveOrganizationDefaultStoreId(
   storeId: string | null,
+  tenant?: TenantWriteContext | null,
 ): Promise<{ ok: boolean; error?: string }> {
-  const organizationId = resolveOrganizationId();
+  const companyId = await resolveTenantOrganizationId(tenant);
   try {
     const trimmed = storeId?.trim() ?? "";
     if (trimmed && !isUuidString(trimmed)) {
@@ -34,19 +37,18 @@ export async function saveOrganizationDefaultStoreId(
     if (finalId) {
       const { data: store, error: storeErr } = await supabaseServer
         .from("stores")
-        .select("id")
+        .select("id, organization_id")
         .eq("id", finalId)
-        .eq("company_id", organizationId)
         .maybeSingle();
       if (storeErr || !store) {
-        return { ok: false, error: "Store not found in this workspace." };
+        return { ok: false, error: "Store not found." };
       }
     }
 
     const { data: existing, error: selErr } = await supabaseServer
       .from("organization_settings")
-      .select("company_id")
-      .eq("company_id", organizationId)
+      .select("organization_id")
+      .eq("organization_id", companyId)
       .maybeSingle();
 
     if (selErr) return { ok: false, error: selErr.message };
@@ -55,11 +57,11 @@ export async function saveOrganizationDefaultStoreId(
       const { error: updErr } = await supabaseServer
         .from("organization_settings")
         .update({ default_store_id: finalId })
-        .eq("company_id", organizationId);
+        .eq("organization_id", companyId);
       if (updErr) return { ok: false, error: updErr.message };
     } else {
       const { error: insErr } = await supabaseServer.from("organization_settings").insert({
-        company_id: organizationId,
+        organization_id: companyId,
         is_ai_label_ocr_enabled: false,
         is_ai_packing_slip_ocr_enabled: false,
         default_claim_evidence: {},
