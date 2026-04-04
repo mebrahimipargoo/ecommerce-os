@@ -75,11 +75,13 @@ export function ClaimInvestigationClient({
   logs,
   returnRow,
   previewUrl,
+  readOnly = false,
 }: {
   submission: Record<string, unknown>;
   logs: ClaimHistoryLogRow[];
   returnRow: Record<string, unknown> | null;
   previewUrl: string | null;
+  readOnly?: boolean;
 }) {
   const status = String(submission.status ?? "");
   const badge = submissionCrmBadgeLabel(status);
@@ -93,6 +95,11 @@ export function ClaimInvestigationClient({
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-gradient-to-br dark:from-slate-950 dark:via-slate-950 dark:to-slate-900">
       <header className="border-b border-slate-200 bg-white/90 px-4 py-4 backdrop-blur dark:border-slate-800 dark:bg-slate-950/80 md:px-8">
+        {readOnly ? (
+          <div className="mx-auto mb-3 max-w-3xl rounded-xl border border-slate-200 bg-slate-100 px-3 py-2 text-center text-xs font-medium text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200">
+            View only — this claim is closed. Transcript is read-only.
+          </div>
+        ) : null}
         <div className="mx-auto flex max-w-3xl flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <Link
@@ -201,9 +208,11 @@ export function ClaimInvestigationClient({
                         <span className="font-normal opacity-80">· {formatWhen(log.created_at)}</span>
                       </div>
                       <p className="whitespace-pre-wrap text-[13px] leading-relaxed">{log.message_content}</p>
-                      <p className="mt-2 text-[10px] text-muted-foreground">
-                        Status after: <span className="font-mono">{log.status_at_time}</span>
-                      </p>
+                      {log.status_at_time ? (
+                        <p className="mt-2 text-[10px] text-muted-foreground">
+                          Status after: <span className="font-mono">{log.status_at_time}</span>
+                        </p>
+                      ) : null}
                     </div>
                   </div>
                 );

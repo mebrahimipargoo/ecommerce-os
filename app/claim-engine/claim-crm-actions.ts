@@ -20,6 +20,7 @@ export type ClaimHistoryMessageKind =
 export type ClaimHistoryLogRow = {
   id: string;
   organization_id: string;
+  /** Same UUID as `claim_id` on the log row (submission id). */
   submission_id: string;
   actor: ClaimHistoryActor;
   message_content: string;
@@ -28,6 +29,51 @@ export type ClaimHistoryLogRow = {
   message_kind: ClaimHistoryMessageKind | null;
   created_at: string;
 };
+
+const CLAIM_HISTORY_SELECT =
+  "id, organization_id, claim_id, action, details, actor, created_at";
+
+function asDetailsObj(raw: unknown): Record<string, unknown> {
+  if (raw != null && typeof raw === "object" && !Array.isArray(raw)) return raw as Record<string, unknown>;
+  return {};
+}
+
+function mapClaimHistoryLogRow(r: Record<string, unknown>): ClaimHistoryLogRow {
+  const d = asDetailsObj(r.details);
+  const claimId = String(r.claim_id ?? "");
+  const action = String(r.action ?? "").trim();
+  const message_content =
+    typeof d.message_content === "string" && d.message_content.trim() ? d.message_content.trim() : action;
+  const statusRaw = d.status ?? d.status_at_time;
+  const status_at_time = typeof statusRaw === "string" && statusRaw.trim() ? statusRaw.trim() : "";
+  const mk = d.message_kind;
+  const message_kind: ClaimHistoryMessageKind | null =
+    mk === "marketplace_response" || mk === "agent_reply" || mk === "note" || mk === "system"
+      ? mk
+      : null;
+
+  const roleRaw = typeof d.actor_role === "string" ? d.actor_role : "";
+  let actor: ClaimHistoryActor = "human_admin";
+  if (roleRaw === "marketplace_bot" || roleRaw === "agent" || roleRaw === "human_admin") {
+    actor = roleRaw;
+  } else {
+    const a = String(r.actor ?? "").toLowerCase();
+    if (a.includes("marketplace") || a.includes("bot")) actor = "marketplace_bot";
+    else if (a.includes("agent") && !a.includes("human")) actor = "agent";
+  }
+
+  return {
+    id: r.id as string,
+    organization_id: r.organization_id as string,
+    submission_id: claimId,
+    actor,
+    message_content,
+    attachments: d,
+    status_at_time,
+    message_kind,
+    created_at: r.created_at as string,
+  };
+}
 
 export type ClaimEngineKpis = {
   totalActiveClaims: number;
@@ -133,27 +179,14 @@ export async function getClaimHistoryLogsForSubmission(
   try {
     const { data, error } = await supabaseServer
       .from(CLAIM_HISTORY_TABLE)
-      .select("*")
-      .eq("submission_id", submissionId)
+      .select(CLAIM_HISTORY_SELECT)
+      .eq("claim_id", submissionId)
       .eq("organization_id", organizationId)
       .order("created_at", { ascending: true });
 
     if (error) throw new Error(error.message);
 
-    const logs: ClaimHistoryLogRow[] = (data ?? []).map((row) => {
-      const r = row as Record<string, unknown>;
-      return {
-        id: r.id as string,
-        organization_id: r.organization_id as string,
-        submission_id: r.submission_id as string,
-        actor: r.actor as ClaimHistoryActor,
-        message_content: r.message_content as string,
-        attachments: (r.attachments as Record<string, unknown>) ?? {},
-        status_at_time: r.status_at_time as string,
-        message_kind: (r.message_kind as ClaimHistoryMessageKind | null) ?? null,
-        created_at: r.created_at as string,
-      };
-    });
+    const logs: ClaimHistoryLogRow[] = (data ?? []).map((row) => mapClaimHistoryLogRow(row as Record<string, unknown>));
 
     return { ok: true, data: logs };
   } catch (e) {
@@ -189,27 +222,16 @@ export async function getClaimInvestigationPayload(
 
     const { data: logsRaw, error: lErr } = await supabaseServer
       .from(CLAIM_HISTORY_TABLE)
-      .select("*")
-      .eq("submission_id", submissionId)
+      .select(CLAIM_HISTORY_SELECT)
+      .eq("claim_id", submissionId)
       .eq("organization_id", organizationId)
       .order("created_at", { ascending: true });
 
     if (lErr) throw new Error(lErr.message);
 
-    const logs: ClaimHistoryLogRow[] = (logsRaw ?? []).map((row) => {
-      const r = row as Record<string, unknown>;
-      return {
-        id: r.id as string,
-        organization_id: r.organization_id as string,
-        submission_id: r.submission_id as string,
-        actor: r.actor as ClaimHistoryActor,
-        message_content: r.message_content as string,
-        attachments: (r.attachments as Record<string, unknown>) ?? {},
-        status_at_time: r.status_at_time as string,
-        message_kind: (r.message_kind as ClaimHistoryMessageKind | null) ?? null,
-        created_at: r.created_at as string,
-      };
-    });
+    const logs: ClaimHistoryLogRow[] = (logsRaw ?? []).map((row) =>
+      mapClaimHistoryLogRow(row as Record<string, unknown>),
+    );
 
     const preview_url = await signedUrlForReport(subRow.report_url as string | null);
 
@@ -270,18 +292,18 @@ export async function syncMarketplaceStatus(opts: {
 
     for (const log of opts.logs) {
       const msg = log.message_content.trim() || "Update";
+      const details = {
+        ...(log.attachments ?? {}),
+        status: log.status_at_time,
+        message_kind: log.message_kind ?? null,
+        actor_role: log.actor,
+      };
       const { error: insErr } = await supabaseServer.from(CLAIM_HISTORY_TABLE).insert({
         organization_id: organizationId,
-        submission_id: opts.submissionId,
         claim_id: opts.submissionId,
         action: msg,
-        details: log.attachments ?? {},
-        actor_label: log.actor.replace(/_/g, " "),
-        actor: log.actor,
-        message_content: msg,
-        attachments: log.attachments ?? {},
-        status_at_time: log.status_at_time,
-        message_kind: log.message_kind ?? null,
+        details,
+        actor: log.actor.replace(/_/g, " "),
       });
       if (insErr) throw new Error(insErr.message);
     }

@@ -5,19 +5,22 @@ import { Building2, Bot, Clock, Loader2, User, X } from "lucide-react";
 import { getClaimTimelineLogs, type ClaimTimelineRow } from "./claim-history-timeline-actions";
 
 function formatWhen(iso: string): string {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "—";
   return new Intl.DateTimeFormat("en-US", {
     month: "short",
     day: "numeric",
     year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(new Date(iso));
+  }).format(new Date(t));
 }
 
 function timelineIcon(actor: string | null) {
   const a = (actor ?? "").toLowerCase();
   if (a.includes("marketplace") || a.includes("bot")) return Building2;
   if (a.includes("agent")) return Bot;
+  if (a.includes("admin") || a.includes("user") || a.includes("@")) return User;
   return User;
 }
 
@@ -38,12 +41,15 @@ export function ClaimHistoryModal({
   onClose,
   claimId,
   organizationId,
+  readOnly = false,
 }: {
   open: boolean;
   onClose: () => void;
   claimId: string | null;
   /** Tenant scope — same as `profiles.organization_id` / organization UUID string. */
   organizationId: string;
+  /** When true (e.g. closed-claims tab), emphasize view-only UI. */
+  readOnly?: boolean;
 }) {
   const [logs, setLogs] = useState<ClaimTimelineRow[]>([]);
   const [loading, setLoading] = useState(false);
@@ -61,7 +67,7 @@ export function ClaimHistoryModal({
     void getClaimTimelineLogs(claimId, organizationId).then((r) => {
       if (cancelled) return;
       setLoading(false);
-      if (r.ok) setLogs(r.rows);
+      if (r.ok) setLogs(Array.isArray(r.rows) ? r.rows : []);
       else setErr(r.error ?? "Failed to load");
     });
     return () => {
@@ -81,6 +87,9 @@ export function ClaimHistoryModal({
             <div>
               <p className="text-sm font-semibold text-slate-900 dark:text-slate-50">Claim history</p>
               <p className="font-mono text-[10px] text-muted-foreground">{claimId}</p>
+              {readOnly ? (
+                <p className="mt-0.5 text-[10px] font-medium text-slate-500 dark:text-slate-400">View only</p>
+              ) : null}
             </div>
           </div>
           <button
@@ -100,7 +109,7 @@ export function ClaimHistoryModal({
           ) : err ? (
             <p className="text-center text-sm text-rose-600">{err}</p>
           ) : logs.length === 0 ? (
-            <p className="text-center text-sm text-muted-foreground">No history entries yet.</p>
+            <p className="text-center text-sm text-muted-foreground">No history available.</p>
           ) : (
             <div className="relative pl-2">
               <div
@@ -108,10 +117,10 @@ export function ClaimHistoryModal({
                 aria-hidden
               />
               <ul className="relative space-y-6">
-                {logs.map((log) => {
+                {logs.map((log, idx) => {
                   const Icon = timelineIcon(log.actor);
                   return (
-                    <li key={log.id} className="relative pl-8">
+                    <li key={log.id || `log-${idx}`} className="relative pl-8">
                       <span
                         className="absolute left-0 top-1 flex h-[22px] w-[22px] items-center justify-center rounded-full border border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-800 dark:bg-sky-950/50 dark:text-sky-300"
                         aria-hidden

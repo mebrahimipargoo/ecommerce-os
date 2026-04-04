@@ -277,6 +277,44 @@ export async function refreshClaimReportSignedUrl(
   }
 }
 
+/**
+ * Uploads a generated claim PDF to Storage and sets `claim_submissions.report_url` + `created_by`
+ * so the file appears on Report History with a working download.
+ */
+export async function uploadClaimPdfExport(formData: FormData): Promise<{ ok: boolean; error?: string }> {
+  const file = formData.get("pdf");
+  if (!(file instanceof Blob)) return { ok: false, error: "Missing PDF." };
+  const submissionId = String(formData.get("submissionId") ?? "").trim();
+  const organizationId = String(formData.get("organizationId") ?? "").trim();
+  const actorUserIdRaw = String(formData.get("actorUserId") ?? "").trim();
+  const actorUserId = actorUserIdRaw && isUuidString(actorUserIdRaw) ? actorUserIdRaw : null;
+  if (!isUuidString(submissionId) || !organizationId) return { ok: false, error: "Invalid parameters." };
+
+  try {
+    const buf = Buffer.from(await file.arrayBuffer());
+    const path = `${organizationId}/${submissionId}/claim-export-${Date.now()}.pdf`;
+    const { error: upErr } = await supabaseServer.storage.from(BUCKET).upload(path, buf, {
+      contentType: "application/pdf",
+      upsert: false,
+    });
+    if (upErr) throw new Error(upErr.message);
+
+    const { error: dbErr } = await supabaseServer
+      .from(CLAIM_SUBMISSIONS_TABLE)
+      .update({
+        report_url: path,
+        updated_at: new Date().toISOString(),
+        ...(actorUserId ? { created_by: actorUserId } : {}),
+      })
+      .eq("id", submissionId)
+      .eq("organization_id", organizationId);
+    if (dbErr) throw new Error(dbErr.message);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Upload failed." };
+  }
+}
+
 export async function markClaimSubmissionManualSubmit(
   submissionId: string,
   marketplaceCaseId: string,
@@ -362,16 +400,16 @@ export async function bulkSubmitClaimsToMarketplace(
     const actorLabel = await resolveProfileDisplayName(actorUserId ?? null);
     const logRows = targetIds.map((submission_id) => ({
       organization_id: organizationId,
-      submission_id,
       claim_id: submission_id,
       action: msg,
-      details: { batch: true, source: "bulk_submit_to_marketplace" },
-      actor_label: actorLabel,
-      actor: "human_admin" as const,
-      message_content: msg,
-      attachments: {},
-      status_at_time: "submitted",
-      message_kind: "system",
+      details: {
+        batch: true,
+        source: "bulk_submit_to_marketplace",
+        status: "submitted",
+        message_kind: "system",
+        actor_role: "human_admin",
+      },
+      actor: actorLabel,
     }));
 
     const { error: logErr } = await supabaseServer.from(HISTORY_TABLE).insert(logRows);

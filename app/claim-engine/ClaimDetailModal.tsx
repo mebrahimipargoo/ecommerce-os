@@ -26,9 +26,11 @@ export function ClaimDetailModal({
   open,
   onClose,
   claim,
+  readOnly = false,
   coreSettings,
   stores,
   organizationId,
+  actorUserId,
   defaultClaimEvidence,
   onToast,
   onUpdated,
@@ -36,9 +38,11 @@ export function ClaimDetailModal({
   open: boolean;
   onClose: () => void;
   claim: ClaimRecord | null;
+  readOnly?: boolean;
   coreSettings: CoreSettings;
   stores: StoreRow[];
   organizationId: string;
+  actorUserId?: string | null;
   defaultClaimEvidence: Record<ClaimEvidenceKey, boolean>;
   onToast: (msg: string, kind?: "success" | "error" | "warning") => void;
   onUpdated: () => void;
@@ -88,7 +92,7 @@ export function ClaimDetailModal({
   const isSyntheticClaim = claim.id.startsWith("synthetic-return:");
 
   async function handleSave() {
-    if (!claim || isSyntheticClaim) return;
+    if (!claim || isSyntheticClaim || readOnly) return;
     setSaving(true);
     const amt = parseFloat(claimAmount);
     const reimbStr = reimbursementAmount.trim();
@@ -131,6 +135,7 @@ export function ClaimDetailModal({
       onClose={() => setClaimGenOpen(false)}
       submissionId={claim?.id ?? null}
       organizationId={organizationId}
+      actorUserId={actorUserId}
       coreSettings={coreSettings}
       stores={stores}
       defaultClaimEvidence={defaultClaimEvidence}
@@ -148,12 +153,15 @@ export function ClaimDetailModal({
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">Claim details</p>
             <p className="font-mono text-sm font-bold text-slate-900 dark:text-slate-100">{claim.id}</p>
+            {readOnly ? (
+              <p className="mt-1 text-[10px] font-medium text-slate-500 dark:text-slate-400">Read-only — claim is closed</p>
+            ) : null}
           </div>
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => handleOpenClaimPdf()}
-              disabled={loading || !detail}
+              disabled={loading || !detail || readOnly}
               className="inline-flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-800 disabled:opacity-50 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-200"
             >
               <FileDown className="h-4 w-4" />
@@ -264,7 +272,7 @@ export function ClaimDetailModal({
                     <input
                       type="text"
                       inputMode="decimal"
-                      disabled={isSyntheticClaim}
+                      disabled={isSyntheticClaim || readOnly}
                       className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-7 pr-3 text-sm dark:border-slate-700 dark:bg-slate-900 disabled:opacity-60"
                       value={claimAmount}
                       onChange={(e) => setClaimAmount(e.target.value)}
@@ -287,7 +295,8 @@ export function ClaimDetailModal({
                       <input
                         type="text"
                         inputMode="decimal"
-                        className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-7 pr-3 text-sm dark:border-slate-700 dark:bg-slate-900"
+                        disabled={readOnly}
+                        className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-7 pr-3 text-sm dark:border-slate-700 dark:bg-slate-900 disabled:opacity-60"
                         value={reimbursementAmount}
                         onChange={(e) => setReimbursementAmount(e.target.value)}
                         placeholder="Actual payout"
@@ -302,7 +311,8 @@ export function ClaimDetailModal({
                   <label className="text-xs font-semibold text-slate-500">Marketplace claim ID</label>
                   <input
                     type="text"
-                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-sm dark:border-slate-700 dark:bg-slate-900"
+                    disabled={readOnly}
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 font-mono text-sm dark:border-slate-700 dark:bg-slate-900 disabled:opacity-60"
                     value={claimIdField}
                     onChange={(e) => setClaimIdField(e.target.value)}
                     placeholder="From Seller Central / Walmart"
@@ -311,7 +321,8 @@ export function ClaimDetailModal({
                 <div className="sm:col-span-2">
                   <label className="text-xs font-semibold text-slate-500">Marketplace link status</label>
                   <select
-                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900"
+                    disabled={readOnly}
+                    className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 disabled:opacity-60"
                     value={linkStatus}
                     onChange={(e) => setLinkStatus(e.target.value)}
                   >
@@ -334,7 +345,7 @@ export function ClaimDetailModal({
                 <button
                   type="button"
                   onClick={() => void handleSave()}
-                  disabled={saving || isSyntheticClaim}
+                  disabled={saving || isSyntheticClaim || readOnly}
                   className="rounded-xl bg-sky-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-50"
                 >
                   {saving ? "Saving…" : "Save"}

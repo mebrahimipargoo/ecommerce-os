@@ -12,7 +12,8 @@ import {
   type ClaimEvidenceKey,
   type ClaimEvidenceSlot,
 } from "./claim-evidence-settings";
-import { downloadEnterpriseClaimPdf } from "./claim-pdf-download";
+import { buildEnterpriseClaimPdfBlob } from "./claim-pdf-download";
+import { uploadClaimPdfExport } from "./claim-submission-actions";
 
 type StoreRow = { id: string; name: string; platform: string };
 
@@ -27,6 +28,7 @@ export function ClaimGenerationModal({
   onClose,
   submissionId,
   organizationId,
+  actorUserId,
   coreSettings,
   stores,
   defaultClaimEvidence,
@@ -38,6 +40,8 @@ export function ClaimGenerationModal({
   onClose: () => void;
   submissionId: string | null;
   organizationId: string;
+  /** Session user — stored on `claim_submissions.created_by` for Report History. */
+  actorUserId?: string | null;
   coreSettings: CoreSettings;
   stores: StoreRow[];
   defaultClaimEvidence: Record<ClaimEvidenceKey, boolean>;
@@ -84,7 +88,7 @@ export function ClaimGenerationModal({
   }
 
   async function handleConfirm() {
-    if (!detail) return;
+    if (!detail || !submissionId) return;
     const chosen = slots.filter((s) => selection[s.id]);
     if (chosen.length === 0) {
       onToast("Select at least one photo to include, or cancel.", "warning");
@@ -95,16 +99,33 @@ export function ClaimGenerationModal({
       const st = resolveStoreFromDetail(detail, stores);
       const storeName = st?.name ?? "Store";
       const storePlatform = st?.platform ?? "amazon";
-      await downloadEnterpriseClaimPdf({
+      const evidenceSlots = chosen.map((s) => ({ label: s.label, url: s.url }));
+      const blob = await buildEnterpriseClaimPdfBlob({
         tenant: coreSettings,
         storeName,
         storePlatform,
         detail,
         claimAmountNote,
         marketplaceClaimIdNote,
-        evidenceSlots: chosen.map((s) => ({ label: s.label, url: s.url })),
+        evidenceSlots,
       });
-      onToast("PDF downloaded", "success");
+      const filename = `claim-${detail.claim.id}.pdf`;
+      const fd = new FormData();
+      fd.append("pdf", blob, filename);
+      fd.append("submissionId", submissionId);
+      fd.append("organizationId", organizationId);
+      if (actorUserId) fd.append("actorUserId", actorUserId);
+      const up = await uploadClaimPdfExport(fd);
+      if (!up.ok) {
+        onToast(up.error ?? "Could not save PDF to report history", "error");
+        return;
+      }
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      onToast("PDF saved to Report History and downloaded", "success");
       onClose();
     } catch {
       onToast("PDF generation failed", "error");

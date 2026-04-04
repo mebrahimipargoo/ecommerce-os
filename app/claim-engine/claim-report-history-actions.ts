@@ -17,8 +17,8 @@ export type ClaimReportHistoryRow = {
   report_name: string;
   /** Same source as Claim Engine: `source_payload.claim_type` (adapter / case type). */
   claim_type: string | null;
-  /** Resolved from `profiles` when `created_by` is a UUID; else operator text. */
-  generated_by: string | null;
+  /** Resolved from `profiles` when `created_by` is a UUID; otherwise e.g. "System Agent". */
+  generated_by: string;
   created_at: string;
   report_url: string | null;
   status_label: ClaimReportHistoryStatusLabel;
@@ -134,7 +134,7 @@ export async function listClaimReportHistory(
     }
     const profileMap = await loadProfileNames(creatorCandidates);
 
-    function resolveGeneratedBy(sub: Record<string, unknown>, ret: Record<string, unknown> | null): string | null {
+    function resolveGeneratedBy(sub: Record<string, unknown>, ret: Record<string, unknown> | null): string {
       const subCb = sub.created_by as string | null | undefined;
       if (subCb && isUuidString(subCb.trim())) {
         const n = profileMap.get(subCb.trim());
@@ -150,7 +150,7 @@ export async function listClaimReportHistory(
         return t;
       }
       if (subCb && String(subCb).trim()) return String(subCb).trim();
-      return null;
+      return "System Agent";
     }
 
     const rows: ClaimReportHistoryRow[] = [];

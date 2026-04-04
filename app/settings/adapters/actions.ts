@@ -404,6 +404,7 @@ export type StorePublicRow = {
   name: string;
   platform: string;
   is_active: boolean;
+  is_default: boolean | null;
   marketplace_id: string | null;
   organization_id: string;
   created_at: string;
@@ -416,20 +417,64 @@ export type StoreInsertPayload = {
   marketplace_id?: string;
 };
 
+/** PostgREST / Postgres error when `select` references a column not yet migrated. */
+function isMissingColumnError(err: { message?: string } | null, column: string): boolean {
+  const m = (err?.message ?? "").toLowerCase();
+  const c = column.toLowerCase();
+  return (
+    m.includes(c) &&
+    (m.includes("does not exist") || m.includes("schema cache") || m.includes("column"))
+  );
+}
+
+const STORES_LIST_SELECT_WITH_DEFAULT =
+  "id, name, platform, is_active, is_default, marketplace_id, organization_id, created_at";
+const STORES_LIST_SELECT_BASE =
+  "id, name, platform, is_active, marketplace_id, organization_id, created_at";
+
 export async function listStores(
   _ctx?: RbacContext | null
 ): Promise<{ ok: boolean; data?: StorePublicRow[]; error?: string }> {
   try {
-    const { data, error } = await supabaseServer
+    // Always query `public.stores` (not amazon_*). Ignore _ctx for row scope —
+    // service role returns all stores; tenant UI can filter client-side if needed.
+    let { data, error } = await supabaseServer
       .from("stores")
-      .select("id, name, platform, is_active, marketplace_id, organization_id, created_at")
+      .select(STORES_LIST_SELECT_WITH_DEFAULT)
       .order("created_at", { ascending: false });
 
-    if (error) throw new Error(error.message);
-    return { ok: true, data: (data ?? []) as StorePublicRow[] };
+    if (error && isMissingColumnError(error, "is_default")) {
+      const retry = await supabaseServer
+        .from("stores")
+        .select(STORES_LIST_SELECT_BASE)
+        .order("created_at", { ascending: false });
+      data = retry.data;
+      error = retry.error;
+    }
+
+    if (error) {
+      console.error("[listStores] Store error:", error.message, error);
+      throw new Error(error.message);
+    }
+
+    const rows = (data ?? []) as Record<string, unknown>[];
+    const normalized: StorePublicRow[] = rows.map((r) => ({
+      id: String(r.id ?? ""),
+      name: String(r.name ?? ""),
+      platform: String(r.platform ?? ""),
+      is_active: Boolean(r.is_active !== false),
+      is_default: typeof r.is_default === "boolean" ? r.is_default : null,
+      marketplace_id: (r.marketplace_id as string | null) ?? null,
+      organization_id: String(r.organization_id ?? ""),
+      created_at: String(r.created_at ?? ""),
+    }));
+
+    console.log("[listStores] Fetched stores:", normalized.length, "row(s)");
+    return { ok: true, data: normalized };
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Failed to load stores.";
+    console.error("[listStores] Store error:", message);
     return { ok: false, error: message };
   }
 }

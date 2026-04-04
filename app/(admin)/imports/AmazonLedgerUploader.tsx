@@ -169,7 +169,12 @@ export function AmazonLedgerUploader({
   useEffect(() => {
     let cancelled = false;
     void listStores().then((result) => {
-      if (cancelled || !result.ok || !result.data) return;
+      if (cancelled) return;
+      if (!result.ok || !result.data) {
+        console.error("Store error:", result.ok === false ? result.error : "No data");
+        return;
+      }
+      console.log("Fetched stores:", result.data);
       const stores = result.data
         .filter((s) => s.is_active !== false)
         .map((s) => ({ id: s.id, name: s.name, platform: s.platform }));

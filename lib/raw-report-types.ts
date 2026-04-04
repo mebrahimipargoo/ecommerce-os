@@ -1,10 +1,25 @@
-/** Stored in `raw_report_uploads.report_type` — aligned with Amazon report families. */
+/** Stored in `raw_report_uploads.report_type` — smart-import canonical + legacy Amazon slugs. */
 
 /**
  * Canonical DB values (CHECK on `raw_report_uploads.report_type`).
- * User-facing labels map roughly to: returns, reimbursements, inventory, safe-t, transactions, settlement.
+ *
+ * Smart-import canonical types (written by header classification):
+ *   FBA_RETURNS | REMOVAL_ORDER | INVENTORY_LEDGER |
+ *   REIMBURSEMENTS | SETTLEMENT | SAFET_CLAIMS | TRANSACTIONS | UNKNOWN
+ *
+ * Legacy rows may use fba_customer_returns, inventory_ledger, safe_t_claims, etc.
  */
 export const RAW_REPORT_TYPES = [
+  // ── Smart-import canonical (rule-based / AI detected) ────────────────────
+  "FBA_RETURNS",
+  "REMOVAL_ORDER",
+  "INVENTORY_LEDGER",
+  "REIMBURSEMENTS",
+  "SETTLEMENT",
+  "SAFET_CLAIMS",
+  "TRANSACTIONS",
+  "UNKNOWN",
+  // ── Legacy slugs (kept for backward-compat with older rows) ───────────────
   "fba_customer_returns",
   "reimbursements",
   "inventory_ledger",

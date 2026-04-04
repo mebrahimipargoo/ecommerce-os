@@ -15,7 +15,7 @@
  *
  *   When both subscriptions are live, `file_processing_status` wins for pct values
  *   because it carries the freshest granular counters. `raw_report_uploads` is still
- *   observed for final `status` transitions ("complete", "failed").
+ *   observed for final `status` transitions ("synced", "complete", "failed").
  *
  *   Polling falls back automatically if Realtime is unavailable for either table.
  *
@@ -36,6 +36,7 @@ export type ImportProgressStatus =
   | "pending"
   | "uploading"
   | "processing"
+  | "synced"
   | "complete"
   | "failed";
 
@@ -92,7 +93,7 @@ function rowToState(row: Record<string, unknown>): ImportProgressState {
 function fpsRowToState(row: Record<string, unknown>, fallback: ImportProgressState): ImportProgressState {
   const rawStatus = String(row.status ?? "pending").toLowerCase();
   const status = [
-    "idle", "pending", "uploading", "processing", "complete", "failed",
+    "idle", "pending", "uploading", "processing", "synced", "complete", "failed",
   ].includes(rawStatus)
     ? (rawStatus as ImportProgressStatus)
     : fallback.status;
@@ -198,7 +199,7 @@ export function useImportProgress(uploadId: string | null): ImportProgressState 
     fpsChannelRef.current = fpsChannel;
 
     // 2b. Secondary Realtime: raw_report_uploads (status transitions, legacy metadata).
-    //     Stays live in parallel; used mainly for "complete" / "failed" state changes.
+    //     Stays live in parallel; used mainly for "synced" / "complete" / "failed" state changes.
     const mainChannel = supabase
       .channel(`import-progress:${uploadId}`)
       .on(

@@ -610,9 +610,16 @@ export default function SettingsPage() {
     listStores(settingsRbac)
       .then((res) => {
         if (cancelled) return;
-        if (res.ok && res.data) setStoresList(res.data);
+        if (!res.ok || !res.data) {
+          console.error("Store error:", res.ok === false ? res.error : "No data");
+          return;
+        }
+        console.log("Fetched stores:", res.data);
+        setStoresList(res.data);
       })
-      .catch(() => {})
+      .catch((e) => {
+        console.error("Store error:", e);
+      })
       .finally(() => { if (!cancelled) setStoresListLoading(false); });
     return () => { cancelled = true; };
   }, [mounted, settingsRbac]);

@@ -4,10 +4,12 @@ import React, { useCallback, useRef, useState } from "react";
 import { FileText, Loader2, UploadCloud, X } from "lucide-react";
 import { isAdminRole, useUserRole } from "../../../components/UserRoleContext";
 import { REPORT_TYPE_SPECS } from "../../../lib/csv-import-mapping";
+import { parseCsvToMatrix } from "../../../lib/csv-parse-basic";
 import { RAW_REPORT_TYPE_ORDER, type RawReportType } from "../../../lib/raw-report-types";
 import {
   createRawReportUploadSession,
   finalizeRawReportUpload,
+  updateUploadSessionClassification,
 } from "./import-actions";
 
 const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB
@@ -31,7 +33,16 @@ function getFileExtension(name: string): string {
   return name.split(".").pop()?.toLowerCase() ?? "csv";
 }
 
-type Phase = "idle" | "uploading" | "processing" | "done" | "error";
+/** Read header row from the start of the file (first 1 MiB) without loading the whole file. */
+async function readCsvHeadersFromFile(f: File): Promise<string[]> {
+  const n = Math.min(f.size, 1024 * 1024);
+  const text = await f.slice(0, n).text();
+  const matrix = parseCsvToMatrix(text.trim());
+  if (matrix.length === 0) return [];
+  return matrix[0].map((h) => h.trim()).filter((cell) => cell.length > 0);
+}
+
+type Phase = "idle" | "uploading" | "processing" | "done" | "needs_mapping" | "error";
 
 type RawReportUploaderProps = {
   /** Called when upload + processing completes so the history panel can refresh. */
@@ -40,7 +51,7 @@ type RawReportUploaderProps = {
 
 export function RawReportUploader({ onUploadComplete }: RawReportUploaderProps) {
   const { role, actorUserId } = useUserRole();
-  const [reportType, setReportType] = useState<RawReportType>("fba_customer_returns");
+  const [reportType, setReportType] = useState<RawReportType>(RAW_REPORT_TYPE_ORDER[0] ?? "FBA_RETURNS");
   const [file, setFile] = useState<File | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [uploadPct, setUploadPct] = useState(0);
@@ -100,21 +111,66 @@ export function RawReportUploader({ onUploadComplete }: RawReportUploaderProps) 
       const totalParts = Math.max(1, Math.ceil(totalBytes / CHUNK_SIZE));
       const md5Hash = await quickHash(file);
 
+      // ── RECORD-FIRST: Insert the DB row immediately with status="uploading".
+      // The file appears in History the moment this call resolves — before any
+      // chunk is sent and before classification. If the upload fails later, the
+      // row stays with status="failed" so the user can delete it from History.
       const session = await createRawReportUploadSession({
         fileName: file.name,
         totalBytes,
-        reportType,
+        reportType: "UNKNOWN",   // updated below after classify-headers returns
         md5Hash,
         fileExtension: ext,
         fileSizeBytes: totalBytes,
         uploadChunksCount: totalParts,
+        initialStatus: "uploading",
         actorUserId,
       });
-
       if (!session.ok) throw new Error(session.error);
       const uploadId = session.id;
 
-      // Send chunks sequentially
+      // Notify parent immediately so the History panel remounts / re-fetches.
+      // This gives the user instant visual feedback that the upload has started.
+      onUploadComplete?.();
+
+      // ── Read CSV headers (first 1 MiB slice — does not load the whole file)
+      const headers = await readCsvHeadersFromFile(file);
+      if (headers.length === 0) {
+        throw new Error("Could not read CSV headers. Check the file is valid CSV.");
+      }
+
+      // ── Classify headers (rule-based → GPT fallback)
+      const clsRes = await fetch("/api/settings/imports/classify-headers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ headers, actor_user_id: actorUserId }),
+      });
+      const clsJson = (await clsRes.json()) as {
+        ok?: boolean;
+        report_type?: string;
+        column_mapping?: Record<string, string>;
+        needs_mapping?: boolean;
+        error?: string;
+      };
+      if (!clsRes.ok || !clsJson.ok) {
+        throw new Error(clsJson.error ?? "Could not classify CSV headers.");
+      }
+      const resolvedReportType = clsJson.report_type as RawReportType;
+      const resolvedColumnMapping = clsJson.column_mapping ?? {};
+      const needsManualMapping = clsJson.needs_mapping ?? false;
+      setReportType(resolvedReportType);
+
+      // ── Patch the existing session row with classification results.
+      // This also saves csv_headers into metadata for the mapping modal dropdowns.
+      await updateUploadSessionClassification({
+        uploadId,
+        reportType: resolvedReportType,
+        columnMapping: resolvedColumnMapping,
+        csvHeaders: headers,
+        actorUserId,
+      });
+
+      // ── Upload file chunks sequentially
       for (let i = 0; i < totalParts; i++) {
         if (abortRef.current) throw new Error("Upload cancelled.");
         const start = i * CHUNK_SIZE;
@@ -137,10 +193,21 @@ export function RawReportUploader({ onUploadComplete }: RawReportUploaderProps) 
         setUploadPct(Math.round(((i + 1) / totalParts) * 100));
       }
 
-      await finalizeRawReportUpload({ uploadId, actorUserId });
+      // ── Finalize: transition to "ready" (or "needs_mapping" if mapping is incomplete)
+      await finalizeRawReportUpload({
+        uploadId,
+        actorUserId,
+        targetStatus: needsManualMapping ? "needs_mapping" : "ready",
+      });
       setUploadPct(100);
 
-      // Trigger processing
+      if (needsManualMapping) {
+        setPhase("needs_mapping");
+        onUploadComplete?.();
+        return;
+      }
+
+      // ── Auto-process when mapping resolved cleanly (Inventory Ledger / exact headers)
       setPhase("processing");
       setProcessPct(5);
 
@@ -310,13 +377,13 @@ export function RawReportUploader({ onUploadComplete }: RawReportUploaderProps) 
               {phase === "uploading" ? "Uploading…" : "Processing…"}
             </div>
           )}
-          {(phase === "done" || phase === "error" || (phase === "idle" && file)) && (
+          {(phase === "done" || phase === "needs_mapping" || phase === "error" || (phase === "idle" && file)) && (
             <button
               type="button"
               onClick={reset}
               className="inline-flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition hover:bg-accent"
             >
-              {phase === "done" ? "Upload another" : "Reset"}
+              {phase === "done" || phase === "needs_mapping" ? "Upload another" : "Reset"}
             </button>
           )}
         </div>
@@ -324,6 +391,12 @@ export function RawReportUploader({ onUploadComplete }: RawReportUploaderProps) 
         {phase === "done" && (
           <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">
             ✓ Upload complete — history updated below.
+          </p>
+        )}
+
+        {phase === "needs_mapping" && (
+          <p className="text-sm font-medium text-amber-600 dark:text-amber-400">
+            ⚠ Column mapping required — find this file in History below and click &quot;Map Columns&quot; before syncing.
           </p>
         )}
       </div>

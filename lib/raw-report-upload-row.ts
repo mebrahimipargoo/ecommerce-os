@@ -5,10 +5,11 @@ export type RawReportUploadRow = {
   id: string;
   organization_id: string;
   file_name: string;
-  /** Current or legacy slug from `raw_report_uploads.report_type`. */
+  /** Smart-import canonical (FBA_RETURNS, …) or legacy Amazon slug — `raw_report_uploads.report_type`. */
   report_type: string;
   /** Parsed from `metadata.storage_prefix`. */
   storage_prefix: string | null;
+  /** Lifecycle + sync: pending | uploading | processing | synced | failed | … */
   status: string;
   /** Parsed from `metadata.upload_progress`. */
   upload_progress: number;

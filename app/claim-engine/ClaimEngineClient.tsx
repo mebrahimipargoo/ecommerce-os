@@ -88,6 +88,12 @@ function formatEstimatedUsd(value: unknown): string {
   return formatMoneyUsd2(Number.isFinite(n) ? n : 0);
 }
 
+function formatFinalPayoutUsd(claim: ClaimRecord): string {
+  const reimb = claim.reimbursement_amount;
+  if (reimb != null && Number(reimb) > 0) return formatCurrency(Number(reimb));
+  return formatCurrency(Number(claim.amount) || 0);
+}
+
 function formatDate(iso: string): string {
   return new Intl.DateTimeFormat("en-US", {
     month: "short",
@@ -143,6 +149,13 @@ const SUBMISSION_STATUS_STYLES: Record<string, string> = {
   /** Added by Neda's migration — terminal system failure, shown in queue and history. */
   failed: "border-rose-800/70 bg-rose-950/60 text-rose-200",
 };
+
+/** UI buckets over existing `claim_submissions.status` — no schema changes. */
+const SUBMISSION_QUEUE_STATUSES = new Set(["draft", "ready_to_send"]);
+const ACTIVE_CLAIM_STATUSES = new Set(["submitted", "evidence_requested", "investigating"]);
+const CLOSED_CLAIM_STATUSES = new Set(["accepted", "rejected", "failed"]);
+
+type ClaimEngineTabId = "submission_queue" | "active" | "closed";
 
 function resolveStore(claim: ClaimRecord, stores: StoreRow[]): StoreRow | null {
   if (!claim.store_id) return null;
@@ -228,19 +241,21 @@ export function ClaimEngineClient({
   const [modalClaim, setModalClaim] = useState<ClaimRecord | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [toast, setToast] = useState<{ msg: string; kind: "success" | "error" | "warning" } | null>(null);
-  const [activeTab, setActiveTab] = useState<"workspace" | "queue">("workspace");
+  const [claimEngineTab, setClaimEngineTab] = useState<ClaimEngineTabId>("submission_queue");
   const [generateBusy, setGenerateBusy] = useState(false);
   const [bulkSubmitBusy, setBulkSubmitBusy] = useState(false);
   const [queueBusyId, setQueueBusyId] = useState<string | null>(null);
   const [approveBusyId, setApproveBusyId] = useState<string | null>(null);
-  const [historySubmissionId, setHistorySubmissionId] = useState<string | null>(null);
+  const [historyClaimId, setHistoryClaimId] = useState<string | null>(null);
+  const [detailModalReadOnly, setDetailModalReadOnly] = useState(false);
   /** Submission-queue row selection for PDF batch (takes priority over workspace selection). */
   const [queueSelectedIds, setQueueSelectedIds] = useState<Set<string>>(new Set());
   const [queueBulkPdfBusy, setQueueBulkPdfBusy] = useState(false);
   const [claimGenSubmissionId, setClaimGenSubmissionId] = useState<string | null>(null);
   const [claimGenAmountNote, setClaimGenAmountNote] = useState<string | undefined>(undefined);
 
-  const claimsSf = useSortFilterState();
+  const activeClaimsSf = useSortFilterState();
+  const closedClaimsSf = useSortFilterState();
   const queueSf = useSortFilterState();
 
   useEffect(() => {
@@ -256,9 +271,25 @@ export function ClaimEngineClient({
     });
   }, [initialSubmissions]);
 
-  const readyToSendCount = useMemo(
-    () => submissionQueueRows.filter((r) => r.status === "ready_to_send").length,
+  /** Pre–marketplace filing: draft / ready_to_send only (per product tab). */
+  const submissionQueueFiltered = useMemo(
+    () => submissionQueueRows.filter((r) => SUBMISSION_QUEUE_STATUSES.has(r.status)),
     [submissionQueueRows],
+  );
+
+  const readyToSendCount = useMemo(
+    () => submissionQueueFiltered.filter((r) => r.status === "ready_to_send").length,
+    [submissionQueueFiltered],
+  );
+
+  const activeClaimsFiltered = useMemo(
+    () => claims.filter((c) => ACTIVE_CLAIM_STATUSES.has(c.status)),
+    [claims],
+  );
+
+  const closedClaimsFiltered = useMemo(
+    () => claims.filter((c) => CLOSED_CLAIM_STATUSES.has(c.status)),
+    [claims],
   );
 
   const claimColumns = useMemo(
@@ -282,6 +313,21 @@ export function ClaimEngineClient({
     [stores],
   );
 
+  const closedClaimColumns = useMemo(
+    () => [
+      ...claimColumns,
+      {
+        key: "payout",
+        pickText: (c: ClaimRecord) => {
+          const r = c.reimbursement_amount;
+          if (r != null && Number(r) >= 0) return String(r);
+          return String(Number(c.amount) || 0);
+        },
+      },
+    ],
+    [claimColumns],
+  );
+
   const queueColumns = useMemo(
     () => [
       {
@@ -296,14 +342,21 @@ export function ClaimEngineClient({
     [],
   );
 
-  const displayClaims = useTableSortFilter(claims, {
-    filter: claimsSf.filter,
-    sortKey: claimsSf.sortKey,
-    sortDir: claimsSf.sortDir,
+  const activeDisplayClaims = useTableSortFilter(activeClaimsFiltered, {
+    filter: activeClaimsSf.filter,
+    sortKey: activeClaimsSf.sortKey,
+    sortDir: activeClaimsSf.sortDir,
     columns: claimColumns,
   });
 
-  const submissionQueueDisplay = useTableSortFilter(submissionQueueRows, {
+  const closedDisplayClaims = useTableSortFilter(closedClaimsFiltered, {
+    filter: closedClaimsSf.filter,
+    sortKey: closedClaimsSf.sortKey,
+    sortDir: closedClaimsSf.sortDir,
+    columns: closedClaimColumns,
+  });
+
+  const submissionQueueDisplay = useTableSortFilter(submissionQueueFiltered, {
     filter: queueSf.filter,
     sortKey: queueSf.sortKey,
     sortDir: queueSf.sortDir,
@@ -314,16 +367,16 @@ export function ClaimEngineClient({
    * Opens the evidence picker for exactly one selected submission (queue or workspace claim row).
    */
   function handleGeneratePdfReport() {
-    if (activeTab === "queue") {
+    if (claimEngineTab === "submission_queue") {
       if (queueSelectedIds.size === 1) {
         const id = [...queueSelectedIds][0];
-        const row = submissionQueueRows.find((r) => r.id === id);
+        const row = submissionQueueFiltered.find((r) => r.id === id);
         setClaimGenAmountNote(row ? String(row.claim_amount ?? "") : undefined);
         setClaimGenSubmissionId(id);
         return;
       }
       showToast(
-        "Select exactly one submission in the queue (checkbox) to configure evidence, or use Generate PDF on a row.",
+        "Select exactly one submission in the queue (checkbox) to configure evidence, or use Review evidence on a row.",
         "warning",
       );
       return;
@@ -335,7 +388,7 @@ export function ClaimEngineClient({
       setClaimGenSubmissionId(id);
       return;
     }
-    showToast("Select exactly one claim in the workspace table to configure evidence.", "warning");
+    showToast("Select exactly one claim in the Active claims table to configure evidence.", "warning");
   }
 
   function openClaimGenerationForRow(row: ClaimSubmissionListRow) {
@@ -424,7 +477,12 @@ export function ClaimEngineClient({
   ).length;
 
   const allSelected =
-    displayClaims.length > 0 && displayClaims.every((c) => selectedIds.has(c.id));
+    activeDisplayClaims.length > 0 && activeDisplayClaims.every((c) => selectedIds.has(c.id));
+
+  useEffect(() => {
+    setSelectedIds(new Set());
+    setQueueSelectedIds(new Set());
+  }, [claimEngineTab]);
 
   function toggleRow(id: string, e: MouseEvent) {
     e.stopPropagation();
@@ -437,7 +495,7 @@ export function ClaimEngineClient({
   }
 
   function toggleAll(e: ChangeEvent<HTMLInputElement>) {
-    if (e.target.checked) setSelectedIds(new Set(displayClaims.map((c) => c.id)));
+    if (e.target.checked) setSelectedIds(new Set(activeDisplayClaims.map((c) => c.id)));
     else setSelectedIds(new Set());
   }
 
@@ -562,7 +620,7 @@ export function ClaimEngineClient({
         </div>
       ) : null}
 
-      {activeTab === "queue" && queueSelectedIds.size > 0 ? (
+      {claimEngineTab === "submission_queue" && queueSelectedIds.size > 0 ? (
         <div className="pointer-events-auto fixed bottom-20 left-1/2 z-[470] flex w-[min(100vw-2rem,36rem)] max-w-[calc(100vw-2rem)] -translate-x-1/2 flex-col gap-3 rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 shadow-xl backdrop-blur-md dark:border-slate-700 dark:bg-slate-900/95 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-center text-sm font-semibold text-slate-800 dark:text-slate-100 sm:text-left">
             {queueSelectedIds.size} claim{queueSelectedIds.size === 1 ? "" : "s"} selected
@@ -587,6 +645,7 @@ export function ClaimEngineClient({
         }}
         submissionId={claimGenSubmissionId}
         organizationId={organizationId}
+        actorUserId={actorUserId}
         coreSettings={coreSettings}
         stores={stores}
         defaultClaimEvidence={defaultClaimEvidence}
@@ -596,23 +655,30 @@ export function ClaimEngineClient({
 
       <ClaimDetailModal
         open={modalClaim !== null}
-        onClose={() => setModalClaim(null)}
+        onClose={() => {
+          setModalClaim(null);
+          setDetailModalReadOnly(false);
+        }}
         claim={modalClaim}
+        readOnly={detailModalReadOnly}
         coreSettings={coreSettings}
         stores={stores}
         organizationId={organizationId}
+        actorUserId={actorUserId}
         defaultClaimEvidence={defaultClaimEvidence}
         onToast={showToast}
         onUpdated={() => {
           setModalClaim(null);
+          setDetailModalReadOnly(false);
         }}
       />
 
       <ClaimHistoryModal
-        open={historySubmissionId !== null}
-        onClose={() => setHistorySubmissionId(null)}
-        claimId={historySubmissionId}
+        open={historyClaimId !== null}
+        onClose={() => setHistoryClaimId(null)}
+        claimId={historyClaimId}
         organizationId={organizationId}
+        readOnly={claimEngineTab === "closed"}
       />
 
       <header className="flex h-16 flex-col gap-2 border-b border-slate-200 bg-white/80 px-4 backdrop-blur-xl dark:border-slate-800 dark:bg-slate-950/70 sm:flex-row sm:items-center sm:justify-between sm:gap-4 md:px-6">
@@ -712,21 +778,9 @@ export function ClaimEngineClient({
           <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-3 dark:border-slate-800">
             <button
               type="button"
-              onClick={() => setActiveTab("workspace")}
+              onClick={() => setClaimEngineTab("submission_queue")}
               className={`inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold transition ${
-                activeTab === "workspace"
-                  ? "bg-sky-600 text-white shadow-sm"
-                  : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
-              }`}
-            >
-              <ShieldAlert className="h-3.5 w-3.5" />
-              Claims workspace
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTab("queue")}
-              className={`inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold transition ${
-                activeTab === "queue"
+                claimEngineTab === "submission_queue"
                   ? "bg-sky-600 text-white shadow-sm"
                   : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
               }`}
@@ -734,9 +788,227 @@ export function ClaimEngineClient({
               <Inbox className="h-3.5 w-3.5" />
               Submission queue
             </button>
+            <button
+              type="button"
+              onClick={() => setClaimEngineTab("active")}
+              className={`inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold transition ${
+                claimEngineTab === "active"
+                  ? "bg-sky-600 text-white shadow-sm"
+                  : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+              }`}
+            >
+              <ShieldAlert className="h-3.5 w-3.5" />
+              Active claims
+            </button>
+            <button
+              type="button"
+              onClick={() => setClaimEngineTab("closed")}
+              className={`inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold transition ${
+                claimEngineTab === "closed"
+                  ? "bg-sky-600 text-white shadow-sm"
+                  : "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+              }`}
+            >
+              <CheckCircle2 className="h-3.5 w-3.5" />
+              Closed claims
+            </button>
           </div>
 
-          {activeTab === "workspace" ? (
+          {claimEngineTab === "submission_queue" ? (
+            <section className="w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                <div>
+                  <p className="text-xs font-semibold tracking-tight text-slate-900 dark:text-slate-50">Submission queue</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Draft / ready to send — not yet filed with the marketplace. Review evidence, preview PDFs, then submit the claim.
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void handleGeneratePdfReport()}
+                    className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-900 disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100"
+                  >
+                    <FileText className="h-4 w-4" />
+                    Review evidence (PDF)
+                  </button>
+                  <button
+                    type="button"
+                    disabled={generateBusy}
+                    onClick={() => void handleEnqueuePipelineReports()}
+                    className="inline-flex items-center gap-2 rounded-xl border border-sky-300 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-900 disabled:opacity-50 dark:border-sky-700 dark:bg-sky-950/40 dark:text-sky-100"
+                  >
+                    {generateBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+                    Build queue from returns
+                  </button>
+                  <button
+                    type="button"
+                    disabled={bulkSubmitBusy}
+                    onClick={() => void handleBulkMarketplace()}
+                    className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-800 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+                  >
+                    {bulkSubmitBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                    Submit claim to marketplace
+                  </button>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 border-b border-slate-200 px-4 py-2 dark:border-slate-800">
+                <div className="relative min-w-[200px] max-w-md flex-1">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                  <input
+                    type="search"
+                    placeholder="Filter submission queue…"
+                    value={queueSf.filter}
+                    onChange={(e) => queueSf.setFilter(e.target.value)}
+                    className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm dark:border-slate-700 dark:bg-slate-900"
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                  <span className="font-medium">Sort</span>
+                  <select
+                    value={queueSf.sortKey ?? ""}
+                    onChange={(e) => queueSf.setSortKey(e.target.value || null)}
+                    className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-900"
+                  >
+                    <option value="">(list order)</option>
+                    <option value="identifiers">Identifiers</option>
+                    <option value="status">Status</option>
+                    <option value="amount">Amount</option>
+                    <option value="created">Created</option>
+                  </select>
+                  <select
+                    value={queueSf.sortDir}
+                    onChange={(e) => queueSf.setSortDir(e.target.value as SortDir)}
+                    className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-900"
+                  >
+                    <option value="asc">Asc</option>
+                    <option value="desc">Desc</option>
+                  </select>
+                </div>
+                {queueSelectedIds.size > 0 ? (
+                  <span className="text-xs font-semibold text-emerald-800 dark:text-emerald-200">
+                    {queueSelectedIds.size} row(s) selected for PDF
+                  </span>
+                ) : null}
+              </div>
+              {submissionsError ? (
+                <div className="border-b border-rose-700/40 bg-rose-950/30 px-4 py-2 text-xs text-rose-100">{submissionsError}</div>
+              ) : null}
+              {readyToSendCount > 0 ? (
+                <div className="border-b border-sky-300/80 bg-gradient-to-r from-sky-100/90 to-sky-50/90 px-4 py-3 dark:border-sky-800 dark:from-sky-950/80 dark:to-slate-950/60">
+                  <p className="text-sm font-bold text-sky-950 dark:text-sky-100">
+                    {readyToSendCount} claim{readyToSendCount === 1 ? "" : "s"} ready to send
+                  </p>
+                </div>
+              ) : null}
+              {submissionQueueFiltered.length === 0 ? (
+                <div className="px-6 py-12 text-center text-sm text-muted-foreground">
+                  No generated reports yet. Run <span className="font-semibold text-slate-700 dark:text-slate-300">Generate reports</span> to build PDFs for
+                  returns in <span className="font-semibold">ready for claim</span> status.
+                </div>
+              ) : submissionQueueDisplay.length === 0 ? (
+                <div className="px-6 py-10 text-center text-sm text-muted-foreground">
+                  No queue rows match this filter.
+                </div>
+              ) : (
+                <ul className="divide-y divide-slate-100 dark:divide-slate-800/60">
+                  {submissionQueueDisplay.map((row) => (
+                    <li
+                      key={row.id}
+                      className={[
+                        "flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-stretch",
+                        row.status === "ready_to_send" ? "bg-sky-50/50 dark:bg-sky-950/20" : "",
+                      ].join(" ")}
+                    >
+                      <div className="flex min-w-0 flex-1 gap-3">
+                        <div
+                          className="flex shrink-0 items-start pt-1"
+                          onClick={(e) => toggleQueueRow(row.id, e)}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={queueSelectedIds.has(row.id)}
+                            readOnly
+                            className="pointer-events-none mt-0.5 h-4 w-4 rounded border-slate-300 text-emerald-600"
+                            aria-label="Select for PDF batch"
+                          />
+                        </div>
+                        <div
+                          className="flex h-16 w-14 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-gradient-to-br from-slate-100 to-slate-200 dark:border-slate-700 dark:from-slate-800 dark:to-slate-900"
+                          aria-hidden
+                        >
+                          <FileText className="h-7 w-7 text-slate-500 dark:text-slate-400" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <ReturnIdentifiersColumn
+                            compact
+                            itemName={row.item_name}
+                            asin={row.asin}
+                            fnsku={row.fnsku}
+                            sku={row.sku}
+                            storePlatform={storePlatformForSubmission(row, stores)}
+                            onToast={showToast}
+                          />
+                          <p className="mt-2 rounded-lg border border-emerald-200/80 bg-emerald-50/50 px-3 py-2 text-sm dark:border-emerald-900/50 dark:bg-emerald-950/30">
+                            <span className="font-semibold text-slate-600 dark:text-slate-300">Requested amount </span>
+                            <span className="font-bold tabular-nums text-emerald-800 dark:text-emerald-300">
+                              {formatMoneyUsd2(Number(row.claim_amount) || 0)}
+                            </span>
+                          </p>
+                          <p className="mt-1 text-[10px] text-muted-foreground">
+                            {formatDate(row.created_at)}
+                            {typeof row.success_probability === "number" && !Number.isNaN(row.success_probability) ? (
+                              <span className="ml-2 text-violet-600 dark:text-violet-400">
+                                P(success): {row.success_probability.toFixed(0)}%
+                              </span>
+                            ) : null}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+                        <span
+                          className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${
+                            SUBMISSION_STATUS_STYLES[row.status] ?? SUBMISSION_STATUS_STYLES.draft
+                          }`}
+                        >
+                          {row.status.replace(/_/g, " ")}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => openClaimGenerationForRow(row)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100"
+                        >
+                          <FileText className="h-3.5 w-3.5" />
+                          Review evidence
+                        </button>
+                        <button
+                          type="button"
+                          disabled={queueBusyId === row.id || !row.report_url}
+                          onClick={() => void handlePreview(row)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-slate-800 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                        >
+                          {queueBusyId === row.id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Eye className="h-3.5 w-3.5" />
+                          )}
+                          Preview
+                        </button>
+                        <button
+                          type="button"
+                          disabled={queueBusyId === row.id}
+                          onClick={() => void handleManualSubmit(row)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-900 disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100"
+                        >
+                          Submit claim
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          ) : claimEngineTab === "active" ? (
             <>
           {claimsError && (
             <div className="rounded-2xl border border-rose-700/60 bg-rose-950/40 px-4 py-3 text-xs text-rose-100">
@@ -823,8 +1095,8 @@ export function ClaimEngineClient({
             <DatabaseTag table="claim_submissions" />
             <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
               <div>
-                <p className="text-xs font-semibold tracking-tight text-slate-900 dark:text-slate-50">Marketplace investigations</p>
-                <p className="text-[11px] text-muted-foreground">Filed or in-review submissions (not the pre-send queue).</p>
+                <p className="text-xs font-semibold tracking-tight text-slate-900 dark:text-slate-50">Active claims</p>
+                <p className="text-[11px] text-muted-foreground">Submitted, in review, or awaiting evidence — includes Case ID and negotiation when available.</p>
               </div>
               <FileText className="h-4 w-4 text-muted-foreground" />
             </div>
@@ -834,21 +1106,21 @@ export function ClaimEngineClient({
                 <input
                   type="search"
                   placeholder="Filter claims (identifiers, order, status…)"
-                  value={claimsSf.filter}
-                  onChange={(e) => claimsSf.setFilter(e.target.value)}
+                  value={activeClaimsSf.filter}
+                  onChange={(e) => activeClaimsSf.setFilter(e.target.value)}
                   className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm dark:border-slate-700 dark:bg-slate-900"
                 />
               </div>
             </div>
 
-            {claims.length === 0 ? (
+            {activeClaimsFiltered.length === 0 ? (
               <div className="flex flex-col items-center justify-center gap-3 px-6 py-12 text-center">
                 <div className="flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
                   <FileText className="h-5 w-5 text-muted-foreground" />
                 </div>
-                <p className="text-sm font-medium text-slate-700 dark:text-slate-300">No active marketplace investigations found.</p>
+                <p className="text-sm font-medium text-slate-700 dark:text-slate-300">No active claims in this pipeline.</p>
                 <p className="max-w-xs text-xs text-slate-500">
-                  Investigations appear when submissions move past <span className="font-medium">ready to send</span> (submitted, evidence, accepted, etc.).
+                  Active claims use statuses such as submitted, evidence requested, or investigating after a case is filed with the marketplace.
                 </p>
                 <Link
                   href="/settings"
@@ -857,7 +1129,7 @@ export function ClaimEngineClient({
                   Adapter settings
                 </Link>
               </div>
-            ) : displayClaims.length === 0 ? (
+            ) : activeDisplayClaims.length === 0 ? (
               <div className="px-6 py-10 text-center text-sm text-muted-foreground">
                 No claims match this filter. Clear the search box to see all rows.
               </div>
@@ -879,65 +1151,63 @@ export function ClaimEngineClient({
                         <DataTableSortHeader
                           label="Identifiers"
                           colKey="identifiers"
-                          sortKey={claimsSf.sortKey}
-                          sortDir={claimsSf.sortDir}
-                          onToggle={claimsSf.toggleSort}
+                          sortKey={activeClaimsSf.sortKey}
+                          sortDir={activeClaimsSf.sortDir}
+                          onToggle={activeClaimsSf.toggleSort}
                         />
                         <DataTableSortHeader
                           label="Store"
                           colKey="store"
-                          sortKey={claimsSf.sortKey}
-                          sortDir={claimsSf.sortDir}
-                          onToggle={claimsSf.toggleSort}
+                          sortKey={activeClaimsSf.sortKey}
+                          sortDir={activeClaimsSf.sortDir}
+                          onToggle={activeClaimsSf.toggleSort}
                         />
                         <DataTableSortHeader
                           label="Claim Type"
                           colKey="type"
-                          sortKey={claimsSf.sortKey}
-                          sortDir={claimsSf.sortDir}
-                          onToggle={claimsSf.toggleSort}
+                          sortKey={activeClaimsSf.sortKey}
+                          sortDir={activeClaimsSf.sortDir}
+                          onToggle={activeClaimsSf.toggleSort}
                         />
                         <DataTableSortHeader
                           label="Order / Ref"
                           colKey="order"
-                          sortKey={claimsSf.sortKey}
-                          sortDir={claimsSf.sortDir}
-                          onToggle={claimsSf.toggleSort}
+                          sortKey={activeClaimsSf.sortKey}
+                          sortDir={activeClaimsSf.sortDir}
+                          onToggle={activeClaimsSf.toggleSort}
                         />
                         <DataTableSortHeader
                           label="Amount"
                           colKey="amount"
-                          sortKey={claimsSf.sortKey}
-                          sortDir={claimsSf.sortDir}
-                          onToggle={claimsSf.toggleSort}
+                          sortKey={activeClaimsSf.sortKey}
+                          sortDir={activeClaimsSf.sortDir}
+                          onToggle={activeClaimsSf.toggleSort}
                           align="right"
                         />
                         <DataTableSortHeader
                           label="Status"
                           colKey="status"
-                          sortKey={claimsSf.sortKey}
-                          sortDir={claimsSf.sortDir}
-                          onToggle={claimsSf.toggleSort}
+                          sortKey={activeClaimsSf.sortKey}
+                          sortDir={activeClaimsSf.sortDir}
+                          onToggle={activeClaimsSf.toggleSort}
                         />
                         <DataTableSortHeader
                           label="Date"
                           colKey="date"
-                          sortKey={claimsSf.sortKey}
-                          sortDir={claimsSf.sortDir}
-                          onToggle={claimsSf.toggleSort}
+                          sortKey={activeClaimsSf.sortKey}
+                          sortDir={activeClaimsSf.sortDir}
+                          onToggle={activeClaimsSf.toggleSort}
                         />
+                        <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Case ID</th>
+                        <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Negotiation</th>
                         <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">History</th>
                         <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Details</th>
                         <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Actions</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
-                      {displayClaims.map((claim) => (
-                        <tr
-                          key={claim.id}
-                          className="cursor-pointer transition hover:bg-accent/40"
-                          onClick={() => setHistorySubmissionId(claim.id)}
-                        >
+                      {activeDisplayClaims.map((claim) => (
+                        <tr key={claim.id} className="transition hover:bg-accent/40">
                           <td
                             className="w-10 px-2 py-3"
                             onClick={(e) => toggleRow(claim.id, e)}
@@ -997,20 +1267,35 @@ export function ClaimEngineClient({
                           <td className="px-4 py-3 align-top text-xs text-muted-foreground">
                             {formatDate(claim.created_at)}
                           </td>
-                          <td className="px-4 py-3 align-top" onClick={(e) => e.stopPropagation()}>
+                          <td className="px-4 py-3 align-top font-mono text-xs text-muted-foreground">
+                            {claim.marketplace_claim_id?.trim() ? claim.marketplace_claim_id : "—"}
+                          </td>
+                          <td className="px-4 py-3 align-top">
+                            <Link
+                              href={`/claim-engine/investigation/${claim.id}`}
+                              className="inline-flex items-center gap-1 rounded-lg border border-violet-200 bg-violet-50 px-2 py-1 text-[11px] font-semibold text-violet-900 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-100"
+                            >
+                              <MessageSquare className="h-3.5 w-3.5" />
+                              Negotiation
+                            </Link>
+                          </td>
+                          <td className="px-4 py-3 align-top">
                             <button
                               type="button"
-                              onClick={() => setHistorySubmissionId(claim.id)}
+                              onClick={() => setHistoryClaimId(claim.id)}
                               className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                             >
                               <HistoryIcon className="h-3.5 w-3.5" />
                               History
                             </button>
                           </td>
-                          <td className="px-4 py-3 align-top" onClick={(e) => e.stopPropagation()}>
+                          <td className="px-4 py-3 align-top">
                             <button
                               type="button"
-                              onClick={() => setModalClaim(claim)}
+                              onClick={() => {
+                                setDetailModalReadOnly(false);
+                                setModalClaim(claim);
+                              }}
                               className="inline-flex items-center gap-1 rounded-lg border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] font-semibold text-sky-900 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-100"
                             >
                               Details
@@ -1038,21 +1323,25 @@ export function ClaimEngineClient({
                 </div>
 
                 <div className="space-y-3 p-3 md:hidden">
-                  {displayClaims.map((claim) => (
+                  {activeDisplayClaims.map((claim) => (
                     <div
                       key={claim.id}
-                      className="cursor-pointer rounded-xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/50"
-                      onClick={() => setHistorySubmissionId(claim.id)}
-                      role="presentation"
+                      className="rounded-xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/50"
                     >
                       <p className="text-sm font-semibold text-slate-900 dark:text-slate-50">
                         {claim.item_name?.trim() || "Claim"}
                       </p>
                       <p className="mt-1 text-xs text-muted-foreground">
+                        Case ID:{" "}
+                        <span className="font-mono text-slate-700 dark:text-slate-200">
+                          {claim.marketplace_claim_id?.trim() ? claim.marketplace_claim_id : "—"}
+                        </span>
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
                         {formatCurrency(Number(claim.amount) || 0)} ·{" "}
                         <span className="font-medium text-slate-700 dark:text-slate-300">{claim.status}</span>
                       </p>
-                      <div className="mt-3 flex flex-wrap gap-2" onClick={(e) => e.stopPropagation()}>
+                      <div className="mt-3 flex flex-wrap gap-2">
                         <button
                           type="button"
                           disabled={approveBusyId === claim.id || claim.status === "accepted"}
@@ -1066,9 +1355,16 @@ export function ClaimEngineClient({
                           )}
                           Approve
                         </button>
+                        <Link
+                          href={`/claim-engine/investigation/${claim.id}`}
+                          className="inline-flex flex-1 items-center justify-center gap-1 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2 text-xs font-semibold text-violet-900 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-100"
+                        >
+                          <MessageSquare className="h-4 w-4" />
+                          Negotiation
+                        </Link>
                         <button
                           type="button"
-                          onClick={() => setHistorySubmissionId(claim.id)}
+                          onClick={() => setHistoryClaimId(claim.id)}
                           className="inline-flex flex-1 items-center justify-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                         >
                           <HistoryIcon className="h-4 w-4" />
@@ -1076,7 +1372,10 @@ export function ClaimEngineClient({
                         </button>
                         <button
                           type="button"
-                          onClick={() => setModalClaim(claim)}
+                          onClick={() => {
+                            setDetailModalReadOnly(false);
+                            setModalClaim(claim);
+                          }}
                           className="inline-flex flex-1 items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-900 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-100"
                         >
                           Details
@@ -1090,219 +1389,293 @@ export function ClaimEngineClient({
           </section>
             </>
           ) : (
-            <section className="w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
-              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
-                <div>
-                  <p className="text-xs font-semibold tracking-tight text-slate-900 dark:text-slate-50">Submission queue</p>
-                  <p className="text-[11px] text-muted-foreground">
-                    Auto-generated claim PDFs (Supabase Storage). <span className="font-semibold text-sky-700 dark:text-sky-400">ready_to_send</span> rows surface first for Agent testing; preview before filing; manual submit records the marketplace case ID.
-                  </p>
+            <>
+              {claimsError && (
+                <div className="rounded-2xl border border-rose-700/60 bg-rose-950/40 px-4 py-3 text-xs text-rose-100">
+                  <span className="font-semibold">Data warning:</span> {claimsError}
                 </div>
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => void handleGeneratePdfReport()}
-                    className="inline-flex items-center gap-2 rounded-xl border border-emerald-300 bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-900 disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100"
-                  >
-                    <FileText className="h-4 w-4" />
-                    Generate PDF report
-                  </button>
-                  <button
-                    type="button"
-                    disabled={generateBusy}
-                    onClick={() => void handleEnqueuePipelineReports()}
-                    className="inline-flex items-center gap-2 rounded-xl border border-sky-300 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-900 disabled:opacity-50 dark:border-sky-700 dark:bg-sky-950/40 dark:text-sky-100"
-                  >
-                    {generateBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-                    Build queue from returns
-                  </button>
-                  <button
-                    type="button"
-                    disabled={bulkSubmitBusy}
-                    onClick={() => void handleBulkMarketplace()}
-                    className="inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs font-semibold text-slate-800 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
-                  >
-                    {bulkSubmitBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                    Bulk submit to marketplace
-                  </button>
-                </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-3 border-b border-slate-200 px-4 py-2 dark:border-slate-800">
-                <div className="relative min-w-[200px] max-w-md flex-1">
-                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-                  <input
-                    type="search"
-                    placeholder="Filter submission queue…"
-                    value={queueSf.filter}
-                    onChange={(e) => queueSf.setFilter(e.target.value)}
-                    className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm dark:border-slate-700 dark:bg-slate-900"
-                  />
-                </div>
-                <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
-                  <span className="font-medium">Sort</span>
-                  <select
-                    value={queueSf.sortKey ?? ""}
-                    onChange={(e) => queueSf.setSortKey(e.target.value || null)}
-                    className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-900"
-                  >
-                    <option value="">(list order)</option>
-                    <option value="identifiers">Identifiers</option>
-                    <option value="status">Status</option>
-                    <option value="amount">Amount</option>
-                    <option value="created">Created</option>
-                  </select>
-                  <select
-                    value={queueSf.sortDir}
-                    onChange={(e) => queueSf.setSortDir(e.target.value as SortDir)}
-                    className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-900"
-                  >
-                    <option value="asc">Asc</option>
-                    <option value="desc">Desc</option>
-                  </select>
-                </div>
-                {queueSelectedIds.size > 0 ? (
-                  <span className="text-xs font-semibold text-emerald-800 dark:text-emerald-200">
-                    {queueSelectedIds.size} row(s) selected for PDF
-                  </span>
-                ) : null}
-              </div>
-              {submissionsError ? (
-                <div className="border-b border-rose-700/40 bg-rose-950/30 px-4 py-2 text-xs text-rose-100">{submissionsError}</div>
-              ) : null}
-              {readyToSendCount > 0 ? (
-                <div className="border-b border-sky-300/80 bg-gradient-to-r from-sky-100/90 to-sky-50/90 px-4 py-3 dark:border-sky-800 dark:from-sky-950/80 dark:to-slate-950/60">
-                  <p className="text-sm font-bold text-sky-950 dark:text-sky-100">
-                    {readyToSendCount} claim{readyToSendCount === 1 ? "" : "s"} ready to send
-                  </p>
-                </div>
-              ) : null}
-              {submissionQueueRows.length === 0 ? (
-                <div className="px-6 py-12 text-center text-sm text-muted-foreground">
-                  No generated reports yet. Run <span className="font-semibold text-slate-700 dark:text-slate-300">Generate reports</span> to build PDFs for
-                  returns in <span className="font-semibold">ready for claim</span> status.
-                </div>
-              ) : submissionQueueDisplay.length === 0 ? (
-                <div className="px-6 py-10 text-center text-sm text-muted-foreground">
-                  No queue rows match this filter.
-                </div>
-              ) : (
-                <ul className="divide-y divide-slate-100 dark:divide-slate-800/60">
-                  {submissionQueueDisplay.map((row) => (
-                    <li
-                      key={row.id}
-                      className={[
-                        "flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-stretch",
-                        row.status === "ready_to_send"
-                          ? "bg-sky-50/50 dark:bg-sky-950/20"
-                          : "",
-                      ].join(" ")}
-                    >
-                      <div className="flex min-w-0 flex-1 gap-3">
-                        <div
-                          className="flex shrink-0 items-start pt-1"
-                          onClick={(e) => toggleQueueRow(row.id, e)}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={queueSelectedIds.has(row.id)}
-                            readOnly
-                            className="pointer-events-none mt-0.5 h-4 w-4 rounded border-slate-300 text-emerald-600"
-                            aria-label="Select for PDF batch"
-                          />
-                        </div>
-                        <div
-                          className="flex h-16 w-14 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-gradient-to-br from-slate-100 to-slate-200 dark:border-slate-700 dark:from-slate-800 dark:to-slate-900"
-                          aria-hidden
-                        >
-                          <FileText className="h-7 w-7 text-slate-500 dark:text-slate-400" />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <ReturnIdentifiersColumn
-                            compact
-                            itemName={row.item_name}
-                            asin={row.asin}
-                            fnsku={row.fnsku}
-                            sku={row.sku}
-                            storePlatform={storePlatformForSubmission(row, stores)}
-                            onToast={showToast}
-                          />
-                          <p className="mt-2 rounded-lg border border-emerald-200/80 bg-emerald-50/50 px-3 py-2 text-sm dark:border-emerald-900/50 dark:bg-emerald-950/30">
-                            <span className="font-semibold text-slate-600 dark:text-slate-300">Requested amount </span>
-                            <span className="font-bold tabular-nums text-emerald-800 dark:text-emerald-300">
-                              {formatMoneyUsd2(Number(row.claim_amount) || 0)}
-                            </span>
-                          </p>
-                          <p className="mt-1 text-[10px] text-muted-foreground">
-                            {formatDate(row.created_at)}
-                            {row.submission_id ? (
-                              <span className="ml-2 font-mono text-slate-600 dark:text-slate-400">Case: {row.submission_id}</span>
-                            ) : null}
-                            {typeof row.success_probability === "number" && !Number.isNaN(row.success_probability) ? (
-                              <span className="ml-2 text-violet-600 dark:text-violet-400">
-                                P(success): {row.success_probability.toFixed(0)}%
-                              </span>
-                            ) : null}
-                          </p>
-                        </div>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2 sm:justify-end">
-                        <span
-                          className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-medium ${
-                            SUBMISSION_STATUS_STYLES[row.status] ?? SUBMISSION_STATUS_STYLES.draft
-                          }`}
-                        >
-                          {row.status.replace(/_/g, " ")}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => openClaimGenerationForRow(row)}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100"
-                        >
-                          <FileText className="h-3.5 w-3.5" />
-                          Generate PDF
-                        </button>
-                        <Link
-                          href={`/claim-engine/investigation/${row.id}`}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-violet-200 bg-violet-50 px-2.5 py-1.5 text-[11px] font-semibold text-violet-900 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-100"
-                        >
-                          <MessageSquare className="h-3.5 w-3.5" />
-                          Investigate
-                        </Link>
-                        <button
-                          type="button"
-                          onClick={() => setHistorySubmissionId(row.id)}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                        >
-                          <HistoryIcon className="h-3.5 w-3.5" />
-                          History
-                        </button>
-                        <button
-                          type="button"
-                          disabled={queueBusyId === row.id || !row.report_url}
-                          onClick={() => void handlePreview(row)}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-slate-800 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                        >
-                          {queueBusyId === row.id ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            <Eye className="h-3.5 w-3.5" />
-                          )}
-                          Preview
-                        </button>
-                        <button
-                          type="button"
-                          disabled={queueBusyId === row.id}
-                          onClick={() => void handleManualSubmit(row)}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-[11px] font-semibold text-emerald-900 disabled:opacity-50 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100"
-                        >
-                          Manual submit
-                        </button>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
               )}
-            </section>
+
+              <section className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                <div className="relative overflow-hidden rounded-2xl border bg-slate-950/70 px-4 py-4 shadow-sm ring-1 ring-inset ring-slate-800/80 border-sky-500/30">
+                  <div className="relative flex items-start justify-between gap-3">
+                    <div className="space-y-2">
+                      <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Total Recovered</p>
+                      <p className="text-2xl font-semibold tracking-tight text-slate-50">{formatCurrency(totalRecoveredDisplay)}</p>
+                    </div>
+                    <TrendingUp className="h-5 w-5 text-sky-400" />
+                  </div>
+                  <p className="relative mt-3 text-[11px] text-slate-400">
+                    Reimbursement when recorded, else accepted claim_amount (USD)
+                  </p>
+                </div>
+                <div className="relative overflow-hidden rounded-2xl border bg-slate-950/70 px-4 py-4 shadow-sm ring-1 ring-inset ring-slate-800/80 border-amber-500/30">
+                  <div className="relative flex items-start justify-between gap-3">
+                    <div className="space-y-2">
+                      <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Pending Claims</p>
+                      <p className="text-2xl font-semibold tracking-tight text-slate-50">{pendingCount}</p>
+                    </div>
+                    <Clock className="h-5 w-5 text-amber-400" />
+                  </div>
+                  <p className="relative mt-3 text-[11px] text-slate-400">Awaiting action from marketplace sync</p>
+                </div>
+                <div className="relative overflow-hidden rounded-2xl border bg-slate-950/70 px-4 py-4 shadow-sm ring-1 ring-inset ring-slate-800/80 border-rose-500/30">
+                  <div className="relative flex items-start justify-between gap-3">
+                    <div className="space-y-2">
+                      <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Suspicious</p>
+                      <p className="text-2xl font-semibold tracking-tight text-slate-50">{suspiciousCount}</p>
+                    </div>
+                    <AlertTriangle className="h-5 w-5 text-rose-400" />
+                  </div>
+                  <p className="relative mt-3 text-[11px] text-slate-400">Flagged by adapter rules</p>
+                </div>
+              </section>
+
+              <section className="relative w-full overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-950/70">
+                <DatabaseTag table="claim_submissions" />
+                <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                  <div>
+                    <p className="text-xs font-semibold tracking-tight text-slate-900 dark:text-slate-50">Closed claims</p>
+                    <p className="text-[11px] text-muted-foreground">
+                      Accepted, denied, or failed — view-only history, transcript, and final payout.
+                    </p>
+                  </div>
+                  <FileText className="h-4 w-4 text-muted-foreground" />
+                </div>
+                <div className="border-b border-slate-200 px-4 py-2 dark:border-slate-800">
+                  <div className="relative max-w-md">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                    <input
+                      type="search"
+                      placeholder="Filter closed claims…"
+                      value={closedClaimsSf.filter}
+                      onChange={(e) => closedClaimsSf.setFilter(e.target.value)}
+                      className="w-full rounded-lg border border-slate-200 bg-white py-2 pl-9 pr-3 text-sm dark:border-slate-700 dark:bg-slate-900"
+                    />
+                  </div>
+                </div>
+
+                {closedClaimsFiltered.length === 0 ? (
+                  <div className="px-6 py-12 text-center text-sm text-muted-foreground">
+                    No closed claims yet. Resolved submissions (accepted, denied, failed) appear here.
+                  </div>
+                ) : closedDisplayClaims.length === 0 ? (
+                  <div className="px-6 py-10 text-center text-sm text-muted-foreground">
+                    No rows match this filter. Clear the search to see all closed claims.
+                  </div>
+                ) : (
+                  <>
+                    <div className="hidden overflow-x-auto md:block">
+                      <table className="w-full min-w-[1100px] text-sm">
+                        <thead>
+                          <tr className="border-b border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-900/40">
+                            <DataTableSortHeader
+                              label="Identifiers"
+                              colKey="identifiers"
+                              sortKey={closedClaimsSf.sortKey}
+                              sortDir={closedClaimsSf.sortDir}
+                              onToggle={closedClaimsSf.toggleSort}
+                            />
+                            <DataTableSortHeader
+                              label="Store"
+                              colKey="store"
+                              sortKey={closedClaimsSf.sortKey}
+                              sortDir={closedClaimsSf.sortDir}
+                              onToggle={closedClaimsSf.toggleSort}
+                            />
+                            <DataTableSortHeader
+                              label="Claim Type"
+                              colKey="type"
+                              sortKey={closedClaimsSf.sortKey}
+                              sortDir={closedClaimsSf.sortDir}
+                              onToggle={closedClaimsSf.toggleSort}
+                            />
+                            <DataTableSortHeader
+                              label="Order / Ref"
+                              colKey="order"
+                              sortKey={closedClaimsSf.sortKey}
+                              sortDir={closedClaimsSf.sortDir}
+                              onToggle={closedClaimsSf.toggleSort}
+                            />
+                            <DataTableSortHeader
+                              label="Amount"
+                              colKey="amount"
+                              sortKey={closedClaimsSf.sortKey}
+                              sortDir={closedClaimsSf.sortDir}
+                              onToggle={closedClaimsSf.toggleSort}
+                              align="right"
+                            />
+                            <DataTableSortHeader
+                              label="Status"
+                              colKey="status"
+                              sortKey={closedClaimsSf.sortKey}
+                              sortDir={closedClaimsSf.sortDir}
+                              onToggle={closedClaimsSf.toggleSort}
+                            />
+                            <DataTableSortHeader
+                              label="Date"
+                              colKey="date"
+                              sortKey={closedClaimsSf.sortKey}
+                              sortDir={closedClaimsSf.sortDir}
+                              onToggle={closedClaimsSf.toggleSort}
+                            />
+                            <DataTableSortHeader
+                              label="Final payout"
+                              colKey="payout"
+                              sortKey={closedClaimsSf.sortKey}
+                              sortDir={closedClaimsSf.sortDir}
+                              onToggle={closedClaimsSf.toggleSort}
+                              align="right"
+                            />
+                            <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Case ID</th>
+                            <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Transcript</th>
+                            <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">History</th>
+                            <th className="px-4 py-2.5 text-left text-[11px] font-medium uppercase tracking-wide text-slate-500">Details</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60">
+                          {closedDisplayClaims.map((claim) => (
+                            <tr key={claim.id} className="transition hover:bg-accent/40">
+                              <td className="px-4 py-3 align-top">
+                                <ReturnIdentifiersColumn
+                                  compact
+                                  itemName={claim.item_name}
+                                  asin={claim.asin}
+                                  fnsku={claim.fnsku}
+                                  sku={claim.sku}
+                                  storePlatform={resolveStore(claim, stores)?.platform}
+                                  onToast={showToast}
+                                />
+                              </td>
+                              <td className="px-4 py-3 align-top">
+                                {claim.marketplace_provider ? (
+                                  <span
+                                    className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
+                                      claim.marketplace_provider === "amazon_sp_api"
+                                        ? "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-300"
+                                        : claim.marketplace_provider === "walmart_api"
+                                          ? "border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-700/50 dark:bg-sky-950/30 dark:text-sky-300"
+                                          : "border-rose-300 bg-rose-50 text-rose-700 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-300"
+                                    }`}
+                                  >
+                                    {providerLabel(claim.marketplace_provider)}
+                                  </span>
+                                ) : (
+                                  <span className="text-xs text-muted-foreground">—</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-3 align-top text-xs text-slate-600 dark:text-slate-300">
+                                {claim.claim_type ?? "—"}
+                              </td>
+                              <td className="px-4 py-3 align-top font-mono text-xs text-muted-foreground">
+                                {claim.amazon_order_id ?? "—"}
+                              </td>
+                              <td className="px-4 py-3 align-top text-right text-xs font-semibold text-slate-900 dark:text-slate-50">
+                                {formatCurrency(Number(claim.amount) || 0)}
+                              </td>
+                              <td className="px-4 py-3 align-top">
+                                <span
+                                  className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${CLAIM_ROW_STATUS_STYLES[claim.status] ?? CLAIM_ROW_STATUS_STYLES.pending}`}
+                                >
+                                  {claim.status.charAt(0).toUpperCase() + claim.status.slice(1)}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3 align-top text-xs text-muted-foreground">
+                                {formatDate(claim.created_at)}
+                              </td>
+                              <td className="px-4 py-3 align-top text-right text-xs font-semibold text-emerald-800 dark:text-emerald-200">
+                                {formatFinalPayoutUsd(claim)}
+                              </td>
+                              <td className="px-4 py-3 align-top font-mono text-xs text-muted-foreground">
+                                {claim.marketplace_claim_id?.trim() ? claim.marketplace_claim_id : "—"}
+                              </td>
+                              <td className="px-4 py-3 align-top">
+                                <Link
+                                  href={`/claim-engine/investigation/${claim.id}?readonly=1`}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-violet-200 bg-violet-50 px-2 py-1 text-[11px] font-semibold text-violet-900 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-100"
+                                >
+                                  <MessageSquare className="h-3.5 w-3.5" />
+                                  Transcript
+                                </Link>
+                              </td>
+                              <td className="px-4 py-3 align-top">
+                                <button
+                                  type="button"
+                                  onClick={() => setHistoryClaimId(claim.id)}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                                >
+                                  <HistoryIcon className="h-3.5 w-3.5" />
+                                  History
+                                </button>
+                              </td>
+                              <td className="px-4 py-3 align-top">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setDetailModalReadOnly(true);
+                                    setModalClaim(claim);
+                                  }}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-sky-200 bg-sky-50 px-2 py-1 text-[11px] font-semibold text-sky-900 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-100"
+                                >
+                                  Details
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <div className="space-y-3 p-3 md:hidden">
+                      {closedDisplayClaims.map((claim) => (
+                        <div
+                          key={claim.id}
+                          className="rounded-xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-800 dark:bg-slate-900/50"
+                        >
+                          <p className="text-sm font-semibold text-slate-900 dark:text-slate-50">
+                            {claim.item_name?.trim() || "Claim"}
+                          </p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            Final payout:{" "}
+                            <span className="font-semibold text-emerald-800 dark:text-emerald-200">{formatFinalPayoutUsd(claim)}</span>
+                          </p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            {formatCurrency(Number(claim.amount) || 0)} requested · {claim.status}
+                          </p>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <Link
+                              href={`/claim-engine/investigation/${claim.id}?readonly=1`}
+                              className="inline-flex flex-1 items-center justify-center gap-1 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2 text-xs font-semibold text-violet-900 dark:border-violet-800 dark:bg-violet-950/40 dark:text-violet-100"
+                            >
+                              <MessageSquare className="h-4 w-4" />
+                              Transcript
+                            </Link>
+                            <button
+                              type="button"
+                              onClick={() => setHistoryClaimId(claim.id)}
+                              className="inline-flex flex-1 items-center justify-center gap-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                            >
+                              <HistoryIcon className="h-4 w-4" />
+                              History
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setDetailModalReadOnly(true);
+                                setModalClaim(claim);
+                              }}
+                              className="inline-flex flex-1 items-center justify-center rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-900 dark:border-sky-800 dark:bg-sky-950/40 dark:text-sky-100"
+                            >
+                              Details
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </section>
+            </>
           )}
         </div>
       </main>

@@ -47,6 +47,29 @@ export async function downloadSingleClaimPdf(opts: {
 /**
  * Enterprise claim PDF: cover letter + embedded labeled images (fetched client-side to data URIs).
  */
+export async function buildEnterpriseClaimPdfBlob(opts: {
+  tenant: CoreSettings;
+  storeName: string;
+  storePlatform: string;
+  detail: ClaimDetailPayload;
+  claimAmountNote?: string;
+  marketplaceClaimIdNote?: string;
+  evidenceSlots: { label: string; url: string }[];
+}): Promise<Blob> {
+  const evidenceImages = await fetchEvidenceImagesForPdf(opts.evidenceSlots);
+  return pdf(
+    <SingleClaimPdfDocument
+      tenant={opts.tenant}
+      storeName={opts.storeName}
+      storePlatform={opts.storePlatform}
+      detail={opts.detail}
+      claimAmountNote={opts.claimAmountNote}
+      marketplaceClaimIdNote={opts.marketplaceClaimIdNote}
+      evidenceImages={evidenceImages}
+    />,
+  ).toBlob();
+}
+
 export async function downloadEnterpriseClaimPdf(opts: {
   tenant: CoreSettings;
   storeName: string;
@@ -58,18 +81,7 @@ export async function downloadEnterpriseClaimPdf(opts: {
   evidenceSlots: { label: string; url: string }[];
   filename?: string;
 }): Promise<void> {
-  const evidenceImages = await fetchEvidenceImagesForPdf(opts.evidenceSlots);
-  const blob = await pdf(
-    <SingleClaimPdfDocument
-      tenant={opts.tenant}
-      storeName={opts.storeName}
-      storePlatform={opts.storePlatform}
-      detail={opts.detail}
-      claimAmountNote={opts.claimAmountNote}
-      marketplaceClaimIdNote={opts.marketplaceClaimIdNote}
-      evidenceImages={evidenceImages}
-    />,
-  ).toBlob();
+  const blob = await buildEnterpriseClaimPdfBlob(opts);
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = opts.filename ?? `claim-${opts.detail.claim.id}.pdf`;

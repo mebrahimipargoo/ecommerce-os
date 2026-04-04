@@ -11,7 +11,7 @@ export type ClaimTimelineRow = {
   actor: string | null;
   organization_id: string | null;
   created_at: string;
-  /** Legacy status snapshot when present. */
+  /** Status snapshot — read from `details.status` (or legacy `details.status_at_time`). */
   status_at_time?: string | null;
 };
 
@@ -21,9 +21,29 @@ function asDetails(raw: unknown): Record<string, unknown> | null {
   return null;
 }
 
+function statusFromDetails(details: Record<string, unknown> | null): string | null {
+  if (!details) return null;
+  const s = details.status ?? details.status_at_time;
+  if (typeof s === "string" && s.trim()) return s.trim();
+  return null;
+}
+
+/** Map DB `actor` (text or legacy enum-like strings) to a short display label. */
+function formatActorDisplay(raw: unknown): string | null {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  if (s.includes("@")) return s;
+  const lower = s.toLowerCase();
+  if (lower === "human_admin") return "Human admin";
+  if (lower === "marketplace_bot") return "Marketplace bot";
+  if (lower === "agent") return "Agent";
+  if (lower === "system") return "System";
+  return s.replace(/_/g, " ");
+}
+
 /**
- * Loads timeline rows for a claim (submission id). Filters by `organization_id` (text)
- * and `claim_id` / `submission_id` match.
+ * Loads timeline rows for a claim (submission id). Filters by `organization_id` and `claim_id`.
  */
 export async function getClaimTimelineLogs(
   claimId: string,
@@ -34,8 +54,7 @@ export async function getClaimTimelineLogs(
   if (!cid) return { ok: false, error: "organization_id is required." };
 
   try {
-    const selectCols =
-      "id, claim_id, action, details, actor_label, organization_id, created_at, status_at_time, message_content, attachments, actor";
+    const selectCols = "id, claim_id, action, details, actor, organization_id, created_at";
 
     const { data, error } = await supabaseServer
       .from("claim_history_logs")
@@ -48,15 +67,9 @@ export async function getClaimTimelineLogs(
 
     const rows: ClaimTimelineRow[] = (data ?? []).map((row) => {
       const r = row as Record<string, unknown>;
-      const action = (r.action as string | null) ?? (r.message_content as string) ?? "";
-      const details =
-        asDetails(r.details) ??
-        asDetails(r.attachments) ??
-        null;
-      const actor =
-        (r.actor_label as string | null)?.trim() ||
-        (r.actor != null ? String(r.actor) : null) ||
-        null;
+      const details = asDetails(r.details);
+      const action = (r.action as string | null)?.trim() || "";
+      const actor = formatActorDisplay(r.actor);
       const claimFk = (r.claim_id as string | null) ?? claimId;
       return {
         id: String(r.id),
@@ -66,7 +79,7 @@ export async function getClaimTimelineLogs(
         actor,
         organization_id: (r.organization_id as string | null) ?? cid,
         created_at: String(r.created_at ?? ""),
-        status_at_time: r.status_at_time != null ? String(r.status_at_time) : null,
+        status_at_time: statusFromDetails(details),
       };
     });
 
@@ -94,7 +107,7 @@ export async function resolveProfileDisplayName(profileId: string | null | undef
 }
 
 /**
- * Appends a timeline row. Sets legacy columns so existing RLS policies and readers keep working.
+ * Appends a timeline row. Persists status and kind inside `details` JSONB (no extra table columns).
  */
 export async function appendClaimHistoryTimelineEntry(input: {
   claimId: string;
@@ -103,16 +116,20 @@ export async function appendClaimHistoryTimelineEntry(input: {
   details?: Record<string, unknown> | null;
   statusAtTime: string;
   actorLabel: string;
-  actorEnum?: "human_admin" | "agent" | "marketplace_bot";
 }): Promise<{ ok: boolean; error?: string }> {
   if (!isUuidString(input.claimId)) return { ok: false, error: "Invalid claim id." };
   const orgId = input.organizationId.trim();
   if (!orgId) return { ok: false, error: "organization_id is required." };
 
-  const details = input.details ?? {};
+  const base = input.details ?? {};
   const action = input.action.trim() || "Update";
   const actorLabel = input.actorLabel.trim() || "User";
-  const actorEnum = input.actorEnum ?? "human_admin";
+  const details: Record<string, unknown> = {
+    ...base,
+    status: input.statusAtTime,
+    message_kind: "system",
+    actor_role: "human_admin",
+  };
 
   try {
     const { error } = await supabaseServer.from("claim_history_logs").insert({
@@ -120,12 +137,7 @@ export async function appendClaimHistoryTimelineEntry(input: {
       claim_id: input.claimId,
       action,
       details,
-      actor_label: actorLabel,
-      actor: actorEnum,
-      message_content: action,
-      attachments: details,
-      status_at_time: input.statusAtTime,
-      message_kind: "system",
+      actor: actorLabel,
     });
     if (error) throw new Error(error.message);
     return { ok: true };

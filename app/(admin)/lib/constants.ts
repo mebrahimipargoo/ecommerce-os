@@ -7,7 +7,17 @@ export const DB_TABLES = {
   stores: "stores",
   organizationSettings: "organization_settings",
   rawReportUploads: "raw_report_uploads",
-  amazonLedgerStaging: "amazon_ledger_staging",
+  /** Phase 2 staging table (renamed from amazon_ledger_staging in 20260430 migration). */
+  amazonLedgerStaging: "amazon_staging",
+
+  // ── Amazon domain tables (amazon_ prefix standard, all have raw_data JSONB) ──
+  amazonReturns: "amazon_returns",
+  amazonRemovals: "amazon_removals",
+  amazonInventoryLedger: "amazon_inventory_ledger",
+  amazonReimbursements: "amazon_reimbursements",
+  amazonSettlements: "amazon_settlements",
+  amazonSafetClaims: "amazon_safet_claims",
+  amazonTransactions: "amazon_transactions",
 } as const;
 
 /** Storage bucket for raw report CSV files. */
