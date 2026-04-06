@@ -1,22 +1,29 @@
 "use client";
 
 /**
- * Technical debug (#db: table tags).
- * — UI state is read only from localStorage (synchronous on the client) so the toggle never flips
- *   after a server round-trip. Server persistence is write-only via saveOrganizationDebugMode.
+ * DebugModeContext — master debug toggle + granular developer flags.
+ *
+ * Master `debugMode` uses useSyncExternalStore for cross-tab sync.
+ * Granular flags use useState + useEffect (localStorage after mount) for SSR safety.
+ * Server persistence for master toggle: saveOrganizationDebugMode.
  */
 
 import React, {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
+  useState,
   useSyncExternalStore,
 } from "react";
 import { saveOrganizationDebugMode } from "../app/settings/debug-mode-actions";
 
 const DEBUG_MODE_LS_KEY = "ecommerce_os_debug_mode";
 const DEBUG_MODE_STORE_EVENT = "ecommerce_os_debug_mode_changed";
+const DEBUG_DB_TABLES_KEY = "ecommerce_os_debug_db_tables";
+const DEBUG_API_LOGS_KEY = "ecommerce_os_debug_api_logs";
+const DEBUG_RAW_JSON_KEY = "ecommerce_os_debug_raw_json";
 
 function readDebugSnapshot(): boolean {
   if (typeof window === "undefined") return false;
@@ -38,12 +45,18 @@ function subscribeDebugStore(onStore: () => void): () => void {
   };
 }
 
-type DebugModeContextValue = {
+export type DebugModeContextValue = {
   debugMode: boolean;
   loaded: boolean;
   setDebugMode: (enabled: boolean) => void;
-  /** Re-read localStorage and notify subscribers (no server fetch). */
   refresh: () => void;
+  showDbTableNames: boolean;
+  setShowDbTableNames: (v: boolean) => void;
+  showApiLogs: boolean;
+  setShowApiLogs: (v: boolean) => void;
+  showRawJson: boolean;
+  setShowRawJson: (v: boolean) => void;
+  resetAllDebugFlags: () => void;
 };
 
 const DebugModeContext = createContext<DebugModeContextValue | null>(null);
@@ -55,6 +68,20 @@ export function DebugModeProvider({ children }: { children: React.ReactNode }) {
     readDebugSnapshot,
   );
   const loaded = true;
+
+  const [showDbTableNames, setShowDbTableNamesState] = useState(false);
+  const [showApiLogs, setShowApiLogsState] = useState(false);
+  const [showRawJson, setShowRawJsonState] = useState(false);
+
+  useEffect(() => {
+    try {
+      setShowDbTableNamesState(localStorage.getItem(DEBUG_DB_TABLES_KEY) === "1");
+      setShowApiLogsState(localStorage.getItem(DEBUG_API_LOGS_KEY) === "1");
+      setShowRawJsonState(localStorage.getItem(DEBUG_RAW_JSON_KEY) === "1");
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const refresh = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -77,9 +104,67 @@ export function DebugModeProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  const setShowDbTableNames = useCallback((v: boolean) => {
+    setShowDbTableNamesState(v);
+    try {
+      localStorage.setItem(DEBUG_DB_TABLES_KEY, v ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const setShowApiLogs = useCallback((v: boolean) => {
+    setShowApiLogsState(v);
+    try {
+      localStorage.setItem(DEBUG_API_LOGS_KEY, v ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const setShowRawJson = useCallback((v: boolean) => {
+    setShowRawJsonState(v);
+    try {
+      localStorage.setItem(DEBUG_RAW_JSON_KEY, v ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const resetAllDebugFlags = useCallback(() => {
+    setShowDbTableNames(false);
+    setShowApiLogs(false);
+    setShowRawJson(false);
+    setDebugMode(false);
+  }, [setShowDbTableNames, setShowApiLogs, setShowRawJson, setDebugMode]);
+
   const value = useMemo(
-    () => ({ debugMode, loaded, setDebugMode, refresh }),
-    [debugMode, loaded, setDebugMode, refresh],
+    () => ({
+      debugMode,
+      loaded,
+      setDebugMode,
+      refresh,
+      showDbTableNames,
+      setShowDbTableNames,
+      showApiLogs,
+      setShowApiLogs,
+      showRawJson,
+      setShowRawJson,
+      resetAllDebugFlags,
+    }),
+    [
+      debugMode,
+      loaded,
+      setDebugMode,
+      refresh,
+      showDbTableNames,
+      setShowDbTableNames,
+      showApiLogs,
+      setShowApiLogs,
+      showRawJson,
+      setShowRawJson,
+      resetAllDebugFlags,
+    ],
   );
 
   return (
@@ -95,6 +180,13 @@ export function useDebugMode(): DebugModeContextValue {
       loaded: true,
       setDebugMode: () => {},
       refresh: () => {},
+      showDbTableNames: false,
+      setShowDbTableNames: () => {},
+      showApiLogs: false,
+      setShowApiLogs: () => {},
+      showRawJson: false,
+      setShowRawJson: () => {},
+      resetAllDebugFlags: () => {},
     };
   }
   return ctx;

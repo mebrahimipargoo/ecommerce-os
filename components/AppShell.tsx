@@ -17,23 +17,23 @@ import { createPortal } from "react-dom";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  ChevronDown, ChevronRight,
-  Database, FileText,
-  LayoutDashboard,
+  Banknote, Building2, ChevronDown,
+  ClipboardList, Database, DollarSign, FileText,
+  Package,
   PanelLeftClose, PanelLeftOpen,
-  RotateCcw, ScanLine, Settings, Shield, ShieldAlert, Users, X,
+  RotateCcw, ScanLine, Settings, Shield, ShieldAlert, Users, Wrench, X,
 } from "lucide-react";
 import { TopHeader } from "./TopHeader";
 import { BrandingProvider, useBranding } from "./BrandingContext";
 import { BrandLogoImage } from "./BrandLogoImage";
 import { GlobalSearchProvider } from "./GlobalSearchContext";
 import { UserRoleProvider } from "./UserRoleContext";
-import { SidebarDebugToggle } from "./SidebarDebugToggle";
+import { TechDebugPanel } from "./TechDebugPanel";
 import { useRbacPermissions } from "../hooks/useRbacPermissions";
 
 // ─── Nav Definitions ──────────────────────────────────────────────────────────
 
-type NavChild   = { label: string; href: string; disabled?: boolean; badge?: string };
+type NavChild   = { label: string; href: string; icon?: React.ElementType; disabled?: boolean; badge?: string };
 type NavItemDef = {
   label: string; icon: React.ElementType;
   href?: string; disabled?: boolean; badge?: string;
@@ -41,36 +41,47 @@ type NavItemDef = {
 };
 type NavSection = { id: string; label: string; items: NavItemDef[] };
 
-/** Full operational nav — filtered per role in SidebarBody */
-const OPS_NAV: NavSection = {
-  id: "ops",
-  label: "Operations",
-  items: [
-    { label: "Dashboard",          icon: LayoutDashboard, href: "/" },
-    { label: "Returns Processing", icon: RotateCcw,       href: "/returns" },
-    { label: "Claim Engine",       icon: ShieldAlert,     href: "/claim-engine" },
-    { label: "Report History",     icon: FileText,        href: "/claim-engine/report-history" },
+/** Warehouse Operations — accordion group */
+const WAREHOUSE_GROUP: NavItemDef = {
+  label: "Warehouse Operations",
+  icon:  Package,
+  children: [
+    { label: "Returns Processing", icon: RotateCcw,     href: "/returns"   },
+    { label: "Inventory Ledger",   icon: ClipboardList, href: "/inventory" },
   ],
 };
 
-/** System nav — visible to admin+ */
-const SYS_NAV: NavSection = {
-  id: "sys",
-  label: "System",
-  items: [
-    { label: "Users",    icon: Users,    href: "/users" },
-    { label: "Settings", icon: Settings, href: "/settings" },
+/** Finance & Claims — accordion group */
+const FINANCE_GROUP: NavItemDef = {
+  label: "Finance & Claims",
+  icon:  DollarSign,
+  children: [
+    { label: "Settlements",    icon: Banknote,    href: "/settlements"             },
+    { label: "Claim Engine",   icon: ShieldAlert, href: "/claim-engine"            },
+    { label: "Report History", icon: FileText,    href: "/claim-engine/report-history" },
   ],
 };
 
-/** WMS nav — shown to all; the ONLY section visible to operators */
+/** System Settings — accordion group (admin+) */
+const SYSTEM_GROUP: NavItemDef = {
+  label: "System Settings",
+  icon:  Settings,
+  children: [
+    { label: "Stores & Adapters", icon: Building2, href: "/settings" },
+    { label: "Users",             icon: Users,     href: "/users"    },
+  ],
+};
+
+/** WMS section — operators only */
 const WMS_NAV: NavSection = {
-  id: "wms",
-  label: "WMS",
+  id: "wms", label: "WMS",
   items: [
     { label: "Scan Item", icon: ScanLine, href: "/returns", badge: "WMS" },
   ],
 };
+
+// All accordion groups — used for auto-expand on navigation
+const ACCORDION_GROUPS = [WAREHOUSE_GROUP, FINANCE_GROUP, SYSTEM_GROUP];
 
 // ─── Shell context (mobile menu trigger) ──────────────────────────────────────
 
@@ -102,10 +113,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 // ─── Inner shell (has access to context) ─────────────────────────────────────
 
 function AppShellInner({ children }: { children: React.ReactNode }) {
-  const [collapsed,  setCollapsed]  = useState(false);
-  const [mobileOpen, setMobileOpen] = useState(false);
-  const [mounted,    setMounted]    = useState(false);
-  const [expanded,   setExpanded]   = useState<Record<string, boolean>>({});
+  const [collapsed,     setCollapsed]     = useState(false);
+  const [mobileOpen,    setMobileOpen]    = useState(false);
+  const [techDebugOpen, setTechDebugOpen] = useState(false);
+  const [mounted,       setMounted]       = useState(false);
+  const [expanded,      setExpanded]      = useState<Record<string, boolean>>({});
   const { companyName: brandName } = useBranding();
   const pathname = usePathname();
 
@@ -139,14 +151,13 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     return path === href || path.startsWith(`${href}/`);
   }
 
+  // Auto-expand accordion groups when a child route becomes active
   useEffect(() => {
     const auto: Record<string, boolean> = {};
-    [OPS_NAV, SYS_NAV, WMS_NAV].forEach((sec) => {
-      sec.items.forEach((item) => {
-        if (item.children?.some((c) => isActive(c.href))) {
-          auto[`${sec.id}-${item.label}`] = true;
-        }
-      });
+    ACCORDION_GROUPS.forEach((group) => {
+      if (group.children?.some((c) => isActive(c.href))) {
+        auto[`nav-${group.label}`] = true;
+      }
     });
     if (Object.keys(auto).length) setExpanded((p) => ({ ...p, ...auto }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -154,9 +165,14 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
 
   const closeMenu = () => setMobileOpen(false);
 
+  function openTechDebug() {
+    closeMenu();
+    setTechDebugOpen(true);
+  }
+
   // ── NavLink ────────────────────────────────────────────────────────────────
   function NavLink({ item, child = false, alwaysFull = false }: {
-    item: NavItemDef | NavChild;
+    item:        NavItemDef | NavChild;
     child?:      boolean;
     alwaysFull?: boolean;
   }) {
@@ -164,7 +180,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     const disabled = !!(item as NavItemDef).disabled;
     const badge    = (item as NavItemDef).badge;
     const active   = isActive(href);
-    const Icon     = (item as NavItemDef).icon;
+    const Icon     = (item as NavItemDef).icon ?? (item as NavChild).icon;
     const showText = alwaysFull || !collapsed;
 
     return (
@@ -182,9 +198,9 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
       >
         {Icon && (
           <Icon className={[
-            "h-5 w-5 shrink-0",
-            active   && !disabled ? "text-sky-600 dark:text-sky-400" : "",
-            disabled ? "opacity-40" : "",
+            child ? "h-4 w-4 shrink-0" : "h-5 w-5 shrink-0",
+            active && !disabled ? "text-sky-600 dark:text-sky-400" : "",
+            disabled             ? "opacity-40"                     : "",
           ].join(" ")} />
         )}
 
@@ -214,7 +230,9 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
 
   // ── AccordionItem ─────────────────────────────────────────────────────────
   function AccordionItem({ item, sectionId, alwaysFull = false }: {
-    item: NavItemDef; sectionId: string; alwaysFull?: boolean;
+    item:        NavItemDef;
+    sectionId:   string;
+    alwaysFull?: boolean;
   }) {
     const key         = `${sectionId}-${item.label}`;
     const open        = expanded[key] ?? false;
@@ -227,22 +245,30 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         <button
           type="button"
           onClick={() => showText && toggleAccordion(key)}
+          aria-expanded={showText ? open : undefined}
           className={[
             CLS.linkBase,
             collapsed && !showText ? "justify-center" : "",
             childActive ? CLS.linkActive : CLS.linkIdle,
           ].join(" ")}
         >
-          <Icon className={["h-5 w-5 shrink-0", childActive ? "text-sky-600 dark:text-sky-400" : ""].join(" ")} />
+          <Icon className={[
+            "h-5 w-5 shrink-0",
+            childActive ? "text-sky-600 dark:text-sky-400" : "",
+          ].join(" ")} />
+
           {showText && (
             <>
               <span className="flex-1 truncate text-left">{item.label}</span>
-              {open
-                ? <ChevronDown  className="h-4 w-4 shrink-0 opacity-50 transition-transform" />
-                : <ChevronRight className="h-4 w-4 shrink-0 opacity-50 transition-transform" />
-              }
+              <ChevronDown
+                className={[
+                  "h-4 w-4 shrink-0 opacity-50 transition-transform duration-200",
+                  open ? "rotate-0" : "-rotate-90",
+                ].join(" ")}
+              />
             </>
           )}
+
           {!showText && (
             <span
               role="tooltip"
@@ -253,11 +279,21 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
           )}
         </button>
 
-        {showText && open && (
-          <div className="mt-0.5 space-y-0.5">
-            {item.children?.map((c) => (
-              <NavLink key={c.href} item={c} child alwaysFull={alwaysFull} />
-            ))}
+        {/* Smooth height reveal via CSS grid rows trick */}
+        {showText && (
+          <div
+            className={[
+              "grid transition-[grid-template-rows] duration-200 ease-in-out",
+              open ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
+            ].join(" ")}
+          >
+            <div className="overflow-hidden">
+              <div className="mt-0.5 space-y-0.5 pb-1">
+                {item.children?.map((c) => (
+                  <NavLink key={c.href} item={c} child alwaysFull={alwaysFull} />
+                ))}
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -272,86 +308,94 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     collapsed: sidebarCollapsed,
   }: {
     alwaysFull?: boolean;
-    collapsed: boolean;
+    collapsed:   boolean;
   }) {
-    const perms = useRbacPermissions();
+    const perms       = useRbacPermissions();
     const showSection = alwaysFull || !sidebarCollapsed;
 
-    function Section({ sec }: { sec: NavSection }) {
+    // ── OPERATOR: WMS-only view ──────────────────────────────────────────────
+    if (perms.isWmsOnly) {
       return (
         <div className="mb-4">
           {showSection
-            ? <p className={CLS.section}>{sec.label}</p>
+            ? <p className={CLS.section}>{WMS_NAV.label}</p>
             : <div className="mb-2 mx-3 h-px bg-border" />
           }
           <div className="space-y-0.5">
-            {sec.items.map((item) =>
-              item.children?.length
-                ? <AccordionItem key={item.label} item={item} sectionId={sec.id} alwaysFull={alwaysFull} />
-                : <NavLink       key={item.label} item={item} alwaysFull={alwaysFull} />
-            )}
+            {WMS_NAV.items.map((item) => (
+              <NavLink key={item.label} item={item} alwaysFull={alwaysFull} />
+            ))}
           </div>
         </div>
       );
     }
 
-    // ── OPERATOR: WMS-only view ──────────────────────────────────────────────
-    if (perms.isWmsOnly) {
-      return <Section sec={WMS_NAV} />;
-    }
+    // ── Build filtered children per accordion group ──────────────────────────
 
-    // ── NON-OPERATOR: build nav sections dynamically ─────────────────────────
+    const warehouseChildren = [
+      perms.canSeeReturns && { label: "Returns Processing", icon: RotateCcw,     href: "/returns"   },
+                              { label: "Inventory Ledger",   icon: ClipboardList, href: "/inventory" },
+    ].filter(Boolean) as NavChild[];
 
-    // Operations — filter items the role can see
-    const opsItems = OPS_NAV.items.filter((item) => {
-      if (item.href === "/")                           return perms.canSeeDashboard;
-      if (item.href === "/returns")                    return perms.canSeeReturns;
-      if (item.href === "/claim-engine")               return perms.canSeeClaimEngine;
-      if (item.href === "/claim-engine/report-history") return perms.canSeeReportHistory;
-      return true;
-    });
+    const financeChildren = [
+                                  { label: "Settlements",    icon: Banknote,    href: "/settlements"             },
+      perms.canSeeClaimEngine   && { label: "Claim Engine",   icon: ShieldAlert, href: "/claim-engine"            },
+      perms.canSeeReportHistory && { label: "Report History", icon: FileText,    href: "/claim-engine/report-history" },
+    ].filter(Boolean) as NavChild[];
 
-    // System — filter items the role can see
-    const sysItems = SYS_NAV.items.filter((item) => {
-      if (item.href === "/users")    return perms.canSeeUsers;
-      if (item.href === "/settings") return perms.canSeeSettings;
-      return true;
-    });
+    const systemChildren = [
+      perms.canSeeSettings && { label: "Stores & Adapters", icon: Building2, href: "/settings" },
+      perms.canSeeUsers    && { label: "Users",              icon: Users,     href: "/users"    },
+    ].filter(Boolean) as NavChild[];
 
     return (
       <>
-        {/* Operations */}
-        {opsItems.length > 0 && (
-          <Section sec={{ ...OPS_NAV, items: opsItems }} />
-        )}
+        {/* ── Core accordion groups ─────────────────────────────────────── */}
+        <div className="space-y-1">
+          {warehouseChildren.length > 0 && (
+            <AccordionItem
+              item={{ ...WAREHOUSE_GROUP, children: warehouseChildren }}
+              sectionId="nav"
+              alwaysFull={alwaysFull}
+            />
+          )}
 
-        {/* System (admin+) */}
-        {sysItems.length > 0 && (
-          <Section sec={{ ...SYS_NAV, items: sysItems }} />
-        )}
+          {financeChildren.length > 0 && (
+            <AccordionItem
+              item={{ ...FINANCE_GROUP, children: financeChildren }}
+              sectionId="nav"
+              alwaysFull={alwaysFull}
+            />
+          )}
 
-        {/* System Admin panel — Imports + Debug toggle (admin+) */}
-        {perms.canSeeSystemAdmin && (
-          <div className="mb-4">
+          {systemChildren.length > 0 && (
+            <AccordionItem
+              item={{ ...SYSTEM_GROUP, children: systemChildren }}
+              sectionId="nav"
+              alwaysFull={alwaysFull}
+            />
+          )}
+        </div>
+
+        {/* ── System Admin — Imports (admin+) ───────────────────────────── */}
+        {perms.canSeeSystemAdmin && perms.canSeeImports && (
+          <div className="mt-4">
             {showSection
               ? <p className={CLS.section}>System Admin</p>
               : <div className="mb-2 mx-3 h-px bg-border" />
             }
             <div className="space-y-0.5">
-              {perms.canSeeImports && (
-                <NavLink
-                  item={{ label: "Imports", icon: Database, href: "/imports" }}
-                  alwaysFull={alwaysFull}
-                />
-              )}
-              <SidebarDebugToggle collapsed={sidebarCollapsed} />
+              <NavLink
+                item={{ label: "Imports", icon: Database, href: "/imports" }}
+                alwaysFull={alwaysFull}
+              />
             </div>
           </div>
         )}
 
-        {/* Platform (super_admin only) */}
+        {/* ── Platform (super_admin only) ───────────────────────────────── */}
         {perms.canSeePlatformAdmin && (
-          <div className="mb-4">
+          <div className="mt-4">
             {showSection
               ? <p className={CLS.section}>Platform</p>
               : <div className="mb-2 mx-3 h-px bg-border" />
@@ -361,6 +405,13 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                 item={{ label: "Admin Settings", icon: Shield, href: "/admin/settings" }}
                 alwaysFull={alwaysFull}
               />
+              {perms.canSeeTechDebug && (
+                <TechDebugNavButton
+                  collapsed={sidebarCollapsed}
+                  alwaysFull={alwaysFull}
+                  onClick={openTechDebug}
+                />
+              )}
             </div>
           </div>
         )}
@@ -469,8 +520,56 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
           </div>
 
           {mobileOpen && mounted && createPortal(mobileDrawer, document.body)}
+
+          <TechDebugPanel open={techDebugOpen} onClose={() => setTechDebugOpen(false)} />
         </div>
       </MobileMenuCtx.Provider>
     </GlobalSearchProvider>
+  );
+}
+
+// ─── TechDebugNavButton — opens TechDebugPanel (super_admin) ─────────────────
+
+function TechDebugNavButton({
+  collapsed,
+  alwaysFull,
+  onClick,
+}: {
+  collapsed:  boolean;
+  alwaysFull: boolean;
+  onClick:    () => void;
+}) {
+  const showText = alwaysFull || !collapsed;
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label="Open Tech Debug panel"
+      className={[
+        CLS.linkBase, CLS.linkIdle,
+        collapsed && !showText ? "justify-center" : "",
+      ].join(" ")}
+    >
+      <Wrench className="h-5 w-5 shrink-0" />
+
+      {showText && (
+        <>
+          <span className="flex-1 truncate text-left">Tech Debug</span>
+          <span className="shrink-0 rounded-full bg-violet-100 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-violet-700 dark:bg-violet-950/50 dark:text-violet-300">
+            SA
+          </span>
+        </>
+      )}
+
+      {!showText && (
+        <span
+          role="tooltip"
+          className="invisible absolute left-full top-1/2 z-50 ml-3 -translate-y-1/2 whitespace-nowrap rounded-xl border border-border bg-popover px-3 py-1.5 text-xs font-semibold text-popover-foreground shadow-lg group-hover:visible"
+        >
+          Tech Debug
+        </span>
+      )}
+    </button>
   );
 }

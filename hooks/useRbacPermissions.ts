@@ -31,6 +31,11 @@ export type RbacPermissions = {
   // ── Platform (super_admin only) ───────────────────────────
   canSeePlatformAdmin:   boolean;
 
+  /**
+   * Tech Debug slide-over panel (granular debug flags). super_admin only.
+   */
+  canSeeTechDebug:       boolean;
+
   // ── WMS (all roles; ONLY section shown to operator) ───────
   canSeeWmsTools:        boolean;
   /**
@@ -80,6 +85,8 @@ export function useRbacPermissions(): RbacPermissions {
 
       // Platform menu: super_admin only
       canSeePlatformAdmin:  role === "super_admin",
+
+      canSeeTechDebug:      role === "super_admin",
 
       // WMS: available to all roles; operators see only this section
       canSeeWmsTools:       true,

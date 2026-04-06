@@ -18,6 +18,7 @@ import {
   insertReturn, updateReturn, deleteReturn, bulkDeleteReturns,
   createPallet, updatePallet, updatePalletStatus, deletePallet,
   createPackage, updatePackage, closePackage, deletePackage,
+  getAmazonExpectedItems,
 } from "./actions";
 import { RETURN_SELECT } from "./returns-constants";
 import type {
@@ -704,6 +705,37 @@ export function PalletStatusBadge({ status }: { status: PalletStatus }) {
   const cfg = PALLET_STATUS_CFG[status];
   return <span className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${cfg.cls}`}>{cfg.label}</span>;
 }
+
+/** Platform-aware store name badge. Amazon → amber, Walmart → blue, others → slate. */
+export function StoreBadge({ name, platform, fallback = "Multi-Store" }: {
+  name?:     string | null;
+  platform?: string | null;
+  fallback?: string;
+}) {
+  if (!name) {
+    return (
+      <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-500">
+        {fallback}
+      </span>
+    );
+  }
+  const slug = (platform ?? "").toLowerCase();
+  const isAmazon  = slug.includes("amazon") || slug === "amz";
+  const isWalmart = slug.includes("walmart") || slug === "wmt";
+  const cls = isAmazon
+    ? "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-300"
+    : isWalmart
+    ? "border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-800/50 dark:bg-blue-950/30 dark:text-blue-300"
+    : "border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300";
+  const dot = isAmazon ? "bg-amber-400" : isWalmart ? "bg-blue-400" : "bg-slate-400";
+  return (
+    <span className={`inline-flex max-w-[160px] items-center gap-1.5 truncate rounded-full border px-2 py-0.5 text-[10px] font-semibold ${cls}`} title={name}>
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot}`} aria-hidden />
+      {name}
+    </span>
+  );
+}
+
 export function RoleBadge({ user, onToggle }: { user: MockUser; onToggle: () => void }) {
   const adminish = isAdminRole(user.role);
   return (
@@ -2756,9 +2788,44 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
   const [editManifestOcrRunning, setEditManifestOcrRunning] = useState(false);
   const [editManifestErr, setEditManifestErr] = useState("");
 
-  const reconciliationLines = useMemo((): SlipExpectedItem[] | null => {
-    return null;
-  }, []);
+  const [reconciliationLines, setReconciliationLines] = useState<SlipExpectedItem[] | null>(null);
+  const [reconciliationSource, setReconciliationSource] = useState<"amazon" | "ocr" | null>(null);
+
+  useEffect(() => {
+    const tn = pkg.tracking_number?.trim() ?? "";
+
+    function applyOcrFallback() {
+      const md = pkg.manifest_data;
+      if (md && md.length > 0) {
+        setReconciliationLines(
+          md.map((ei) => ({ barcode: ei.sku, name: ei.description ?? ei.sku, expected_qty: ei.expected_qty })),
+        );
+        setReconciliationSource("ocr");
+      } else {
+        setReconciliationLines(null);
+        setReconciliationSource(null);
+      }
+    }
+
+    if (!tn) {
+      applyOcrFallback();
+      return;
+    }
+
+    let cancelled = false;
+    void getAmazonExpectedItems(tn, pkg.organization_id).then((res) => {
+      if (cancelled) return;
+      if (res.ok && res.data.length > 0) {
+        setReconciliationLines(
+          res.data.map((ei) => ({ barcode: ei.sku, name: ei.description ?? ei.sku, expected_qty: ei.expected_qty })),
+        );
+        setReconciliationSource("amazon");
+      } else {
+        applyOcrFallback();
+      }
+    });
+    return () => { cancelled = true; };
+  }, [pkg.tracking_number, pkg.organization_id, pkg.manifest_data]);
 
   /** Same source as the Packages accordion — `listReturns()` page state (`allReturns`). */
   const items = useMemo(
@@ -3009,7 +3076,14 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
               className="hidden"
               onChange={handleEditManifestUpload}
             />
-            {editManifestOcrRunning ? (
+            {reconciliationSource === "amazon" ? (
+              <div className="flex items-center gap-2 rounded-xl bg-emerald-50 px-4 py-3 dark:bg-emerald-950/30">
+                <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                <span className="text-sm font-semibold text-emerald-700 dark:text-emerald-300">
+                  Amazon Sync active — packing slip scan not required.
+                </span>
+              </div>
+            ) : editManifestOcrRunning ? (
               <div className="flex items-center gap-3 rounded-xl bg-violet-100/80 px-4 py-3 dark:bg-violet-950/40">
                 <Loader2 className="h-5 w-5 shrink-0 animate-spin text-violet-500" />
                 <span className="text-sm font-semibold text-violet-800 dark:text-violet-200">Analyzing manifest…</span>
@@ -3252,17 +3326,29 @@ export function PackageDrawerContent({ pkg: initPkg, role, actor, actorProfileId
         />
       )}
 
-      {/* ── Read-only: reconciliation from saved manifest_data (upload lives in Edit) ── */}
+      {/* ── Read-only: reconciliation from Amazon sync or manifest_data OCR ── */}
       <div className="rounded-2xl border border-slate-200 bg-slate-50/50 p-4 dark:border-slate-700 dark:bg-slate-900/40">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <p className="text-sm font-bold text-foreground">Packing slip / manifest</p>
-            <span className="inline-flex items-center gap-1 rounded-full bg-violet-100 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-violet-700 dark:bg-violet-900/40 dark:text-violet-300">
-              <Sparkles className="h-3 w-3" />
-              Read-only
-            </span>
+            {reconciliationSource === "amazon" ? (
+              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
+                <CheckCircle2 className="h-3 w-3" />
+                Amazon Sync
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 rounded-full bg-violet-100 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-violet-700 dark:bg-violet-900/40 dark:text-violet-300">
+                <Sparkles className="h-3 w-3" />
+                Read-only
+              </span>
+            )}
           </div>
-          {reconciliationLines && normalizeEntityPhotoEvidenceUrls(pkg.photo_evidence).length > 0 && (
+          {reconciliationSource === "amazon" && (
+            <p className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
+              Expected items loaded securely from Amazon files.
+            </p>
+          )}
+          {reconciliationSource !== "amazon" && reconciliationLines && normalizeEntityPhotoEvidenceUrls(pkg.photo_evidence).length > 0 && (
             <a
               href={normalizeEntityPhotoEvidenceUrls(pkg.photo_evidence).slice(-1)[0] ?? "#"}
               target="_blank"
@@ -6567,7 +6653,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, actorPro
                       </div>
                     </td>
                     {showCompanyColumn && (
-                      <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[r.organization_id] ?? r.organization_id}>
+                      <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-semibold text-violet-600 dark:text-violet-400 md:table-cell" title={organizationLabelById[r.organization_id] ?? r.organization_id}>
                         {organizationLabelById[r.organization_id] ?? `${r.organization_id.slice(0, 8)}…`}
                       </td>
                     )}
@@ -6597,11 +6683,11 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, actorPro
                       </div>
                     </td>
                     <td className="hidden px-4 py-3 sm:table-cell">
-                      {r.stores ? (
-                        <span className="max-w-[140px] truncate text-xs font-medium text-slate-700 dark:text-slate-300" title={r.stores.name}>{r.stores.name}</span>
-                      ) : (
-                        <span className="text-xs font-medium text-slate-500 dark:text-slate-400">{formatMarketplaceSource(r.marketplace)}</span>
-                      )}
+                      <StoreBadge
+                        name={r.stores?.name ?? (r.marketplace ? formatMarketplaceSource(r.marketplace) : null)}
+                        platform={r.stores?.platform ?? r.marketplace}
+                        fallback="—"
+                      />
                     </td>
                     <td className="hidden px-4 py-3 lg:table-cell"><div className="flex flex-wrap gap-1">{r.conditions.slice(0,2).map((c) => <ConditionBadge key={c} value={c} />)}</div></td>
                     <td className="px-4 py-3"><StatusBadge status={r.status} /></td>
@@ -6840,7 +6926,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                         </div>
                       </td>
                       {showCompanyColumn && (
-                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
+                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-semibold text-violet-600 dark:text-violet-400 md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
                           {organizationLabelById[p.organization_id] ?? `${p.organization_id.slice(0, 8)}…`}
                         </td>
                       )}
@@ -6851,11 +6937,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                         </div>
                       </td>
                       <td className="hidden px-4 py-3 md:table-cell">
-                        {p.stores ? (
-                          <span className="max-w-[140px] truncate text-xs font-medium text-slate-700 dark:text-slate-300" title={p.stores.name}>{p.stores.name}</span>
-                        ) : (
-                          <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-400 dark:border-slate-700 dark:bg-slate-900">Mixed / Unassigned</span>
-                        )}
+                        <StoreBadge name={p.stores?.name} platform={p.stores?.platform} fallback="Mixed / Unassigned" />
                       </td>
                       <td className="hidden px-4 py-3 sm:table-cell" onClick={(e) => e.stopPropagation()}>
                         <div className="flex flex-col gap-0.5">
@@ -7123,7 +7205,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                         </div>
                       </td>
                       {showCompanyColumn && (
-                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-medium text-muted-foreground md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
+                        <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-semibold text-violet-600 dark:text-violet-400 md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
                           {organizationLabelById[p.organization_id] ?? `${p.organization_id.slice(0, 8)}…`}
                         </td>
                       )}
@@ -7134,11 +7216,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                         </div>
                       </td>
                       <td className="hidden px-4 py-3 md:table-cell">
-                        {p.stores ? (
-                          <span className="max-w-[140px] truncate text-xs font-medium text-slate-700 dark:text-slate-300" title={p.stores.name}>{p.stores.name}</span>
-                        ) : (
-                          <span className="inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-400 dark:border-slate-700 dark:bg-slate-900">Mixed / Unassigned</span>
-                        )}
+                        <StoreBadge name={p.stores?.name} platform={p.stores?.platform} fallback="Multi-Store" />
                       </td>
                       <td className="px-4 py-3"><span className="font-bold text-slate-700 dark:text-slate-300">{p._rollupPkgs}</span><span className="mx-1 text-slate-300 dark:text-slate-600">pkgs</span><span className="font-bold text-slate-500">{p._rollupItems}</span><span className="ml-1 text-slate-300 dark:text-slate-600">items</span></td>
                       <td className="px-4 py-3"><PalletStatusBadge status={p.status} /></td>

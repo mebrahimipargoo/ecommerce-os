@@ -1409,3 +1409,109 @@ export async function getReturnsAnalyticsData(
     };
   }
 }
+
+/**
+ * Fetch expected items for a package from synced Amazon raw-data tables.
+ *
+ * Priority:
+ *   1. `amazon_removals` — matched by `tracking_number` (exact, case-insensitive).
+ *      Groups by sku/fnsku and sums `shipped_quantity`.
+ *   2. `amazon_returns`  — matched by `lpn` (FBA return LPN = tracking number).
+ *      Groups by sku and counts rows (no shipped_quantity column).
+ *   3. Returns empty array when neither table has a match — caller falls back to
+ *      `manifest_data` (OCR packing-slip).
+ */
+export async function getAmazonExpectedItems(
+  trackingNumber: string,
+  organizationId: string,
+): Promise<{ ok: true; data: ExpectedItem[] } | { ok: false; error: string }> {
+  try {
+    const tn = trackingNumber.trim();
+
+    // ── 1. amazon_removals ────────────────────────────────────────────────────
+    const { data: removalRows, error: removalErr } = await supabaseServer
+      .from("amazon_removals")
+      .select("sku, fnsku, shipped_quantity, raw_data")
+      .eq("organization_id", organizationId)
+      .ilike("tracking_number", tn);
+
+    if (removalErr) throw new Error(removalErr.message);
+
+    if (removalRows && removalRows.length > 0) {
+      const bySkuMap = new Map<string, { sku: string; qty: number; name: string }>();
+      for (const row of removalRows as {
+        sku?: string | null;
+        fnsku?: string | null;
+        shipped_quantity?: number | null;
+        raw_data?: Record<string, unknown> | null;
+      }[]) {
+        const sku = row.fnsku?.trim() || row.sku?.trim() || "UNKNOWN";
+        const qty = Number(row.shipped_quantity) || 1;
+        const rd = row.raw_data ?? {};
+        const name =
+          (rd["product-name"] as string | null)?.trim() ||
+          (rd["product_name"] as string | null)?.trim() ||
+          (rd["title"] as string | null)?.trim() ||
+          sku;
+        const existing = bySkuMap.get(sku);
+        if (existing) {
+          existing.qty += qty;
+        } else {
+          bySkuMap.set(sku, { sku, qty, name });
+        }
+      }
+      const data: ExpectedItem[] = [...bySkuMap.values()].map((v) => ({
+        sku: v.sku,
+        expected_qty: v.qty,
+        description: v.name,
+      }));
+      return { ok: true, data };
+    }
+
+    // ── 2. amazon_returns (FBA returns — lpn = tracking number) ──────────────
+    const { data: returnRows, error: returnErr } = await supabaseServer
+      .from("amazon_returns")
+      .select("sku, asin, product_name, raw_data")
+      .eq("organization_id", organizationId)
+      .ilike("lpn", tn);
+
+    if (returnErr) throw new Error(returnErr.message);
+
+    if (returnRows && returnRows.length > 0) {
+      const bySkuMap = new Map<string, { sku: string; qty: number; name: string }>();
+      for (const row of returnRows as {
+        sku?: string | null;
+        asin?: string | null;
+        product_name?: string | null;
+        raw_data?: Record<string, unknown> | null;
+      }[]) {
+        const sku = row.sku?.trim() || row.asin?.trim() || "UNKNOWN";
+        const rd = row.raw_data ?? {};
+        const name =
+          row.product_name?.trim() ||
+          (rd["product-name"] as string | null)?.trim() ||
+          (rd["product_name"] as string | null)?.trim() ||
+          sku;
+        const existing = bySkuMap.get(sku);
+        if (existing) {
+          existing.qty += 1;
+        } else {
+          bySkuMap.set(sku, { sku, qty: 1, name });
+        }
+      }
+      const data: ExpectedItem[] = [...bySkuMap.values()].map((v) => ({
+        sku: v.sku,
+        expected_qty: v.qty,
+        description: v.name,
+      }));
+      return { ok: true, data };
+    }
+
+    return { ok: true, data: [] };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : "Failed to load Amazon expected items.",
+    };
+  }
+}

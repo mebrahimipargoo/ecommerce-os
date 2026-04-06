@@ -84,6 +84,9 @@ export default function ReturnsPage() {
     for (const o of companyOptions) {
       m[o.organization_id] = o.display_name;
     }
+    // MVP seed org: only fall back if it wasn't returned by the admin query
+    const MVP_ORG = "00000000-0000-0000-0000-000000000001";
+    if (!m[MVP_ORG]) m[MVP_ORG] = "Global Operations";
     return m;
   }, [companyOptions]);
 
