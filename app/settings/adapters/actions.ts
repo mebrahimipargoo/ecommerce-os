@@ -438,17 +438,23 @@ export async function listStores(
   try {
     // Always query `public.stores` (not amazon_*). Ignore _ctx for row scope —
     // service role returns all stores; tenant UI can filter client-side if needed.
-    let { data, error } = await supabaseServer
+    const first = await supabaseServer
       .from("stores")
       .select(STORES_LIST_SELECT_WITH_DEFAULT)
       .order("created_at", { ascending: false });
+
+    // Widen to a loose row shape: retry path omits `is_default` (pre-migration DBs)
+    // and must not be assigned to the narrow type inferred from the first select().
+    let data: Record<string, unknown>[] | null =
+      (first.data as Record<string, unknown>[] | null) ?? null;
+    let error = first.error;
 
     if (error && isMissingColumnError(error, "is_default")) {
       const retry = await supabaseServer
         .from("stores")
         .select(STORES_LIST_SELECT_BASE)
         .order("created_at", { ascending: false });
-      data = retry.data;
+      data = (retry.data as Record<string, unknown>[] | null) ?? null;
       error = retry.error;
     }
 
@@ -457,7 +463,7 @@ export async function listStores(
       throw new Error(error.message);
     }
 
-    const rows = (data ?? []) as Record<string, unknown>[];
+    const rows = data ?? [];
     const normalized: StorePublicRow[] = rows.map((r) => ({
       id: String(r.id ?? ""),
       name: String(r.name ?? ""),
