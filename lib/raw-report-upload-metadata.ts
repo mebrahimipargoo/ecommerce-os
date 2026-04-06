@@ -12,6 +12,10 @@ export type RawReportUploadMetadata = {
   upload_progress?: number;
   uploaded_bytes?: number;
   process_progress?: number;
+  /** Phase 3 (Sync): 0–100 while domain upserts run in chunks. */
+  sync_progress?: number;
+  /** Which ETL phase last wrote progress (upload | staging | sync). */
+  etl_phase?: "upload" | "staging" | "sync";
   row_count?: number;
   /** Original extension, e.g. `.csv` */
   file_extension?: string;

@@ -10,10 +10,21 @@ import { resolveWriteOrganizationId } from "../../../../../lib/server-tenant";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 import type { RawReportType } from "../../../../../lib/raw-report-types";
+import {
+  contentSuggestsReportsRepositorySample,
+  fileNameSuggestsReportsRepository,
+} from "../../../../../lib/reports-repository-header";
 
 export const runtime = "nodejs";
 
-type Body = { headers?: unknown; actor_user_id?: unknown };
+type Body = {
+  headers?: unknown;
+  actor_user_id?: unknown;
+  /** Original file name — if it contains "Reports Repository", classification favors REPORTS_REPOSITORY. */
+  file_name?: unknown;
+  /** First ~64KB of file text — detects Reports Repository preamble / header line hints. */
+  content_sample?: unknown;
+};
 
 /**
  * When report_type is SAFET_CLAIMS, fill any gaps in `existing` mapping by
@@ -50,12 +61,35 @@ const SAFET_FALLBACK_ALIASES: Record<string, string[]> = {
  *   "date/time"→ posted_date
  */
 const TRANSACTIONS_FALLBACK_ALIASES: Record<string, string[]> = {
+  settlement_id:           ["settlement-id", "settlement id", "Settlement ID"],
   transaction_type:        ["transaction-type", "transaction type", "type"],
   order_id:                ["order-id", "order id", "amazon-order-id", "amazon order id"],
-  amount:                  ["amount", "Amount", "total"],
+  amount:                  ["amount", "Amount", "total", "total-amount", "total amount", "price-amount", "price amount"],
   total_product_charges:   ["total-product-charges", "total product charges"],
   posted_date:             ["date/time", "date-time", "posted-date", "posted date"],
   sku:                     ["sku", "SKU"],
+};
+
+/** Gap-fill for Reports Repository transaction CSV (lowercase headers, column "type"). */
+const REPORTS_REPOSITORY_FALLBACK_ALIASES: Record<string, string[]> = {
+  date_time:         ["date/time", "date-time", "datetime", "posted-date", "posted date"],
+  settlement_id:     ["settlement-id", "settlement id", "Settlement ID"],
+  transaction_type:  ["type", "transaction-type", "transaction type"],
+  order_id:          ["order-id", "order id", "amazon-order-id", "amazon order id"],
+  sku:               ["sku", "SKU", "merchant-sku", "msku"],
+  description:       ["description", "Description"],
+  total_amount:      ["total", "Total", "total-amount", "total amount"],
+};
+
+const SETTLEMENT_FLAT_FALLBACK_ALIASES: Record<string, string[]> = {
+  settlement_id:         ["settlement-id", "settlement id", "Settlement ID"],
+  settlement_start_date: ["settlement-start-date", "settlement start date"],
+  settlement_end_date:   ["settlement-end-date", "settlement end date"],
+  deposit_date:          ["deposit-date", "deposit date"],
+  total_amount:          ["total-amount", "total amount"],
+  currency:              ["currency", "Currency"],
+  transaction_status:    ["transaction-type", "transaction type", "transaction-status", "transaction status"],
+  order_id:              ["order-id", "order id", "amazon-order-id", "amazon order id"],
 };
 
 function applySafeTFallbackMapping(
@@ -86,6 +120,42 @@ function applyTransactionsFallbackMapping(
 ): Record<string, string> {
   const result = { ...existing };
   for (const [canonical, aliases] of Object.entries(TRANSACTIONS_FALLBACK_ALIASES)) {
+    if (result[canonical]) continue;
+    const normalizedAliases = aliases.map(normH);
+    for (const header of headers) {
+      if (normalizedAliases.includes(normH(header))) {
+        result[canonical] = header;
+        break;
+      }
+    }
+  }
+  return result;
+}
+
+function applySettlementFlatFallbackMapping(
+  headers: string[],
+  existing: Record<string, string>,
+): Record<string, string> {
+  const result = { ...existing };
+  for (const [canonical, aliases] of Object.entries(SETTLEMENT_FLAT_FALLBACK_ALIASES)) {
+    if (result[canonical]) continue;
+    const normalizedAliases = aliases.map(normH);
+    for (const header of headers) {
+      if (normalizedAliases.includes(normH(header))) {
+        result[canonical] = header;
+        break;
+      }
+    }
+  }
+  return result;
+}
+
+function applyReportsRepositoryFallbackMapping(
+  headers: string[],
+  existing: Record<string, string>,
+): Record<string, string> {
+  const result = { ...existing };
+  for (const [canonical, aliases] of Object.entries(REPORTS_REPOSITORY_FALLBACK_ALIASES)) {
     if (result[canonical]) continue;
     const normalizedAliases = aliases.map(normH);
     for (const header of headers) {
@@ -129,6 +199,9 @@ export async function POST(req: Request): Promise<Response> {
       return NextResponse.json({ ok: false, error: "Missing headers array." }, { status: 400 });
     }
 
+    const fileName = typeof body.file_name === "string" ? body.file_name.trim() : "";
+    const contentSample = typeof body.content_sample === "string" ? body.content_sample.slice(0, 65536) : "";
+
     const orgId = await resolveWriteOrganizationId(actor, null);
     if (!isUuidString(orgId)) {
       return NextResponse.json({ ok: false, error: "Invalid organization scope." }, { status: 400 });
@@ -140,7 +213,7 @@ export async function POST(req: Request): Promise<Response> {
     const rules = classifyCsvHeadersRuleBased(headers);
     let reportType: RawReportType = rules.reportType;
     let aiColumnMapping: Record<string, string> = {};
-    let source: "memory" | "rules" | "gpt" | "rules+gpt" = "rules";
+    let source: "memory" | "rules" | "gpt" | "rules+gpt" | "filename" | "content_sample" = "rules";
 
     // ── Step 0: MAPPING MEMORY — only when rules say UNKNOWN ──────────────────
     // Compute a deterministic fingerprint from the sorted lowercase header list.
@@ -209,8 +282,33 @@ export async function POST(req: Request): Promise<Response> {
     let column_mapping = merged;
     if ((reportType as string) === "SAFET_CLAIMS") {
       column_mapping = applySafeTFallbackMapping(headers, merged);
+    } else if ((reportType as string) === "SETTLEMENT") {
+      column_mapping = applySettlementFlatFallbackMapping(headers, merged);
     } else if ((reportType as string) === "TRANSACTIONS") {
       column_mapping = applyTransactionsFallbackMapping(headers, merged);
+    } else if ((reportType as string) === "REPORTS_REPOSITORY") {
+      column_mapping = applyReportsRepositoryFallbackMapping(headers, merged);
+    }
+
+    // ── Step 3.6: Filename / content — do not mis-file Reports Repository as Settlement ─
+    if (fileNameSuggestsReportsRepository(fileName)) {
+      reportType = "REPORTS_REPOSITORY";
+      source = "filename";
+      column_mapping = applyReportsRepositoryFallbackMapping(
+        headers,
+        { ...buildColumnMappingFromHeaders(headers, "REPORTS_REPOSITORY"), ...column_mapping },
+      );
+    } else if (
+      contentSample.length > 0 &&
+      contentSuggestsReportsRepositorySample(contentSample) &&
+      (reportType === "SETTLEMENT" || reportType === "TRANSACTIONS" || reportType === "UNKNOWN")
+    ) {
+      reportType = "REPORTS_REPOSITORY";
+      source = "content_sample";
+      column_mapping = applyReportsRepositoryFallbackMapping(
+        headers,
+        { ...buildColumnMappingFromHeaders(headers, "REPORTS_REPOSITORY"), ...column_mapping },
+      );
     }
 
     // ── Step 4: Determine if manual intervention is required ───────────────────

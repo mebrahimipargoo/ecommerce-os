@@ -28,7 +28,15 @@ import {
   updateUploadSessionClassification,
 } from "./import-actions";
 import { createLedgerStorageSignedUploadUrl } from "../lib/amazon-ledger-actions";
+import { classifyCsvHeadersRuleBased } from "../../../lib/csv-import-detected-type";
 import { findHeaderRowIndex, parseCsvToMatrix } from "../../../lib/csv-parse-basic";
+import {
+  contentSuggestsReportsRepositorySample,
+  fileNameSuggestsReportsRepository,
+  findReportsRepositoryHeaderLineIndex,
+  REPORTS_REPOSITORY_PREAMBLE_LINE_COUNT,
+  sliceCsvFromHeaderLine,
+} from "../../../lib/reports-repository-header";
 import { supabase } from "../../../src/lib/supabase";
 import type { RawReportType } from "../../../lib/raw-report-types";
 import { listStores } from "../../settings/adapters/actions";
@@ -108,8 +116,36 @@ function choiceToInitialReportType(choice: ReportTypeChoice): RawReportType {
   if (choice === "REIMBURSEMENTS") return "REIMBURSEMENTS";
   if (choice === "SETTLEMENT") return "SETTLEMENT";
   if (choice === "SAFET_CLAIMS") return "SAFET_CLAIMS";
-  if (choice === "TRANSACTIONS" || choice === "TRANSACTIONS_REPORTS_REPO") return "TRANSACTIONS";
+  if (choice === "TRANSACTIONS") return "TRANSACTIONS";
+  if (choice === "TRANSACTIONS_REPORTS_REPO") return "REPORTS_REPOSITORY";
   return "UNKNOWN";
+}
+
+/** Keyword/regex failed → optional gpt-4o-mini line index; else Amazon default row 9. */
+async function resolveReportsRepositoryHeaderLineIndexWithFallback(
+  firstTwentyLinesJoined: string,
+  fileName: string,
+  manualRepo: boolean,
+  actorUserId: string,
+): Promise<number> {
+  const det = findReportsRepositoryHeaderLineIndex(firstTwentyLinesJoined);
+  if (det.method !== "fallback_zero") return det.index;
+  if (!manualRepo && !fileNameSuggestsReportsRepository(fileName)) return det.index;
+  const lines = firstTwentyLinesJoined.split(/\r?\n/).slice(0, 20);
+  try {
+    const res = await fetch("/api/settings/imports/reports-repo-header-ai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lines, actor_user_id: actorUserId }),
+    });
+    const j = (await res.json()) as { ok?: boolean; line_index?: number | null };
+    if (res.ok && j.ok && typeof j.line_index === "number" && j.line_index >= 0 && j.line_index < 20) {
+      return j.line_index;
+    }
+  } catch {
+    /* optional AI */
+  }
+  return REPORTS_REPOSITORY_PREAMBLE_LINE_COUNT;
 }
 
 export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Props = {}) {
@@ -144,6 +180,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   const [totalRows, setTotalRows] = useState(0);
   const [processedRows, setProcessedRows] = useState(0);
   const [processPct, setProcessPct] = useState(0);
+  const [syncPct, setSyncPct] = useState(0);
 
   const pollRef2 = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -262,6 +299,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     setTotalRows(0);
     setProcessedRows(0);
     setProcessPct(0);
+    setSyncPct(0);
     stopRef.current = false;
     if (pollRef2.current) { clearInterval(pollRef2.current); pollRef2.current = null; }
   }
@@ -350,7 +388,22 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     if (!sessionUploadId) return;
     setErr(null);
     setPhase("syncing");
+    setSyncPct(0);
     setProgressMsg("Syncing to final tables…");
+    const uploadIdSnap = sessionUploadId;
+    if (pollRef2.current) clearInterval(pollRef2.current);
+    pollRef2.current = setInterval(() => {
+      void supabase
+        .from("raw_report_uploads")
+        .select("metadata")
+        .eq("id", uploadIdSnap)
+        .maybeSingle()
+        .then(({ data }) => {
+          const m = data?.metadata as Record<string, unknown> | null;
+          if (!m) return;
+          if (typeof m.sync_progress === "number") setSyncPct(m.sync_progress);
+        });
+    }, 400);
     try {
       const res = await fetch("/api/settings/imports/sync", {
         method: "POST",
@@ -359,6 +412,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       });
       const json = (await res.json()) as { ok?: boolean; error?: string; rowsSynced?: number };
       if (!res.ok || !json.ok) throw new Error(json.error ?? "Sync failed.");
+      setSyncPct(100);
       setProgressMsg(`Sync complete — ${json.rowsSynced?.toLocaleString() ?? "?"} rows written.`);
       setPhase("synced");
       bumpHistory();
@@ -366,6 +420,11 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       setErr(e instanceof Error ? e.message : "Sync failed.");
       setPhase("staged");
       bumpHistory();
+    } finally {
+      if (pollRef2.current) {
+        clearInterval(pollRef2.current);
+        pollRef2.current = null;
+      }
     }
   }
 
@@ -446,7 +505,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     bumpHistory();
 
     try {
-      // ── STEP 3: Upload file to Storage as a SINGLE object ────────────────────
+      // ── STEP 3: Upload file to Storage (Supabase SDK — same auth/RLS as before) ─
       setProgressMsg("Uploading to storage…");
 
       const signedRes = await createLedgerStorageSignedUploadUrl({
@@ -466,28 +525,72 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
 
       setUploadPct(100);
 
-      // ── STEP 4: Read headers + count total rows ───────────────────────────────
-      // Read first 64 KB to find the real header row (skips junk preamble rows).
-      // Then do a fast line-count of the full file to get totalRows for the X/Y display.
+      // ── STEP 4: Full text + dynamic Reports Repository header row ─────────────
       setProgressMsg("Reading CSV headers…");
-      const headerText = await file.slice(0, Math.min(file.size, 65536)).text();
-      const matrix = parseCsvToMatrix(headerText.trim());
-      const headerRowIdx = findHeaderRowIndex(matrix);
-      const headers = (matrix[headerRowIdx] ?? []).map((h) => h.trim()).filter(Boolean);
-
-      // Count total data rows (fast newline scan — no full CSV parse needed)
-      setProgressMsg("Counting rows…");
       const fullText = await file.text();
-      const lineCount = fullText.split("\n").filter((l) => l.trim().length > 0).length;
-      const csvTotalRows = Math.max(0, lineCount - headerRowIdx - 1);
-      setTotalRows(csvTotalRows);
+      const delim = ext === "txt" ? "\t" : undefined;
+      const contentSample = fullText.slice(0, 65536);
+
+      const headerPeek = fullText.slice(0, Math.min(fullText.length, 65536));
+      const matrixRaw = parseCsvToMatrix(headerPeek.trim(), delim);
+      const headerRowIdxRaw = findHeaderRowIndex(matrixRaw);
+      const headersRaw = (matrixRaw[headerRowIdxRaw] ?? []).map((h) => h.trim()).filter(Boolean);
+
+      const first20 = fullText.split(/\r?\n/).slice(0, 20).join("\n");
+      const manualReportsRepo = reportTypeChoice === "TRANSACTIONS_REPORTS_REPO";
+
+      const detProbe = findReportsRepositoryHeaderLineIndex(first20);
+      const probeSlice = fullText.split(/\r?\n/).slice(0, 20).slice(detProbe.index).join("\n");
+      const probeHeaders = (parseCsvToMatrix(probeSlice.trim(), delim)[0] ?? [])
+        .map((h) => h.trim())
+        .filter(Boolean);
+      const strippedRule = classifyCsvHeadersRuleBased(probeHeaders);
+
+      const autoReportsRepo =
+        reportTypeChoice === "AUTO" &&
+        (strippedRule.reportType === "REPORTS_REPOSITORY" ||
+          fileNameSuggestsReportsRepository(file.name) ||
+          contentSuggestsReportsRepositorySample(contentSample));
+      const useReportsRepoPreamble = manualReportsRepo || autoReportsRepo;
+
+      let headerRowIdx: number;
+      let headers: string[];
+      let csvTotalRows: number;
+
+      if (useReportsRepoPreamble) {
+        headerRowIdx = await resolveReportsRepositoryHeaderLineIndexWithFallback(
+          first20,
+          file.name,
+          manualReportsRepo,
+          actor,
+        );
+        const csvFromHeader = sliceCsvFromHeaderLine(fullText, headerRowIdx);
+        const matrix = parseCsvToMatrix(csvFromHeader.trim(), delim);
+        headers = (matrix[0] ?? []).map((h) => h.trim()).filter(Boolean);
+        setProgressMsg("Counting rows…");
+        const lineCount = csvFromHeader.split(/\r?\n/).filter((l) => l.trim().length > 0).length;
+        csvTotalRows = Math.max(0, lineCount - 1);
+        setTotalRows(csvTotalRows);
+      } else {
+        headerRowIdx = headerRowIdxRaw;
+        headers = headersRaw;
+        setProgressMsg("Counting rows…");
+        const lineCount = fullText.split(/\r?\n/).filter((l) => l.trim().length > 0).length;
+        csvTotalRows = Math.max(0, lineCount - headerRowIdx - 1);
+        setTotalRows(csvTotalRows);
+      }
 
       // ── STEP 5: AI auto-detect ────────────────────────────────────────────────
       setProgressMsg("Running AI header classification…");
       const clsRes = await fetch("/api/settings/imports/classify-headers", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ headers, actor_user_id: actor }),
+        body: JSON.stringify({
+          headers,
+          actor_user_id: actor,
+          file_name: file.name,
+          content_sample: contentSample,
+        }),
       });
       const clsJson = (await clsRes.json()) as {
         ok?: boolean;
@@ -501,7 +604,9 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       const apiType =
         clsRes.ok && clsJson.ok && clsJson.report_type ? clsJson.report_type.trim() : "";
       let resolvedType: RawReportType;
-      if (apiType && apiType !== "UNKNOWN") {
+      if (reportTypeChoice === "TRANSACTIONS_REPORTS_REPO") {
+        resolvedType = "REPORTS_REPOSITORY";
+      } else if (apiType && apiType !== "UNKNOWN") {
         resolvedType = apiType as RawReportType;
       } else if (userHint !== "UNKNOWN") {
         resolvedType = userHint;
@@ -900,8 +1005,10 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
                 <span>Phase 3 — Sync to Final Tables</span>
-                <span className={phase === "synced" ? "text-emerald-500" : ""}>
-                  {phase === "syncing" ? "running…" : "✓ complete"}
+                <span className={phase === "synced" ? "text-emerald-500" : "tabular-nums"}>
+                  {phase === "syncing"
+                    ? `${Math.max(0, Math.min(100, syncPct))}%`
+                    : "✓ complete"}
                 </span>
               </div>
               <div className="relative h-2 overflow-hidden rounded-full bg-muted">
@@ -910,7 +1017,9 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                 )}
                 <div
                   className="h-full rounded-full bg-emerald-500 transition-all duration-500"
-                  style={{ width: phase === "syncing" ? "50%" : "100%" }}
+                  style={{
+                    width: `${phase === "syncing" ? Math.max(5, Math.min(100, syncPct)) : 100}%`,
+                  }}
                 />
               </div>
             </div>

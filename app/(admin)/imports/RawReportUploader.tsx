@@ -37,7 +37,8 @@ function getFileExtension(name: string): string {
 async function readCsvHeadersFromFile(f: File): Promise<string[]> {
   const n = Math.min(f.size, 1024 * 1024);
   const text = await f.slice(0, n).text();
-  const matrix = parseCsvToMatrix(text.trim());
+  const ext = getFileExtension(f.name);
+  const matrix = parseCsvToMatrix(text.trim(), ext === "txt" ? "\t" : undefined);
   if (matrix.length === 0) return [];
   return matrix[0].map((h) => h.trim()).filter((cell) => cell.length > 0);
 }

@@ -20,7 +20,10 @@ import csv from "csv-parser";
 import { NextResponse } from "next/server";
 
 import { createConcatenatedPartsReadable } from "../../../../../lib/import-raw-report-stream";
-import { applyColumnMappingToRow } from "../../../../../lib/import-sync-mappers";
+import {
+  applyColumnMappingToRow,
+  normalizeAmazonReportRowKeys,
+} from "../../../../../lib/import-sync-mappers";
 import { mergeUploadMetadata, parseRawReportMetadata } from "../../../../../lib/raw-report-upload-metadata";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
@@ -44,6 +47,7 @@ type Body = {
 /** Date columns to probe (in priority order) when applying a date range filter. */
 const DATE_COLUMN_CANDIDATES = [
   "date/time", "Date/Time",
+  "date_time",
   "posted-date", "Posted Date",
   "date", "Date",
   "return-date", "Return Date",
@@ -159,7 +163,7 @@ export async function POST(req: Request): Promise<Response> {
     const reportTypeRaw = String((row as { report_type?: unknown }).report_type ?? "").trim();
     const knownTypes = [
       "FBA_RETURNS", "REMOVAL_ORDER", "INVENTORY_LEDGER",
-      "REIMBURSEMENTS", "SETTLEMENT", "SAFET_CLAIMS", "TRANSACTIONS",
+      "REIMBURSEMENTS", "SETTLEMENT", "SAFET_CLAIMS", "TRANSACTIONS", "REPORTS_REPOSITORY",
       "fba_customer_returns", "inventory_ledger", "safe_t_claims",
       "reimbursements", "settlement_repository", "transaction_view",
     ];
@@ -315,7 +319,7 @@ export async function POST(req: Request): Promise<Response> {
         .update({
           metadata: mergeUploadMetadata(
             (prevRow as { metadata?: unknown } | null)?.metadata,
-            { row_count: staged, process_progress: pct },
+            { row_count: staged, process_progress: pct, etl_phase: "staging" },
           ),
           updated_at: new Date().toISOString(),
         })
@@ -348,7 +352,8 @@ export async function POST(req: Request): Promise<Response> {
           if (!rowMatchesDateRange(csvRow, filterStartDate, filterEndDate)) return;
         }
 
-        const mappedRow = applyColumnMappingToRow(csvRow, columnMapping);
+        const normalizedRow = normalizeAmazonReportRowKeys(csvRow);
+        const mappedRow = applyColumnMappingToRow(normalizedRow, columnMapping);
         const stagingRow: Record<string, unknown> = {
           organization_id: orgId,
           upload_id: uploadId,
@@ -357,7 +362,13 @@ export async function POST(req: Request): Promise<Response> {
 
         // Extract snapshot_date from common date columns
         const dateVal =
-          mappedRow["Date"] ?? mappedRow["date"] ?? mappedRow["Date-Time"] ?? mappedRow["date-time"] ?? "";
+          mappedRow["Date"] ??
+          mappedRow["date"] ??
+          mappedRow["Date-Time"] ??
+          mappedRow["date-time"] ??
+          mappedRow["date_time"] ??
+          mappedRow["date/time"] ??
+          "";
         if (dateVal) {
           const d = new Date(String(dateVal));
           if (!Number.isNaN(d.getTime())) {

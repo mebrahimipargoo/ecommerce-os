@@ -69,9 +69,11 @@ function coerceReportType(v: string): RawReportType {
 
 type RawReportImportsPanelProps = {
   organizationId: string | null;
+  /** Parent increments after upload / org change to trigger an immediate refetch (panel stays mounted). */
+  refreshSignal?: number;
 };
 
-export function RawReportImportsPanel({ organizationId }: RawReportImportsPanelProps) {
+export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: RawReportImportsPanelProps) {
   const { debugMode } = useDebugMode();
   const { actorUserId } = useUserRole();
   const [rows, setRows] = useState<RawReportUploadRow[]>([]);
@@ -93,9 +95,13 @@ export function RawReportImportsPanel({ organizationId }: RawReportImportsPanelP
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const reportTypeOverrideRef = useRef<Map<string, string>>(new Map());
+  /** Ignore stale list responses when org changes or overlapping polls complete out of order. */
+  const listFetchGenerationRef = useRef(0);
 
   const refresh = useCallback(async () => {
+    const gen = ++listFetchGenerationRef.current;
     const res = await listRawReportUploads({ organizationId, actorUserId });
+    if (gen !== listFetchGenerationRef.current) return;
     if (res.ok) {
       const override = reportTypeOverrideRef.current;
       setRows(
@@ -112,11 +118,17 @@ export function RawReportImportsPanel({ organizationId }: RawReportImportsPanelP
     }
   }, [organizationId, actorUserId]);
 
-  useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    void refresh();
+  }, [refresh, refreshSignal]);
 
   useEffect(() => {
-    pollRef.current = setInterval(() => { void refresh(); }, 2000);
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    pollRef.current = setInterval(() => {
+      void refresh();
+    }, 3500);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
   }, [refresh]);
 
   // ── Single row delete ────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import {
   mapRowToExpectedRemoval,
   mapRowToExpectedReturn,
   mapRowToProductFromLedger,
+  normalizeAmazonReportRowKeys,
 } from "../../../../../lib/import-sync-mappers";
 import {
   AMAZON_LEDGER_UPLOAD_SOURCE,
@@ -236,8 +237,10 @@ export async function POST(req: Request): Promise<Response> {
     );
 
     const source = createConcatenatedPartsReadable(supabaseServer, storagePrefix, totalParts);
+    const processSeparator: string = ext === "txt" ? "\t" : ",";
     const parser = csv({
       mapHeaders: ({ header }) => String(header).replace(/^\uFEFF/, "").trim(),
+      separator: processSeparator,
     });
 
     let processed = 0;
@@ -317,7 +320,7 @@ export async function POST(req: Request): Promise<Response> {
       parser.on("data", (csvRow: Record<string, string>) => {
         // Apply the saved column_mapping so user-verified header names resolve correctly
         // even when the CSV uses non-standard column names.
-        const mappedRow = applyColumnMappingToRow(csvRow, columnMapping);
+        const mappedRow = applyColumnMappingToRow(normalizeAmazonReportRowKeys(csvRow), columnMapping);
 
         let insertRow: Record<string, unknown> | null = null;
 

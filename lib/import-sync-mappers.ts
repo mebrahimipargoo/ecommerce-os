@@ -21,6 +21,31 @@ function normKey(s: string): string {
   return s.replace(/^\uFEFF/, "").trim().toLowerCase().replace(/[\s_]+/g, "-");
 }
 
+/** Resolve a cell when CSV headers use hyphens but keys were normalized to underscores (or vice versa). */
+function resolveMappedCell(row: Record<string, string>, csvHeader: string): string | undefined {
+  const h = String(csvHeader).trim().replace(/^\uFEFF/, "");
+  if (h === "") return undefined;
+  if (row[h] !== undefined) return row[h];
+  const unders = h.replace(/-/g, "_");
+  if (row[unders] !== undefined) return row[unders];
+  const hyph = h.replace(/_/g, "-");
+  if (row[hyph] !== undefined) return row[hyph];
+  return undefined;
+}
+
+/**
+ * Amazon .txt flat files use hyphenated headers (order-id). Normalizing keys to
+ * snake_case (order_id) keeps staging rows and mappers aligned.
+ */
+export function normalizeAmazonReportRowKeys(row: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(row)) {
+    const clean = k.replace(/^\uFEFF/, "").trim().replace(/-/g, "_");
+    out[clean] = v;
+  }
+  return out;
+}
+
 /**
  * Applies user-verified `column_mapping` onto a raw CSV row before the fuzzy
  * alias matchers run.
@@ -32,7 +57,7 @@ export function applyColumnMappingToRow(
   if (!columnMapping || Object.keys(columnMapping).length === 0) return row;
   const enhanced = { ...row };
   for (const [canonicalKey, csvHeader] of Object.entries(columnMapping)) {
-    const value = row[csvHeader];
+    const value = resolveMappedCell(row, csvHeader);
     if (value !== undefined && !(canonicalKey in enhanced)) {
       enhanced[canonicalKey] = value;
     }
@@ -138,12 +163,29 @@ export const NATIVE_COLUMNS_REIMBURSEMENTS = new Set([
   "created_at", "raw_data",
 ]);
 
-/** amazon_settlements — physical DB columns */
+/** amazon_settlements — physical DB columns (legacy + flat .txt settlement report) */
 export const NATIVE_COLUMNS_SETTLEMENTS = new Set([
-  "id", "organization_id", "upload_id", "posted_date",
-  "settlement_id", "order_id", "sku", "transaction_type",
-  "amount_total", "product_sales", "selling_fees", "fba_fees", "description",
-  "created_at", "raw_data",
+  "id",
+  "organization_id",
+  "upload_id",
+  "amazon_line_key",
+  "settlement_id",
+  "settlement_start_date",
+  "settlement_end_date",
+  "deposit_date",
+  "total_amount",
+  "currency",
+  "posted_date",
+  "order_id",
+  "sku",
+  "transaction_type",
+  "amount_total",
+  "product_sales",
+  "selling_fees",
+  "fba_fees",
+  "description",
+  "created_at",
+  "raw_data",
 ]);
 
 /** amazon_safet_claims — physical DB columns */
@@ -157,8 +199,15 @@ export const NATIVE_COLUMNS_SAFET = new Set([
 /** amazon_transactions — physical DB columns */
 export const NATIVE_COLUMNS_TRANSACTIONS = new Set([
   "id", "organization_id", "upload_id",
-  "order_id", "transaction_type", "amount",
+  "settlement_id", "order_id", "transaction_type", "amount", "sku", "posted_date",
   "created_at", "raw_data",
+]);
+
+/** amazon_reports_repository — physical DB columns */
+export const NATIVE_COLUMNS_REPORTS_REPOSITORY = new Set([
+  "id", "organization_id", "upload_id",
+  "date_time", "settlement_id", "transaction_type", "order_id", "sku", "description",
+  "total_amount", "created_at", "raw_data",
 ]);
 
 // =============================================================================
@@ -286,6 +335,26 @@ const TX_TYPE_ALIASES          = ["transaction-type", "transaction type"];
 const DEPOSIT_DATE_ALIASES     = ["deposit-date", "deposit date", "posted-date", "posted date"];
 const AMOUNT_TOTAL_ALIASES     = ["total", "amount", "net-proceeds", "net proceeds", "amount-total", "amount total"];
 
+/** Settlement flat-file: settlement id on transaction lines */
+const TX_SETTLEMENT_ID_ALIASES = ["settlement-id", "settlement id", "Settlement ID"];
+const ORDER_ITEM_CODE_ALIASES = ["order-item-code", "order item code"];
+const PRICE_TYPE_ALIASES = ["price-type", "price type"];
+const ITEM_RELATED_FEE_TYPE_ALIASES = ["item-related-fee-type", "item related fee type"];
+const SHIPMENT_FEE_TYPE_ALIASES = ["shipment-fee-type", "shipment fee type"];
+const PROMOTION_TYPE_ALIASES = ["promotion-type", "promotion type"];
+
+/** First non-empty numeric among Amazon settlement line amount columns */
+const TX_LINE_AMOUNT_ALIAS_GROUPS = [
+  ["price-amount", "price amount"],
+  ["item-related-fee-amount", "item related fee amount"],
+  ["shipment-fee-amount", "shipment fee amount"],
+  ["promotion-amount", "promotion amount"],
+  ["direct-payment-amount", "direct payment amount"],
+  ["other-amount", "other amount"],
+  ["misc-fee-amount", "misc fee amount"],
+  ["total-amount", "total amount"],
+];
+
 // ── Transaction aliases ───────────────────────────────────────────────────────
 // Hard-coded: CSV "amount" column → DB amount (prevents raw_data burial)
 const TX_AMOUNT_ALIASES = ["amount", "Amount", "transaction-amount", "transaction amount"];
@@ -309,6 +378,13 @@ function parseIsoDate(v: string): string | null {
   const d = new Date(v);
   if (Number.isNaN(d.getTime())) return null;
   return d.toISOString().slice(0, 10);
+}
+
+function parseIsoDateTime(v: string): string | null {
+  if (!v?.trim()) return null;
+  const d = new Date(v.trim());
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
 }
 
 // =============================================================================
@@ -637,27 +713,92 @@ export function mapRowToAmazonReimbursement(
 }
 
 // ── amazon_settlements ────────────────────────────────────────────────────────
-// DB columns: id · organization_id · upload_id · posted_date · settlement_id ·
-//             order_id · sku · transaction_type · amount_total · product_sales ·
-//             selling_fees · fba_fees · description · created_at · raw_data
+// Legacy CSV + Amazon flat settlement .txt (TSV): header fields on physical cols;
+// all other columns (transaction-type, order-id, sku, fee columns, …) → raw_data.
+// Upsert: (organization_id, upload_id, amazon_line_key).
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type AmazonSettlementInsert = {
-  organization_id: string;
-  upload_id: string;
-  settlement_id: string;
-  order_id: string | null;
-  sku: string | null;
-  /** DB column: `transaction_type`  (was mistakenly `transaction_status`). */
-  transaction_type: string | null;
-  /** DB column: `amount_total`  (was mistakenly `total`). */
-  amount_total: number | null;
-  /** DB column: `posted_date`  (was mistakenly `deposit_date`). */
-  posted_date: string | null;
-  raw_data: Record<string, string> | null;
-};
+/** Normalized keys populated from settlement flat-file header columns (Phase 2). */
+const SETTLEMENT_TXT_PHYSICAL_KEYS = new Set([
+  "settlement_id",
+  "settlement_start_date",
+  "settlement_end_date",
+  "deposit_date",
+  "total_amount",
+  "currency",
+]);
 
-export function mapRowToAmazonSettlement(
+/** Deterministic line id (no node:crypto — this module is imported from client + server). */
+function settlementAmazonLineKey(parts: string[]): string {
+  const s = parts.join("\x1e");
+  let h1 = 2166136261 >>> 0;
+  let h2 = 374761393 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h1 ^= s.charCodeAt(i);
+    h1 = Math.imul(h1, 16777619) >>> 0;
+    h2 += (s.charCodeAt(i) * (i + 1)) >>> 0;
+    h2 = Math.imul(h2, 2654435761) >>> 0;
+  }
+  return `${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}_${s.length.toString(16)}`;
+}
+
+function isAmazonSettlementTxtFlatRow(row: Record<string, string>): boolean {
+  return Object.prototype.hasOwnProperty.call(row, "settlement_start_date");
+}
+
+function mapRowToAmazonSettlementTxtFlat(
+  row: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+): AmazonSettlementInsert | null {
+  const settlement_id = (row.settlement_id ?? "").trim();
+  if (!settlement_id) return null;
+
+  const raw_data: Record<string, string> = {};
+  for (const [k, v] of Object.entries(row)) {
+    if (SETTLEMENT_TXT_PHYSICAL_KEYS.has(k)) continue;
+    const jsonKey = k.replace(/-/g, "_");
+    if (v != null && String(v).trim() !== "") raw_data[jsonKey] = String(v);
+  }
+
+  const totalRaw = (row.total_amount ?? "").trim();
+  const total_amount = totalRaw === "" ? null : parseNum(totalRaw);
+
+  const lineKey = settlementAmazonLineKey([
+    orgId,
+    uploadId,
+    settlement_id,
+    row.settlement_start_date ?? "",
+    row.settlement_end_date ?? "",
+    row.deposit_date ?? "",
+    totalRaw,
+    row.currency ?? "",
+    JSON.stringify(
+      Object.keys(raw_data)
+        .sort()
+        .reduce<Record<string, string>>((acc, key) => {
+          acc[key] = raw_data[key];
+          return acc;
+        }, {}),
+    ),
+  ]);
+
+  return {
+    organization_id: orgId,
+    upload_id: uploadId,
+    settlement_id,
+    amazon_line_key: lineKey,
+    settlement_start_date: parseIsoDateTime(row.settlement_start_date ?? "") ?? null,
+    settlement_end_date: parseIsoDateTime(row.settlement_end_date ?? "") ?? null,
+    deposit_date: parseIsoDateTime(row.deposit_date ?? "") ?? null,
+    total_amount,
+    currency: (row.currency ?? "").trim() || null,
+    raw_data: Object.keys(raw_data).length > 0 ? raw_data : null,
+  };
+}
+
+/** Older settlement CSV shape (order/sku/amount_total on physical columns). */
+function mapRowToAmazonSettlementLegacyCsv(
   row: Record<string, string>,
   orgId: string,
   uploadId: string,
@@ -665,17 +806,64 @@ export function mapRowToAmazonSettlement(
   const consumed = new Set<string>();
   const settlement_id = pickT(row, SETTLEMENT_ID_ALIASES, consumed);
   if (!settlement_id) return null;
+  const order_id = pickT(row, ORDER_ALIASES, consumed) || null;
+  const sku = pickT(row, SKU_ALIASES, consumed) || null;
+  const transaction_type = pickT(row, TX_TYPE_ALIASES, consumed) || null;
+  const amount_total = parseNum(pickT(row, AMOUNT_TOTAL_ALIASES, consumed));
+  const posted_date = parseIsoDate(pickT(row, DEPOSIT_DATE_ALIASES, consumed));
+  const lineKey = settlementAmazonLineKey([
+    "legacy",
+    orgId,
+    uploadId,
+    settlement_id,
+    order_id ?? "",
+    sku ?? "",
+    transaction_type ?? "",
+    String(amount_total ?? ""),
+    posted_date ?? "",
+  ]);
   return {
     organization_id: orgId,
     upload_id: uploadId,
     settlement_id,
-    order_id:         pickT(row, ORDER_ALIASES, consumed) || null,
-    sku:              pickT(row, SKU_ALIASES, consumed) || null,
-    transaction_type: pickT(row, TX_TYPE_ALIASES, consumed) || null,
-    amount_total:     parseNum(pickT(row, AMOUNT_TOTAL_ALIASES, consumed)),
-    posted_date:      parseIsoDate(pickT(row, DEPOSIT_DATE_ALIASES, consumed)),
-    raw_data:         buildRawData(row, consumed),
+    amazon_line_key: lineKey,
+    order_id,
+    sku,
+    transaction_type,
+    amount_total,
+    posted_date,
+    raw_data: buildRawData(row, consumed),
   };
+}
+
+export type AmazonSettlementInsert = {
+  organization_id: string;
+  upload_id: string;
+  settlement_id: string;
+  /** Dedupe key for upsert — required on all inserts (migration backfills legacy to id::text). */
+  amazon_line_key: string;
+  settlement_start_date?: string | null;
+  settlement_end_date?: string | null;
+  deposit_date?: string | null;
+  total_amount?: number | null;
+  currency?: string | null;
+  order_id?: string | null;
+  sku?: string | null;
+  transaction_type?: string | null;
+  amount_total?: number | null;
+  posted_date?: string | null;
+  raw_data?: Record<string, string> | null;
+};
+
+export function mapRowToAmazonSettlement(
+  row: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+): AmazonSettlementInsert | null {
+  if (isAmazonSettlementTxtFlatRow(row)) {
+    return mapRowToAmazonSettlementTxtFlat(row, orgId, uploadId);
+  }
+  return mapRowToAmazonSettlementLegacyCsv(row, orgId, uploadId);
 }
 
 // ── amazon_safet_claims ───────────────────────────────────────────────────────
@@ -729,17 +917,19 @@ export function mapRowToAmazonSafetClaim(
 }
 
 // ── amazon_transactions ───────────────────────────────────────────────────────
-// DB columns: id · organization_id · upload_id · order_id · transaction_type ·
-//             amount · created_at · raw_data
-// (sku / posted_date / total_product_charges → raw_data)
+// DB columns: id · organization_id · upload_id · settlement_id · order_id ·
+//             transaction_type · amount · sku · posted_date · created_at · raw_data
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type AmazonTransactionInsert = {
   organization_id: string;
   upload_id: string;
+  settlement_id: string | null;
   transaction_type: string;
   order_id: string | null;
-  /** DB column: `amount`  Hard-coded fallback: CSV "amount" → amount. */
+  sku: string | null;
+  posted_date: string | null;
+  /** DB column: `amount` — settlement lines use price-amount / fee columns. */
   amount: number | null;
   raw_data: Record<string, string> | null;
 };
@@ -750,17 +940,119 @@ export function mapRowToAmazonTransaction(
   uploadId: string,
 ): AmazonTransactionInsert | null {
   const consumed = new Set<string>();
-  const transaction_type = pickT(row, TX_TYPE_ALIASES, consumed);
-  if (!transaction_type) return null;
-  // Consume (but do not surface) sku / posted_date / total_product_charges — they go to raw_data
-  pickT(row, SKU_ALIASES, consumed);
-  pickT(row, POSTED_DATE_ALIASES, consumed);
+  const base_tx = pickT(row, TX_TYPE_ALIASES, consumed);
+  if (!base_tx?.trim()) return null;
+
+  const settlement_id = pickT(row, TX_SETTLEMENT_ID_ALIASES, consumed) || null;
+  const order_id = pickT(row, ORDER_ALIASES, consumed) || null;
+  const sku = pickT(row, SKU_ALIASES, consumed) || null;
+  const posted_raw = pickT(row, POSTED_DATE_ALIASES, consumed);
+  const posted_date = parseIsoDateTime(posted_raw) ?? null;
+
+  const price_type = pickT(row, PRICE_TYPE_ALIASES, consumed);
+  const item_fee_type = pickT(row, ITEM_RELATED_FEE_TYPE_ALIASES, consumed);
+  const ship_fee_type = pickT(row, SHIPMENT_FEE_TYPE_ALIASES, consumed);
+  const promo_type = pickT(row, PROMOTION_TYPE_ALIASES, consumed);
+  const order_item_code = pickT(row, ORDER_ITEM_CODE_ALIASES, consumed);
+
+  const discrim_parts = [price_type, item_fee_type, ship_fee_type, promo_type, sku, order_item_code].filter(
+    (p) => p && String(p).trim(),
+  );
+  const transaction_type =
+    discrim_parts.length > 0 ? `${base_tx} | ${discrim_parts.join(" | ")}` : base_tx;
+
+  let amount: number | null = null;
+  for (const aliases of TX_LINE_AMOUNT_ALIAS_GROUPS) {
+    const v = pickT(row, aliases, consumed);
+    const n = parseNum(v);
+    if (n != null) {
+      amount = n;
+      break;
+    }
+  }
+  if (amount == null) {
+    amount = parseNum(pickT(row, TX_AMOUNT_ALIASES, consumed));
+  }
+
   return {
     organization_id: orgId,
     upload_id: uploadId,
+    settlement_id,
     transaction_type,
-    order_id: pickT(row, ORDER_ALIASES, consumed) || null,
-    amount:   parseNum(pickT(row, TX_AMOUNT_ALIASES, consumed)),
+    order_id,
+    sku,
+    posted_date,
+    amount,
+    raw_data: buildRawData(row, consumed),
+  };
+}
+
+// ── amazon_reports_repository ─────────────────────────────────────────────────
+// Amazon Reports Repository CSV: date/time, settlement id, type, order id, sku,
+// description, total — remaining columns → raw_data
+// ─────────────────────────────────────────────────────────────────────────────
+
+const REPORTS_REPO_DATE_ALIASES = [
+  "date/time",
+  "date-time",
+  "datetime",
+  "date_time",
+  "posted-date",
+  "posted date",
+];
+const REPORTS_REPO_SETTLEMENT_ALIASES = [
+  "settlement-id",
+  "settlement id",
+  "settlement_id",
+  "Settlement ID",
+];
+const REPORTS_REPO_TYPE_ALIASES = ["type", "transaction-type", "transaction type", "transaction_type"];
+const REPORTS_REPO_DESC_ALIASES = ["description", "Description"];
+const REPORTS_REPO_TOTAL_ALIASES = ["total", "total-amount", "total amount", "total_amount"];
+
+export type AmazonReportsRepositoryInsert = {
+  organization_id: string;
+  upload_id: string;
+  date_time: string | null;
+  settlement_id: string | null;
+  transaction_type: string;
+  order_id: string | null;
+  sku: string | null;
+  description: string | null;
+  total_amount: number;
+  raw_data: Record<string, string> | null;
+};
+
+export function mapRowToAmazonReportsRepository(
+  row: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+): AmazonReportsRepositoryInsert | null {
+  const consumed = new Set<string>();
+  const transaction_type = pickT(row, REPORTS_REPO_TYPE_ALIASES, consumed).trim();
+  if (!transaction_type) return null;
+
+  const date_raw = pickT(row, REPORTS_REPO_DATE_ALIASES, consumed);
+  const date_time = parseIsoDateTime(date_raw) ?? null;
+
+  const settlement_id = pickT(row, REPORTS_REPO_SETTLEMENT_ALIASES, consumed) || null;
+  const order_id = pickT(row, ORDER_ALIASES, consumed) || null;
+  const sku = pickT(row, SKU_ALIASES, consumed) || null;
+  const description = pickT(row, REPORTS_REPO_DESC_ALIASES, consumed) || null;
+
+  const total_raw = pickT(row, REPORTS_REPO_TOTAL_ALIASES, consumed);
+  const total_amount = parseNum(total_raw) ?? 0;
+
+  return {
+    organization_id: orgId,
+    upload_id: uploadId,
+    date_time,
+    settlement_id,
+    transaction_type,
+    order_id,
+    sku,
+    description,
+    total_amount,
     raw_data: buildRawData(row, consumed),
   };
 }

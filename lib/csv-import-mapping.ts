@@ -87,14 +87,16 @@ export const REPORT_TYPE_SPECS: Record<
   SETTLEMENT: {
     canonicalKey: "settlement-id",
     shortLabel: "Settlement (detected)",
-    description: "Settlement ID + transaction status — Amazon payout data",
+    description: "Settlement flat .txt (TSV) or legacy CSV — routed to amazon_settlements",
     aliases: [
       "settlement-id",
       "settlement id",
       "Settlement ID",
+      "settlement-start-date",
+      "transaction-type",
       "transaction-status",
-      "transaction status",
       "deposit-date",
+      "total-amount",
     ],
   },
   SAFET_CLAIMS: {
@@ -119,6 +121,20 @@ export const REPORT_TYPE_SPECS: Record<
       "total-product-charges",
       "total product charges",
       "posted-date",
+    ],
+  },
+  REPORTS_REPOSITORY: {
+    canonicalKey: "date/time",
+    shortLabel: "Reports Repository (transactions CSV)",
+    description: "9-line preamble; headers on row 10 — synced to amazon_reports_repository",
+    aliases: [
+      "date/time",
+      "settlement id",
+      "type",
+      "order id",
+      "sku",
+      "description",
+      "total",
     ],
   },
   fba_customer_returns: {

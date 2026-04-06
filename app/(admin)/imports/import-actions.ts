@@ -896,6 +896,7 @@ export async function deleteRawReportUpload(
     "amazon_settlements",
     "amazon_safet_claims",
     "amazon_transactions",
+    "amazon_reports_repository",
   ] as const;
 
   for (const tbl of AMAZON_DOMAIN_TABLES) {

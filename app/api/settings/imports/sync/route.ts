@@ -12,9 +12,10 @@
  *   REMOVAL_ORDER    → amazon_removals         (upsert on organization_id, order_id, sku)
  *   INVENTORY_LEDGER → amazon_inventory_ledger (upsert on organization_id, fnsku, disposition, location, event_type)
  *   REIMBURSEMENTS   → amazon_reimbursements   (upsert on organization_id, reimbursement_id)
- *   SETTLEMENT       → amazon_settlements      (upsert on organization_id, settlement_id)
+ *   SETTLEMENT       → amazon_settlements      (upsert on organization_id, upload_id, amazon_line_key)
  *   SAFET_CLAIMS     → amazon_safet_claims     (upsert on organization_id, safet_claim_id)
- *   TRANSACTIONS     → amazon_transactions     (upsert on organization_id, order_id, transaction_type)
+ *   TRANSACTIONS        → amazon_transactions        (upsert on organization_id, order_id, transaction_type, amount)
+ *   REPORTS_REPOSITORY  → amazon_reports_repository  (upsert on organization_id, date_time, transaction_type, order_id, sku, description)
  *
  * JSONB Fallback: any CSV column not matched by the typed mapper is stored in
  * the `raw_data` JSONB column — this permanently prevents schema cache crashes.
@@ -39,6 +40,7 @@ import {
   mapRowToAmazonSafetClaim,
   mapRowToAmazonSettlement,
   mapRowToAmazonTransaction,
+  mapRowToAmazonReportsRepository,
   packPayloadForSupabase,
   NATIVE_COLUMNS_RETURNS,
   NATIVE_COLUMNS_REMOVALS,
@@ -47,6 +49,7 @@ import {
   NATIVE_COLUMNS_SETTLEMENTS,
   NATIVE_COLUMNS_SAFET,
   NATIVE_COLUMNS_TRANSACTIONS,
+  NATIVE_COLUMNS_REPORTS_REPOSITORY,
 } from "../../../../../lib/import-sync-mappers";
 import { mergeUploadMetadata } from "../../../../../lib/raw-report-upload-metadata";
 import { supabaseServer } from "../../../../../lib/supabase-server";
@@ -56,6 +59,8 @@ export const runtime = "nodejs";
 export const maxDuration = 300;
 
 const BATCH_SIZE = 500;
+/** Max rows per Postgres upsert call — enables granular sync_progress updates. */
+const UPSERT_CHUNK_SIZE = 500;
 const STAGING_READ_BATCH = 1000;
 const STAGING_TABLE = "amazon_staging";
 
@@ -69,6 +74,7 @@ type SyncKind =
   | "SETTLEMENT"
   | "SAFET_CLAIMS"
   | "TRANSACTIONS"
+  | "REPORTS_REPOSITORY"
   | "UNKNOWN";
 
 /** amazon_ domain table for each report kind (null = no table yet / UNKNOWN). */
@@ -80,6 +86,7 @@ const DOMAIN_TABLE: Record<SyncKind, string | null> = {
   SETTLEMENT:       "amazon_settlements",
   SAFET_CLAIMS:     "amazon_safet_claims",
   TRANSACTIONS:     "amazon_transactions",
+  REPORTS_REPOSITORY: "amazon_reports_repository",
   UNKNOWN:          null,
 };
 
@@ -95,18 +102,21 @@ const DOMAIN_TABLE: Record<SyncKind, string | null> = {
  *   amazon_removals         → (organization_id, order_id, sku)
  *   amazon_inventory_ledger → (organization_id, fnsku, disposition, location, event_type)
  *   amazon_reimbursements   → (organization_id, reimbursement_id, sku)
- *   amazon_settlements      → (organization_id, settlement_id)
+ *   amazon_settlements      → (organization_id, upload_id, amazon_line_key)
  *   amazon_safet_claims     → (organization_id, safet_claim_id)
  *   amazon_transactions     → (organization_id, order_id, transaction_type, amount)
+ *   amazon_reports_repository → (organization_id, date_time, transaction_type, order_id, sku, description)
  */
 const CONFLICT_KEY: Record<SyncKind, string | null> = {
   FBA_RETURNS:      "organization_id,lpn",
   REMOVAL_ORDER:    "organization_id,order_id,sku",
   INVENTORY_LEDGER: "organization_id,fnsku,disposition,location,event_type",
   REIMBURSEMENTS:   "organization_id,reimbursement_id,sku", // matches uq_amazon_reimbursements_org_reimb_sku
-  SETTLEMENT:       "organization_id,settlement_id",
+  SETTLEMENT:       "organization_id,upload_id,amazon_line_key",
   SAFET_CLAIMS:     "organization_id,safet_claim_id",
   TRANSACTIONS:     "organization_id,order_id,transaction_type,amount",
+  REPORTS_REPOSITORY:
+    "organization_id,date_time,transaction_type,order_id,sku,description",
   UNKNOWN:          null,
 };
 
@@ -119,6 +129,7 @@ const NATIVE_COLUMNS_MAP: Record<SyncKind, Set<string> | null> = {
   SETTLEMENT:       NATIVE_COLUMNS_SETTLEMENTS,
   SAFET_CLAIMS:     NATIVE_COLUMNS_SAFET,
   TRANSACTIONS:     NATIVE_COLUMNS_TRANSACTIONS,
+  REPORTS_REPOSITORY: NATIVE_COLUMNS_REPORTS_REPOSITORY,
   UNKNOWN:          null,
 };
 
@@ -132,6 +143,7 @@ function resolveImportKind(reportType: string | null | undefined): SyncKind {
   if (rt === "SETTLEMENT" || rt === "settlement_repository")   return "SETTLEMENT";
   if (rt === "SAFET_CLAIMS" || rt === "safe_t_claims")         return "SAFET_CLAIMS";
   if (rt === "TRANSACTIONS" || rt === "transaction_view")      return "TRANSACTIONS";
+  if (rt === "REPORTS_REPOSITORY")                              return "REPORTS_REPOSITORY";
   return "UNKNOWN";
 }
 
@@ -252,7 +264,12 @@ export async function POST(req: Request): Promise<Response> {
       .from("raw_report_uploads")
       .update({
         status: "processing",
-        metadata: mergeUploadMetadata(meta, { process_progress: 0, error_message: "" }),
+        metadata: mergeUploadMetadata(meta, {
+          process_progress: 0,
+          sync_progress: 0,
+          etl_phase: "sync",
+          error_message: "",
+        }),
         updated_at: new Date().toISOString(),
       })
       .eq("id", uploadId)
@@ -278,6 +295,15 @@ export async function POST(req: Request): Promise<Response> {
       kind,
       domainTable: DOMAIN_TABLE[kind] ?? "none",
     });
+
+    const { count: stagingRowCount } = await supabaseServer
+      .from(STAGING_TABLE)
+      .select("*", { count: "exact", head: true })
+      .eq("upload_id", uploadId)
+      .eq("organization_id", orgId);
+
+    const totalStagingRows = typeof stagingRowCount === "number" ? stagingRowCount : 0;
+    const syncUpserted = { value: 0 };
 
     // ── Phase 3 core: read → map → upsert → delete (strictly sequenced) ───────
     //
@@ -326,6 +352,11 @@ export async function POST(req: Request): Promise<Response> {
             insertRow = mapRowToAmazonSafetClaim(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
           } else if (kind === "TRANSACTIONS") {
             insertRow = mapRowToAmazonTransaction(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
+          } else if (kind === "REPORTS_REPOSITORY") {
+            insertRow = mapRowToAmazonReportsRepository(mappedRow, orgId, uploadId) as Record<
+              string,
+              unknown
+            > | null;
           }
 
           if (insertRow) {
@@ -351,7 +382,12 @@ export async function POST(req: Request): Promise<Response> {
 
       // ── Flush remainder of this staging page ───────────────────────────────
       if (domainBatch.length > 0) {
-        const flushedCount = await flushDomainBatch(kind, domainBatch);
+        const flushedCount = await flushDomainBatch(kind, domainBatch, {
+          uploadId,
+          orgId,
+          totalStagingRows,
+          upserted: syncUpserted,
+        });
         synced += flushedCount;
         await deleteFromStaging(batchStagingIds.splice(0, flushedCount));
       }
@@ -396,7 +432,13 @@ export async function POST(req: Request): Promise<Response> {
         status: "synced",
         metadata: mergeUploadMetadata(
           (prevRow as { metadata?: unknown } | null)?.metadata,
-          { row_count: synced, process_progress: 100, error_message: undefined },
+          {
+            row_count: synced,
+            process_progress: 100,
+            sync_progress: 100,
+            etl_phase: "sync",
+            error_message: undefined,
+          },
         ),
         updated_at: new Date().toISOString(),
       })
@@ -449,6 +491,39 @@ async function deleteFromStaging(ids: string[]): Promise<void> {
   }
 }
 
+type SyncProgressOpts = {
+  uploadId: string;
+  orgId: string;
+  totalStagingRows: number;
+  /** Cumulative domain rows successfully upserted this sync (for progress bar). */
+  upserted: { value: number };
+};
+
+async function bumpSyncProgressMetadata(opts: SyncProgressOpts, chunkRowCount: number): Promise<void> {
+  if (opts.totalStagingRows <= 0 || chunkRowCount <= 0) return;
+  opts.upserted.value += chunkRowCount;
+  const { data: prevRow } = await supabaseServer
+    .from("raw_report_uploads")
+    .select("metadata")
+    .eq("id", opts.uploadId)
+    .maybeSingle();
+  const pct = Math.min(
+    99,
+    Math.round((opts.upserted.value / Math.max(1, opts.totalStagingRows)) * 100),
+  );
+  await supabaseServer
+    .from("raw_report_uploads")
+    .update({
+      metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
+        sync_progress: pct,
+        etl_phase: "sync",
+      }),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", opts.uploadId)
+    .eq("organization_id", opts.orgId);
+}
+
 /**
  * Packs and upserts a batch of mapped domain rows into the correct amazon_ table.
  *
@@ -460,16 +535,15 @@ async function deleteFromStaging(ids: string[]): Promise<void> {
  *    Removes same-batch duplicates before the Postgres upsert to avoid
  *    "ON CONFLICT DO UPDATE command cannot affect a row a second time".
  *
- *  Step 3 — supabase.upsert({ onConflict }):
- *    Uses the explicit conflict key so Postgres knows which unique index to use.
- *    If the upsert fails for any reason, this function throws — the caller must
- *    NOT delete staging rows and must propagate the error.
+ *  Step 3 — supabase.upsert({ onConflict }) in chunks of UPSERT_CHUNK_SIZE:
+ *    Writes progress to metadata.sync_progress after each chunk.
  *
  * @returns Number of rows actually written (after deduplication).
  */
 async function flushDomainBatch(
   kind: SyncKind,
   rows: Record<string, unknown>[],
+  syncProgress?: SyncProgressOpts,
 ): Promise<number> {
   if (rows.length === 0) return 0;
 
@@ -484,25 +558,32 @@ async function flushDomainBatch(
   const deduped = deduplicateByConflictKey(kind, packed);
   console.log(`[${kind}] Original batch size: ${packed.length}, Cleaned batch size: ${deduped.length}`);
 
-  // ── Step 3: upsert with explicit onConflict ────────────────────────────────
+  // ── Step 3: chunked upsert / insert ────────────────────────────────────────
   const conflictKey = CONFLICT_KEY[kind];
 
   if (conflictKey) {
-    const { error } = await supabaseServer
-      .from(table)
-      .upsert(deduped, { onConflict: conflictKey, ignoreDuplicates: false });
+    for (let off = 0; off < deduped.length; off += UPSERT_CHUNK_SIZE) {
+      const chunk = deduped.slice(off, off + UPSERT_CHUNK_SIZE);
+      const { error } = await supabaseServer
+        .from(table)
+        .upsert(chunk, { onConflict: conflictKey, ignoreDuplicates: false });
 
-    if (error) {
-      throw new Error(
-        `[${kind}] upsert into ${table} failed: ${error.message}` +
-        ` (conflict key: ${conflictKey}, batch size: ${deduped.length})`,
-      );
+      if (error) {
+        throw new Error(
+          `[${kind}] upsert into ${table} failed: ${error.message}` +
+            ` (conflict key: ${conflictKey}, chunk size: ${chunk.length})`,
+        );
+      }
+      if (syncProgress) await bumpSyncProgressMetadata(syncProgress, chunk.length);
     }
   } else {
-    // No unique key defined — plain insert
-    const { error } = await supabaseServer.from(table).insert(deduped);
-    if (error) {
-      throw new Error(`[${kind}] insert into ${table} failed: ${error.message}`);
+    for (let off = 0; off < deduped.length; off += UPSERT_CHUNK_SIZE) {
+      const chunk = deduped.slice(off, off + UPSERT_CHUNK_SIZE);
+      const { error } = await supabaseServer.from(table).insert(chunk);
+      if (error) {
+        throw new Error(`[${kind}] insert into ${table} failed: ${error.message}`);
+      }
+      if (syncProgress) await bumpSyncProgressMetadata(syncProgress, chunk.length);
     }
   }
 
@@ -520,6 +601,9 @@ async function flushDomainBatch(
  *   • When a duplicate is found, quantities are SUMMED (additive merge) rather
  *     than last-wins, which matches Amazon ledger semantics where the same
  *     FNSKU can appear multiple times in the same export with partial quantities.
+ *
+ * REPORTS_REPOSITORY: duplicate natural keys in the same batch merge by SUMMING
+ * total_amount (matches pre-upsert dedupe spec).
  *
  * All other tables use last-occurrence-wins (standard upsert semantics).
  *
@@ -562,13 +646,31 @@ function deduplicateByConflictKey(
         key = `${norm(row.organization_id)}|${norm(row.reimbursement_id)}|${norm(row.sku)}`;
         break;
       case "SETTLEMENT":
-        key = `${norm(row.organization_id)}|${norm(row.settlement_id)}`;
+        key = `${norm(row.organization_id)}|${norm(row.upload_id)}|${norm(row.amazon_line_key)}`;
         break;
       case "SAFET_CLAIMS":
         key = `${norm(row.organization_id)}|${norm(row.safet_claim_id)}`;
         break;
       case "TRANSACTIONS":
-        key = `${norm(row.organization_id)}|${norm(row.order_id)}|${norm(row.transaction_type)}|${norm(row.amount)}`;
+        key = [
+          norm(row.organization_id),
+          norm(row.settlement_id),
+          norm(row.order_id),
+          norm(row.transaction_type),
+          norm(row.amount),
+          norm(row.sku),
+          norm(row.posted_date),
+        ].join("|");
+        break;
+      case "REPORTS_REPOSITORY":
+        key = [
+          norm(row.organization_id),
+          String(row.date_time ?? ""),
+          norm(row.transaction_type),
+          norm(row.order_id),
+          norm(row.sku),
+          norm(row.description),
+        ].join("|");
         break;
       default:
         // UNKNOWN — give every row a unique key so nothing is silently dropped
@@ -584,6 +686,13 @@ function deduplicateByConflictKey(
       const incomingQty =
         typeof row.quantity === "number" ? row.quantity : 0;
       seen.set(key, { ...row, quantity: existingQty + incomingQty });
+    } else if (kind === "REPORTS_REPOSITORY" && seen.has(key)) {
+      const existing = seen.get(key)!;
+      const existingAmt =
+        typeof existing.total_amount === "number" ? existing.total_amount : 0;
+      const incomingAmt =
+        typeof row.total_amount === "number" ? row.total_amount : 0;
+      seen.set(key, { ...row, total_amount: existingAmt + incomingAmt });
     } else {
       seen.set(key, row);
     }

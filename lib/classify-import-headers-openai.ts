@@ -56,11 +56,14 @@ Report types, definitive header signals, and canonical fields:
 - TRANSACTIONS: signals = "transaction type" AND "total product charges"
   canonical fields: transaction_type, total_product_charges, order_id, sku, posted_date
 
+- REPORTS_REPOSITORY: signals = "date/time" AND "settlement id" AND "type" AND "order id" AND "sku" AND "description" AND "total" (Amazon Reports Repository CSV; not Fee Preview)
+  canonical fields: date_time, settlement_id, transaction_type, order_id, sku, description, total_amount
+
 - UNKNOWN: none of the above patterns match with at least 85% confidence
 
 Respond ONLY with a single valid JSON object — no markdown, no explanation:
 {
-  "report_type": "FBA_RETURNS" | "REMOVAL_ORDER" | "INVENTORY_LEDGER" | "REIMBURSEMENTS" | "SETTLEMENT" | "SAFET_CLAIMS" | "TRANSACTIONS" | "UNKNOWN",
+  "report_type": "FBA_RETURNS" | "REMOVAL_ORDER" | "INVENTORY_LEDGER" | "REIMBURSEMENTS" | "SETTLEMENT" | "SAFET_CLAIMS" | "TRANSACTIONS" | "REPORTS_REPOSITORY" | "UNKNOWN",
   "mapping": {
     "<canonical_field>": "<exact CSV header string from the input>"
   }

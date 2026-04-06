@@ -9,6 +9,7 @@ export const CLASSIFIED_REPORT_TYPES = [
   "SETTLEMENT",
   "SAFET_CLAIMS",
   "TRANSACTIONS",
+  "REPORTS_REPOSITORY",
   "UNKNOWN",
 ] as const;
 
@@ -234,10 +235,45 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
       aliases: ["settlement-id", "settlement id", "Settlement ID"],
     },
     {
+      key: "settlement_start_date",
+      label: "Settlement Start Date",
+      required: false,
+      aliases: ["settlement-start-date", "settlement start date"],
+    },
+    {
+      key: "settlement_end_date",
+      label: "Settlement End Date",
+      required: false,
+      aliases: ["settlement-end-date", "settlement end date"],
+    },
+    {
+      key: "deposit_date",
+      label: "Deposit Date",
+      required: false,
+      aliases: ["deposit-date", "deposit date"],
+    },
+    {
+      key: "total_amount",
+      label: "Total Amount (header column)",
+      required: false,
+      aliases: ["total-amount", "total amount", "total", "amount", "net-proceeds", "net proceeds"],
+    },
+    {
+      key: "currency",
+      label: "Currency",
+      required: false,
+      aliases: ["currency", "Currency"],
+    },
+    {
       key: "transaction_status",
-      label: "Transaction Status",
-      required: true,
-      aliases: ["transaction-status", "transaction status"],
+      label: "Transaction Status / Type (legacy CSV)",
+      required: false,
+      aliases: [
+        "transaction-status",
+        "transaction status",
+        "transaction-type",
+        "transaction type",
+      ],
     },
     {
       key: "order_id",
@@ -247,15 +283,9 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
     },
     {
       key: "total",
-      label: "Total Amount",
+      label: "Total (legacy key)",
       required: false,
-      aliases: ["total", "amount", "net-proceeds", "net proceeds"],
-    },
-    {
-      key: "deposit_date",
-      label: "Deposit Date",
-      required: false,
-      aliases: ["deposit-date", "deposit date"],
+      aliases: ["net-proceeds", "net proceeds"],
     },
   ],
   SAFET_CLAIMS: [
@@ -292,6 +322,12 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
   ],
   TRANSACTIONS: [
     {
+      key: "settlement_id",
+      label: "Settlement ID",
+      required: false,
+      aliases: ["settlement-id", "settlement id", "Settlement ID"],
+    },
+    {
       key: "transaction_type",
       label: "Transaction Type",
       required: true,
@@ -326,6 +362,50 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
       label: "Amount",
       required: false,
       aliases: ["amount", "Amount", "total"],
+    },
+  ],
+  REPORTS_REPOSITORY: [
+    {
+      key: "date_time",
+      label: "Date / Time",
+      required: true,
+      aliases: ["date/time", "date-time", "datetime", "posted-date", "posted date"],
+    },
+    {
+      key: "settlement_id",
+      label: "Settlement ID",
+      required: false,
+      aliases: ["settlement-id", "settlement id", "Settlement ID"],
+    },
+    {
+      key: "transaction_type",
+      label: "Type",
+      required: true,
+      aliases: ["type", "transaction-type", "transaction type"],
+    },
+    {
+      key: "order_id",
+      label: "Order ID",
+      required: false,
+      aliases: ["order-id", "order id", "amazon-order-id", "amazon order id"],
+    },
+    {
+      key: "sku",
+      label: "SKU",
+      required: false,
+      aliases: ["sku", "SKU", "merchant-sku", "msku"],
+    },
+    {
+      key: "description",
+      label: "Description",
+      required: false,
+      aliases: ["description", "Description"],
+    },
+    {
+      key: "total_amount",
+      label: "Total",
+      required: false,
+      aliases: ["total", "Total", "total-amount", "total amount"],
     },
   ],
 };
@@ -375,7 +455,10 @@ export function mappingHasRequiredGaps(
  *   4. REIMBURSEMENTS   — contains "reimbursement-id" AND "quantity-reimbursed-total"
  *   5. SETTLEMENT       — contains "settlement-id" AND "transaction-status"
  *   6. SAFET_CLAIMS     — contains "safe-t-claim-id" AND "reimbursement-amount"
- *   7. TRANSACTIONS     — contains "transaction-type" AND "total-product-charges"
+ *   7. REPORTS_REPOSITORY — Amazon Reports Repository CSV (after 9-line preamble):
+ *                           "date/time" + "settlement id" + "type" + "order id" + "sku" +
+ *                           "description" + "total"; not the Fee Preview "transaction type" header
+ *   8. TRANSACTIONS     — contains "transaction-type" AND "total-product-charges"
  *
  * Returns UNKNOWN only when no rule matches → triggers Mapping Memory → GPT fallback.
  */
@@ -393,8 +476,25 @@ export function mappingHasRequiredGaps(
  *   4. REIMBURSEMENTS   — "reimbursement id" AND "quantity reimbursed total"
  *   5. SETTLEMENT       — "settlement id" AND "transaction status"
  *   6. SAFET_CLAIMS     — "safe t claim id" AND "reimbursement amount"
- *   7. TRANSACTIONS     — "transaction type" AND "total product charges"
+ *   7. REPORTS_REPOSITORY — "date/time" + "settlement id" + "type" + "order id" + "sku" +
+ *                           "description" + "total" (no "transaction type" header)
+ *   8. TRANSACTIONS     — "transaction type" AND "total product charges"
  */
+/** Same conditions as rule 7 — used to guard settlement flat-file detection. */
+export function headersLookLikeReportsRepository(headers: string[]): boolean {
+  const ds = detectionSet(headers);
+  return (
+    ds.has("date/time") &&
+    ds.has("settlement id") &&
+    ds.has("type") &&
+    ds.has("order id") &&
+    ds.has("sku") &&
+    ds.has("description") &&
+    ds.has("total") &&
+    !ds.has("transaction type")
+  );
+}
+
 export function classifyCsvHeadersRuleBased(headers: string[]): {
   reportType: RawReportType;
   matchedRule: string;
@@ -434,7 +534,13 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
   }
 
   // Rule 5: Settlement report
-  if (ds.has("settlement id") && ds.has("transaction status")) {
+  // Guard: Reports Repository CSVs include "Transaction Status" as an extra column but
+  // are NOT settlement reports — check Rule 7 fingerprint before committing to SETTLEMENT.
+  if (
+    ds.has("settlement id") &&
+    ds.has("transaction status") &&
+    !headersLookLikeReportsRepository(headers)
+  ) {
     return { reportType: "SETTLEMENT", matchedRule: "settlement id+transaction status" };
   }
 
@@ -452,29 +558,47 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
     }
   }
 
-  // Rule 7: Transactions / Fee Preview (standard format)
+  // Rule 7: Amazon Reports Repository transaction CSV (dynamic preamble; header row detected in Phase 1)
+  if (headersLookLikeReportsRepository(headers)) {
+    return {
+      reportType: "REPORTS_REPOSITORY",
+      matchedRule:
+        "Reports Repository CSV: date/time + settlement id + type + order id + sku + description + total (no Fee Preview transaction type header)",
+    };
+  }
+
+  // Rule 8: Transactions / Fee Preview (standard format)
   if (ds.has("transaction type") && ds.has("total product charges")) {
     return { reportType: "TRANSACTIONS", matchedRule: "transaction type+total product charges" };
   }
 
-  // Rule 7b: Amazon Flat File Transactions (Reports Repository format).
+  // Rule 8b: Amazon settlement flat-file detail report (.txt TSV).
   //
-  // The .txt TSV flat file uses abbreviated column names:
-  //   "type" instead of "transaction-type"
-  //   "total" instead of "total-product-charges"
-  //   "order-id" and "settlement-id" are also present
+  // Columns are hyphenated: settlement-id, transaction-type, order-id, total-amount,
+  // price-amount, item-related-fee-amount, etc.  (NOT the Fee Preview "total product charges".)
   //
-  // Guard: "transaction status" must be absent — otherwise this is SETTLEMENT (Rule 5).
+  // detectionSet entries are normForDetection(header) — e.g. "transaction type", "total amount".
+  // Guard: classic SETTLEMENT reports use "transaction status"; this flat file uses "transaction type".
+  const hasAmountLikeHeader = headers.some((h) => {
+    const n = normForDetection(h);
+    return (
+      n === "total amount" ||
+      n === "currency" ||
+      (n.includes("amount") && !n.includes("quantity") && !n.includes("reimbursement"))
+    );
+  });
   if (
     ds.has("settlement id") &&
-    ds.has("type") &&
+    ds.has("transaction type") &&
     ds.has("order id") &&
-    (ds.has("total") || ds.has("amount")) &&
-    !ds.has("transaction status")
+    hasAmountLikeHeader &&
+    !ds.has("transaction status") &&
+    !headersLookLikeReportsRepository(headers)
   ) {
     return {
-      reportType: "TRANSACTIONS",
-      matchedRule: "settlement id+type+order id+total (flat file TSV)",
+      reportType: "SETTLEMENT",
+      matchedRule:
+        "Amazon settlement flat .txt TSV → SETTLEMENT (settlement id + transaction type + order id + amount columns); does not use TRANSACTIONS CSV path",
     };
   }
 
@@ -491,5 +615,6 @@ export function parseGptReportType(raw: string): RawReportType {
   if (/\bSETTLEMENT\b/.test(u)) return "SETTLEMENT";
   if (/\bSAFET_CLAIMS\b/.test(u)) return "SAFET_CLAIMS";
   if (/\bTRANSACTIONS\b/.test(u)) return "TRANSACTIONS";
+  if (/\bREPORTS_REPOSITORY\b/.test(u)) return "REPORTS_REPOSITORY";
   return "UNKNOWN";
 }

@@ -23,6 +23,7 @@ const MODAL_REPORT_TYPES: RawReportType[] = [
   "SETTLEMENT",
   "SAFET_CLAIMS",
   "TRANSACTIONS",
+  "REPORTS_REPOSITORY",
   // ── Fallback ──────────────────────────────────────────────────────────────
   "UNKNOWN",
 ];

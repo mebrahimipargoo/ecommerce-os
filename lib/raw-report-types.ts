@@ -5,7 +5,7 @@
  *
  * Smart-import canonical types (written by header classification):
  *   FBA_RETURNS | REMOVAL_ORDER | INVENTORY_LEDGER |
- *   REIMBURSEMENTS | SETTLEMENT | SAFET_CLAIMS | TRANSACTIONS | UNKNOWN
+ *   REIMBURSEMENTS | SETTLEMENT | SAFET_CLAIMS | TRANSACTIONS | REPORTS_REPOSITORY | UNKNOWN
  *
  * Legacy rows may use fba_customer_returns, inventory_ledger, safe_t_claims, etc.
  */
@@ -18,6 +18,7 @@ export const RAW_REPORT_TYPES = [
   "SETTLEMENT",
   "SAFET_CLAIMS",
   "TRANSACTIONS",
+  "REPORTS_REPOSITORY",
   "UNKNOWN",
   // ── Legacy slugs (kept for backward-compat with older rows) ───────────────
   "fba_customer_returns",

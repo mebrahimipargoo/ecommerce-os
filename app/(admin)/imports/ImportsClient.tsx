@@ -27,8 +27,9 @@ import {
 export function ImportsClient() {
   const { role, organizationId } = useUserRole();
 
-  const [historyKey, setHistoryKey] = useState(0);
-  const refreshHistory = useCallback(() => setHistoryKey((k) => k + 1), []);
+  /** Bumps to tell Import History to refetch — do NOT remount the panel (avoids empty-table flicker). */
+  const [historyRefreshSignal, setHistoryRefreshSignal] = useState(0);
+  const refreshHistory = useCallback(() => setHistoryRefreshSignal((k) => k + 1), []);
 
   const isSuperAdmin = role === "super_admin" || role === "system_employee";
   const [superAdminOrgFilter, setSuperAdminOrgFilter] = useState<string>("");
@@ -67,7 +68,7 @@ export function ImportsClient() {
     const value = e.target.value;
     setSuperAdminOrgFilter(value);
     setSelectedStoreId(null);
-    setHistoryKey((k) => k + 1);
+    setHistoryRefreshSignal((k) => k + 1);
   }, []);
 
   const activeOrgLabel = orgOptions.find(
@@ -135,8 +136,8 @@ export function ImportsClient() {
 
       {/* ── History panel ───────────────────────────────────────────────────── */}
       <RawReportImportsPanel
-        key={historyKey}
         organizationId={historyCompanyId}
+        refreshSignal={historyRefreshSignal}
       />
     </div>
   );
