@@ -6654,7 +6654,7 @@ export function ItemsDataTable({ items, packages, pallets, role, actor, actorPro
                     </td>
                     {showCompanyColumn && (
                       <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-semibold text-violet-600 dark:text-violet-400 md:table-cell" title={organizationLabelById[r.organization_id] ?? r.organization_id}>
-                        {organizationLabelById[r.organization_id] ?? `${r.organization_id.slice(0, 8)}…`}
+                        {organizationLabelById[r.organization_id] ?? <span className="animate-pulse text-violet-300 dark:text-violet-700">Resolving…</span>}
                       </td>
                     )}
                     <td className="w-12 px-2 py-3 align-middle">
@@ -6927,7 +6927,7 @@ export function PackagesDataTable({ packages, returns: allReturns = [], pallets 
                       </td>
                       {showCompanyColumn && (
                         <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-semibold text-violet-600 dark:text-violet-400 md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
-                          {organizationLabelById[p.organization_id] ?? `${p.organization_id.slice(0, 8)}…`}
+                          {organizationLabelById[p.organization_id] ?? <span className="animate-pulse text-violet-300 dark:text-violet-700">Resolving…</span>}
                         </td>
                       )}
                       <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
@@ -7206,7 +7206,7 @@ export function PalletsDataTable({ pallets, packages: allPackages = [], returns:
                       </td>
                       {showCompanyColumn && (
                         <td className="hidden max-w-[140px] truncate px-4 py-3 text-xs font-semibold text-violet-600 dark:text-violet-400 md:table-cell" title={organizationLabelById[p.organization_id] ?? p.organization_id}>
-                          {organizationLabelById[p.organization_id] ?? `${p.organization_id.slice(0, 8)}…`}
+                          {organizationLabelById[p.organization_id] ?? <span className="animate-pulse text-violet-300 dark:text-violet-700">Resolving…</span>}
                         </td>
                       )}
                       <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>

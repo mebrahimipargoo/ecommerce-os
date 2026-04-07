@@ -22,6 +22,7 @@ import { resolveOrganizationId } from "../../lib/organization";
 import { isUuidString } from "../../lib/uuid";
 import {
   listWorkspaceOrganizationsForAdmin,
+  getOrganizationNames,
   type WorkspaceOrganizationOption,
 } from "../session/tenant-actions";
 import { listPlatformMarketplaceIcons } from "../(admin)/lib/platform-actions";
@@ -62,6 +63,9 @@ export default function ReturnsPage() {
   /** Super Admin: org id for new returns / packages / pallets */
   const [superAdminCreateOrg, setSuperAdminCreateOrg] = useState<string>("");
   const [companyOptions, setCompanyOptions] = useState<WorkspaceOrganizationOption[]>([]);
+  /** Real org names fetched directly from organizations + organization_settings tables.
+   *  Populated for every org_id found in the loaded data rows. */
+  const [extraOrgLabels, setExtraOrgLabels] = useState<Record<string, string>>({});
   const [platformIconBySlug, setPlatformIconBySlug] = useState<Record<string, string>>({});
 
   /** Store filter — applies to Items and Packages (pallets don't have store_id in list select). */
@@ -80,15 +84,17 @@ export default function ReturnsPage() {
   }, [actorUserId, role, superAdminListFilter]);
 
   const organizationLabelById = useMemo(() => {
-    const m: Record<string, string> = {};
+    // Layer 1: real DB names from organizations.name (lowest priority base)
+    const m: Record<string, string> = { ...extraOrgLabels };
+    // Layer 2: admin-set display names from companyOptions, but ONLY when the
+    // RPC returned a real name — not when it fell back to the raw UUID string.
     for (const o of companyOptions) {
-      m[o.organization_id] = o.display_name;
+      if (o.display_name && o.display_name !== o.organization_id) {
+        m[o.organization_id] = o.display_name;
+      }
     }
-    // MVP seed org: only fall back if it wasn't returned by the admin query
-    const MVP_ORG = "00000000-0000-0000-0000-000000000001";
-    if (!m[MVP_ORG]) m[MVP_ORG] = "Global Operations";
     return m;
-  }, [companyOptions]);
+  }, [companyOptions, extraOrgLabels]);
 
   const effectiveWriteOrgId =
     role === "super_admin"
@@ -125,6 +131,34 @@ export default function ReturnsPage() {
     });
     return () => { cancelled = true; };
   }, [role]);
+
+  // After data loads, resolve the real DB name for every org_id present in the
+  // rows. This catches the case where list_workspace_organizations_for_admin()
+  // returned a raw UUID as display_name (happens when company_display_name is
+  // NULL in organization_settings but organizations.name has the real value).
+  useEffect(() => {
+    if (role !== "super_admin") return;
+    const orgIds = new Set<string>();
+    for (const r of returns)  if (r.organization_id) orgIds.add(r.organization_id);
+    for (const p of packages) if (p.organization_id) orgIds.add(p.organization_id);
+    for (const p of pallets)  if (p.organization_id) orgIds.add(p.organization_id);
+    if (orgIds.size === 0) return;
+    let cancelled = false;
+    void getOrganizationNames([...orgIds]).then((res) => {
+      if (cancelled || !res.ok) return;
+      setExtraOrgLabels((prev) => {
+        const next = { ...prev };
+        for (const row of res.rows) {
+          // Only store when getOrganizationNames found a real name (not UUID fallback)
+          if (row.display_name && row.display_name !== row.organization_id) {
+            next[row.organization_id] = row.display_name;
+          }
+        }
+        return next;
+      });
+    });
+    return () => { cancelled = true; };
+  }, [role, returns, packages, pallets]);
 
   useEffect(() => {
     let cancelled = false;
