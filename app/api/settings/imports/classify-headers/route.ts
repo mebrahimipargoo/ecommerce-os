@@ -81,6 +81,32 @@ const REPORTS_REPOSITORY_FALLBACK_ALIASES: Record<string, string[]> = {
   total_amount:      ["total", "Total", "total-amount", "total amount"],
 };
 
+const REMOVAL_SHIPMENT_FALLBACK_ALIASES: Record<string, string[]> = {
+  order_id:      ["removal-order-id", "order-id", "order_id", "removal_order_id"],
+  sku:           ["sku"],
+  tracking_number: ["tracking-number", "tracking_number", "tracking-id", "tracking id"],
+  carrier:       ["carrier", "carrier-name", "carrier name"],
+  shipment_date: ["carrier-shipment-date", "shipment-date", "ship-date", "shipped-date", "shipment date"],
+};
+
+function applyRemovalShipmentFallbackMapping(
+  headers: string[],
+  existing: Record<string, string>,
+): Record<string, string> {
+  const result = { ...existing };
+  for (const [canonical, aliases] of Object.entries(REMOVAL_SHIPMENT_FALLBACK_ALIASES)) {
+    if (result[canonical]) continue;
+    const normalizedAliases = aliases.map(normH);
+    for (const header of headers) {
+      if (normalizedAliases.includes(normH(header))) {
+        result[canonical] = header;
+        break;
+      }
+    }
+  }
+  return result;
+}
+
 const SETTLEMENT_FLAT_FALLBACK_ALIASES: Record<string, string[]> = {
   settlement_id:         ["settlement-id", "settlement id", "Settlement ID"],
   settlement_start_date: ["settlement-start-date", "settlement start date"],
@@ -207,6 +233,19 @@ export async function POST(req: Request): Promise<Response> {
       return NextResponse.json({ ok: false, error: "Invalid organization scope." }, { status: 400 });
     }
 
+    // Human-readable labels for rule-based matches (no GPT needed)
+    const REPORT_TYPE_HUMAN_LABELS: Record<string, string> = {
+      FBA_RETURNS:        "Amazon FBA Returns Report",
+      REMOVAL_ORDER:      "Amazon Removal Order Detail",
+      REMOVAL_SHIPMENT:   "Amazon Removal Shipment Detail",
+      INVENTORY_LEDGER:   "Amazon Inventory Ledger",
+      REIMBURSEMENTS:     "Amazon Reimbursements Report",
+      SETTLEMENT:         "Amazon Settlement Report",
+      SAFET_CLAIMS:       "Amazon SAFE-T Claims Report",
+      TRANSACTIONS:       "Amazon Transactions Report",
+      REPORTS_REPOSITORY: "Amazon Reports Repository Export",
+    };
+
     // ── Step 1: Rule-based classification (ALWAYS runs first) ─────────────────
     // Rules are deterministic and must take priority over any cached mapping —
     // a past wrong mapping should never override a clear rule match.
@@ -214,6 +253,9 @@ export async function POST(req: Request): Promise<Response> {
     let reportType: RawReportType = rules.reportType;
     let aiColumnMapping: Record<string, string> = {};
     let source: "memory" | "rules" | "gpt" | "rules+gpt" | "filename" | "content_sample" = "rules";
+    let detectedFileType: string = REPORT_TYPE_HUMAN_LABELS[reportType] ?? reportType;
+    let isSupported: boolean = (reportType as string) !== "UNKNOWN";
+    let aiMessage: string = "";
 
     // ── Step 0: MAPPING MEMORY — only when rules say UNKNOWN ──────────────────
     // Compute a deterministic fingerprint from the sorted lowercase header list.
@@ -245,13 +287,17 @@ export async function POST(req: Request): Promise<Response> {
           "[classify-headers] Mapping Memory hit (rules=UNKNOWN) — pre-filling prior mapping for fingerprint:",
           fingerprint.slice(0, 60),
         );
+        const memType = memoryRow.report_type as string;
         return NextResponse.json({
           ok: true,
-          report_type: memoryRow.report_type as RawReportType,
+          report_type: memType as RawReportType,
           column_mapping: memoryRow.column_mapping as Record<string, string>,
           needs_mapping: true,
           rule: "memory",
           source: "memory",
+          detected_file_type: REPORT_TYPE_HUMAN_LABELS[memType] ?? memType,
+          is_supported: memType !== "UNKNOWN",
+          message: `Previously recognized as ${REPORT_TYPE_HUMAN_LABELS[memType] ?? memType}.`,
         });
       }
     }
@@ -261,6 +307,9 @@ export async function POST(req: Request): Promise<Response> {
       const gptResult = await classifyImportHeadersWithGpt({ organizationId: orgId, headers });
       reportType = gptResult.reportType;
       aiColumnMapping = gptResult.columnMapping;
+      detectedFileType = gptResult.detectedFileType;
+      isSupported = gptResult.isSupported;
+      aiMessage = gptResult.message;
       source = "gpt";
     }
 
@@ -280,7 +329,9 @@ export async function POST(req: Request): Promise<Response> {
     // When required canonical fields are still unmapped after rule + AI passes,
     // scan the actual CSV headers against well-known alias lists and fill gaps.
     let column_mapping = merged;
-    if ((reportType as string) === "SAFET_CLAIMS") {
+    if ((reportType as string) === "REMOVAL_SHIPMENT") {
+      column_mapping = applyRemovalShipmentFallbackMapping(headers, merged);
+    } else if ((reportType as string) === "SAFET_CLAIMS") {
       column_mapping = applySafeTFallbackMapping(headers, merged);
     } else if ((reportType as string) === "SETTLEMENT") {
       column_mapping = applySettlementFlatFallbackMapping(headers, merged);
@@ -312,6 +363,14 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     // ── Step 4: Determine if manual intervention is required ───────────────────
+    // Update is_supported + detectedFileType if reportType was remapped by filename/content rules
+    if ((reportType as string) !== "UNKNOWN") {
+      isSupported = true;
+      if (!detectedFileType || detectedFileType === "Unknown File" || detectedFileType === "UNKNOWN") {
+        detectedFileType = REPORT_TYPE_HUMAN_LABELS[reportType as string] ?? reportType;
+      }
+    }
+
     const needs_mapping =
       (reportType as string) === "UNKNOWN" ||
       ((reportType as string) !== "UNKNOWN" && mappingHasRequiredGaps(column_mapping, reportType));
@@ -323,6 +382,12 @@ export async function POST(req: Request): Promise<Response> {
       needs_mapping,
       rule: rules.matchedRule,
       source,
+      detected_file_type: detectedFileType,
+      is_supported: isSupported,
+      message: aiMessage || (isSupported
+        ? `Recognized as ${detectedFileType}.`
+        : `This file was identified as "${detectedFileType}" but is not yet supported.`
+      ),
     });
   } catch (e) {
     return NextResponse.json(

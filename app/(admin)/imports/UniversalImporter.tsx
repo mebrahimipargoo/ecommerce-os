@@ -71,6 +71,7 @@ type Phase =
   | "uploading"       // Phase 1 in progress
   | "mapped"          // Phase 1 done — ready for Process
   | "needs_mapping"   // Phase 1 done but AI mapping incomplete
+  | "unsupported"     // AI identified file but it is not a supported report type
   | "processing"      // Phase 2 in progress
   | "staged"          // Phase 2 done — ready for Sync
   | "syncing"         // Phase 3 in progress
@@ -597,6 +598,9 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         report_type?: string;
         column_mapping?: Record<string, string>;
         needs_mapping?: boolean;
+        detected_file_type?: string;
+        is_supported?: boolean;
+        message?: string;
         error?: string;
       };
 
@@ -615,6 +619,9 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       }
       const columnMapping = (clsRes.ok && clsJson.ok ? clsJson.column_mapping : null) ?? {};
       const needsMapping = (clsRes.ok && clsJson.ok ? clsJson.needs_mapping : true) ?? true;
+      const detectedFileTypeName = clsJson.detected_file_type ?? (resolvedType !== "UNKNOWN" ? resolvedType : null);
+      const isSupported = clsJson.is_supported !== false; // default true for backward-compat
+      const aiMessage = clsJson.message ?? "";
 
       // ── STEP 6: Update DB — classification + file path + store + row count ──
       await updateUploadSessionClassification({
@@ -633,21 +640,31 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       });
 
       // ── STEP 7: Set final status ──────────────────────────────────────────────
+      const dbTargetStatus = (!isSupported || needsMapping) ? "needs_mapping" : "mapped";
       await finalizeRawReportUpload({
         uploadId,
         actorUserId: actor,
-        targetStatus: needsMapping ? "needs_mapping" : "mapped",
+        targetStatus: dbTargetStatus,
       });
 
       // ── STEP 8: Force UI update again ─────────────────────────────────────────
       setDetectedType(resolvedType !== "UNKNOWN" ? resolvedType : null);
       bumpHistory();
 
-      if (needsMapping) {
+      if (!isSupported) {
+        setProgressMsg(
+          aiMessage ||
+          `File identified as "${detectedFileTypeName ?? "unknown"}" — no database table configured for this type.`,
+        );
+        setPhase("unsupported");
+      } else if (needsMapping) {
         setProgressMsg("AI mapping incomplete — columns need manual review before processing.");
         setPhase("needs_mapping");
       } else {
-        setProgressMsg(`AI detected: ${resolvedType}. Click Process Data to stage rows.`);
+        setProgressMsg(
+          aiMessage ||
+          `AI recognized: ${detectedFileTypeName ?? resolvedType}. Click Process Data to stage rows.`,
+        );
         setPhase("mapped");
       }
     } catch (e) {
@@ -933,6 +950,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                 <span>
                   {phase === "mapped" ? "✓ mapped"
                    : phase === "needs_mapping" ? "⚠ needs review"
+                   : phase === "unsupported" ? "🚫 not supported"
                    : (isUploading && uploadPct === 100) ? "running…"
                    : isUploading ? "pending…"
                    : "✓ done"}
@@ -944,10 +962,12 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                 )}
                 <div
                   className={`h-full rounded-full transition-all duration-500 ${
-                    phase === "needs_mapping" ? "bg-amber-500" : "bg-violet-500"
+                    phase === "needs_mapping" ? "bg-amber-500"
+                    : phase === "unsupported" ? "bg-rose-500"
+                    : "bg-violet-500"
                   }`}
                   style={{
-                    width: ["mapped","needs_mapping","processing","staged","syncing","synced"].includes(phase)
+                    width: ["mapped","needs_mapping","unsupported","processing","staged","syncing","synced"].includes(phase)
                       ? "100%"
                       : isUploading && uploadPct === 100 ? "55%" : "0%",
                   }}
@@ -968,6 +988,15 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           {phase === "needs_mapping" && (
             <div className="rounded-lg border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-700 dark:text-amber-300">
               ⚠ AI could not fully map columns. Use <strong>Map Columns</strong> in the History table below, then Process.
+            </div>
+          )}
+          {phase === "unsupported" && (
+            <div className="rounded-xl border border-rose-400/50 bg-rose-500/10 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">
+              <p className="font-bold mb-1">🚫 File type not supported</p>
+              <p className="text-xs leading-relaxed">{progressMsg}</p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                To add support, a new database table and ETL mapping must be configured by an admin.
+              </p>
             </div>
           )}
 

@@ -20,6 +20,7 @@ import { BRAND_LOGO_IMG_CLASSNAME } from "../../lib/brand-logo-classes";
 import { uploadOrganizationLogoAction } from "./upload-organization-logo-action";
 import { AgentApiKeysSection } from "./AgentApiKeysSection";
 import { RoleTagCombobox } from "./RoleTagCombobox";
+import { upsertProviderApiKey, getProviderApiKey } from "./organization-api-keys-actions";
 import {
   DEFAULT_CLAIM_AGENT_CONFIG,
   DEFAULT_FEFO,
@@ -470,15 +471,39 @@ export default function SettingsPage() {
     };
   }, [showForm]);
 
-  // ── Hydrate from localStorage ──────────────────────────────────────────────
+  // ── Hydrate from localStorage + DB ────────────────────────────────────────
   useEffect(() => {
     setMounted(true);
-    setConfigs(getAIConfigsFromStorage());
+    const localConfigs = getAIConfigsFromStorage();
+    setConfigs(localConfigs);
     setAssignments(getAIRoleAssignmentsFromStorage());
     setBarcodeMode(getBarcodeModeFromStorage());
     setLabelPrinter(getLabelPrinterFromStorage());
     const saved = localStorage.getItem("mock_saas_plan") as SaasPlan | null;
     if (saved && (PLANS as readonly string[]).includes(saved)) setMockPlan(saved as SaasPlan);
+
+    // Merge OpenAI key from DB — enables cross-device access
+    void getProviderApiKey("OpenAI").then((dbKey) => {
+      if (!dbKey) return;
+      setConfigs((prev) => {
+        const hasOpenAI = prev.some((c) => c.provider === "openai" && c.apiKey.trim());
+        if (hasOpenAI) return prev; // Local key already present — don't overwrite
+        const merged: AIConfig[] = [
+          ...prev,
+          {
+            id: `cfg_db_openai_${Date.now()}`,
+            providerName: "OpenAI",
+            provider: "openai" as AIProvider,
+            baseURL: DEFAULT_BASE_URLS.openai,
+            apiKey: dbKey,
+            role: "default",
+            status: "untested" as AIConfigStatus,
+          },
+        ];
+        setAIConfigsInStorage(merged);
+        return merged;
+      });
+    });
   }, []);
 
   // ── Default store: organization_settings.default_store_id is canonical; localStorage is fallback ─
@@ -755,7 +780,7 @@ export default function SettingsPage() {
   }
 
   // ── Save new AI config ─────────────────────────────────────────────────────
-  function handleAddConfig(e: React.FormEvent) {
+  async function handleAddConfig(e: React.FormEvent) {
     e.preventDefault();
     if (!formData.apiKey.trim())  { showToast("API key is required.", false); return; }
     if (!formData.baseURL.trim()) { showToast("Base URL is required.", false); return; }
@@ -779,7 +804,30 @@ export default function SettingsPage() {
     setFormData(newBlankConfig());
     setShowForm(false);
     setSavingForm(false);
-    showToast("API connection saved.", true);
+
+    // For OpenAI configs: persist key to DB and show explicit DB save result
+    if (newCfg.provider === "openai" && newCfg.apiKey) {
+      try {
+        const res = await upsertProviderApiKey("OpenAI", newCfg.apiKey);
+        if (!res.ok) {
+          console.error("[Settings] DB save failed:", res.error);
+          showToast(
+            `Key saved locally but DB sync failed: ${res.error ?? "unknown error"}. Key won't work cross-device.`,
+            false,
+          );
+        } else {
+          showToast("OpenAI key saved & synced to database ✓ — works on all devices.", true);
+        }
+      } catch (err) {
+        console.error("[Settings] upsertProviderApiKey threw:", err);
+        showToast(
+          `Key saved locally but DB sync threw an error: ${err instanceof Error ? err.message : String(err)}`,
+          false,
+        );
+      }
+    } else {
+      showToast("API connection saved.", true);
+    }
   }
 
   function handleToggleGlobalOverride(id: string) {

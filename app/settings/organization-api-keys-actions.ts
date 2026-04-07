@@ -87,3 +87,70 @@ export async function revokeOrganizationApiKey(
   }
 }
 
+// ── LLM Provider keys (plaintext, cross-device) ────────────────────────────
+// These rows store the actual plaintext API key (not a digest) so the server
+// can read and forward it to third-party AI providers (OpenAI, Gemini, etc.).
+// They are distinguished from workspace agent keys by role = 'llm_provider'.
+
+/**
+ * Upserts an LLM provider key (e.g. OpenAI) into organization_api_keys.
+ * Stored as plaintext so server-side AI calls can use it directly.
+ * Rows are identified by (organization_id, name, role='llm_provider').
+ */
+export async function upsertProviderApiKey(
+  name: string,
+  plaintextKey: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const orgId = resolveOrganizationId();
+  const safeName = name.trim().slice(0, 200) || "LLM Provider";
+  try {
+    // Delete any existing row with the same name to simulate upsert
+    // (organization_api_keys may not have a unique constraint on name+org)
+    await supabaseServer
+      .from("organization_api_keys")
+      .delete()
+      .eq("organization_id", orgId)
+      .eq("name", safeName)
+      .eq("role", "llm_provider");
+
+    const { error } = await supabaseServer
+      .from("organization_api_keys")
+      .insert({
+        organization_id: orgId,
+        name: safeName,
+        role: "llm_provider",
+        api_key: plaintextKey.trim(),
+      });
+
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Upsert failed." };
+  }
+}
+
+/**
+ * Fetches the plaintext LLM provider key by name.
+ * Returns null if not found.
+ */
+export async function getProviderApiKey(
+  name: string,
+): Promise<string | null> {
+  const orgId = resolveOrganizationId();
+  try {
+    const { data } = await supabaseServer
+      .from("organization_api_keys")
+      .select("api_key")
+      .eq("organization_id", orgId)
+      .eq("name", name.trim())
+      .eq("role", "llm_provider")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const key = data?.api_key?.trim();
+    return key || null;
+  } catch {
+    return null;
+  }
+}
+

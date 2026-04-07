@@ -168,6 +168,8 @@ REMOVAL_FIELD_MAP: dict[str, list[str]] = {
     "cancelled_quantity": ["cancelled-quantity", "cancelled_quantity"],
     "disposed_quantity":  ["disposed-quantity", "disposed_quantity"],
     "tracking_number":    ["tracking-number", "tracking_number"],
+    "carrier":            ["carrier", "carrier-name", "carrier_name"],
+    "shipment_date":      ["carrier-shipment-date", "shipment-date", "ship-date", "shipped-date"],
     "order_date":         ["request-date", "order-date", "order_date", "request_date"],
 }
 
@@ -590,17 +592,66 @@ def _run_sync_removals(
             _update_task(task_id, 100, "No valid removal rows extracted (missing order_id).", status="completed")
             return
 
-        _update_task(task_id, 40, f"Inserting {len(removal_rows)} rows into amazon_removals...")
+        # ── Smart Merge: fetch existing (order_id, sku) keys to enable UPSERT-like
+        # behaviour without requiring a DB unique constraint.
+        # File 1 (Removal Order Detail): has quantities/disposition, NO tracking_number
+        # File 2 (Removal Shipment Detail): has tracking_number/carrier, fills the gap
+        _update_task(task_id, 38, "Fetching existing amazon_removals keys for merge check...")
+        print(f"[sync-removals] Fetching existing (order_id, sku) keys from amazon_removals...")
+        try:
+            existing_res = (
+                db.table("amazon_removals")
+                .select("id, order_id, sku")
+                .eq("organization_id", organization_id)
+                .execute()
+            )
+            existing_map: dict[tuple[str, str], str] = {
+                (str(r["order_id"]), str(r["sku"])): str(r["id"])
+                for r in (existing_res.data or [])
+                if r.get("order_id") and r.get("sku")
+            }
+        except Exception as fetch_ex:
+            print(f"[sync-removals] WARNING: could not fetch existing rows — will INSERT all: {fetch_ex!s}")
+            existing_map = {}
+
+        print(f"[sync-removals] Found {len(existing_map)} existing rows to merge against")
+
+        rows_to_insert: list[dict[str, Any]] = []
+        rows_to_update: list[tuple[str, dict[str, Any]]] = []  # (id, patch)
+
+        for row in removal_rows:
+            key = (str(row.get("order_id", "")), str(row.get("sku", "")))
+            if key[0] and key[1] and key in existing_map:
+                # Merge — only send non-null fields so existing data is never wiped
+                patch = {
+                    k: v for k, v in row.items()
+                    if v is not None and k not in ("organization_id", "upload_id")
+                }
+                rows_to_update.append((existing_map[key], patch))
+            else:
+                rows_to_insert.append(row)
+
+        print(f"[sync-removals] {len(rows_to_insert)} to INSERT, {len(rows_to_update)} to MERGE-UPDATE")
+
+        _update_task(task_id, 40, f"Writing {len(removal_rows)} rows to amazon_removals...")
 
         inserted = 0
-        total = len(removal_rows)
-        for i in range(0, total, STAGING_INSERT_BATCH):
-            chunk = removal_rows[i : i + STAGING_INSERT_BATCH]
-            print(f"[sync-removals] Inserting chunk {i}–{i + len(chunk)} into amazon_removals")
+        total_insert = len(rows_to_insert)
+        for i in range(0, total_insert, STAGING_INSERT_BATCH):
+            chunk = rows_to_insert[i : i + STAGING_INSERT_BATCH]
+            print(f"[sync-removals] Inserting chunk {i}–{i + len(chunk)}")
             db.table("amazon_removals").insert(chunk).execute()
             inserted += len(chunk)
-            progress = 40 + int((inserted / total) * 40)
-            _update_task(task_id, progress, f"Inserted {inserted}/{total} rows into amazon_removals...")
+            progress = 40 + int((inserted / max(len(removal_rows), 1)) * 35)
+            _update_task(task_id, progress, f"Inserted {inserted}/{total_insert} new rows...")
+
+        merged_count = 0
+        for row_id, patch in rows_to_update:
+            db.table("amazon_removals").update(patch).eq("id", row_id).execute()
+            merged_count += 1
+            if merged_count % 50 == 0:
+                progress = 75 + int((merged_count / max(len(rows_to_update), 1)) * 10)
+                _update_task(task_id, progress, f"Merged {merged_count}/{len(rows_to_update)} existing rows...")
 
         _update_task(task_id, 85, f"Cleaning up {len(staging_ids)} rows from amazon_staging...")
         print(f"[sync-removals] Deleting {len(staging_ids)} staging rows by id")
@@ -609,11 +660,12 @@ def _run_sync_removals(
             id_chunk = staging_ids[i : i + STAGING_INSERT_BATCH]
             db.table("amazon_staging").delete().in_("id", id_chunk).execute()
 
-        print(f"[sync-removals] DONE — {inserted} rows moved to amazon_removals")
+        summary = f"inserted={inserted}, merged={merged_count}"
+        print(f"[sync-removals] DONE — {summary}")
         _update_task(
             task_id,
             100,
-            f"Sync complete. {inserted} rows moved to amazon_removals.",
+            f"Sync complete. {summary} rows written to amazon_removals.",
             status="completed",
         )
 
@@ -736,33 +788,87 @@ def _run_generate_worklist(
         _update_task(task_id, 0, f"Row-building failed: {build_err!s}", status="failed")
         return
 
-    # --- Insert into expected_packages ---
+    # --- Sync into expected_packages (fetch → compare → insert new / update existing) ---
+    # Strategy: fetch existing (organization_id, order_id, sku) keys first, then:
+    #   • Row doesn't exist yet   → INSERT the full package row
+    #   • Row already exists      → UPDATE with all non-null fields from amazon_removals
+    #     This is what fills in tracking_number / carrier when the Shipment file arrives
+    #     after the Order Detail file has already created the expected_packages rows.
     try:
-        _update_task(task_id, 40, f"Inserting {len(package_rows)} rows into expected_packages...")
+        _update_task(task_id, 38, "Fetching existing expected_packages keys for sync check...")
+        print("[generate-worklist] Fetching existing (order_id, sku) keys from expected_packages...")
 
+        existing_pkg_res = (
+            db.table("expected_packages")
+            .select("id, order_id, sku")
+            .eq("organization_id", organization_id)
+            .execute()
+        )
+        existing_pkg_map: dict[tuple[str, str], str] = {
+            (str(r["order_id"]), str(r["sku"])): str(r["id"])
+            for r in (existing_pkg_res.data or [])
+            if r.get("order_id") and r.get("sku")
+        }
+        print(f"[generate-worklist] Found {len(existing_pkg_map)} existing expected_packages rows")
+
+    except Exception as fetch_existing_err:
+        print(f"[generate-worklist] WARNING: could not fetch existing expected_packages — will INSERT all: {fetch_existing_err!s}")
+        existing_pkg_map = {}
+
+    try:
+        pkg_to_insert: list[dict[str, Any]] = []
+        pkg_to_update: list[tuple[str, dict[str, Any]]] = []  # (id, patch)
+
+        for pkg in package_rows:
+            key = (str(pkg.get("order_id", "")), str(pkg.get("sku", "")))
+            if key[0] and key[1] and key in existing_pkg_map:
+                # Build a patch from non-null fields only — never wipe existing data
+                # Crucially: this overwrites NULL tracking_number with the real value
+                patch = {
+                    k: v for k, v in pkg.items()
+                    if v is not None and k not in ("organization_id", "upload_id", "order_status")
+                }
+                if patch:
+                    pkg_to_update.append((existing_pkg_map[key], patch))
+            else:
+                pkg_to_insert.append(pkg)
+
+        print(f"[generate-worklist] {len(pkg_to_insert)} to INSERT, {len(pkg_to_update)} to UPDATE")
+
+        _update_task(task_id, 40, f"Writing {len(package_rows)} rows to expected_packages...")
+
+        # Batch INSERT new rows
         inserted = 0
-        total = len(package_rows)
-        for i in range(0, total, STAGING_INSERT_BATCH):
-            chunk = package_rows[i : i + STAGING_INSERT_BATCH]
+        for i in range(0, len(pkg_to_insert), STAGING_INSERT_BATCH):
+            chunk = pkg_to_insert[i : i + STAGING_INSERT_BATCH]
             print(f"[generate-worklist] Inserting chunk {i}–{i + len(chunk)} into expected_packages")
-            # Using insert() instead of upsert() to avoid dependency on a unique constraint
-            # during initial testing. Switch back to upsert() once the constraint is confirmed.
             db.table("expected_packages").insert(chunk).execute()
             inserted += len(chunk)
-            progress = 40 + int((inserted / total) * 55)
-            _update_task(task_id, progress, f"Inserted {inserted}/{total} rows into expected_packages...")
+            progress = 40 + int((inserted / max(len(package_rows), 1)) * 30)
+            _update_task(task_id, progress, f"Inserted {inserted}/{len(pkg_to_insert)} new rows...")
 
-        print(f"[generate-worklist] DONE — {inserted} rows inserted into expected_packages")
+        # UPDATE existing rows (fills in tracking_number, carrier, etc.)
+        updated = 0
+        for row_id, patch in pkg_to_update:
+            print(f"[generate-worklist] Updating expected_packages id={row_id} patch_keys={list(patch.keys())}")
+            db.table("expected_packages").update(patch).eq("id", row_id).execute()
+            updated += 1
+            if updated % 50 == 0:
+                progress = 70 + int((updated / max(len(pkg_to_update), 1)) * 25)
+                _update_task(task_id, progress, f"Updated {updated}/{len(pkg_to_update)} existing rows...")
+
+        summary = f"inserted={inserted}, updated={updated}"
+        print(f"[generate-worklist] DONE — {summary}")
         _update_task(
             task_id,
             100,
-            f"Worklist generated. {inserted} packages inserted into expected_packages.",
+            f"Worklist synced. {summary} rows in expected_packages.",
             status="completed",
         )
 
-    except Exception as insert_err:
-        print(f"[generate-worklist] INSERT ERROR: {insert_err!s}")
-        _update_task(task_id, 0, f"Insert into expected_packages failed: {insert_err!s}", status="failed")
+    except Exception as sync_err:
+        print(f"[generate-worklist] SYNC ERROR: {sync_err!s}")
+        _update_task(task_id, 0, f"Sync into expected_packages failed: {sync_err!s}", status="failed")
 
 
 # --- ETL Endpoints: Removals Pipeline ---

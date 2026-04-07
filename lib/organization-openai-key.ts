@@ -4,9 +4,31 @@ import { supabaseServer } from "./supabase-server";
 
 /**
  * Reads the OpenAI API key for an organization (server-only).
- * Order: `organization_settings.credentials.openai_api_key`, then `OPENAI_API_KEY` env.
+ *
+ * Priority order:
+ *  1. organization_api_keys WHERE name='OpenAI' AND role='llm_provider'  (saved from Settings UI)
+ *  2. organization_settings.credentials.openai_api_key                   (legacy path)
+ *  3. OPENAI_API_KEY env variable                                         (server default)
  */
 export async function getOrganizationOpenAIApiKey(organizationId: string): Promise<string | null> {
+  // 1. Check organization_api_keys (plaintext provider key saved from Settings page)
+  try {
+    const { data: keyRow } = await supabaseServer
+      .from("organization_api_keys")
+      .select("api_key")
+      .eq("organization_id", organizationId)
+      .eq("name", "OpenAI")
+      .eq("role", "llm_provider")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const dbKey = keyRow?.api_key?.trim();
+    if (dbKey) return dbKey;
+  } catch {
+    /* ignore — fall through to legacy path */
+  }
+
+  // 2. Legacy: organization_settings.credentials.openai_api_key
   try {
     const { data } = await supabaseServer
       .from("organization_settings")
@@ -19,6 +41,8 @@ export async function getOrganizationOpenAIApiKey(organizationId: string): Promi
   } catch {
     /* ignore */
   }
+
+  // 3. Server env fallback
   const env = process.env.OPENAI_API_KEY?.trim();
   return env || null;
 }
