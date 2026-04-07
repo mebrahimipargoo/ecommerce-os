@@ -341,7 +341,7 @@ export default function ScannerPage() {
             {phase === "found" && (
               <section className="flex flex-col gap-3">
                 <StepBadge n={2} label="Scan Item SKU" />
-                <form onSubmit={handleSkuScan} className="flex gap-2">
+                <form onSubmit={handleSkuSubmit} className="flex gap-2">
                   <input
                     ref={skuRef}
                     type="text"
