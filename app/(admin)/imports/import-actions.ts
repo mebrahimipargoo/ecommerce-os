@@ -248,8 +248,10 @@ export async function createRawReportUploadSession(input: {
   totalBytes: number;
   /** Header classification + user selection — persisted as `raw_report_uploads.report_type`. */
   reportType: RawReportType;
-  /** Lowercase hex MD5 of full file content */
+  /** Lowercase hex MD5 of full file content (32 hex) — API validation; may be SHA-256 prefix for compat */
   md5Hash: string;
+  /** Lowercase hex SHA-256 of entire file (64 hex). When set, re-importing the same file removes prior REMOVAL_ORDER data. */
+  contentSha256?: string | null;
   fileExtension: string;
   fileSizeBytes: number;
   uploadChunksCount: number;
@@ -290,6 +292,11 @@ export async function createRawReportUploadSession(input: {
   console.info("[createRawReportUploadSession] inserting org:", orgId, "| actor:", userId, "| file:", input.fileName);
 
   /** Technical tracking lives only in `metadata` JSONB. */
+  const sha =
+    typeof input.contentSha256 === "string" && /^[a-f0-9]{64}$/.test(input.contentSha256.trim().toLowerCase())
+      ? input.contentSha256.trim().toLowerCase()
+      : undefined;
+
   const metadata = mergeUploadMetadata(null, {
     total_bytes: input.totalBytes,
     storage_prefix: storagePrefix,
@@ -297,6 +304,7 @@ export async function createRawReportUploadSession(input: {
     uploaded_bytes: 0,
     process_progress: 0,
     md5_hash: md5,
+    ...(sha ? { content_sha256: sha } : {}),
     file_extension: input.fileExtension,
     file_size_bytes: input.fileSizeBytes,
     upload_chunks_count: input.uploadChunksCount,
@@ -403,6 +411,7 @@ export async function updateUploadSessionClassification(input: {
   }
   if (input.storeId && isUuidString(input.storeId)) {
     metaPatch.ledger_store_id = input.storeId;
+    metaPatch.import_store_id = input.storeId;
   }
   if (typeof input.totalRows === "number" && Number.isFinite(input.totalRows)) {
     metaPatch.total_rows = input.totalRows;
@@ -891,6 +900,7 @@ export async function deleteRawReportUpload(
   const AMAZON_DOMAIN_TABLES = [
     "amazon_returns",
     "amazon_removals",
+    "amazon_removal_shipments",
     "amazon_inventory_ledger",
     "amazon_reimbursements",
     "amazon_settlements",
@@ -923,4 +933,48 @@ export async function deleteRawReportUpload(
   if (delErr) return { ok: false, error: delErr.message };
 
   return { ok: true };
+}
+
+/**
+ * REMOVAL_ORDER Sync (Phase 3): if the user re-uploads the same file bytes, delete older
+ * `raw_report_uploads` rows (and their domain/storage data) that share `metadata.content_sha256`,
+ * so removals/worklist do not accumulate duplicates. Requires `content_sha256` on the current upload.
+ */
+export async function removeOlderRemovalImportsWithSameFileContent(
+  organizationId: string,
+  currentUploadId: string,
+  metadata: unknown,
+): Promise<{ ok: true; removedUploadIds: string[] } | { ok: false; error: string }> {
+  if (!isUuidString(organizationId) || !isUuidString(currentUploadId)) {
+    return { ok: false, error: "Invalid ids." };
+  }
+  const m = metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    ? (metadata as Record<string, unknown>)
+    : {};
+  const contentSha256 =
+    typeof m.content_sha256 === "string" ? m.content_sha256.trim().toLowerCase() : "";
+  if (!/^[a-f0-9]{64}$/.test(contentSha256)) {
+    return { ok: true, removedUploadIds: [] };
+  }
+
+  try {
+    const { data: rows, error } = await supabaseServer
+      .from(DB_TABLES.rawReportUploads)
+      .select("id")
+      .eq("organization_id", organizationId)
+      .eq("report_type", "REMOVAL_ORDER")
+      .neq("id", currentUploadId)
+      .contains("metadata", { content_sha256: contentSha256 });
+
+    if (error) return { ok: false, error: error.message };
+    const ids = (rows ?? []).map((r) => String((r as { id: unknown }).id)).filter(isUuidString);
+    const removedUploadIds: string[] = [];
+    for (const id of ids) {
+      const del = await deleteRawReportUpload(id, null);
+      if (del.ok) removedUploadIds.push(id);
+    }
+    return { ok: true, removedUploadIds };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Cleanup failed." };
+  }
 }

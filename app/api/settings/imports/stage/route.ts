@@ -162,7 +162,7 @@ export async function POST(req: Request): Promise<Response> {
     // Validate report_type early so Phase 3 (Sync) won't fail with "unknown type".
     const reportTypeRaw = String((row as { report_type?: unknown }).report_type ?? "").trim();
     const knownTypes = [
-      "FBA_RETURNS", "REMOVAL_ORDER", "INVENTORY_LEDGER",
+      "FBA_RETURNS", "REMOVAL_ORDER", "REMOVAL_SHIPMENT", "INVENTORY_LEDGER",
       "REIMBURSEMENTS", "SETTLEMENT", "SAFET_CLAIMS", "TRANSACTIONS", "REPORTS_REPOSITORY",
       "fba_customer_returns", "inventory_ledger", "safe_t_claims",
       "reimbursements", "settlement_repository", "transaction_view",

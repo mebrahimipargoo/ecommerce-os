@@ -12,7 +12,8 @@
  *   6. router.refresh()
  *   STOP — no CSV row parsing, no chunking here.
  *
- * Phase 2 (Process) and Phase 3 (Sync) are triggered from the History table.
+ * Phase 2 (Process), Phase 3 (Sync), and Phase 4 (Generate Worklist for removals)
+ * are triggered from this panel.
  */
 
 import React, { useEffect, useRef, useState } from "react";
@@ -75,7 +76,9 @@ type Phase =
   | "processing"      // Phase 2 in progress
   | "staged"          // Phase 2 done — ready for Sync
   | "syncing"         // Phase 3 in progress
-  | "synced"          // Phase 3 done
+  | "synced"          // Phase 3 done (removal files: ready for Phase 4)
+  | "worklisting"     // Phase 4 in progress (expected_packages)
+  | "worklisted"      // Phase 4 done
   | "error";
 
 type StoreOption = { id: string; name: string; platform: string; is_default?: boolean | null };
@@ -182,6 +185,9 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   const [processedRows, setProcessedRows] = useState(0);
   const [processPct, setProcessPct] = useState(0);
   const [syncPct, setSyncPct] = useState(0);
+  const [worklistPct, setWorklistPct] = useState(0);
+  /** Remount Phase 4 bar so width/transition does not carry over from Phase 3’s completed state. */
+  const [worklistBarEpoch, setWorklistBarEpoch] = useState(0);
 
   const pollRef2 = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -193,7 +199,11 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   const isUploading = phase === "uploading";
   const isProcessing = phase === "processing";
   const isSyncing = phase === "syncing";
-  const isActive = isUploading || isProcessing || isSyncing;
+  const isWorklisting = phase === "worklisting";
+  const isActive = isUploading || isProcessing || isSyncing || isWorklisting;
+
+  const isRemovalReport =
+    detectedType === "REMOVAL_ORDER" || detectedType === "REMOVAL_SHIPMENT";
 
   const dateRangeValid = importFullFile || (!!startDate && !!endDate && startDate <= endDate);
   const needsDateRange = reportTypeChoice === "INVENTORY_LEDGER" && !importFullFile;
@@ -301,6 +311,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     setProcessedRows(0);
     setProcessPct(0);
     setSyncPct(0);
+    setWorklistPct(0);
+    setWorklistBarEpoch(0);
     stopRef.current = false;
     if (pollRef2.current) { clearInterval(pollRef2.current); pollRef2.current = null; }
   }
@@ -411,15 +423,79 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ upload_id: sessionUploadId }),
       });
-      const json = (await res.json()) as { ok?: boolean; error?: string; rowsSynced?: number };
+      const json = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        rowsSynced?: number;
+        kind?: string;
+      };
       if (!res.ok || !json.ok) throw new Error(json.error ?? "Sync failed.");
+      if (json.kind === "REMOVAL_ORDER" || json.kind === "REMOVAL_SHIPMENT") {
+        setDetectedType(json.kind);
+      }
       setSyncPct(100);
-      setProgressMsg(`Sync complete — ${json.rowsSynced?.toLocaleString() ?? "?"} rows written.`);
+      const rows = json.rowsSynced?.toLocaleString() ?? "?";
+      const removal = json.kind === "REMOVAL_ORDER" || json.kind === "REMOVAL_SHIPMENT";
+      setProgressMsg(
+        removal
+          ? json.kind === "REMOVAL_SHIPMENT"
+            ? `Phase 3 complete — ${rows} shipment line(s) archived to amazon_removal_shipments; tracking applied to amazon_removals where rows matched. Run Generate Worklist (Phase 4) for expected_packages.`
+            : `Phase 3 complete — ${rows} row(s) synced to amazon_removals. Run Generate Worklist (Phase 4) for expected_packages.`
+          : `Sync complete — ${rows} rows written.`,
+      );
       setPhase("synced");
       bumpHistory();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Sync failed.");
       setPhase("staged");
+      bumpHistory();
+    } finally {
+      if (pollRef2.current) {
+        clearInterval(pollRef2.current);
+        pollRef2.current = null;
+      }
+    }
+  }
+
+  /** Phase 4 (removal imports only): FastAPI → expected_packages worklist for the warehouse scanner. */
+  async function runWorklist() {
+    if (!sessionUploadId) return;
+    setErr(null);
+    setWorklistBarEpoch((n) => n + 1);
+    setWorklistPct(0);
+    setPhase("worklisting");
+    setProgressMsg("Building expected_packages worklist…");
+
+    const uploadIdSnap = sessionUploadId;
+    if (pollRef2.current) clearInterval(pollRef2.current);
+    pollRef2.current = setInterval(() => {
+      void supabase
+        .from("raw_report_uploads")
+        .select("metadata")
+        .eq("id", uploadIdSnap)
+        .maybeSingle()
+        .then(({ data }) => {
+          const m = data?.metadata as Record<string, unknown> | null;
+          if (!m) return;
+          if (typeof m.worklist_progress === "number") setWorklistPct(m.worklist_progress);
+        });
+    }, 400);
+
+    try {
+      const res = await fetch("/api/settings/imports/generate-worklist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_id: sessionUploadId }),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string; message?: string };
+      if (!res.ok || !json.ok) throw new Error(json.error ?? "Worklist generation failed.");
+      setWorklistPct(100);
+      setProgressMsg(json.message?.trim() || "expected_packages worklist is ready.");
+      setPhase("worklisted");
+      bumpHistory();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Worklist generation failed.");
+      setPhase("synced");
       bumpHistory();
     } finally {
       if (pollRef2.current) {
@@ -694,8 +770,10 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         </span>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        Drop a file → <strong>Upload &amp; AI Map</strong> (Phase 1) → <strong>Process Data</strong> (Phase 2) → <strong>Sync to Tables</strong> (Phase 3).
-        All three phases are managed here. History mirrors every status change below.
+        <strong>Removal Order / Removal Shipment</strong> files use four steps: Upload → Process → Sync to{" "}
+        <code className="rounded bg-muted px-1">amazon_removals</code> →{" "}
+        <strong>Generate Worklist</strong> (<code className="rounded bg-muted px-1">expected_packages</code>).
+        Other report types use three steps. History mirrors every status change below.
       </p>
 
       {/* Error */}
@@ -967,7 +1045,17 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                     : "bg-violet-500"
                   }`}
                   style={{
-                    width: ["mapped","needs_mapping","unsupported","processing","staged","syncing","synced"].includes(phase)
+                    width: [
+                      "mapped",
+                      "needs_mapping",
+                      "unsupported",
+                      "processing",
+                      "staged",
+                      "syncing",
+                      "synced",
+                      "worklisting",
+                      "worklisted",
+                    ].includes(phase)
                       ? "100%"
                       : isUploading && uploadPct === 100 ? "55%" : "0%",
                   }}
@@ -977,7 +1065,14 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           </div>
 
           {/* ── AI detected label ─────────────────────────────────────────────── */}
-          {detectedType && (phase === "mapped" || phase === "processing" || phase === "staged" || phase === "syncing" || phase === "synced") && (
+          {detectedType &&
+            (phase === "mapped" ||
+              phase === "processing" ||
+              phase === "staged" ||
+              phase === "syncing" ||
+              phase === "synced" ||
+              phase === "worklisting" ||
+              phase === "worklisted") && (
             <div className="flex items-center gap-2 rounded-lg border border-emerald-400/40 bg-emerald-500/10 px-3 py-2">
               <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" aria-hidden />
               <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-300">
@@ -1001,7 +1096,12 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           )}
 
           {/* ── Phase 2 bar (Process) ─────────────────────────────────────────── */}
-          {(phase === "processing" || phase === "staged" || phase === "syncing" || phase === "synced") && (
+          {(phase === "processing" ||
+            phase === "staged" ||
+            phase === "syncing" ||
+            phase === "synced" ||
+            phase === "worklisting" ||
+            phase === "worklisted") && (
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
                 <span>Phase 2 — Processing to Staging</span>
@@ -1030,11 +1130,20 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           )}
 
           {/* ── Phase 3 bar (Sync) ────────────────────────────────────────────── */}
-          {(phase === "syncing" || phase === "synced") && (
+          {(phase === "syncing" ||
+            phase === "synced" ||
+            phase === "worklisting" ||
+            phase === "worklisted") && (
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span>Phase 3 — Sync to Final Tables</span>
-                <span className={phase === "synced" ? "text-emerald-500" : "tabular-nums"}>
+                <span>Phase 3 — Sync to amazon_removals</span>
+                <span
+                  className={
+                    phase === "synced" || phase === "worklisting" || phase === "worklisted"
+                      ? "text-emerald-500"
+                      : "tabular-nums"
+                  }
+                >
                   {phase === "syncing"
                     ? `${Math.max(0, Math.min(100, syncPct))}%`
                     : "✓ complete"}
@@ -1053,6 +1162,48 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
               </div>
             </div>
           )}
+
+          {/* ── Phase 4 bar (Generate Worklist — removal types only) ─────────── */}
+          {isRemovalReport &&
+            (phase === "synced" || phase === "worklisting" || phase === "worklisted") && (
+              <div key={`worklist-bar-${worklistBarEpoch}`}>
+                <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
+                  <span>Phase 4 — Generate Worklist (expected_packages)</span>
+                  <span
+                    className={
+                      phase === "worklisted" ? "text-emerald-500" : "tabular-nums"
+                    }
+                  >
+                    {phase === "worklisting"
+                      ? worklistPct <= 0
+                        ? "starting…"
+                        : `${Math.max(0, Math.min(100, worklistPct))}%`
+                      : phase === "worklisted"
+                        ? "✓ complete"
+                        : "pending"}
+                  </span>
+                </div>
+                <div className="relative h-2 overflow-hidden rounded-full bg-muted">
+                  {phase === "worklisting" && (
+                    <div className="absolute inset-0 animate-pulse rounded-full bg-amber-400/50" />
+                  )}
+                  <div
+                    className="h-full rounded-full bg-amber-500 transition-all duration-500"
+                    style={{
+                      width: `${
+                        phase === "worklisting"
+                          ? worklistPct <= 0
+                            ? 0
+                            : Math.max(3, Math.min(100, worklistPct))
+                          : phase === "worklisted"
+                            ? 100
+                            : 0
+                      }%`,
+                    }}
+                  />
+                </div>
+              </div>
+            )}
         </div>
       )}
 
@@ -1116,6 +1267,24 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           </button>
         )}
 
+        {/* Phase 4: Generate Worklist — removal imports only, after Phase 3 */}
+        {phase === "synced" && isRemovalReport && (
+          <button
+            type="button"
+            onClick={() => void runWorklist()}
+            className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-amber-700"
+          >
+            <CheckCircle2 className="h-4 w-4" aria-hidden />
+            Generate Worklist
+          </button>
+        )}
+        {phase === "worklisting" && (
+          <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
+            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            Generating worklist…
+          </button>
+        )}
+
         {/* Divider when an upload is active */}
         {phase !== "idle" && <span className="mx-1 text-muted-foreground/40">|</span>}
 
@@ -1144,10 +1313,21 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           </button>
         )}
 
-        {/* Synced success note */}
-        {phase === "synced" && (
+        {/* Completion notes */}
+        {phase === "synced" && !isRemovalReport && (
           <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">
-            ✅ All 3 phases complete. Data is in the destination tables.
+            All 3 phases complete. Data is in the destination tables.
+          </p>
+        )}
+        {phase === "synced" && isRemovalReport && (
+          <p className="text-xs font-semibold text-amber-700 dark:text-amber-400">
+            Phase 3 complete (amazon_removals). Click <strong>Generate Worklist</strong> to sync{" "}
+            <code className="rounded bg-muted px-1 text-foreground">expected_packages</code> for the scanner.
+          </p>
+        )}
+        {phase === "worklisted" && isRemovalReport && (
+          <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">
+            All 4 phases complete. Removal data and warehouse worklist are ready.
           </p>
         )}
       </div>

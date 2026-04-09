@@ -1,9 +1,83 @@
 import io
 import json
+import logging
+import math
+import traceback
 import uuid
+from collections import defaultdict, deque
 from typing import Any
 
 import pandas as pd
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("etl")
+
+
+def _pg_text_unique_field(val: Any) -> str | None:
+    """
+    Normalize text fields that participate in PostgreSQL UNIQUE ... NULLS NOT DISTINCT.
+    None, '', and whitespace-only all map to None so Python grouping matches the DB.
+    """
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except TypeError:
+        pass
+    s = str(val).strip()
+    return None if s == "" else s
+
+
+def _safe_int(val: Any) -> int | None:
+    """Coerce any scalar to int; None/NaN/empty → None. Safe for dirty CSV / Supabase JSON."""
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, str) and val.strip() == "":
+        return None
+    try:
+        f = float(str(val).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+    try:
+        if math.isnan(f) or math.isinf(f):
+            return None
+    except TypeError:
+        return None
+    try:
+        return int(f)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _safe_float(val: Any) -> float | None:
+    """Coerce to float for fees; None/NaN/empty → None."""
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, str) and val.strip() == "":
+        return None
+    try:
+        x = float(str(val).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+    if math.isnan(x) or math.isinf(x):
+        return None
+    return x
+
+
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -87,17 +161,20 @@ def _cell_to_json_safe(val: Any) -> Any:
 def _read_tabular_file(content: bytes) -> pd.DataFrame:
     """Read CSV or tab-separated text; infer delimiter (comma vs tab)."""
     buf = io.BytesIO(content)
+    _csv_kw: dict[str, Any] = {
+        "sep": None,
+        "engine": "python",
+        "encoding": "utf-8-sig",
+        "dtype": object,
+        "keep_default_na": False,
+    }
     try:
-        return pd.read_csv(
-            buf,
-            sep=None,
-            engine="python",
-            encoding="utf-8-sig",
-            dtype=object,
-        )
+        return pd.read_csv(buf, **_csv_kw)
     except Exception:
         buf.seek(0)
-        return pd.read_csv(buf, sep="\t", encoding="utf-8-sig", dtype=object)
+        return pd.read_csv(
+            buf, sep="\t", encoding="utf-8-sig", dtype=object, keep_default_na=False,
+        )
 
 
 def _get_from_row(row: dict[str, Any], *candidates: str) -> str | None:
@@ -157,23 +234,68 @@ def _group_key_for_row(row: dict[str, Any]) -> str | None:
 # --- Removal ETL: field mapping and extraction ---
 
 REMOVAL_FIELD_MAP: dict[str, list[str]] = {
-    "order_id":           ["order-id", "order_id", "removal_order_id", "removal-order-id"],
-    "order_type":         ["order-type", "order_type"],
+    "order_id":           [
+        "order-id",
+        "order_id",
+        "removal_order_id",
+        "removal-order-id",
+        "amazon_order_id",
+        "amazon-order-id",
+    ],
+    "order_source":       ["order-source", "order_source", "order source"],
+    "order_type":         ["order-type", "order_type", "order type"],
     "order_status":       ["order-status", "order_status"],
-    "sku":                ["sku"],
+    "sku":                ["sku", "merchant_sku", "merchant-sku"],
     "fnsku":              ["fnsku"],
-    "disposition":        ["disposition"],
+    "disposition":        ["disposition", "fc-disposition", "detailed-disposition"],
     "shipped_quantity":   ["shipped-quantity", "shipped_quantity"],
     "requested_quantity": ["requested-quantity", "requested_quantity", "quantity"],
     "cancelled_quantity": ["cancelled-quantity", "cancelled_quantity"],
     "disposed_quantity":  ["disposed-quantity", "disposed_quantity"],
+    "in_process_quantity": ["in-process-quantity", "in_process_quantity", "in process quantity"],
     "tracking_number":    ["tracking-number", "tracking_number"],
     "carrier":            ["carrier", "carrier-name", "carrier_name"],
     "shipment_date":      ["carrier-shipment-date", "shipment-date", "ship-date", "shipped-date"],
     "order_date":         ["request-date", "order-date", "order_date", "request_date"],
+    "last_updated_date":  ["last-updated-date", "last_updated_date", "last updated date"],
+    "removal_fee":        ["removal-fee", "removal_fee", "removal fee"],
+    "currency":           ["currency"],
 }
 
-_INT_REMOVAL_COLS = {"shipped_quantity", "requested_quantity", "cancelled_quantity", "disposed_quantity"}
+_INT_REMOVAL_COLS = {
+    "shipped_quantity",
+    "requested_quantity",
+    "cancelled_quantity",
+    "disposed_quantity",
+    "in_process_quantity",
+}
+
+
+def _resolve_import_store_id_from_upload(db: Any, organization_id: str, upload_id: str | None) -> str | None:
+    """Reads import_store_id / ledger_store_id from raw_report_uploads.metadata."""
+    if not upload_id:
+        return None
+    try:
+        res = (
+            db.table("raw_report_uploads")
+            .select("metadata")
+            .eq("id", upload_id)
+            .eq("organization_id", organization_id)
+            .limit(1)
+            .execute()
+        )
+        row = (res.data or [None])[0] if isinstance(res.data, list) else res.data
+        meta = row.get("metadata") if isinstance(row, dict) else None
+        if not isinstance(meta, dict):
+            return None
+        raw = meta.get("import_store_id") or meta.get("ledger_store_id")
+        if not raw:
+            return None
+        sid = str(raw).strip()
+        uuid.UUID(sid)
+        return sid
+    except Exception:
+        return None
 
 
 def _extract_removal_row(
@@ -188,14 +310,8 @@ def _extract_removal_row(
     for db_col, candidates in REMOVAL_FIELD_MAP.items():
         val = _get_from_row(raw, *candidates)
         if db_col in _INT_REMOVAL_COLS:
-            if val is not None:
-                try:
-                    result[db_col] = int(float(str(val).replace(",", "")))
-                except (ValueError, TypeError):
-                    result[db_col] = None
-            else:
-                result[db_col] = None
-        elif db_col == "order_date":
+            result[db_col] = _safe_int(val) if val is not None else None
+        elif db_col in ("order_date", "last_updated_date"):
             if val is not None:
                 try:
                     d = pd.to_datetime(val, errors="coerce")
@@ -204,10 +320,179 @@ def _extract_removal_row(
                     result[db_col] = None
             else:
                 result[db_col] = None
+        elif db_col == "removal_fee":
+            result[db_col] = _safe_float(val) if val is not None else None
         else:
             result[db_col] = val
 
+    # Coalesce SKU from FNSKU when the report only lists FNSKU (distinct 5-column keys).
+    if not _pg_text_unique_field(result.get("sku")):
+        fn = _get_from_row(raw, "fnsku", "asin")
+        if fn:
+            result["sku"] = str(fn).strip()
+
+    # Align nullable text columns with DB NULLS NOT DISTINCT semantics before merge/upsert.
+    for nullable in ("sku", "fnsku", "disposition", "tracking_number"):
+        t = _pg_text_unique_field(result.get(nullable))
+        result[nullable] = t
+
     return result
+
+
+# --- Removals UPSERT: one row per amazon_staging line (source_staging_id) — migration 60519 ---
+
+_REMOVALS_CONFLICT = "organization_id,store_id,order_id,sku,fnsku,disposition,requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date,order_type"
+_REMOVAL_SHIPMENT_CONFLICT = (
+    "organization_id,store_id,order_id,tracking_number,sku,fnsku,disposition,"
+    "requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date,order_type"
+)
+_REMOVAL_WRITE_COLS = frozenset(REMOVAL_FIELD_MAP.keys()) | {
+    "organization_id",
+    "upload_id",
+    "raw_data",
+    "source_staging_id",
+    "store_id",
+}
+
+# Columns managed exclusively by Postgres — NEVER send these in upsert/update payloads.
+# Sending `id=None` triggers "null value in column 'id' violates not-null constraint".
+_DB_SYSTEM_COLS = frozenset({"id", "created_at", "updated_at"})
+
+
+def _removal_order_date_key(val: Any) -> str | None:
+    """Normalize date column for identity tuples (YYYY-MM-DD or None)."""
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
+    if hasattr(val, "isoformat"):
+        try:
+            return str(val.isoformat())[:10]
+        except Exception:
+            pass
+    s = str(val).strip()
+    if not s:
+        return None
+    return s[:10]
+
+
+def _removal_null_slot_match_key(r: dict[str, Any]) -> tuple[Any, ...]:
+    """Match shipment staging lines to NULL-tracking removal rows (same logical line)."""
+    return (
+        _pg_text_unique_field(r.get("order_id")),
+        _pg_text_unique_field(r.get("sku")),
+        _pg_text_unique_field(r.get("fnsku")),
+        _pg_text_unique_field(r.get("disposition")),
+        _safe_int(r.get("requested_quantity")),
+        _safe_int(r.get("shipped_quantity")),
+        _safe_int(r.get("disposed_quantity")),
+        _safe_int(r.get("cancelled_quantity")),
+        _removal_order_date_key(r.get("order_date")),
+        _pg_text_unique_field(r.get("order_type")),
+    )
+
+
+def _removal_row_for_write(row: dict[str, Any]) -> dict[str, Any]:
+    return {k: row[k] for k in _REMOVAL_WRITE_COLS if k in row}
+
+
+def _merge_shipment_into_null_slot(existing: dict[str, Any], shipment: dict[str, Any]) -> dict[str, Any]:
+    """Backfill tracking; fill carrier/shipment_date only when existing is empty (Wave 1)."""
+    out = dict(existing)
+    tn = _pg_text_unique_field(shipment.get("tracking_number"))
+    if tn:
+        out["tracking_number"] = tn
+    inc_c = shipment.get("carrier")
+    if inc_c is not None and str(inc_c).strip() != "":
+        if not _pg_text_unique_field(existing.get("carrier")):
+            out["carrier"] = inc_c
+    inc_sd = shipment.get("shipment_date")
+    if inc_sd is not None and str(inc_sd).strip() != "":
+        if existing.get("shipment_date") is None or str(existing.get("shipment_date")).strip() == "":
+            out["shipment_date"] = inc_sd
+    return out
+
+
+# expected_packages: columns we sync from Amazon (DO UPDATE); all other columns are warehouse-owned.
+EXPECTED_PKG_AMAZON_COLS = frozenset({
+    "organization_id",
+    "store_id",
+    "upload_id",
+    "source_staging_id",
+    "order_type",
+    "order_id",
+    "sku",
+    "fnsku",
+    "tracking_number",
+    "shipped_quantity",
+    "requested_quantity",
+    "disposed_quantity",
+    "cancelled_quantity",
+    "order_status",
+    "disposition",
+    "order_date",
+    "carrier",
+    "shipment_date",
+})
+_EXPECTED_PKG_CONFLICT = "organization_id,store_id,order_id,sku,fnsku,disposition,requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date"
+
+
+def _expected_pkg_identity_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    """Wave 1: prefer business key when store_id is set (matches uq_expected_packages_business_line)."""
+    st = row.get("store_id")
+    if st is not None and str(st).strip() != "":
+        return (
+            str(row.get("organization_id", "")),
+            str(st).strip(),
+            _pg_text_unique_field(row.get("order_id")),
+            _pg_text_unique_field(row.get("sku")),
+            _pg_text_unique_field(row.get("fnsku")),
+            _pg_text_unique_field(row.get("disposition")),
+            _safe_int(row.get("requested_quantity")),
+            _safe_int(row.get("shipped_quantity")),
+            _safe_int(row.get("disposed_quantity")),
+            _safe_int(row.get("cancelled_quantity")),
+            _removal_order_date_key(row.get("order_date")),
+        )
+    sid = row.get("source_staging_id")
+    if sid is not None and str(sid).strip() != "":
+        return (
+            str(row.get("organization_id", "")),
+            str(row.get("upload_id", "")),
+            str(sid).strip(),
+        )
+    return (
+        str(row.get("organization_id", "")),
+        _pg_text_unique_field(row.get("order_id")),
+        _pg_text_unique_field(row.get("sku")),
+        _pg_text_unique_field(row.get("fnsku")),
+        _pg_text_unique_field(row.get("disposition")),
+        _safe_int(row.get("requested_quantity")),
+        _safe_int(row.get("shipped_quantity")),
+        _safe_int(row.get("disposed_quantity")),
+        _safe_int(row.get("cancelled_quantity")),
+        _removal_order_date_key(row.get("order_date")),
+    )
+
+
+def _merge_expected_pkg_amazon_only(existing: dict[str, Any], incoming_amazon: dict[str, Any]) -> dict[str, Any]:
+    """Preserve scanner / warehouse fields; overwrite only Amazon-sourced columns."""
+    out = dict(existing)
+    for k, v in incoming_amazon.items():
+        if k in EXPECTED_PKG_AMAZON_COLS:
+            out[k] = v
+    return out
+
+
+def _is_return_order_type_for_worklist(row: dict[str, Any]) -> bool:
+    """expected_packages worklist: only lines where order-type is Return (case-insensitive)."""
+    t = _pg_text_unique_field(row.get("order_type"))
+    if not t:
+        return False
+    return t.strip().lower() == "return"
 
 
 # Data Model for Amazon SP-API Sync
@@ -268,6 +553,33 @@ async def save_raw_amazon_order(order: AmazonOrderSync):
 # --- ETL: Amazon warehouse / removal file staging ---
 
 STAGING_INSERT_BATCH = 500
+# PostgREST caps responses at ~1000 rows unless paged — full-table reads must loop.
+WORKLIST_FETCH_PAGE = 1000
+
+
+def _fetch_org_table_all(
+    db: Any,
+    table: str,
+    organization_id: str,
+) -> list[dict[str, Any]]:
+    """Fetch every row for an org (paginated). Static snapshot; no deletes between pages."""
+    out: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        res = (
+            db.table(table)
+            .select("*")
+            .eq("organization_id", organization_id)
+            .order("id")
+            .range(offset, offset + WORKLIST_FETCH_PAGE - 1)
+            .execute()
+        )
+        chunk = res.data or []
+        out.extend(chunk)
+        if len(chunk) < WORKLIST_FETCH_PAGE:
+            break
+        offset += WORKLIST_FETCH_PAGE
+    return out
 
 
 @app.post("/etl/upload-removal")
@@ -524,13 +836,32 @@ def _run_sync_removals(
     organization_id: str,
     upload_id: str | None,
 ) -> None:
+    """
+    ETL Phase 3: amazon_staging → amazon_removals (+ append-only shipment history).
+
+    Identity: (organization_id, order_id, sku, disposition, tracking_number) with
+    PostgreSQL NULLS NOT DISTINCT.
+
+    Same-key rows in one import are merged: quantity columns are summed; other
+    fields use the last non-null value in file order (Amazon updates win).
+
+    Shipment rows with tracking append to amazon_removal_shipments (full raw history).
+    NULL-tracking DB rows matched on (order_id, sku, disposition) are UPDATED in place
+    (no DELETE) when a shipment line fills in tracking.
+
+    Re-syncs UPSERT so changed order_status / quantities update existing rows.
+    """
     print(f"[sync-removals] START task_id={task_id} org={organization_id} upload_id={upload_id}")
-    _update_task(task_id, 10, "Task is alive. Connecting to database...")
+    log.info(
+        "[sync-removals] START task_id=%s org=%s upload_id=%s",
+        task_id, organization_id, upload_id,
+    )
+    _update_task(task_id, 5, "Task is alive. Connecting to database...")
 
     _url = os.getenv("SUPABASE_URL")
     _key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not _url or not _key:
-        print("[sync-removals] ERROR: Missing Supabase credentials")
+        log.error("[sync-removals] ERROR: Missing Supabase credentials")
         _update_task(task_id, 0, "Missing Supabase credentials in environment.", status="failed")
         return
 
@@ -538,31 +869,46 @@ def _run_sync_removals(
         db = create_client(_url, _key)
         print("[sync-removals] Supabase client created successfully")
     except Exception as conn_err:
-        print(f"[sync-removals] CONNECTION ERROR: {conn_err!s}")
+        log.error("[sync-removals] CONNECTION ERROR: %s", conn_err)
         _update_task(task_id, 0, f"Failed to connect to database: {conn_err!s}", status="failed")
         return
 
-    try:
-        _update_task(task_id, 10, "Fetching rows from amazon_staging...")
-        print(f"[sync-removals] Querying amazon_staging (upload_id filter: {upload_id})")
+    store_id = _resolve_import_store_id_from_upload(db, organization_id, upload_id)
+    if not store_id:
+        log.error("[sync-removals] Missing Imports Target Store on raw_report_uploads metadata")
+        _update_task(
+            task_id,
+            0,
+            "Imports Target Store missing — set import_store_id or ledger_store_id on the upload metadata.",
+            status="failed",
+        )
+        return
+    log.info("[sync-removals] Using store_id=%s", store_id)
 
+    enriched_count = 0
+    unmatched_shipment_rows: list[dict[str, Any]] = []
+    no_tracking_rows: list[dict[str, Any]] = []
+
+    try:
+        # ── Phase 1: Fetch staging rows ───────────────────────────────────────────
+        _update_task(task_id, 10, "Fetching rows from amazon_staging...")
         query = db.table("amazon_staging").select("*").eq("organization_id", organization_id)
         if upload_id:
             query = query.eq("upload_id", upload_id)
-        res = query.execute()
-        staging_rows: list[dict[str, Any]] = res.data or []
-        print(f"[sync-removals] Fetched {len(staging_rows)} rows from amazon_staging")
+        staging_rows: list[dict[str, Any]] = (query.execute().data or [])
+        log.info("[sync-removals] Fetched %d rows from amazon_staging", len(staging_rows))
 
         if not staging_rows:
-            print("[sync-removals] No staging rows found — completing early")
             _update_task(task_id, 100, "No staging rows found. Nothing to sync.", status="completed")
             return
 
-        _update_task(task_id, 20, f"Extracting {len(staging_rows)} staging rows...")
+        # ── Phase 2: Extract, keep staging id + raw for shipment archive ──────────
+        _update_task(task_id, 18, f"Extracting {len(staging_rows)} staging rows...")
 
-        removal_rows: list[dict[str, Any]] = []
+        packed: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         staging_ids: list[str] = []
         skipped = 0
+        skipped_no_order_id = 0
 
         for row in staging_rows:
             raw = row.get("raw_row", {})
@@ -579,133 +925,473 @@ def _run_sync_removals(
             row_upload_id: str | None = row.get("upload_id") or upload_id
             extracted = _extract_removal_row(raw, organization_id, row_upload_id)
 
-            if not extracted.get("order_id"):
+            if not _pg_text_unique_field(extracted.get("order_id")):
                 skipped += 1
+                skipped_no_order_id += 1
                 continue
 
-            removal_rows.append(extracted)
-            staging_ids.append(row["id"])
+            staging_uuid = str(row["id"])
+            extracted["source_staging_id"] = staging_uuid
+            extracted["store_id"] = store_id
 
-        print(f"[sync-removals] Extracted {len(removal_rows)} valid rows; skipped {skipped}")
+            packed.append((staging_uuid, raw, extracted))
+            staging_ids.append(str(row["id"]))
 
-        if not removal_rows:
+        log.info("[sync-removals] Extracted %d valid rows; skipped %d", len(packed), skipped)
+        if skipped_no_order_id > 0:
+            log.warning(
+                "[sync-removals] SKIPPED %d staging rows with no valid order_id — "
+                "these rows remain in amazon_staging and are NOT written to amazon_removals.",
+                skipped_no_order_id,
+            )
+
+        if not packed:
             _update_task(task_id, 100, "No valid removal rows extracted (missing order_id).", status="completed")
             return
 
-        # ── Smart Merge: fetch existing (order_id, sku) keys to enable UPSERT-like
-        # behaviour without requiring a DB unique constraint.
-        # File 1 (Removal Order Detail): has quantities/disposition, NO tracking_number
-        # File 2 (Removal Shipment Detail): has tracking_number/carrier, fills the gap
-        _update_task(task_id, 38, "Fetching existing amazon_removals keys for merge check...")
-        print(f"[sync-removals] Fetching existing (order_id, sku) keys from amazon_removals...")
-        try:
-            existing_res = (
-                db.table("amazon_removals")
-                .select("id, order_id, sku")
-                .eq("organization_id", organization_id)
-                .execute()
-            )
-            existing_map: dict[tuple[str, str], str] = {
-                (str(r["order_id"]), str(r["sku"])): str(r["id"])
-                for r in (existing_res.data or [])
-                if r.get("order_id") and r.get("sku")
+        # ── Phase 2b: Append-only raw history — one row per staging line (aligned with Next.js REMOVAL_SHIPMENT sync).
+        shipment_history_rows: list[dict[str, Any]] = []
+        for staging_id, raw, ext in packed:
+            row_ship: dict[str, Any] = {
+                "organization_id": organization_id,
+                "upload_id": ext.get("upload_id"),
+                "amazon_staging_id": staging_id,
+                "store_id": store_id,
+                "raw_row": raw,
+                "order_id": ext.get("order_id"),
+                "sku": ext.get("sku"),
+                "fnsku": ext.get("fnsku"),
+                "disposition": ext.get("disposition"),
+                "tracking_number": ext.get("tracking_number"),
+                "carrier": ext.get("carrier"),
+                "shipment_date": ext.get("shipment_date"),
+                "order_date": ext.get("order_date"),
+                "order_type": ext.get("order_type"),
+                "requested_quantity": ext.get("requested_quantity"),
+                "shipped_quantity": ext.get("shipped_quantity"),
+                "disposed_quantity": ext.get("disposed_quantity"),
+                "cancelled_quantity": ext.get("cancelled_quantity"),
             }
-        except Exception as fetch_ex:
-            print(f"[sync-removals] WARNING: could not fetch existing rows — will INSERT all: {fetch_ex!s}")
-            existing_map = {}
+            shipment_history_rows.append(row_ship)
+        if shipment_history_rows:
+            _update_task(task_id, 20, f"Archiving {len(shipment_history_rows)} raw shipment rows...")
+            for i in range(0, len(shipment_history_rows), STAGING_INSERT_BATCH):
+                chunk = shipment_history_rows[i : i + STAGING_INSERT_BATCH]
+                db.table("amazon_removal_shipments").upsert(
+                    chunk,
+                    on_conflict=_REMOVAL_SHIPMENT_CONFLICT,
+                ).execute()
+            log.info(
+                "[sync-removals] Archived %d rows to amazon_removal_shipments",
+                len(shipment_history_rows),
+            )
 
-        print(f"[sync-removals] Found {len(existing_map)} existing rows to merge against")
+        # ── Phase 3: One removal row per staging line (no pre-merge by logical key) ─
+        extracted_rows = [p[2] for p in packed]
+        _update_task(task_id, 24, f"Prepared {len(extracted_rows)} removal line(s) (one per staging row)...")
 
-        rows_to_insert: list[dict[str, Any]] = []
-        rows_to_update: list[tuple[str, dict[str, Any]]] = []  # (id, patch)
-
-        for row in removal_rows:
-            key = (str(row.get("order_id", "")), str(row.get("sku", "")))
-            if key[0] and key[1] and key in existing_map:
-                # Merge — only send non-null fields so existing data is never wiped
-                patch = {
-                    k: v for k, v in row.items()
-                    if v is not None and k not in ("organization_id", "upload_id")
-                }
-                rows_to_update.append((existing_map[key], patch))
+        has_tracking_rows: list[dict[str, Any]] = []
+        for r in extracted_rows:
+            if _pg_text_unique_field(r.get("tracking_number")):
+                has_tracking_rows.append(r)
             else:
-                rows_to_insert.append(row)
+                no_tracking_rows.append(r)
 
-        print(f"[sync-removals] {len(rows_to_insert)} to INSERT, {len(rows_to_update)} to MERGE-UPDATE")
+        log.info(
+            "[sync-removals] Split: %d order rows (no tracking), %d rows with tracking",
+            len(no_tracking_rows), len(has_tracking_rows),
+        )
 
-        _update_task(task_id, 40, f"Writing {len(removal_rows)} rows to amazon_removals...")
+        upserted_total = 0
 
-        inserted = 0
-        total_insert = len(rows_to_insert)
-        for i in range(0, total_insert, STAGING_INSERT_BATCH):
-            chunk = rows_to_insert[i : i + STAGING_INSERT_BATCH]
-            print(f"[sync-removals] Inserting chunk {i}–{i + len(chunk)}")
-            db.table("amazon_removals").insert(chunk).execute()
-            inserted += len(chunk)
-            progress = 40 + int((inserted / max(len(removal_rows), 1)) * 35)
-            _update_task(task_id, progress, f"Inserted {inserted}/{total_insert} new rows...")
+        # ── Phase 4: Upsert order rows (tracking IS NULL) ─────────────────────────
+        if no_tracking_rows:
+            n_order = len(no_tracking_rows)
+            _update_task(task_id, 28, f"Upserting {n_order} order rows (no tracking)...")
+            for i in range(0, n_order, STAGING_INSERT_BATCH):
+                chunk = [_removal_row_for_write(r) for r in no_tracking_rows[i : i + STAGING_INSERT_BATCH]]
+                db.table("amazon_removals").upsert(
+                    chunk, on_conflict=_REMOVALS_CONFLICT,
+                ).execute()
+                upserted_total += len(chunk)
+                progress = 28 + int((min(i + STAGING_INSERT_BATCH, n_order) / max(n_order, 1)) * 18)
+                _update_task(task_id, progress, f"Upserted order rows… {min(i + STAGING_INSERT_BATCH, n_order)}/{n_order}")
+            log.info("[sync-removals] Upserted %d order rows into amazon_removals", n_order)
 
-        merged_count = 0
-        for row_id, patch in rows_to_update:
-            db.table("amazon_removals").update(patch).eq("id", row_id).execute()
-            merged_count += 1
-            if merged_count % 50 == 0:
-                progress = 75 + int((merged_count / max(len(rows_to_update), 1)) * 10)
-                _update_task(task_id, progress, f"Merged {merged_count}/{len(rows_to_update)} existing rows...")
+        # ── Phase 5: Shipment rows — UPDATE NULL slots in place; UPSERT the rest ───
+        if has_tracking_rows:
+            _update_task(
+                task_id, 48,
+                f"Matching {len(has_tracking_rows)} shipment rows to NULL-tracking removals...",
+            )
 
-        _update_task(task_id, 85, f"Cleaning up {len(staging_ids)} rows from amazon_staging...")
-        print(f"[sync-removals] Deleting {len(staging_ids)} staging rows by id")
+            try:
+                existing_null_rows: list[dict[str, Any]] = (
+                    db.table("amazon_removals")
+                    .select("*")
+                    .eq("organization_id", organization_id)
+                    .eq("store_id", store_id)
+                    .is_("tracking_number", "null")
+                    .execute()
+                    .data or []
+                )
+            except Exception as fetch_err:
+                log.warning(
+                    "[sync-removals] Could not fetch NULL-tracking rows (%s) — "
+                    "all shipment rows will be upserted as new entries.", fetch_err,
+                )
+                existing_null_rows = []
 
+            log.info(
+                "[sync-removals] Found %d NULL-tracking rows for enrichment",
+                len(existing_null_rows),
+            )
+
+            null_match: dict[tuple[Any, ...], deque] = defaultdict(deque)
+            null_rows_by_id: dict[str, dict[str, Any]] = {}
+
+            for db_row in existing_null_rows:
+                mk = _removal_null_slot_match_key(db_row)
+                rid = str(db_row["id"])
+                null_match[mk].append(rid)
+                null_rows_by_id[rid] = db_row
+
+            for s_row in has_tracking_rows:
+                match_key = _removal_null_slot_match_key(s_row)
+
+                if null_match[match_key]:
+                    match_id = null_match[match_key].popleft()
+                    existing = null_rows_by_id[match_id]
+                    merged = _merge_shipment_into_null_slot(existing, s_row)
+                    payload = _removal_row_for_write(merged)
+                    db.table("amazon_removals").update(payload).eq("id", match_id).execute()
+                    enriched_count += 1
+                else:
+                    unmatched_shipment_rows.append(s_row)
+
+            log.info(
+                "[sync-removals] Shipment handling: %d rows updated in place, %d upserted as new",
+                enriched_count, len(unmatched_shipment_rows),
+            )
+
+            if unmatched_shipment_rows:
+                _update_task(task_id, 68, f"Upserting {len(unmatched_shipment_rows)} new shipment rows...")
+                for i in range(0, len(unmatched_shipment_rows), STAGING_INSERT_BATCH):
+                    chunk = [
+                        _removal_row_for_write(r)
+                        for r in unmatched_shipment_rows[i : i + STAGING_INSERT_BATCH]
+                    ]
+                    db.table("amazon_removals").upsert(
+                        chunk, on_conflict=_REMOVALS_CONFLICT,
+                    ).execute()
+                    upserted_total += len(chunk)
+
+        # ── Phase 6: Row-count verification ───────────────────────────────────────
+        # Every extracted staging line must either be upserted as new OR updated in-place.
+        staged_line_count = len(extracted_rows)
+        accounted_for = upserted_total + enriched_count
+        if accounted_for < staged_line_count:
+            log.warning(
+                "[sync-removals] ROW COUNT MISMATCH: %d staging lines but only %d accounted for "
+                "(upserted=%d + enriched_in_place=%d). %d rows may have been silently dropped. "
+                "Check for upstream errors in the log above.",
+                staged_line_count,
+                accounted_for,
+                upserted_total,
+                enriched_count,
+                staged_line_count - accounted_for,
+            )
+        else:
+            log.info(
+                "[sync-removals] Row count OK: all %d staging lines accounted for "
+                "(upserted=%d, enriched_in_place=%d).",
+                staged_line_count,
+                upserted_total,
+                enriched_count,
+            )
+        if skipped > 0:
+            log.info(
+                "[sync-removals] Staging rows skipped (total=%d, no_order_id=%d): "
+                "these remain in amazon_staging and are excluded from the counts above.",
+                skipped,
+                skipped_no_order_id,
+            )
+
+        # ── Phase 7: Clean up staging ─────────────────────────────────────────────
+        _update_task(task_id, 82, f"Cleaning up {len(staging_ids)} rows from amazon_staging...")
+        log.info("[sync-removals] Deleting %d staging rows by id", len(staging_ids))
         for i in range(0, len(staging_ids), STAGING_INSERT_BATCH):
-            id_chunk = staging_ids[i : i + STAGING_INSERT_BATCH]
-            db.table("amazon_staging").delete().in_("id", id_chunk).execute()
+            db.table("amazon_staging").delete().in_(
+                "id", staging_ids[i : i + STAGING_INSERT_BATCH]
+            ).execute()
 
-        summary = f"inserted={inserted}, merged={merged_count}"
-        print(f"[sync-removals] DONE — {summary}")
+        log.info(
+            "[sync-removals] wave1_reconciliation %s",
+            json.dumps(
+                {
+                    "store_id": store_id,
+                    "staging_lines": staged_line_count,
+                    "upsert_chunks_rows": upserted_total,
+                    "enriched_in_place": enriched_count,
+                    "skipped_staging": skipped,
+                },
+                default=str,
+            ),
+        )
+        log.info(
+            "[sync-removals] DONE — upserted=%d updated_in_place=%d staging_skipped=%d",
+            upserted_total,
+            enriched_count,
+            skipped,
+        )
         _update_task(
-            task_id,
-            100,
-            f"Sync complete. {summary} rows written to amazon_removals.",
+            task_id, 100,
+            (
+                f"Sync complete: {upserted_total} upserts + {enriched_count} in-place enrichments "
+                f"into amazon_removals ({len(shipment_history_rows)} raw shipment rows archived). "
+                "Run Generate Worklist to update expected_packages."
+            ),
             status="completed",
         )
 
     except Exception as e:
-        print(f"[sync-removals] ERROR: {e!s}")
+        log.error("[sync-removals] FATAL ERROR:\n%s", traceback.format_exc())
         _update_task(task_id, 0, f"Sync failed: {e!s}", status="failed")
 
 
-# --- Background task: amazon_removals -> expected_packages ---
-# Must be a plain def (not async) so FastAPI runs it in a thread pool,
-# keeping the synchronous supabase-py client off the event loop.
-# IMPORTANT: never call _require_supabase() here — it raises HTTPException,
-# which is a Starlette request-level exception and will cause
-# "RuntimeError: Caught handled exception, but response already started"
-# when raised outside a request context (i.e., in a background thread).
+# --- Helpers for worklist generation ---
 
-def _safe_int(val: Any) -> int | None:
-    """Coerce any scalar to int, returning None on failure."""
-    if val is None:
-        return None
+
+def _generate_worklist_core(
+    db: Any,
+    task_id: str,
+    organization_id: str,
+    *,
+    progress_start: int = 0,
+) -> None:
+    """
+    Phase 4: amazon_removals → expected_packages (warehouse worklist).
+
+    Only removal rows whose order_type is Return are written to expected_packages
+    (Disposal / Liquidations stay in amazon_removals only).
+
+    Rows are written with INSERT ... ON CONFLICT ... DO UPDATE (via Supabase upsert).
+
+    No wholesale DELETE: warehouse fields (e.g. actual_scanned_count) are merged
+    from existing expected_packages and never overwritten by Amazon-only columns.
+
+    progress_start: baseline when called from POST /etl/generate-worklist.
+    """
+
+    def _prog(fraction: float, msg: str) -> None:
+        actual = min(int(progress_start + fraction * (100 - progress_start)), 99)
+        _update_task(task_id, actual, msg)
+
     try:
-        return int(float(str(val).replace(",", "")))
-    except (ValueError, TypeError):
-        return None
+        # ── 1. Fetch amazon_removals ──────────────────────────────────────────────
+        _prog(0.02, "Fetching amazon_removals rows for worklist generation...")
+        log.info("[worklist-core] Fetching amazon_removals for org=%s", organization_id)
 
+        try:
+            removal_rows = _fetch_org_table_all(db, "amazon_removals", organization_id)
+        except Exception as fetch_err:
+            log.exception("[worklist-core] FETCH amazon_removals FAILED")
+            _update_task(task_id, 0, f"Worklist fetch failed: {fetch_err!s}", status="failed")
+            return
+
+        log.info("[worklist-core] Fetched %d rows from amazon_removals", len(removal_rows))
+
+        if not removal_rows:
+            log.warning("[worklist-core] amazon_removals is empty for this org — worklist unchanged")
+            _update_task(task_id, 100, "No removal rows found; worklist unchanged.", status="completed")
+            return
+
+        # ── 2. Load existing worklist (preserve warehouse columns) ───────────────
+        _prog(0.08, "Loading existing expected_packages for merge...")
+        try:
+            existing_ep = _fetch_org_table_all(db, "expected_packages", organization_id)
+        except Exception as ep_err:
+            log.exception("[worklist-core] FETCH expected_packages FAILED")
+            _update_task(task_id, 0, f"Worklist existing fetch failed: {ep_err!s}", status="failed")
+            return
+
+        existing_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for er in existing_ep:
+            existing_by_key[_expected_pkg_identity_key(er)] = er
+
+        # ── 3. Map removals → Amazon column set; merge with existing worklist rows ─
+        _prog(0.12, f"Mapping {len(removal_rows)} rows to expected_packages format...")
+
+        merged_rows: list[dict[str, Any]] = []
+        skipped_no_order = 0
+        skipped_non_return = 0
+
+        for row in removal_rows:
+            order_id = _pg_text_unique_field(row.get("order_id"))
+            if not order_id:
+                skipped_no_order += 1
+                continue
+            if not _is_return_order_type_for_worklist(row):
+                skipped_non_return += 1
+                continue
+
+            incoming: dict[str, Any] = {"organization_id": organization_id, "order_id": order_id}
+            for k in EXPECTED_PKG_AMAZON_COLS:
+                if k in ("organization_id", "order_id"):
+                    continue
+                if k in row:
+                    incoming[k] = row[k]
+
+            if not incoming.get("sku"):
+                incoming["sku"] = ""
+            if not incoming.get("order_status"):
+                incoming["order_status"] = "Pending"
+
+            k = _expected_pkg_identity_key(incoming)
+            if k in existing_by_key:
+                merged_rows.append(_merge_expected_pkg_amazon_only(existing_by_key[k], incoming))
+            else:
+                merged_rows.append(incoming)
+
+        log.info(
+            "[worklist-core] Prepared %d upsert rows (skipped %d no order_id, %d non-Return order_type)",
+            len(merged_rows), skipped_no_order, skipped_non_return,
+        )
+
+        if skipped_no_order > 0:
+            log.warning(
+                "[worklist-core] SKIPPED %d removal rows with no order_id — "
+                "these will NOT appear in expected_packages.",
+                skipped_no_order,
+            )
+        if skipped_non_return > 0:
+            log.info(
+                "[worklist-core] SKIPPED %d removal rows (order_type is not Return) — "
+                "expected_packages only includes Return lines.",
+                skipped_non_return,
+            )
+
+        if not merged_rows:
+            _update_task(task_id, 100, "No worklist rows produced from amazon_removals.", status="completed")
+            return
+
+        skipped_no_staging_id = sum(1 for r in merged_rows if not r.get("source_staging_id"))
+        merged_rows = [r for r in merged_rows if r.get("source_staging_id")]
+        if skipped_no_staging_id:
+            log.warning(
+                "[worklist-core] Skipped %d Return row(s) with no source_staging_id (legacy data). "
+                "Re-sync removal uploads after migration 60519 so worklist upserts are idempotent.",
+                skipped_no_staging_id,
+            )
+
+        if not merged_rows:
+            _update_task(
+                task_id, 100,
+                "No worklist rows with source_staging_id — re-sync removals after migration 60519.",
+                status="completed",
+            )
+            return
+
+        # ── 4. UPSERT (no DELETE) ─────────────────────────────────────────────────
+        # Strip Postgres-managed system columns before upserting.  Sending id=None
+        # (when an existing row was merged then cleared of its PK) triggers the
+        # "null value in column 'id' violates not-null constraint" error.
+        _prog(0.28, f"Upserting {len(merged_rows)} rows into expected_packages...")
+
+        upserted = 0
+        n_pkg = len(merged_rows)
+        for i in range(0, n_pkg, STAGING_INSERT_BATCH):
+            # Strip system columns so Postgres manages id/created_at/updated_at itself.
+            chunk = [
+                {k: v for k, v in r.items() if k not in _DB_SYSTEM_COLS}
+                for r in merged_rows[i : i + STAGING_INSERT_BATCH]
+            ]
+            try:
+                db.table("expected_packages").upsert(
+                    chunk, on_conflict=_EXPECTED_PKG_CONFLICT,
+                ).execute()
+                upserted += len(chunk)
+                frac = 0.28 + (upserted / max(n_pkg, 1)) * 0.70
+                _prog(frac, f"Upserted {upserted}/{n_pkg} expected_packages rows...")
+            except Exception as ins_err:
+                log.exception("[worklist-core] UPSERT chunk at offset %d FAILED", i)
+                _update_task(
+                    task_id, 0,
+                    f"expected_packages upsert failed at offset {i}: {ins_err!s}",
+                    status="failed",
+                )
+                return
+
+        # ── Row-count verification ─────────────────────────────────────────────
+        if upserted < len(merged_rows):
+            log.warning(
+                "[worklist-core] ROW COUNT MISMATCH: prepared %d rows but only %d were upserted.",
+                len(merged_rows), upserted,
+            )
+        explained = skipped_no_order + skipped_non_return + skipped_no_staging_id + len(merged_rows)
+        if explained != len(removal_rows):
+            log.warning(
+                "[worklist-core] ROW COUNT WARNING: amazon_removals=%d rows but "
+                "skipped_no_order=%d + skipped_non_return=%d + skipped_no_staging_id=%d + worklist=%d = %d.",
+                len(removal_rows),
+                skipped_no_order,
+                skipped_non_return,
+                skipped_no_staging_id,
+                len(merged_rows),
+                explained,
+            )
+        else:
+            log.info(
+                "[worklist-core] Row count OK: %d removals = %d skipped (no order) + "
+                "%d skipped (non-Return) + %d Return line(s) for worklist.",
+                len(removal_rows), skipped_no_order, skipped_non_return, len(merged_rows),
+            )
+
+        log.info(
+            "[worklist-core] DONE — upserted %d rows (source amazon_removals=%d, skipped_no_order=%d, skipped_non_return=%d)",
+            upserted, len(removal_rows), skipped_no_order, skipped_non_return,
+        )
+        log.info(
+            "[worklist-core] wave1_reconciliation %s",
+            json.dumps(
+                {
+                    "phase": "generate_worklist",
+                    "amazon_removals_rows": len(removal_rows),
+                    "expected_packages_upserted": upserted,
+                    "skipped_no_order": skipped_no_order,
+                    "skipped_non_return": skipped_non_return,
+                    "skipped_no_source_staging_id": skipped_no_staging_id,
+                },
+                default=str,
+            ),
+        )
+        _update_task(
+            task_id, 100,
+            f"Worklist complete: {upserted} rows upserted into expected_packages "
+            f"(Amazon fields updated; warehouse scan progress preserved).",
+            status="completed",
+        )
+
+    except Exception as e:
+        log.exception("[worklist-core] Phase 4 (generate worklist) failed")
+        _update_task(task_id, 0, f"Worklist failed: {e!s}", status="failed")
+
+
+# --- Background task: amazon_removals -> expected_packages (standalone trigger) ---
+# Must be a plain def (not async) so FastAPI runs it in a thread pool.
+# Triggered only via POST /etl/generate-worklist (Phase 4 in the Next.js importer).
 
 def _run_generate_worklist(
     task_id: str,
     organization_id: str,
-    upload_id: str | None,
+    upload_id: str | None,  # kept for API compatibility; ignored inside core
 ) -> None:
-    print(f"[generate-worklist] START task_id={task_id} org={organization_id} upload_id={upload_id}")
-
-    # Immediate heartbeat — proves the thread is alive before any DB work
-    _update_task(task_id, 10, "Task is alive. Connecting to database...")
+    print(f"[generate-worklist] START task_id={task_id} org={organization_id}")
+    _update_task(task_id, 5, "Task is alive. Connecting to database...")
 
     _url = os.getenv("SUPABASE_URL")
     _key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not _url or not _key:
-        print("[generate-worklist] ERROR: Missing Supabase credentials")
         _update_task(task_id, 0, "Missing Supabase credentials in environment.", status="failed")
         return
 
@@ -713,162 +1399,14 @@ def _run_generate_worklist(
         db = create_client(_url, _key)
         print("[generate-worklist] Supabase client created successfully")
     except Exception as conn_err:
-        print(f"[generate-worklist] CONNECTION ERROR: {conn_err!s}")
         _update_task(task_id, 0, f"Failed to connect to database: {conn_err!s}", status="failed")
         return
 
-    # --- Fetch from amazon_removals (isolated try-except for clear error reporting) ---
-    _update_task(task_id, 15, "Fetching rows from amazon_removals...")
     try:
-        print("DEBUG: Starting fetch from removals...")
-        print(f"[generate-worklist] Querying amazon_removals (upload_id filter: {upload_id})")
-        query = db.table("amazon_removals").select("*").eq("organization_id", organization_id)
-        if upload_id:
-            query = query.eq("upload_id", upload_id)
-        res = query.execute()
-        removal_rows: list[dict[str, Any]] = res.data or []
-        print(f"[generate-worklist] Fetched {len(removal_rows)} rows from amazon_removals")
-    except Exception as fetch_err:
-        print(f"[generate-worklist] FETCH ERROR: {fetch_err!s}")
-        _update_task(task_id, 0, f"Database fetch failed: {fetch_err!s}", status="failed")
-        return
-
-    if not removal_rows:
-        print("[generate-worklist] No rows found — completing early")
-        _update_task(task_id, 100, "No removal rows found. Worklist is empty.", status="completed")
-        return
-
-    # --- Build package rows ---
-    try:
-        _update_task(task_id, 25, f"Building package rows from {len(removal_rows)} removal rows...")
-        print("[generate-worklist] Building expected_packages rows...")
-
-        package_rows: list[dict[str, Any]] = []
-        skipped = 0
-        for row in removal_rows:
-            order_id = row.get("order_id")
-            sku = row.get("sku")
-            if not order_id or not sku:
-                print(f"[generate-worklist] Skipping row — missing order_id or sku: {row}")
-                skipped += 1
-                continue
-
-            shipped_qty = _safe_int(row.get("shipped_quantity"))
-            print(
-                f"[generate-worklist] order_id={order_id} sku={sku} "
-                f"shipped_quantity raw={row.get('shipped_quantity')!r} coerced={shipped_qty}"
-            )
-
-            pkg: dict[str, Any] = {
-                "organization_id": organization_id,
-                "order_id": order_id,
-                "sku": sku,
-                "tracking_number": row.get("tracking_number"),
-                "shipped_quantity": shipped_qty,
-                "requested_quantity": _safe_int(row.get("requested_quantity")),
-                "disposed_quantity": _safe_int(row.get("disposed_quantity")),
-                "cancelled_quantity": _safe_int(row.get("cancelled_quantity")),
-                "order_status": "Pending",
-                "disposition": row.get("disposition"),
-                "order_date": row.get("order_date"),
-            }
-            if upload_id:
-                pkg["upload_id"] = upload_id
-
-            package_rows.append(pkg)
-
-        print(f"[generate-worklist] Built {len(package_rows)} package rows; skipped {skipped}")
-
-        if not package_rows:
-            _update_task(task_id, 100, "No valid package rows to insert (missing order_id or sku).", status="completed")
-            return
-
-    except Exception as build_err:
-        print(f"[generate-worklist] BUILD ERROR: {build_err!s}")
-        _update_task(task_id, 0, f"Row-building failed: {build_err!s}", status="failed")
-        return
-
-    # --- Sync into expected_packages (fetch → compare → insert new / update existing) ---
-    # Strategy: fetch existing (organization_id, order_id, sku) keys first, then:
-    #   • Row doesn't exist yet   → INSERT the full package row
-    #   • Row already exists      → UPDATE with all non-null fields from amazon_removals
-    #     This is what fills in tracking_number / carrier when the Shipment file arrives
-    #     after the Order Detail file has already created the expected_packages rows.
-    try:
-        _update_task(task_id, 38, "Fetching existing expected_packages keys for sync check...")
-        print("[generate-worklist] Fetching existing (order_id, sku) keys from expected_packages...")
-
-        existing_pkg_res = (
-            db.table("expected_packages")
-            .select("id, order_id, sku")
-            .eq("organization_id", organization_id)
-            .execute()
-        )
-        existing_pkg_map: dict[tuple[str, str], str] = {
-            (str(r["order_id"]), str(r["sku"])): str(r["id"])
-            for r in (existing_pkg_res.data or [])
-            if r.get("order_id") and r.get("sku")
-        }
-        print(f"[generate-worklist] Found {len(existing_pkg_map)} existing expected_packages rows")
-
-    except Exception as fetch_existing_err:
-        print(f"[generate-worklist] WARNING: could not fetch existing expected_packages — will INSERT all: {fetch_existing_err!s}")
-        existing_pkg_map = {}
-
-    try:
-        pkg_to_insert: list[dict[str, Any]] = []
-        pkg_to_update: list[tuple[str, dict[str, Any]]] = []  # (id, patch)
-
-        for pkg in package_rows:
-            key = (str(pkg.get("order_id", "")), str(pkg.get("sku", "")))
-            if key[0] and key[1] and key in existing_pkg_map:
-                # Build a patch from non-null fields only — never wipe existing data
-                # Crucially: this overwrites NULL tracking_number with the real value
-                patch = {
-                    k: v for k, v in pkg.items()
-                    if v is not None and k not in ("organization_id", "upload_id", "order_status")
-                }
-                if patch:
-                    pkg_to_update.append((existing_pkg_map[key], patch))
-            else:
-                pkg_to_insert.append(pkg)
-
-        print(f"[generate-worklist] {len(pkg_to_insert)} to INSERT, {len(pkg_to_update)} to UPDATE")
-
-        _update_task(task_id, 40, f"Writing {len(package_rows)} rows to expected_packages...")
-
-        # Batch INSERT new rows
-        inserted = 0
-        for i in range(0, len(pkg_to_insert), STAGING_INSERT_BATCH):
-            chunk = pkg_to_insert[i : i + STAGING_INSERT_BATCH]
-            print(f"[generate-worklist] Inserting chunk {i}–{i + len(chunk)} into expected_packages")
-            db.table("expected_packages").insert(chunk).execute()
-            inserted += len(chunk)
-            progress = 40 + int((inserted / max(len(package_rows), 1)) * 30)
-            _update_task(task_id, progress, f"Inserted {inserted}/{len(pkg_to_insert)} new rows...")
-
-        # UPDATE existing rows (fills in tracking_number, carrier, etc.)
-        updated = 0
-        for row_id, patch in pkg_to_update:
-            print(f"[generate-worklist] Updating expected_packages id={row_id} patch_keys={list(patch.keys())}")
-            db.table("expected_packages").update(patch).eq("id", row_id).execute()
-            updated += 1
-            if updated % 50 == 0:
-                progress = 70 + int((updated / max(len(pkg_to_update), 1)) * 25)
-                _update_task(task_id, progress, f"Updated {updated}/{len(pkg_to_update)} existing rows...")
-
-        summary = f"inserted={inserted}, updated={updated}"
-        print(f"[generate-worklist] DONE — {summary}")
-        _update_task(
-            task_id,
-            100,
-            f"Worklist synced. {summary} rows in expected_packages.",
-            status="completed",
-        )
-
-    except Exception as sync_err:
-        print(f"[generate-worklist] SYNC ERROR: {sync_err!s}")
-        _update_task(task_id, 0, f"Sync into expected_packages failed: {sync_err!s}", status="failed")
+        _generate_worklist_core(db, task_id, organization_id, progress_start=0)
+    except Exception:
+        log.exception("[generate-worklist] background task crashed")
+        _update_task(task_id, 0, "Worklist task crashed — see server logs.", status="failed")
 
 
 # --- ETL Endpoints: Removals Pipeline ---
@@ -906,7 +1444,8 @@ async def etl_generate_worklist(
 ):
     """
     Transform amazon_removals rows into expected_packages (operational worklist).
-    Uses UPSERT on (order_id, sku, tracking_number).
+    Uses UPSERT on (organization_id, order_id, sku, disposition, tracking_number);
+    warehouse scan fields are preserved on conflict.
     Returns a task_id immediately; poll GET /etl/task/{task_id} for progress.
     """
     try:

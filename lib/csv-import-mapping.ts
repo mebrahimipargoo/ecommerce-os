@@ -60,6 +60,12 @@ export const REPORT_TYPE_SPECS: Record<
     description: "Tracking + shipment id — routed to expected packages",
     aliases: ["tracking-number", "shipment-id", "Tracking Number", "Shipment ID"],
   },
+  REMOVAL_SHIPMENT: {
+    canonicalKey: "tracking-number",
+    shortLabel: "Removal shipment (detected)",
+    description: "Tracking + carrier — routed to amazon_removals",
+    aliases: ["tracking-number", "carrier", "carrier-shipment-date"],
+  },
   INVENTORY_LEDGER: {
     canonicalKey: "fnsku",
     shortLabel: "Inventory ledger (detected)",

@@ -20,13 +20,18 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** Compute a quick 32-char pseudo-hash (SHA-256 first 64 KB, truncated) for dedup. */
-async function quickHash(file: File): Promise<string> {
-  const slice = await file.slice(0, 65536).arrayBuffer();
-  const buf = await crypto.subtle.digest("SHA-256", slice);
-  return Array.from(new Uint8Array(buf).slice(0, 16))
+/** Full-file SHA-256 (64 hex). Used so re-uploading the same removal CSV can replace prior imports. */
+async function sha256HexFullFile(file: File): Promise<string> {
+  const buf = await file.arrayBuffer();
+  const hashBuf = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(hashBuf))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+/** Legacy 32-hex fingerprint for `md5_hash` column validation (first 32 chars of full SHA-256). */
+function first32HexOfSha256(fullSha256: string): string {
+  return fullSha256.slice(0, 32).toLowerCase();
 }
 
 function getFileExtension(name: string): string {
@@ -110,7 +115,8 @@ export function RawReportUploader({ onUploadComplete }: RawReportUploaderProps) 
       const ext = getFileExtension(file.name);
       const totalBytes = file.size;
       const totalParts = Math.max(1, Math.ceil(totalBytes / CHUNK_SIZE));
-      const md5Hash = await quickHash(file);
+      const contentSha256 = await sha256HexFullFile(file);
+      const md5Hash = first32HexOfSha256(contentSha256);
 
       // ── RECORD-FIRST: Insert the DB row immediately with status="uploading".
       // The file appears in History the moment this call resolves — before any
@@ -121,6 +127,7 @@ export function RawReportUploader({ onUploadComplete }: RawReportUploaderProps) 
         totalBytes,
         reportType: "UNKNOWN",   // updated below after classify-headers returns
         md5Hash,
+        contentSha256,
         fileExtension: ext,
         fileSizeBytes: totalBytes,
         uploadChunksCount: totalParts,
@@ -302,6 +309,10 @@ export function RawReportUploader({ onUploadComplete }: RawReportUploaderProps) 
                 <p className="text-sm font-medium text-foreground">Drag &amp; drop a file here</p>
                 <p className="text-xs text-muted-foreground">
                   or click to browse · .csv, .txt, .xlsx · 40MB parts · very large files supported
+                </p>
+                <p className="max-w-md text-[11px] leading-snug text-muted-foreground">
+                  Removal orders: uploading the same file again (identical bytes) removes the previous import’s
+                  data at Sync time — you do not need a separate “replace” toggle.
                 </p>
               </>
             )}

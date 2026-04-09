@@ -4,6 +4,7 @@ import type { RawReportType } from "./raw-report-types";
 export const CLASSIFIED_REPORT_TYPES = [
   "FBA_RETURNS",
   "REMOVAL_ORDER",
+  "REMOVAL_SHIPMENT",
   "INVENTORY_LEDGER",
   "REIMBURSEMENTS",
   "SETTLEMENT",
@@ -151,6 +152,68 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
       label: "Order Status",
       required: false,
       aliases: ["order-status", "order status", "status"],
+    },
+    {
+      key: "tracking_number",
+      label: "Tracking Number",
+      required: false,
+      aliases: ["tracking-number", "tracking number", "tracking_number", "tracking-id", "tracking id"],
+    },
+    {
+      key: "carrier",
+      label: "Carrier",
+      required: false,
+      aliases: ["carrier", "carrier-name", "carrier name"],
+    },
+    {
+      key: "shipment_date",
+      label: "Shipment Date",
+      required: false,
+      aliases: ["carrier-shipment-date", "shipment-date", "shipment date", "ship-date", "shipped-date"],
+    },
+  ],
+  REMOVAL_SHIPMENT: [
+    {
+      key: "order_id",
+      label: "Removal Order ID",
+      required: true,
+      aliases: ["removal-order-id", "removal order id", "order-id", "order id"],
+    },
+    {
+      key: "sku",
+      label: "SKU",
+      required: false,
+      aliases: ["sku", "SKU", "merchant-sku", "msku"],
+    },
+    {
+      key: "fnsku",
+      label: "FNSKU",
+      required: false,
+      aliases: ["fnsku", "FNSKU", "fulfillment-network-sku"],
+    },
+    {
+      key: "tracking_number",
+      label: "Tracking Number",
+      required: false,
+      aliases: ["tracking-number", "tracking number", "tracking_number", "tracking-id", "tracking id"],
+    },
+    {
+      key: "carrier",
+      label: "Carrier",
+      required: false,
+      aliases: ["carrier", "carrier-name", "carrier name"],
+    },
+    {
+      key: "shipment_date",
+      label: "Shipment Date",
+      required: false,
+      aliases: ["carrier-shipment-date", "shipment-date", "shipment date", "ship-date", "shipped-date"],
+    },
+    {
+      key: "shipped_quantity",
+      label: "Shipped Quantity",
+      required: false,
+      aliases: ["shipped-quantity", "shipped quantity"],
     },
   ],
   INVENTORY_LEDGER: [
@@ -507,7 +570,17 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
     return { reportType: "FBA_RETURNS", matchedRule: "license plate number+detailed disposition" };
   }
 
-  // Rule 2: Removal Orders
+  // Rule 2a: Removal Shipment Detail (tracking-number + carrier or carrier-shipment-date)
+  // Must come BEFORE the generic Removal Order rule — a Shipment file contains order-id
+  // but does NOT have removal-order-id, requested-quantity, or disposed-quantity.
+  if (
+    ds.has("tracking number") &&
+    (ds.has("carrier") || ds.has("carrier shipment date") || ds.has("shipment date"))
+  ) {
+    return { reportType: "REMOVAL_SHIPMENT", matchedRule: "tracking number+carrier/shipment-date" };
+  }
+
+  // Rule 2b: Removal Order Detail
   if (
     ds.has("removal order id") ||
     (ds.has("requested quantity") && ds.has("disposed quantity"))

@@ -133,10 +133,16 @@ export const NATIVE_COLUMNS_RETURNS = new Set([
 
 /** amazon_removals — physical DB columns */
 export const NATIVE_COLUMNS_REMOVALS = new Set([
-  "id", "organization_id", "upload_id", "request_date",
+  "id", "organization_id", "store_id", "upload_id", "source_staging_id", "order_date",
   "order_id", "sku", "fnsku", "disposition",
   "shipped_quantity", "cancelled_quantity", "disposed_quantity", "requested_quantity",
-  "status", "tracking_number", "carrier",
+  "status", "tracking_number", "carrier", "shipment_date",
+  "order_source",
+  "order_type",
+  "last_updated_date",
+  "in_process_quantity",
+  "removal_fee",
+  "currency",
   "created_at", "raw_data",
 ]);
 
@@ -277,7 +283,9 @@ const REMOVAL_ORDER_ID_ALIASES = [
   "removal-order-id", "removal order id", "removal_order_id",
   "order-id", "order id",
 ];
-const TRACK_ALIASES      = ["tracking-number", "tracking number", "tracking id", "tracking-id"];
+const TRACK_ALIASES         = ["tracking-number", "tracking number", "tracking id", "tracking-id"];
+const CARRIER_ALIASES       = ["carrier", "carrier-name", "carrier name"];
+const SHIPMENT_DATE_ALIASES = ["carrier-shipment-date", "shipment-date", "shipment date", "ship-date", "shipped-date"];
 const SKU_ALIASES        = ["sku", "merchant-sku", "msku", "SKU"];
 const QTY_ALIASES        = ["requested-quantity", "requested quantity", "quantity", "qty"];
 const SHIPPED_QTY_ALIASES   = ["shipped-quantity", "shipped quantity"];
@@ -286,6 +294,20 @@ const CANCELLED_QTY_ALIASES = ["cancelled-quantity", "cancelled quantity"];
 const ORDER_STATUS_ALIASES  = ["order-status", "order status", "status"];
 const DISPOSITION_ALIASES   = ["disposition", "detailed-disposition", "detailed disposition"];
 const ORDER_DATE_ALIASES    = ["order-date", "order date", "request-date", "requested-date"];
+const ORDER_SOURCE_ALIASES = ["order-source", "order source", "order_source"];
+const ORDER_TYPE_ALIASES = ["order-type", "order type", "order_type"];
+const LAST_UPDATED_DATE_ALIASES = [
+  "last-updated-date",
+  "last updated date",
+  "last_updated_date",
+];
+const IN_PROCESS_QTY_ALIASES = [
+  "in-process-quantity",
+  "in process quantity",
+  "in_process_quantity",
+];
+const REMOVAL_FEE_ALIASES = ["removal-fee", "removal fee", "removal_fee"];
+const CURRENCY_ALIASES = ["currency"];
 const FNSKU_ALIASES      = ["fnsku", "FNSKU", "fulfillment-network-sku"];
 const LOCATION_ALIASES   = [
   "fulfillment-center", "fulfillment center", "fc", "warehouse", "location",
@@ -375,7 +397,12 @@ function parseNum(v: string): number | null {
 
 function parseIsoDate(v: string): string | null {
   if (!v) return null;
-  const d = new Date(v);
+  const s = v.trim();
+  // Amazon request-date is often "2026-04-02T20:01:41-07:00" — use calendar date as in file,
+  // not UTC conversion (avoids wrong day near midnight in local TZ).
+  const ymd = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (ymd) return ymd[1];
+  const d = new Date(s);
   if (Number.isNaN(d.getTime())) return null;
   return d.toISOString().slice(0, 10);
 }
@@ -418,8 +445,11 @@ export function mapRowToExpectedReturn(
 export type ExpectedPackageInsert = {
   organization_id: string;
   upload_id: string;
+  source_staging_id?: string | null;
   order_id: string;
   sku: string;
+  /** Distinguishes multiple UNKNOW merchant-sku lines (Amazon FNSKU). */
+  fnsku: string | null;
   tracking_number: string | null;
   requested_quantity: number | null;
   shipped_quantity: number | null;
@@ -460,6 +490,7 @@ export function mapRowToExpectedPackage(
     upload_id: uploadId,
     order_id,
     sku: pick(row, SKU_ALIASES) || "",
+    fnsku: pick(row, FNSKU_ALIASES) || null,
     tracking_number: pick(row, TRACK_ALIASES) || null,
     requested_quantity: parseQty(pick(row, QTY_ALIASES)),
     shipped_quantity: parseQty(pick(row, SHIPPED_QTY_ALIASES)),
@@ -568,49 +599,238 @@ export function mapRowToAmazonReturn(
 }
 
 // ── amazon_removals ───────────────────────────────────────────────────────────
-// DB columns: id · organization_id · upload_id · request_date · order_id · sku ·
-//             fnsku · disposition · shipped_quantity · cancelled_quantity ·
-//             disposed_quantity · requested_quantity · status · tracking_number ·
-//             carrier · created_at · raw_data
+// DB columns include order_date, order_source, order_type, last_updated_date,
+// in_process_quantity, removal_fee, currency (see migration 20260516).
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type AmazonRemovalInsert = {
   organization_id: string;
+  /** Imports Target Store — required for Wave 1 business dedupe. */
+  store_id: string;
   upload_id: string;
+  /** Set in Phase 3 sync from amazon_staging.id — one DB row per CSV line (migration 60519). */
+  source_staging_id?: string;
   order_id: string;
   sku: string;
   fnsku: string | null;
   disposition: string | null;
+  /** Request / order date from CSV — part of DB unique key (see migration 20260515). */
+  order_date: string | null;
+  order_source: string | null;
+  /** Disposal | Liquidations | Return — worklist (expected_packages) uses Return rows only. */
+  order_type: string | null;
+  last_updated_date: string | null;
+  in_process_quantity: number | null;
+  removal_fee: number | null;
+  currency: string | null;
   shipped_quantity: number | null;
   cancelled_quantity: number | null;
   disposed_quantity: number | null;
   requested_quantity: number | null;
   status: string | null;
   tracking_number: string | null;
+  carrier: string | null;
+  shipment_date: string | null;
   raw_data: Record<string, string> | null;
 };
+
+/**
+ * Amazon SP-API `GET_FBA_FULFILLMENT_REMOVAL_SHIPMENT_DETAIL_DATA` — tab-delimited attributes (hyphens in file).
+ * Staging uses `normalizeAmazonReportRowKeys`: hyphens → underscores (e.g. `order-id` → `order_id`,
+ * `removal-order-type` → `removal_order_type`).
+ */
+const REMOVAL_SHIPMENT_ORDER_ID_PRIORITY = [
+  "order-id",
+  "order_id",
+  "order id",
+  "removal-order-id",
+  "removal_order_id",
+  "removal order id",
+  "amazon-order-id",
+  "amazon_order_id",
+  "amazon order id",
+];
+
+/** Shipment report uses `request-date` for the order/request line date (not only `order-date`). */
+const REMOVAL_SHIPMENT_REQUEST_OR_ORDER_DATE_PRIORITY = [
+  "request-date",
+  "request_date",
+  "request date",
+  "order-date",
+  "order_date",
+  "order date",
+  "requested-date",
+  "requested_date",
+];
+
+const REMOVAL_SHIPMENT_SHIPMENT_DATE_PRIORITY = [
+  "shipment-date",
+  "shipment_date",
+  "shipment date",
+  "carrier-shipment-date",
+  "carrier_shipment_date",
+  "carrier shipment date",
+  "ship-date",
+  "shipped-date",
+];
+
+/** Shipment detail report uses `removal-order-type`; removal order detail uses `order-type`. */
+const REMOVAL_SHIPMENT_ORDER_TYPE_PRIORITY = [
+  "removal-order-type",
+  "removal_order_type",
+  "removal order type",
+  "order-type",
+  "order_type",
+  "order type",
+];
+
+const REMOVAL_SHIPMENT_TRACKING_PRIORITY = [
+  "tracking-number",
+  "tracking_number",
+  "tracking number",
+  "tracking-id",
+  "tracking_id",
+  "tracking id",
+];
+
+const REMOVAL_SHIPMENT_CARRIER_PRIORITY = [
+  "carrier",
+  "carrier-name",
+  "carrier_name",
+  "carrier name",
+];
+
+/**
+ * Prefer the first alias that maps to a non-empty cell (exact header match after normKey).
+ * Avoids an empty `removal-order-id` / `carrier-shipment-date` winning before `order-id` / `shipment-date`
+ * when `Object.entries` order varies.
+ */
+function pickFirstNonEmptyForAliases(
+  row: Record<string, string>,
+  aliases: string[],
+  consumed: Set<string>,
+): string {
+  for (const a of aliases) {
+    const na = normKey(a);
+    for (const [k, v] of Object.entries(row)) {
+      if (normKey(k) !== na) continue;
+      const s = String(v ?? "").trim();
+      if (!s) continue;
+      consumed.add(k);
+      return s;
+    }
+  }
+  return "";
+}
+
+/**
+ * REMOVAL_SHIPMENT (FBA Removal Shipment Detail) — same DB shape as removal orders but column names differ;
+ * uses priority picks + `removal-order-type` / `request-date` / `shipment-date` per SP-API report schema.
+ */
+export function mapRowToAmazonRemovalShipment(
+  row: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+  storeId: string,
+): AmazonRemovalInsert | null {
+  const consumed = new Set<string>();
+
+  let order_id = pickFirstNonEmptyForAliases(row, REMOVAL_SHIPMENT_ORDER_ID_PRIORITY, consumed);
+  if (!order_id) order_id = pickT(row, REMOVAL_ORDER_ID_ALIASES, consumed);
+  if (!order_id) return null;
+
+  const sku = pickT(row, SKU_ALIASES, consumed) || "";
+  const fnsku = pickT(row, FNSKU_ALIASES, consumed) || null;
+  const disposition = pickT(row, DISPOSITION_ALIASES, consumed) || null;
+
+  let orderDateRaw = pickFirstNonEmptyForAliases(row, REMOVAL_SHIPMENT_REQUEST_OR_ORDER_DATE_PRIORITY, consumed);
+  if (!orderDateRaw) orderDateRaw = pickT(row, ORDER_DATE_ALIASES, consumed);
+  const order_date = parseIsoDate(orderDateRaw);
+
+  const order_source = pickT(row, ORDER_SOURCE_ALIASES, consumed) || null;
+
+  let order_type_raw = pickFirstNonEmptyForAliases(row, REMOVAL_SHIPMENT_ORDER_TYPE_PRIORITY, consumed);
+  if (!order_type_raw) order_type_raw = pickT(row, ORDER_TYPE_ALIASES, consumed);
+
+  const last_updated_date = parseIsoDate(pickT(row, LAST_UPDATED_DATE_ALIASES, consumed));
+  const in_process_quantity = parseQty(pickT(row, IN_PROCESS_QTY_ALIASES, consumed));
+  const removal_fee = parseNum(pickT(row, REMOVAL_FEE_ALIASES, consumed));
+  const currency = pickT(row, CURRENCY_ALIASES, consumed) || null;
+  const shipped_quantity = parseQty(pickT(row, SHIPPED_QTY_ALIASES, consumed));
+  const cancelled_quantity = parseQty(pickT(row, CANCELLED_QTY_ALIASES, consumed));
+  const disposed_quantity = parseQty(pickT(row, DISPOSED_QTY_ALIASES, consumed));
+  const requested_quantity = parseQty(pickT(row, QTY_ALIASES, consumed));
+  const status = pickT(row, ORDER_STATUS_ALIASES, consumed) || null;
+
+  let tracking_raw = pickFirstNonEmptyForAliases(row, REMOVAL_SHIPMENT_TRACKING_PRIORITY, consumed);
+  if (!tracking_raw) tracking_raw = pickT(row, TRACK_ALIASES, consumed);
+
+  let carrier_raw = pickFirstNonEmptyForAliases(row, REMOVAL_SHIPMENT_CARRIER_PRIORITY, consumed);
+  if (!carrier_raw) carrier_raw = pickT(row, CARRIER_ALIASES, consumed);
+
+  let shipDateRaw = pickFirstNonEmptyForAliases(row, REMOVAL_SHIPMENT_SHIPMENT_DATE_PRIORITY, consumed);
+  if (!shipDateRaw) shipDateRaw = pickT(row, SHIPMENT_DATE_ALIASES, consumed);
+  const shipment_date = parseIsoDate(shipDateRaw);
+
+  return {
+    organization_id: orgId,
+    store_id: storeId,
+    upload_id: uploadId,
+    order_id,
+    sku,
+    fnsku,
+    disposition,
+    order_date,
+    order_source,
+    order_type: order_type_raw || null,
+    last_updated_date,
+    in_process_quantity,
+    removal_fee,
+    currency,
+    shipped_quantity,
+    cancelled_quantity,
+    disposed_quantity,
+    requested_quantity,
+    status,
+    tracking_number: tracking_raw || null,
+    carrier: carrier_raw || null,
+    shipment_date,
+    raw_data: buildRawData(row, consumed),
+  };
+}
 
 export function mapRowToAmazonRemoval(
   row: Record<string, string>,
   orgId: string,
   uploadId: string,
+  storeId: string,
 ): AmazonRemovalInsert | null {
   const consumed = new Set<string>();
   const order_id = pickT(row, REMOVAL_ORDER_ID_ALIASES, consumed);
   if (!order_id) return null;
   return {
     organization_id: orgId,
+    store_id: storeId,
     upload_id: uploadId,
     order_id,
     sku:                pickT(row, SKU_ALIASES, consumed) || "",
     fnsku:              pickT(row, FNSKU_ALIASES, consumed) || null,
     disposition:        pickT(row, DISPOSITION_ALIASES, consumed) || null,
+    order_date:         parseIsoDate(pickT(row, ORDER_DATE_ALIASES, consumed)),
+    order_source:       pickT(row, ORDER_SOURCE_ALIASES, consumed) || null,
+    order_type:         pickT(row, ORDER_TYPE_ALIASES, consumed) || null,
+    last_updated_date:  parseIsoDate(pickT(row, LAST_UPDATED_DATE_ALIASES, consumed)),
+    in_process_quantity: parseQty(pickT(row, IN_PROCESS_QTY_ALIASES, consumed)),
+    removal_fee:        parseNum(pickT(row, REMOVAL_FEE_ALIASES, consumed)),
+    currency:           pickT(row, CURRENCY_ALIASES, consumed) || null,
     shipped_quantity:   parseQty(pickT(row, SHIPPED_QTY_ALIASES, consumed)),
     cancelled_quantity: parseQty(pickT(row, CANCELLED_QTY_ALIASES, consumed)),
     disposed_quantity:  parseQty(pickT(row, DISPOSED_QTY_ALIASES, consumed)),
     requested_quantity: parseQty(pickT(row, QTY_ALIASES, consumed)),
     status:             pickT(row, ORDER_STATUS_ALIASES, consumed) || null,
     tracking_number:    pickT(row, TRACK_ALIASES, consumed) || null,
+    carrier:            pickT(row, CARRIER_ALIASES, consumed) || null,
+    shipment_date:      pickT(row, SHIPMENT_DATE_ALIASES, consumed) || null,
     raw_data:           buildRawData(row, consumed),
   };
 }

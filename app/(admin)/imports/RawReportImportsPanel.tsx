@@ -547,12 +547,43 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                       )}
                     </td>
 
-                    {/* Row count — shows staged / total when available */}
+                    {/* Row count — Phase 3+: sync/stage when present; else row_count / CSV total */}
                     <td className="px-4 py-3 text-right tabular-nums text-xs text-muted-foreground">
                       {(() => {
+                        const stagedCount = num(
+                          (metaObj as { staging_row_count?: unknown } | undefined)?.staging_row_count,
+                          -1,
+                        );
+                        const syncCount = num(
+                          (metaObj as { sync_row_count?: unknown } | undefined)?.sync_row_count,
+                          -1,
+                        );
+                        const collapsed = num(
+                          (metaObj as { sync_collapsed_by_dedupe?: unknown } | undefined)
+                            ?.sync_collapsed_by_dedupe,
+                          -1,
+                        );
                         const processed = num(metaObj?.row_count, -1);
-                        const total     = num(metaObj?.total_rows, 0);
-                        // Before Phase 2 completes, show total from Phase 1 with dash prefix
+                        const total = num(metaObj?.total_rows, 0);
+                        if (stagedCount >= 0 && syncCount >= 0) {
+                          const extra =
+                            collapsed > 0
+                              ? ` — ${collapsed.toLocaleString()} staging line(s) merged (same unique key)`
+                              : "";
+                          return (
+                            <span
+                              title={
+                                "Phase 3: unique rows upserted / rows in staging. " +
+                                (collapsed > 0
+                                  ? `${collapsed} CSV lines shared a key with another line and did not add a new DB row.`
+                                  : "")
+                              }
+                              className="cursor-help"
+                            >
+                              {`${syncCount.toLocaleString()} / ${stagedCount.toLocaleString()}${extra}`}
+                            </span>
+                          );
+                        }
                         if (processed < 0 && total > 0) return `— / ${total.toLocaleString()}`;
                         if (processed < 0) return "—";
                         if (total > 0)

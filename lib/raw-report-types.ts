@@ -13,6 +13,7 @@ export const RAW_REPORT_TYPES = [
   // ── Smart-import canonical (rule-based / AI detected) ────────────────────
   "FBA_RETURNS",
   "REMOVAL_ORDER",
+  "REMOVAL_SHIPMENT",
   "INVENTORY_LEDGER",
   "REIMBURSEMENTS",
   "SETTLEMENT",

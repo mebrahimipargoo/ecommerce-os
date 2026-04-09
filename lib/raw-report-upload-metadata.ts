@@ -14,13 +14,30 @@ export type RawReportUploadMetadata = {
   process_progress?: number;
   /** Phase 3 (Sync): 0–100 while domain upserts run in chunks. */
   sync_progress?: number;
-  /** Which ETL phase last wrote progress (upload | staging | sync). */
-  etl_phase?: "upload" | "staging" | "sync";
+  /** Phase 4 (Removal imports): 0–100 while expected_packages worklist is built via FastAPI. */
+  worklist_progress?: number;
+  /** Set when POST /etl/generate-worklist (or Next proxy) finishes successfully. */
+  worklist_completed?: boolean;
+  /** Which ETL phase last wrote progress (upload | staging | sync | worklist). */
+  etl_phase?: "upload" | "staging" | "sync" | "worklist";
   row_count?: number;
+  /** Rows in amazon_staging before Phase 3 (for UI: staged vs synced). */
+  staging_row_count?: number;
+  /** Rows written in Phase 3 after dedupe / shipment archive (see sync route). */
+  sync_row_count?: number;
+  /** Staging rows where the domain mapper returned null (Phase 3). */
+  sync_mapper_null_count?: number;
+  /**
+   * Staging lines merged into another row because they shared the same DB conflict key
+   * (after mapper). staging ≈ sync_row_count + sync_mapper_null_count + this.
+   */
+  sync_collapsed_by_dedupe?: number;
   /** Original extension, e.g. `.csv` */
   file_extension?: string;
-  /** Lowercase hex MD5 of full file bytes */
+  /** Lowercase hex MD5 of full file bytes (legacy; may be first 32 hex of SHA-256 for compat) */
   md5_hash?: string;
+  /** Lowercase hex SHA-256 of entire file — used to replace prior REMOVAL_ORDER imports when re-uploading the same file */
+  content_sha256?: string;
   file_size_bytes?: number;
   /** Planned chunk count for this upload */
   upload_chunks_count?: number;
@@ -40,6 +57,8 @@ export type RawReportUploadMetadata = {
   ledger_storage_path?: string;
   /** Target `stores.id` for ledger uploads (tenant scope remains `organization_id` on the row) */
   ledger_store_id?: string;
+  /** Imports Target Store (Wave 1) — propagated to removal domain tables */
+  import_store_id?: string;
   /** e.g. `amazon_ledger_uploader` — distinguishes client-only ledger sessions */
   source?: string;
   /** Original CSV header row captured on upload — used to populate manual mapping dropdowns. */
