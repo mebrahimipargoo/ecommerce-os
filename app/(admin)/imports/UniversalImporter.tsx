@@ -94,11 +94,18 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-async function quickHash(file: File): Promise<string> {
-  const buf = await crypto.subtle.digest("SHA-256", await file.slice(0, 65536).arrayBuffer());
-  return Array.from(new Uint8Array(buf).slice(0, 16))
+/** Full-file SHA-256 (64 hex). Matches RawReportUploader — enables same-file cleanup (`metadata.content_sha256`) on sync. */
+async function sha256HexFullFile(file: File): Promise<string> {
+  const buf = await file.arrayBuffer();
+  const hashBuf = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(hashBuf))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+/** Legacy 32-hex fingerprint for `md5_hash` validation (first 32 chars of full SHA-256). */
+function first32HexOfSha256(fullSha256: string): string {
+  return fullSha256.slice(0, 32).toLowerCase();
 }
 
 async function getBrowserSessionUserId(): Promise<string | null> {
@@ -545,7 +552,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     }
 
     const ext = file.name.split(".").pop()?.toLowerCase() ?? "csv";
-    const md5Hash = await quickHash(file);
+    const contentSha256 = await sha256HexFullFile(file);
+    const md5Hash = first32HexOfSha256(contentSha256);
     const initialType = choiceToInitialReportType(reportTypeChoice);
 
     // ── STEP 1: Insert DB row FIRST ───────────────────────────────────────────
@@ -559,6 +567,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       totalBytes: file.size,
       reportType: initialType,
       md5Hash,
+      contentSha256,
       fileExtension: ext,
       fileSizeBytes: file.size,
       uploadChunksCount: 1,

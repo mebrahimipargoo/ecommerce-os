@@ -38,6 +38,8 @@ export type RawReportUploadMetadata = {
   md5_hash?: string;
   /** Lowercase hex SHA-256 of entire file — used to replace prior REMOVAL_ORDER imports when re-uploading the same file */
   content_sha256?: string;
+  /** Mirror of `raw_report_uploads.file_name` for JSON-only consumers */
+  file_name?: string;
   file_size_bytes?: number;
   /** Planned chunk count for this upload */
   upload_chunks_count?: number;

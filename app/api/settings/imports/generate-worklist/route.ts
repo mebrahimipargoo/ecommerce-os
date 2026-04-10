@@ -7,6 +7,10 @@
  * Requires env LOGISTICS_AGENT_API_URL (e.g. http://127.0.0.1:8000).
  *
  * Body: { upload_id: string }
+ *
+ * After FastAPI worklist completes, calls DB RPC `enrich_expected_packages_from_shipment_allocations`
+ * to fill shipment-derived fields on expected_packages from removal_item_allocations + shipment tree
+ * when exactly one container path exists.
  */
 
 import { NextResponse } from "next/server";
@@ -30,6 +34,58 @@ function logisticsBaseUrl(): string | null {
   const raw = process.env.LOGISTICS_AGENT_API_URL?.trim();
   if (!raw) return null;
   return raw.replace(/\/$/, "");
+}
+
+/** Imports Target Store on `raw_report_uploads.metadata` (same as sync route). */
+function resolveImportStoreId(meta: unknown): string | null {
+  const m =
+    meta && typeof meta === "object" && !Array.isArray(meta)
+      ? (meta as Record<string, unknown>)
+      : {};
+  const a = typeof m.import_store_id === "string" ? m.import_store_id.trim() : "";
+  if (a && isUuidString(a)) return a;
+  const b = typeof m.ledger_store_id === "string" ? m.ledger_store_id.trim() : "";
+  if (b && isUuidString(b)) return b;
+  return null;
+}
+
+/** DB-side enrichment: expected_packages ← allocation layer (single container path only). */
+async function enrichExpectedPackagesFromShipmentAllocations(opts: {
+  organizationId: string;
+  uploadId: string;
+  storeId: string | null;
+}): Promise<void> {
+  const { organizationId, uploadId, storeId } = opts;
+  try {
+    const { data, error } = await supabaseServer.rpc("enrich_expected_packages_from_shipment_allocations", {
+      p_organization_id: organizationId,
+      p_upload_id: uploadId,
+      p_store_id: storeId,
+    });
+    if (error) {
+      console.warn("[generate-worklist] enrich_expected_packages_from_shipment_allocations:", error.message);
+      return;
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row || typeof row !== "object") return;
+    const r = row as Record<string, unknown>;
+    console.log(
+      JSON.stringify({
+        phase: "expected_packages_allocation_enrich",
+        upload_id: uploadId,
+        organization_id: organizationId,
+        expected_rows_with_single_allocation_path: r.expected_rows_with_single_allocation_path,
+        expected_rows_with_multiple_allocation_paths: r.expected_rows_with_multiple_allocation_paths,
+        expected_rows_with_no_allocation_path: r.expected_rows_with_no_allocation_path,
+        expected_rows_enriched_from_allocation: r.expected_rows_enriched_from_allocation,
+      }),
+    );
+  } catch (e) {
+    console.warn(
+      "[generate-worklist] enrich_expected_packages_from_shipment_allocations:",
+      e instanceof Error ? e.message : e,
+    );
+  }
 }
 
 export async function POST(req: Request): Promise<Response> {
@@ -201,6 +257,12 @@ export async function POST(req: Request): Promise<Response> {
           })
           .eq("id", uploadId)
           .eq("organization_id", orgId);
+
+        await enrichExpectedPackagesFromShipmentAllocations({
+          organizationId: orgId,
+          uploadId,
+          storeId: resolveImportStoreId(meta),
+        });
 
         return NextResponse.json({ ok: true, task_id: taskId, message: lastMsg });
       }

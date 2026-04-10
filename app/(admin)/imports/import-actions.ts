@@ -250,7 +250,7 @@ export async function createRawReportUploadSession(input: {
   reportType: RawReportType;
   /** Lowercase hex MD5 of full file content (32 hex) — API validation; may be SHA-256 prefix for compat */
   md5Hash: string;
-  /** Lowercase hex SHA-256 of entire file (64 hex). When set, re-importing the same file removes prior REMOVAL_ORDER data. */
+  /** Lowercase hex SHA-256 of entire file (64 hex). When set, re-importing the same file removes prior REMOVAL_ORDER / REMOVAL_SHIPMENT data for that report type. */
   contentSha256?: string | null;
   fileExtension: string;
   fileSizeBytes: number;
@@ -305,6 +305,7 @@ export async function createRawReportUploadSession(input: {
     process_progress: 0,
     md5_hash: md5,
     ...(sha ? { content_sha256: sha } : {}),
+    file_name: input.fileName,
     file_extension: input.fileExtension,
     file_size_bytes: input.fileSizeBytes,
     upload_chunks_count: input.uploadChunksCount,
@@ -425,10 +426,11 @@ export async function updateUploadSessionClassification(input: {
     metaPatch.header_row_index = input.headerRowIndex;
   }
 
+  const mergedForWrite = mergeUploadMetadata((row as { metadata?: unknown }).metadata, metaPatch);
   const updateRow: Record<string, unknown> = {
     report_type: input.reportType,
     column_mapping: serializeColumnMappingJson(input.columnMapping ?? null),
-    metadata: mergeUploadMetadata((row as { metadata?: unknown }).metadata, metaPatch),
+    metadata: mergedForWrite,
     updated_at: new Date().toISOString(),
   };
 
@@ -439,6 +441,20 @@ export async function updateUploadSessionClassification(input: {
     .eq("organization_id", orgId);
 
   if (error) return { ok: false, error: error.message };
+
+  if (input.reportType === "REMOVAL_SHIPMENT") {
+    const cs =
+      typeof mergedForWrite.content_sha256 === "string"
+        ? mergedForWrite.content_sha256.trim().toLowerCase()
+        : "";
+    console.info(
+      JSON.stringify({
+        phase: "import_classification",
+        report_type: "REMOVAL_SHIPMENT",
+        content_sha256_present: /^[a-f0-9]{64}$/.test(cs),
+      }),
+    );
+  }
 
   await audit(orgId, userId, "import.classification_updated", input.uploadId, {
     reportType: input.reportType,
@@ -936,14 +952,16 @@ export async function deleteRawReportUpload(
 }
 
 /**
- * REMOVAL_ORDER Sync (Phase 3): if the user re-uploads the same file bytes, delete older
- * `raw_report_uploads` rows (and their domain/storage data) that share `metadata.content_sha256`,
- * so removals/worklist do not accumulate duplicates. Requires `content_sha256` on the current upload.
+ * REMOVAL_ORDER / REMOVAL_SHIPMENT Sync (Phase 3): if the user re-uploads the same file bytes,
+ * delete older `raw_report_uploads` rows (and their domain/storage data) that share
+ * `metadata.content_sha256` for the same `report_type`, so removals/shipment archive do not
+ * accumulate duplicates. Requires `content_sha256` on the current upload.
  */
 export async function removeOlderRemovalImportsWithSameFileContent(
   organizationId: string,
   currentUploadId: string,
   metadata: unknown,
+  reportType: "REMOVAL_ORDER" | "REMOVAL_SHIPMENT" = "REMOVAL_ORDER",
 ): Promise<{ ok: true; removedUploadIds: string[] } | { ok: false; error: string }> {
   if (!isUuidString(organizationId) || !isUuidString(currentUploadId)) {
     return { ok: false, error: "Invalid ids." };
@@ -962,7 +980,7 @@ export async function removeOlderRemovalImportsWithSameFileContent(
       .from(DB_TABLES.rawReportUploads)
       .select("id")
       .eq("organization_id", organizationId)
-      .eq("report_type", "REMOVAL_ORDER")
+      .eq("report_type", reportType)
       .neq("id", currentUploadId)
       .contains("metadata", { content_sha256: contentSha256 });
 

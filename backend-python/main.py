@@ -380,18 +380,17 @@ def _removal_order_date_key(val: Any) -> str | None:
 
 
 def _removal_null_slot_match_key(r: dict[str, Any]) -> tuple[Any, ...]:
-    """Match shipment staging lines to NULL-tracking removal rows (same logical line)."""
+    """Match shipment lines to NULL-tracking removal rows — canonical cross-file identity (no qty/date)."""
+    sid = r.get("store_id")
+    store_part = str(sid).strip() if sid is not None and str(sid).strip() != "" else ""
     return (
+        str(r.get("organization_id") or "").strip(),
+        store_part,
         _pg_text_unique_field(r.get("order_id")),
+        _pg_text_unique_field(r.get("order_type")),
         _pg_text_unique_field(r.get("sku")),
         _pg_text_unique_field(r.get("fnsku")),
         _pg_text_unique_field(r.get("disposition")),
-        _safe_int(r.get("requested_quantity")),
-        _safe_int(r.get("shipped_quantity")),
-        _safe_int(r.get("disposed_quantity")),
-        _safe_int(r.get("cancelled_quantity")),
-        _removal_order_date_key(r.get("order_date")),
-        _pg_text_unique_field(r.get("order_type")),
     )
 
 
@@ -437,61 +436,112 @@ EXPECTED_PKG_AMAZON_COLS = frozenset({
     "carrier",
     "shipment_date",
 })
-_EXPECTED_PKG_CONFLICT = "organization_id,store_id,order_id,sku,fnsku,disposition,requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date"
+# Shipment-derived columns (from amazon_removals after Phase 3 enrichment): merge fill-null only.
+_EP_WORKLIST_AMAZON_FILL_NULL = frozenset({
+    "tracking_number",
+    "carrier",
+    "shipment_date",
+    "order_date",
+    "fnsku",
+    "store_id",
+    "order_type",
+})
+# Matches uq_expected_packages_canonical_cross_file (quantities/dates are attributes, not upsert keys).
+_EXPECTED_PKG_CONFLICT = (
+    "organization_id,store_id,order_id,order_type,sku,fnsku,disposition"
+)
+
+
+def _ep_value_absent(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str) and str(v).strip() == "":
+        return True
+    return False
 
 
 def _expected_pkg_identity_key(row: dict[str, Any]) -> tuple[Any, ...]:
-    """Wave 1: prefer business key when store_id is set (matches uq_expected_packages_business_line)."""
+    """Canonical cross-file key: matches uq_expected_packages_canonical_cross_file (DB)."""
     st = row.get("store_id")
-    if st is not None and str(st).strip() != "":
-        return (
-            str(row.get("organization_id", "")),
-            str(st).strip(),
-            _pg_text_unique_field(row.get("order_id")),
-            _pg_text_unique_field(row.get("sku")),
-            _pg_text_unique_field(row.get("fnsku")),
-            _pg_text_unique_field(row.get("disposition")),
-            _safe_int(row.get("requested_quantity")),
-            _safe_int(row.get("shipped_quantity")),
-            _safe_int(row.get("disposed_quantity")),
-            _safe_int(row.get("cancelled_quantity")),
-            _removal_order_date_key(row.get("order_date")),
-        )
-    sid = row.get("source_staging_id")
-    if sid is not None and str(sid).strip() != "":
-        return (
-            str(row.get("organization_id", "")),
-            str(row.get("upload_id", "")),
-            str(sid).strip(),
-        )
+    sid = str(st).strip() if st is not None and str(st).strip() != "" else ""
     return (
         str(row.get("organization_id", "")),
+        sid,
         _pg_text_unique_field(row.get("order_id")),
+        _pg_text_unique_field(row.get("order_type")),
         _pg_text_unique_field(row.get("sku")),
         _pg_text_unique_field(row.get("fnsku")),
         _pg_text_unique_field(row.get("disposition")),
-        _safe_int(row.get("requested_quantity")),
-        _safe_int(row.get("shipped_quantity")),
-        _safe_int(row.get("disposed_quantity")),
-        _safe_int(row.get("cancelled_quantity")),
-        _removal_order_date_key(row.get("order_date")),
     )
 
 
+# When merging duplicate expected_packages payloads for one ON CONFLICT key, prefer filled shipment/line fields.
+_EP_UPSERT_COLLAPSE_PREFER_FIELDS = frozenset({
+    "tracking_number",
+    "carrier",
+    "shipment_date",
+    "order_type",
+    "fnsku",
+})
+
+
+def _dedupe_merged_rows_for_expected_packages_upsert(
+    merged_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Collapse rows sharing _expected_pkg_identity_key (same as upsert ON CONFLICT) to avoid duplicate-row errors."""
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    key_order: list[tuple[Any, ...]] = []
+    for r in merged_rows:
+        k = _expected_pkg_identity_key(r)
+        if k not in groups:
+            key_order.append(k)
+            groups[k] = []
+        groups[k].append(r)
+
+    out: list[dict[str, Any]] = []
+    collapsed = 0
+    for k in key_order:
+        group = groups[k]
+        if len(group) == 1:
+            out.append(group[0])
+            continue
+        collapsed += len(group) - 1
+        merged = dict(group[0])
+        for other in group[1:]:
+            for fk in _EP_UPSERT_COLLAPSE_PREFER_FIELDS:
+                if fk not in merged or _ep_value_absent(merged.get(fk)):
+                    v = other.get(fk)
+                    if not _ep_value_absent(v):
+                        merged[fk] = v
+        out.append(merged)
+
+    return out, collapsed
+
+
 def _merge_expected_pkg_amazon_only(existing: dict[str, Any], incoming_amazon: dict[str, Any]) -> dict[str, Any]:
-    """Preserve scanner / warehouse fields; overwrite only Amazon-sourced columns."""
+    """Preserve scanner / warehouse fields; overwrite only Amazon-sourced columns.
+
+    For shipment-derived fields already on amazon_removals, propagate into expected_packages but never
+    replace a populated worklist value with null/empty from incoming.
+    """
     out = dict(existing)
     for k, v in incoming_amazon.items():
-        if k in EXPECTED_PKG_AMAZON_COLS:
+        if k not in EXPECTED_PKG_AMAZON_COLS:
+            continue
+        if k in _EP_WORKLIST_AMAZON_FILL_NULL:
+            if _ep_value_absent(v):
+                continue
+            out[k] = v
+        else:
             out[k] = v
     return out
 
 
 def _is_return_order_type_for_worklist(row: dict[str, Any]) -> bool:
-    """expected_packages worklist: only lines where order-type is Return (case-insensitive)."""
+    """expected_packages worklist: Return lines only; missing order_type counts as Return (shipment CSV often omits it)."""
     t = _pg_text_unique_field(row.get("order_type"))
     if not t:
-        return False
+        return True
     return t.strip().lower() == "return"
 
 
@@ -580,6 +630,41 @@ def _fetch_org_table_all(
             break
         offset += WORKLIST_FETCH_PAGE
     return out
+
+
+def _fetch_amazon_removal_shipments_by_upload(
+    db: Any,
+    organization_id: str,
+    upload_id: str,
+) -> list[dict[str, Any]]:
+    """Rows archived for one import session (REMOVAL_SHIPMENT sync target)."""
+    out: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        res = (
+            db.table("amazon_removal_shipments")
+            .select("*")
+            .eq("organization_id", organization_id)
+            .eq("upload_id", upload_id)
+            .order("id")
+            .range(offset, offset + WORKLIST_FETCH_PAGE - 1)
+            .execute()
+        )
+        chunk = res.data or []
+        out.extend(chunk)
+        if len(chunk) < WORKLIST_FETCH_PAGE:
+            break
+        offset += WORKLIST_FETCH_PAGE
+    return out
+
+
+def _removal_like_from_shipment_archive(sh: dict[str, Any]) -> dict[str, Any]:
+    """Map amazon_removal_shipments → amazon_removals-shaped row for the worklist loop."""
+    row = dict(sh)
+    sid = sh.get("amazon_staging_id")
+    if sid is not None and str(sid).strip() != "":
+        row["source_staging_id"] = sid
+    return row
 
 
 @app.post("/etl/upload-removal")
@@ -839,14 +924,14 @@ def _run_sync_removals(
     """
     ETL Phase 3: amazon_staging → amazon_removals (+ append-only shipment history).
 
-    Identity: (organization_id, order_id, sku, disposition, tracking_number) with
-    PostgreSQL NULLS NOT DISTINCT.
+    Identity: UPSERT uses DB conflict key on amazon_removals (staging + business line).
 
     Same-key rows in one import are merged: quantity columns are summed; other
     fields use the last non-null value in file order (Amazon updates win).
 
     Shipment rows with tracking append to amazon_removal_shipments (full raw history).
-    NULL-tracking DB rows matched on (order_id, sku, disposition) are UPDATED in place
+    NULL-tracking DB rows matched on canonical cross-file key (org, store, order_id,
+    order_type, sku, fnsku, disposition) are UPDATED in place
     (no DELETE) when a shipment line fills in tracking.
 
     Re-syncs UPSERT so changed order_status / quantities update existing rows.
@@ -1168,6 +1253,7 @@ def _generate_worklist_core(
     organization_id: str,
     *,
     progress_start: int = 0,
+    upload_id: str | None = None,
 ) -> None:
     """
     Phase 4: amazon_removals → expected_packages (warehouse worklist).
@@ -1180,6 +1266,11 @@ def _generate_worklist_core(
     No wholesale DELETE: warehouse fields (e.g. actual_scanned_count) are merged
     from existing expected_packages and never overwritten by Amazon-only columns.
 
+    When upload_id is set (Phase 4 from the importer), input rows are scoped to that
+    session: prefer amazon_removals with matching upload_id; if none (REMOVAL_SHIPMENT
+    only wrote amazon_removal_shipments), build from that archive. expected_packages
+    rows are stamped with this upload_id.
+
     progress_start: baseline when called from POST /etl/generate-worklist.
     """
 
@@ -1188,6 +1279,8 @@ def _generate_worklist_core(
         _update_task(task_id, actual, msg)
 
     try:
+        session_upload = str(upload_id).strip() if upload_id else None
+
         # ── 1. Fetch amazon_removals ──────────────────────────────────────────────
         _prog(0.02, "Fetching amazon_removals rows for worklist generation...")
         log.info("[worklist-core] Fetching amazon_removals for org=%s", organization_id)
@@ -1199,11 +1292,30 @@ def _generate_worklist_core(
             _update_task(task_id, 0, f"Worklist fetch failed: {fetch_err!s}", status="failed")
             return
 
-        log.info("[worklist-core] Fetched %d rows from amazon_removals", len(removal_rows))
+        n_removals_loaded = len(removal_rows)
+        log.info("[worklist-core] amazon_removals rows loaded for generation: %d", n_removals_loaded)
+
+        if session_upload:
+            scoped = [r for r in removal_rows if str(r.get("upload_id") or "").strip() == session_upload]
+            if scoped:
+                removal_rows = scoped
+                log.info(
+                    "[worklist-core] scoped to upload_id=%s: %d amazon_removals row(s)",
+                    session_upload,
+                    len(removal_rows),
+                )
+            else:
+                ship_rows = _fetch_amazon_removal_shipments_by_upload(db, organization_id, session_upload)
+                removal_rows = [_removal_like_from_shipment_archive(x) for x in ship_rows]
+                log.info(
+                    "[worklist-core] no amazon_removals for upload_id=%s: using %d amazon_removal_shipments row(s)",
+                    session_upload,
+                    len(removal_rows),
+                )
 
         if not removal_rows:
-            log.warning("[worklist-core] amazon_removals is empty for this org — worklist unchanged")
-            _update_task(task_id, 100, "No removal rows found; worklist unchanged.", status="completed")
+            log.warning("[worklist-core] no input rows for this worklist run — nothing to write")
+            _update_task(task_id, 100, "No removal or shipment rows for this upload; worklist unchanged.", status="completed")
             return
 
         # ── 2. Load existing worklist (preserve warehouse columns) ───────────────
@@ -1239,13 +1351,20 @@ def _generate_worklist_core(
             for k in EXPECTED_PKG_AMAZON_COLS:
                 if k in ("organization_id", "order_id"):
                     continue
-                if k in row:
-                    incoming[k] = row[k]
+                if k not in row:
+                    continue
+                val = row[k]
+                if k in _EP_WORKLIST_AMAZON_FILL_NULL and _ep_value_absent(val):
+                    continue
+                incoming[k] = val
 
             if not incoming.get("sku"):
                 incoming["sku"] = ""
             if not incoming.get("order_status"):
                 incoming["order_status"] = "Pending"
+
+            if session_upload:
+                incoming["upload_id"] = session_upload
 
             k = _expected_pkg_identity_key(incoming)
             if k in existing_by_key:
@@ -1272,25 +1391,26 @@ def _generate_worklist_core(
             )
 
         if not merged_rows:
+            log.info(
+                "[worklist-core] rows skipped before insert: no_order=%d non_return=%d — no merged rows",
+                skipped_no_order,
+                skipped_non_return,
+            )
             _update_task(task_id, 100, "No worklist rows produced from amazon_removals.", status="completed")
             return
 
-        skipped_no_staging_id = sum(1 for r in merged_rows if not r.get("source_staging_id"))
-        merged_rows = [r for r in merged_rows if r.get("source_staging_id")]
-        if skipped_no_staging_id:
-            log.warning(
-                "[worklist-core] Skipped %d Return row(s) with no source_staging_id (legacy data). "
-                "Re-sync removal uploads after migration 60519 so worklist upserts are idempotent.",
-                skipped_no_staging_id,
-            )
+        log.info(
+            "[worklist-core] rows skipped before insert: no_order=%d non_return=%d",
+            skipped_no_order,
+            skipped_non_return,
+        )
 
-        if not merged_rows:
-            _update_task(
-                task_id, 100,
-                "No worklist rows with source_staging_id — re-sync removals after migration 60519.",
-                status="completed",
-            )
-            return
+        merged_before_dedupe = len(merged_rows)
+        merged_rows, merged_collapsed = _dedupe_merged_rows_for_expected_packages_upsert(merged_rows)
+        merged_after_dedupe = len(merged_rows)
+        log.info("[worklist-core] merged_rows_before_dedupe: %d", merged_before_dedupe)
+        log.info("[worklist-core] merged_rows_after_dedupe: %d", merged_after_dedupe)
+        log.info("[worklist-core] merged_rows_collapsed_by_conflict_key: %d", merged_collapsed)
 
         # ── 4. UPSERT (no DELETE) ─────────────────────────────────────────────────
         # Strip Postgres-managed system columns before upserting.  Sending id=None
@@ -1322,33 +1442,68 @@ def _generate_worklist_core(
                 )
                 return
 
+        ep_rows_generated = len(merged_rows)
+        ep_rows_populated_shipment_derived = sum(
+            1
+            for r in merged_rows
+            if any(not _ep_value_absent(r.get(fk)) for fk in _EP_WORKLIST_AMAZON_FILL_NULL)
+        )
+        ep_rows_missing_tracking_carrier_or_shipment_date = sum(
+            1
+            for r in merged_rows
+            if _ep_value_absent(r.get("tracking_number"))
+            or _ep_value_absent(r.get("carrier"))
+            or _ep_value_absent(r.get("shipment_date"))
+        )
+
+        log.info(
+            "[worklist-core] REMOVAL_PIPELINE %s",
+            json.dumps(
+                {
+                    "checkpoint": "REMOVAL_PIPELINE",
+                    "stage": "C_expected_packages",
+                    "organization_id": organization_id,
+                    "expected_rows_generated": ep_rows_generated,
+                    "expected_rows_populated_shipment_derived": ep_rows_populated_shipment_derived,
+                    "expected_rows_missing_tracking_carrier_or_shipment_date": (
+                        ep_rows_missing_tracking_carrier_or_shipment_date
+                    ),
+                    "expected_packages_upserted": upserted,
+                    "skipped_no_order": skipped_no_order,
+                    "skipped_non_return": skipped_non_return,
+                },
+                default=str,
+            ),
+        )
+
+        log.info("[worklist-core] expected_packages rows inserted: %d", upserted)
+
         # ── Row-count verification ─────────────────────────────────────────────
         if upserted < len(merged_rows):
             log.warning(
                 "[worklist-core] ROW COUNT MISMATCH: prepared %d rows but only %d were upserted.",
                 len(merged_rows), upserted,
             )
-        explained = skipped_no_order + skipped_non_return + skipped_no_staging_id + len(merged_rows)
+        explained = skipped_no_order + skipped_non_return + len(merged_rows)
         if explained != len(removal_rows):
             log.warning(
-                "[worklist-core] ROW COUNT WARNING: amazon_removals=%d rows but "
-                "skipped_no_order=%d + skipped_non_return=%d + skipped_no_staging_id=%d + worklist=%d = %d.",
+                "[worklist-core] ROW COUNT WARNING: input_rows=%d but "
+                "skipped_no_order=%d + skipped_non_return=%d + worklist=%d = %d.",
                 len(removal_rows),
                 skipped_no_order,
                 skipped_non_return,
-                skipped_no_staging_id,
                 len(merged_rows),
                 explained,
             )
         else:
             log.info(
-                "[worklist-core] Row count OK: %d removals = %d skipped (no order) + "
-                "%d skipped (non-Return) + %d Return line(s) for worklist.",
+                "[worklist-core] Row count OK: %d input = %d skipped (no order) + "
+                "%d skipped (non-Return) + %d worklist row(s).",
                 len(removal_rows), skipped_no_order, skipped_non_return, len(merged_rows),
             )
 
         log.info(
-            "[worklist-core] DONE — upserted %d rows (source amazon_removals=%d, skipped_no_order=%d, skipped_non_return=%d)",
+            "[worklist-core] DONE — upserted %d rows (input_rows=%d, skipped_no_order=%d, skipped_non_return=%d)",
             upserted, len(removal_rows), skipped_no_order, skipped_non_return,
         )
         log.info(
@@ -1356,11 +1511,16 @@ def _generate_worklist_core(
             json.dumps(
                 {
                     "phase": "generate_worklist",
-                    "amazon_removals_rows": len(removal_rows),
+                    "upload_id": session_upload,
+                    "input_rows": len(removal_rows),
                     "expected_packages_upserted": upserted,
+                    "expected_packages_rows_generated": ep_rows_generated,
+                    "expected_packages_rows_populated_shipment_derived": ep_rows_populated_shipment_derived,
+                    "expected_packages_rows_missing_tracking_carrier_or_shipment_date": (
+                        ep_rows_missing_tracking_carrier_or_shipment_date
+                    ),
                     "skipped_no_order": skipped_no_order,
                     "skipped_non_return": skipped_non_return,
-                    "skipped_no_source_staging_id": skipped_no_staging_id,
                 },
                 default=str,
             ),
@@ -1403,7 +1563,7 @@ def _run_generate_worklist(
         return
 
     try:
-        _generate_worklist_core(db, task_id, organization_id, progress_start=0)
+        _generate_worklist_core(db, task_id, organization_id, progress_start=0, upload_id=upload_id)
     except Exception:
         log.exception("[generate-worklist] background task crashed")
         _update_task(task_id, 0, "Worklist task crashed — see server logs.", status="failed")
@@ -1444,8 +1604,8 @@ async def etl_generate_worklist(
 ):
     """
     Transform amazon_removals rows into expected_packages (operational worklist).
-    Uses UPSERT on (organization_id, order_id, sku, disposition, tracking_number);
-    warehouse scan fields are preserved on conflict.
+    Uses UPSERT on canonical cross-file key (organization_id, store_id, order_id, order_type, sku, fnsku, disposition);
+    quantities/dates are row attributes; warehouse scan fields are preserved on conflict.
     Returns a task_id immediately; poll GET /etl/task/{task_id} for progress.
     """
     try:

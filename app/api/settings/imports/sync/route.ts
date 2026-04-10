@@ -65,8 +65,6 @@ const BATCH_SIZE = 500;
 const UPSERT_CHUNK_SIZE = 500;
 /** Page size for staging reads. Always use range(0, …); do not advance offset after rows are deleted. */
 const STAGING_READ_BATCH = 1000;
-/** Parallel amazon_removals UPDATEs per batch (shipment sync performance). */
-const REMOVAL_UPDATE_CONCURRENCY = 45;
 const STAGING_TABLE = "amazon_staging";
 
 type Body = { upload_id?: string };
@@ -119,8 +117,8 @@ const CONFLICT_KEY: Record<SyncKind, string | null> = {
   FBA_RETURNS:        "organization_id,lpn",
   // Wave 1: business-line dedupe (uq_amazon_removals_business_line); upload/staging idempotency via same upsert updating source_staging_id.
   REMOVAL_ORDER:      "organization_id,store_id,order_id,sku,fnsku,disposition,requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date,order_type",
-  // Unused for REMOVAL_SHIPMENT (custom sync path — no flushDomainBatch upsert to removals).
-  REMOVAL_SHIPMENT:   "organization_id,upload_id,source_staging_id",
+  // Unused for REMOVAL_SHIPMENT (custom path: `runRemovalShipmentSync` upserts `amazon_staging_id`).
+  REMOVAL_SHIPMENT:   "organization_id,upload_id,amazon_staging_id",
   INVENTORY_LEDGER:   "organization_id,fnsku,disposition,location,event_type",
   REIMBURSEMENTS:   "organization_id,reimbursement_id,sku", // matches uq_amazon_reimbursements_org_reimb_sku
   SETTLEMENT:       "organization_id,upload_id,amazon_line_key",
@@ -242,82 +240,47 @@ function removalBusinessDedupKey(row: Record<string, unknown>): string {
   ].join("|");
 }
 
-/** PostgREST upsert arbiter for `amazon_removal_shipments` Wave 1 business line (typed columns). */
-const REMOVAL_SHIPMENT_BUSINESS_CONFLICT =
-  "organization_id,store_id,order_id,tracking_number,sku,fnsku,disposition,requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date,order_type";
-
-/** Staging-line idempotency when mapper cannot fill `order_id` (raw-only archive). */
+/**
+ * Raw shipment archive: one row per staging line. Arbiter matches
+ * `uq_amazon_removal_shipments_org_upload_staging` (see 20260521_wave1_removal_store_dual_dedupe
+ * and migration dropping business-line uniqueness for raw archive).
+ */
 const REMOVAL_SHIPMENT_STAGING_CONFLICT = "organization_id,upload_id,amazon_staging_id";
 
 /**
- * Shipment business dedupe (batch pre-upsert): same key as SQL GROUP BY below, excluding quantities.
- * Aligns with Postgres date/text NULL semantics via pgTextUniqueField + dateKey.
+ * Patch `amazon_removals` from typed `amazon_removal_shipments` — fill missing fields only
+ * (no null/empty overwrites of existing values).
  */
-function removalShipmentArchiveBusinessDedupKey(row: Record<string, unknown>): string {
-  return [
-    String(row.organization_id ?? "").trim(),
-    String(row.store_id ?? "").trim(),
-    pgTextUniqueField(row.order_id) ?? "",
-    pgTextUniqueField(row.tracking_number) ?? "",
-    pgTextUniqueField(row.sku) ?? "",
-    pgTextUniqueField(row.fnsku) ?? "",
-    pgTextUniqueField(row.disposition) ?? "",
-    dateKey(row.order_date),
-    pgTextUniqueField(row.order_type) ?? "",
-  ].join("\x1e");
-}
-
-function sumShippedQuantityFromArchiveGroup(rows: Record<string, unknown>[]): number {
-  let s = 0;
-  for (const r of rows) {
-    const v = r.shipped_quantity;
-    if (v === null || v === undefined) continue;
-    const n = typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : parseInt(String(v), 10);
-    if (Number.isFinite(n)) s += n;
+function buildRemovalFillFromShipment(
+  existing: Record<string, unknown>,
+  shipment: Record<string, unknown>,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  const tn = pgTextUniqueField(shipment.tracking_number);
+  if (tn && !pgTextUniqueField(existing.tracking_number as string | null)) {
+    payload.tracking_number = tn;
   }
-  return s;
-}
-
-/**
- * Collapse rows that share the same shipment identity within one sync batch so the PostgREST
- * upsert payload does not repeat the same `REMOVAL_SHIPMENT_BUSINESS_CONFLICT` key.
- * `shipped_quantity` is summed; other typed columns come from the first row (stable sort by staging id).
- *
- * SQL equivalent (aggregate `shipped_quantity` only; non-sum columns = any row per group, e.g. MIN(staging id)):
- *
- * WITH deduped AS (
- *   SELECT
- *     organization_id, store_id, order_id, tracking_number, sku, fnsku, disposition,
- *     order_date, order_type,
- *     SUM(COALESCE(shipped_quantity, 0))::integer AS shipped_quantity
- *   FROM shipment_archive_batch
- *   GROUP BY
- *     organization_id, store_id, order_id, tracking_number, sku, fnsku, disposition,
- *     order_date, order_type
- * )
- * SELECT * FROM deduped;
- */
-function dedupeRemovalShipmentArchiveRowsForBusinessUpsert(
-  rows: Record<string, unknown>[],
-): Record<string, unknown>[] {
-  if (rows.length <= 1) return rows;
-  const groups = new Map<string, Record<string, unknown>[]>();
-  for (const r of rows) {
-    const k = removalShipmentArchiveBusinessDedupKey(r);
-    const arr = groups.get(k);
-    if (arr) arr.push(r);
-    else groups.set(k, [r]);
+  const incC = shipment.carrier;
+  if (incC !== undefined && incC !== null && String(incC).trim() !== "") {
+    if (!pgTextUniqueField(existing.carrier as string | null)) payload.carrier = incC;
   }
-  const out: Record<string, unknown>[] = [];
-  for (const [, group] of groups) {
-    group.sort((a, b) =>
-      String(a.amazon_staging_id ?? "").localeCompare(String(b.amazon_staging_id ?? "")),
-    );
-    const merged: Record<string, unknown> = { ...group[0] };
-    merged.shipped_quantity = sumShippedQuantityFromArchiveGroup(group);
-    out.push(merged);
+  const incSd = shipment.shipment_date;
+  if (incSd !== undefined && incSd !== null && String(incSd).trim() !== "") {
+    if (existing.shipment_date == null || String(existing.shipment_date).trim() === "") {
+      payload.shipment_date = incSd;
+    }
   }
-  return out;
+  const incOd = shipment.order_date;
+  if (incOd !== undefined && incOd !== null && String(incOd).trim() !== "") {
+    if (existing.order_date == null || String(existing.order_date).trim() === "") {
+      payload.order_date = incOd;
+    }
+  }
+  const incOt = shipment.order_type;
+  if (incOt !== undefined && incOt !== null && String(incOt).trim() !== "") {
+    if (!pgTextUniqueField(existing.order_type as string | null)) payload.order_type = incOt;
+  }
+  return payload;
 }
 
 function parseStagingRawRow(raw: unknown): Record<string, string> {
@@ -352,8 +315,9 @@ type RemovalShipmentSyncOpts = {
 };
 
 /**
- * REMOVAL_SHIPMENT: append every staging line to amazon_removal_shipments (full raw_row);
- * update amazon_removals with tracking_number (+ carrier, shipment_date) only — no full removal upsert.
+ * REMOVAL_SHIPMENT: for each staging line, upsert into `amazon_removal_shipments` (raw archive) using
+ * staging identity only (`organization_id`, `upload_id`, `amazon_staging_id`). After sync, shipment
+ * tree + allocations are rebuilt via DB RPCs (legacy per-batch enrichment of `amazon_removals` is bypassed).
  */
 async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
   synced: number;
@@ -361,43 +325,43 @@ async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
 }> {
   const { uploadId, orgId, storeId, totalStagingRows, columnMapping, syncUpserted } = opts;
 
-  const { data: nullRows, error: nullErr } = await supabaseServer
-    .from("amazon_removals")
-    .select(
-      "id, store_id, carrier, shipment_date, order_id, sku, fnsku, disposition, requested_quantity, shipped_quantity, disposed_quantity, cancelled_quantity, order_date, order_type",
-    )
-    .eq("organization_id", orgId)
-    .eq("store_id", storeId)
-    .is("tracking_number", null);
-
-  if (nullErr) {
-    throw new Error(`[REMOVAL_SHIPMENT] Could not load NULL-tracking removals: ${nullErr.message}`);
-  }
-
-  const nullQueues = new Map<string, string[]>();
-  const nullRowDetail: Record<string, Record<string, unknown>> = {};
-  for (const r of nullRows ?? []) {
-    const rid = String((r as { id: unknown }).id);
-    nullRowDetail[rid] = r as Record<string, unknown>;
-    const k = removalLineKeyFromMapped(r as Record<string, unknown>);
-    const arr = nullQueues.get(k);
-    if (arr) arr.push(rid);
-    else nullQueues.set(k, [rid]);
-  }
+  let shipmentArchiveRowsAttempted = 0;
+  let shipmentArchiveRowsWritten = 0;
 
   let archived = 0;
   let mapperNull = 0;
-  let removalsUpdated = 0;
+  const removalsUpdated = 0;
   let loggedShipmentRawKeys = false;
   let loggedShipmentMappedSample = false;
 
+  const REMOVAL_ENRICH_VERIFY_FIELDS = [
+    "tracking_number",
+    "carrier",
+    "shipment_date",
+    "order_date",
+    "order_type",
+  ] as const;
+
+  let verifyAStagingFetched = 0;
+  let verifyAShipmentWritten = 0;
+  let verifyAStagingDeleted = 0;
+  let verifyBEnrichConsidered = 0;
+  let verifyBEnrichMatched = 0;
+  let verifyBEnrichUpdatedOk = 0;
+  const verifyBEnrichFieldInPayload: Record<string, number> = {};
+  for (const k of REMOVAL_ENRICH_VERIFY_FIELDS) verifyBEnrichFieldInPayload[k] = 0;
+
+  let removalShipmentBatchIndex = 0;
+
   while (true) {
+    removalShipmentBatchIndex++;
     const { data: stagingRows, error: readErr } = await supabaseServer
       .from(STAGING_TABLE)
       .select("id, raw_row")
       .eq("upload_id", uploadId)
       .eq("organization_id", orgId)
-      .range(0, STAGING_READ_BATCH - 1);
+      .order("id", { ascending: true })
+      .limit(STAGING_READ_BATCH);
 
     if (readErr) throw new Error(`Staging read failed: ${readErr.message}`);
     if (!stagingRows || stagingRows.length === 0) break;
@@ -472,40 +436,26 @@ async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
         });
       }
       archiveRows.push(baseArchive);
+      if (!mappedRemoval) mapperNull++;
     }
 
-    const withOrderIdRows = archiveRows.filter((r) => pgTextUniqueField(r.order_id as string | null));
-    const rawOnlyRows = archiveRows.filter((r) => !pgTextUniqueField(r.order_id as string | null));
-    const dedupedWithOrderId = dedupeRemovalShipmentArchiveRowsForBusinessUpsert(withOrderIdRows);
+    shipmentArchiveRowsAttempted += archiveRows.length;
 
-    for (let i = 0; i < dedupedWithOrderId.length; i += UPSERT_CHUNK_SIZE) {
-      const chunk = dedupedWithOrderId.slice(i, i + UPSERT_CHUNK_SIZE);
-      if (chunk.length > 0) {
-        const { error: insErr } = await supabaseServer.from("amazon_removal_shipments").upsert(chunk, {
-          onConflict: REMOVAL_SHIPMENT_BUSINESS_CONFLICT,
-          ignoreDuplicates: false,
-        });
-        if (insErr) {
-          throw new Error(
-            `[REMOVAL_SHIPMENT] upsert into amazon_removal_shipments failed: ${insErr.message}`,
-          );
-        }
+    for (let i = 0; i < archiveRows.length; i += UPSERT_CHUNK_SIZE) {
+      const chunk = archiveRows.slice(i, i + UPSERT_CHUNK_SIZE);
+      if (chunk.length === 0) continue;
+      const { error: upsertErr } = await supabaseServer.from("amazon_removal_shipments").upsert(chunk, {
+        onConflict: REMOVAL_SHIPMENT_STAGING_CONFLICT,
+        ignoreDuplicates: false,
+      });
+      if (upsertErr) {
+        throw new Error(
+          `[REMOVAL_SHIPMENT] upsert (staging-key) into amazon_removal_shipments failed: ${upsertErr.message}`,
+        );
       }
     }
-    for (let i = 0; i < rawOnlyRows.length; i += UPSERT_CHUNK_SIZE) {
-      const chunk = rawOnlyRows.slice(i, i + UPSERT_CHUNK_SIZE);
-      if (chunk.length > 0) {
-        const { error: rawErr } = await supabaseServer.from("amazon_removal_shipments").upsert(chunk, {
-          onConflict: REMOVAL_SHIPMENT_STAGING_CONFLICT,
-          ignoreDuplicates: false,
-        });
-        if (rawErr) {
-          throw new Error(
-            `[REMOVAL_SHIPMENT] upsert (staging-key) into amazon_removal_shipments failed: ${rawErr.message}`,
-          );
-        }
-      }
-    }
+
+    shipmentArchiveRowsWritten += archiveRows.length;
 
     archived += archiveRows.length;
     await bumpSyncProgressMetadata(
@@ -513,117 +463,121 @@ async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
       archiveRows.length,
     );
 
-    const pendingUpdates: { id: string; payload: Record<string, unknown> }[] = [];
+    // Legacy step bypassed: loading `amazon_removal_shipments` by `.in("amazon_staging_id", ids)` for
+    // per-batch enrichment of `amazon_removals` (PostgREST "Bad Request" on large batches). Tree +
+    // allocations are rebuilt once after full sync via `rebuild_shipment_tree_from_removal_shipments`
+    // and `rebuild_removal_item_allocations`.
 
-    for (const sr of stagingRows) {
-      const rawObj = parseStagingRawRow(sr.raw_row);
-      const mappedRow = applyColumnMappingToRow(rawObj, columnMapping);
-      const insertRow = mapRowToAmazonRemovalShipment(mappedRow, orgId, uploadId, storeId) as Record<
-        string,
-        unknown
-      > | null;
-      if (!insertRow) {
-        mapperNull++;
-        continue;
-      }
+    const enrichmentShipmentsConsidered = 0;
+    const enrichmentRemovalsMatched = 0;
+    const enrichmentRemovalsUpdated = 0;
+    const enrichPayloadFieldCounts: Record<string, number> = {};
+    for (const k of REMOVAL_ENRICH_VERIFY_FIELDS) enrichPayloadFieldCounts[k] = 0;
 
-      const tn = pgTextUniqueField(insertRow.tracking_number);
-      if (!tn) continue;
-
-      const oid = pgTextUniqueField(insertRow.order_id);
-      if (!oid) continue;
-
-      const lineKey = removalLineKeyFromMapped(insertRow);
-      const q = nullQueues.get(lineKey);
-      if (q && q.length > 0) {
-        const rid = q.shift()!;
-        const existing = nullRowDetail[rid] ?? {};
-        const payload: Record<string, unknown> = { tracking_number: tn };
-        const incC = insertRow.carrier;
-        if (incC !== undefined && incC !== null && String(incC).trim() !== "") {
-          if (!pgTextUniqueField(existing.carrier as string | null)) payload.carrier = incC;
-        }
-        const incSd = insertRow.shipment_date;
-        if (incSd !== undefined && incSd !== null && String(incSd).trim() !== "") {
-          if (existing.shipment_date == null || String(existing.shipment_date).trim() === "") {
-            payload.shipment_date = incSd;
-          }
-        }
-        pendingUpdates.push({ id: rid, payload });
-      } else {
-        const skuVal = insertRow.sku !== undefined && insertRow.sku !== null
-          ? String(insertRow.sku).trim()
-          : "";
-        const dispVal = insertRow.disposition !== undefined ? insertRow.disposition : null;
-        const { data: candidates, error: hitErr } = await supabaseServer
-          .from("amazon_removals")
-          .select(
-            "id, carrier, shipment_date, sku, fnsku, disposition, requested_quantity, shipped_quantity, disposed_quantity, cancelled_quantity, order_date, order_type",
-          )
-          .eq("organization_id", orgId)
-          .eq("store_id", storeId)
-          .eq("order_id", oid)
-          .eq("tracking_number", tn)
-          .limit(50);
-
-        if (hitErr) {
-          console.warn("[REMOVAL_SHIPMENT] lookup existing tracked row failed:", hitErr.message);
-          continue;
-        }
-
-        const wantSku = pgTextUniqueField(skuVal || null) ?? "";
-        const wantDisp = pgTextUniqueField(dispVal);
-        const hit = (candidates ?? []).find((r) => {
-          const row = r as Record<string, unknown>;
-          const rs = pgTextUniqueField(row.sku) ?? "";
-          const rd = pgTextUniqueField(row.disposition);
-          return (
-            rs === wantSku &&
-            rd === wantDisp &&
-            removalLineKeyFromMapped(row) === lineKey
-          );
-        }) as { id?: string } | undefined;
-
-        if (hit?.id) {
-          const existing = hit as Record<string, unknown>;
-          const payload: Record<string, unknown> = {};
-          const incC = insertRow.carrier;
-          if (incC !== undefined && incC !== null && String(incC).trim() !== "") {
-            if (!pgTextUniqueField(existing.carrier as string | null)) payload.carrier = incC;
-          }
-          const incSd = insertRow.shipment_date;
-          if (incSd !== undefined && incSd !== null && String(incSd).trim() !== "") {
-            if (existing.shipment_date == null || String(existing.shipment_date).trim() === "") {
-              payload.shipment_date = incSd;
-            }
-          }
-          if (Object.keys(payload).length > 0) {
-            pendingUpdates.push({ id: hit.id, payload });
-          }
-        }
-      }
-    }
-
-    for (let u = 0; u < pendingUpdates.length; u += REMOVAL_UPDATE_CONCURRENCY) {
-      const slice = pendingUpdates.slice(u, u + REMOVAL_UPDATE_CONCURRENCY);
-      const results = await Promise.allSettled(
-        slice.map(({ id, payload }) =>
-          supabaseServer.from("amazon_removals").update(payload).eq("id", id),
-        ),
-      );
-      for (let i = 0; i < results.length; i++) {
-        const res = results[i];
-        if (res.status === "fulfilled" && !res.value.error) removalsUpdated++;
-        else if (res.status === "fulfilled" && res.value.error) {
-          console.warn("[REMOVAL_SHIPMENT] update failed:", res.value.error.message);
-        } else if (res.status === "rejected") {
-          console.warn("[REMOVAL_SHIPMENT] update rejected:", res.reason);
-        }
-      }
-    }
-
+    const removalShipmentsUpsertRowCount = archiveRows.length;
     await deleteFromStaging(ids);
+
+    verifyAStagingFetched += stagingRows.length;
+    verifyAShipmentWritten += removalShipmentsUpsertRowCount;
+    verifyAStagingDeleted += ids.length;
+    verifyBEnrichConsidered += enrichmentShipmentsConsidered;
+    verifyBEnrichMatched += enrichmentRemovalsMatched;
+    verifyBEnrichUpdatedOk += enrichmentRemovalsUpdated;
+    for (const fk of REMOVAL_ENRICH_VERIFY_FIELDS) {
+      verifyBEnrichFieldInPayload[fk] += enrichPayloadFieldCounts[fk];
+    }
+
+    console.log(
+      JSON.stringify({
+        checkpoint: "REMOVAL_PIPELINE",
+        stage: "AB_per_batch",
+        upload_id: uploadId,
+        organization_id: orgId,
+        store_id: storeId,
+        batch_index: removalShipmentBatchIndex,
+        A_sync: {
+          staging_rows_fetched: stagingRows.length,
+          shipment_rows_written: removalShipmentsUpsertRowCount,
+          shipment_archive_rows_attempted: shipmentArchiveRowsAttempted,
+          shipment_archive_rows_written: shipmentArchiveRowsWritten,
+          shipment_archive_rows_collapsed_by_raw_archive_logic: 0,
+          staging_rows_deleted: ids.length,
+        },
+        B_enrichment: {
+          legacy_bypassed: true,
+          shipment_rows_considered: enrichmentShipmentsConsidered,
+          removal_rows_matched: enrichmentRemovalsMatched,
+          removal_rows_updated: enrichmentRemovalsUpdated,
+          removal_updates_including_field: enrichPayloadFieldCounts,
+        },
+      }),
+    );
   }
+
+  const stagingCountReconciles =
+    totalStagingRows <= 0 || archived === totalStagingRows;
+
+  const pStoreIdForRpc = isUuidString(storeId) ? storeId : null;
+  console.log(
+    `[REMOVAL_SHIPMENT] shipment sync completed organization_id=${orgId} p_store_id=${pStoreIdForRpc ?? "null"}`,
+  );
+
+  const { data: treeCounts, error: treeErr } = await supabaseServer.rpc(
+    "rebuild_shipment_tree_from_removal_shipments",
+    { p_organization_id: orgId, p_store_id: pStoreIdForRpc },
+  );
+  if (treeErr) {
+    throw new Error(
+      `[REMOVAL_SHIPMENT] rebuild_shipment_tree_from_removal_shipments failed: ${treeErr.message}`,
+    );
+  }
+  const treeRow = Array.isArray(treeCounts) ? treeCounts[0] : treeCounts;
+  console.log(`[REMOVAL_SHIPMENT] shipment tree rebuilt`, JSON.stringify(treeRow ?? null));
+
+  const { data: allocCount, error: allocErr } = await supabaseServer.rpc("rebuild_removal_item_allocations", {
+    p_organization_id: orgId,
+    p_store_id: pStoreIdForRpc,
+  });
+  if (allocErr) {
+    throw new Error(`[REMOVAL_SHIPMENT] rebuild_removal_item_allocations failed: ${allocErr.message}`);
+  }
+  console.log(`[REMOVAL_SHIPMENT] removal allocations rebuilt count=${String(allocCount ?? "null")}`);
+
+  console.log(
+    JSON.stringify({
+      checkpoint: "REMOVAL_PIPELINE",
+      stage: "AB_upload_totals",
+      upload_id: uploadId,
+      organization_id: orgId,
+      store_id: storeId,
+      A_sync_totals: {
+        staging_rows_fetched: verifyAStagingFetched,
+        shipment_rows_written: verifyAShipmentWritten,
+        shipment_archive_rows_attempted: shipmentArchiveRowsAttempted,
+        shipment_archive_rows_written: shipmentArchiveRowsWritten,
+        shipment_archive_rows_collapsed_by_raw_archive_logic: 0,
+        staging_rows_deleted: verifyAStagingDeleted,
+        initial_staging_row_count: totalStagingRows,
+        staging_rows_processed: archived,
+        staging_fetch_equals_delete: verifyAStagingFetched === verifyAStagingDeleted,
+        shipment_written_vs_staging_processed_note:
+          verifyAShipmentWritten < archived
+            ? "fewer_shipment_upsert_rows_than_staging_lines_unexpected"
+            : "ok",
+      },
+      B_enrichment_totals: {
+        legacy_bypassed: true,
+        shipment_rows_considered: verifyBEnrichConsidered,
+        removal_rows_matched: verifyBEnrichMatched,
+        removal_rows_updated: verifyBEnrichUpdatedOk,
+        removal_updates_including_field: verifyBEnrichFieldInPayload,
+      },
+      integrity: {
+        staging_rows_not_skipped_by_traversal: stagingCountReconciles,
+        mapper_null_rows: mapperNull,
+      },
+    }),
+  );
 
   console.log(
     JSON.stringify({
@@ -817,12 +771,19 @@ export async function POST(req: Request): Promise<Response> {
       domainTable: DOMAIN_TABLE[kind] ?? "none",
     });
 
-    // Same removal file re-uploaded: drop older imports with identical SHA-256 (storage + domain + history row).
-    if (kind === "REMOVAL_ORDER") {
-      const rep = await removeOlderRemovalImportsWithSameFileContent(orgId, uploadId, meta);
+    // Same removal-order or removal-shipment file re-uploaded: drop older imports with identical
+    // SHA-256 (storage + domain + history row). Scoped by report_type so order vs shipment files
+    // do not cross-delete.
+    if (kind === "REMOVAL_ORDER" || kind === "REMOVAL_SHIPMENT") {
+      const rep = await removeOlderRemovalImportsWithSameFileContent(
+        orgId,
+        uploadId,
+        meta,
+        kind === "REMOVAL_SHIPMENT" ? "REMOVAL_SHIPMENT" : "REMOVAL_ORDER",
+      );
       if (rep.ok && rep.removedUploadIds.length > 0) {
         console.log(
-          `[sync][REMOVAL_ORDER] Replaced ${rep.removedUploadIds.length} prior import(s) with the same file (SHA-256).`,
+          `[sync][${kind}] Replaced ${rep.removedUploadIds.length} prior import(s) with the same file (SHA-256).`,
         );
         await audit(orgId, "import.removal_same_file_replaced_prior_uploads", uploadId, {
           removed_upload_ids: rep.removedUploadIds,
@@ -851,7 +812,7 @@ export async function POST(req: Request): Promise<Response> {
     //   remaining staging rows are left untouched so the user can retry.
     //
     // REMOVAL_SHIPMENT: dedicated path — full raw rows → amazon_removal_shipments;
-    // amazon_removals only receives tracking_number (+ carrier, shipment_date) updates.
+    // then DB RPCs rebuild shipment tree + removal_item_allocations (legacy amazon_removals enrichment bypassed).
     //
     // Errors propagate immediately — no swallowing, no silent fallbacks.
     let synced = 0;
