@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CheckCircle2, Package2, ScanLine, XCircle, AlertTriangle, RotateCcw } from "lucide-react";
-import { supabase } from "../../src/lib/supabase";
+import { isSupabaseConfigured, supabase } from "../../src/lib/supabase";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -93,6 +93,10 @@ export default function ScannerPage() {
       e.preventDefault();
       const tracking = trackingValue.trim();
       if (!tracking) return;
+      if (!isSupabaseConfigured()) {
+        setTrackingError("API not configured (NEXT_PUBLIC_SUPABASE_*). Rebuild after setting env.");
+        return;
+      }
 
       setIsLookingUp(true);
       setTrackingError(null);
@@ -136,6 +140,10 @@ export default function ScannerPage() {
       e.preventDefault();
       const sku = skuValue.trim();
       if (!sku) return;
+      if (!isSupabaseConfigured()) {
+        setSkuError("API not configured (NEXT_PUBLIC_SUPABASE_*).");
+        return;
+      }
 
       setSkuError(null);
 
@@ -212,7 +220,20 @@ export default function ScannerPage() {
   // ─── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div className="min-h-screen bg-background text-foreground flex flex-col">
+    <div className="min-h-[100dvh] min-h-screen bg-background text-foreground flex flex-col pb-[env(safe-area-inset-bottom)]">
+
+      {!isSupabaseConfigured() && (
+        <div
+          role="alert"
+          className="shrink-0 mx-3 mt-3 rounded-lg border border-amber-500/80 bg-amber-950/90 px-3 py-2 text-amber-100 text-xs leading-snug"
+        >
+          <strong className="block text-amber-50 mb-1">Configuration required</strong>
+          Set{" "}
+          <code className="rounded bg-black/30 px-1">NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
+          <code className="rounded bg-black/30 px-1">NEXT_PUBLIC_SUPABASE_ANON_KEY</code>{" "}
+          on the server and rebuild. Without them the scanner cannot load data.
+        </div>
+      )}
 
       {/* ── Sticky Header ─────────────────────────────────────────────────── */}
       <header className="sticky top-0 z-20 bg-background/95 backdrop-blur-sm border-b border-border px-4 py-3 flex items-center gap-3">

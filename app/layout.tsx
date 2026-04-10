@@ -24,8 +24,10 @@ export const metadata: Metadata = {
 export const viewport = {
   width: "device-width",
   initialScale: 1,
-  maximumScale: 1,
-  userScalable: false,
+  /** Zebra / rugged Android browsers: allow pinch-zoom; fixed max scale can break layout on some WebViews. */
+  maximumScale: 5,
+  userScalable: true,
+  viewportFit: "cover",
 };
 
 export default function RootLayout({
