@@ -18,12 +18,24 @@ const MODAL_REPORT_TYPES: RawReportType[] = [
   // ── Canonical auto-detected types ─────────────────────────────────────────
   "FBA_RETURNS",
   "REMOVAL_ORDER",
+  "REMOVAL_SHIPMENT",
   "INVENTORY_LEDGER",
   "REIMBURSEMENTS",
   "SETTLEMENT",
   "SAFET_CLAIMS",
   "TRANSACTIONS",
   "REPORTS_REPOSITORY",
+  "ALL_ORDERS",
+  "REPLACEMENTS",
+  "FBA_GRADE_AND_RESELL",
+  "MANAGE_FBA_INVENTORY",
+  "FBA_INVENTORY",
+  "RESERVED_INVENTORY",
+  "FEE_PREVIEW",
+  "MONTHLY_STORAGE_FEES",
+  "CATEGORY_LISTINGS",
+  "ALL_LISTINGS",
+  "ACTIVE_LISTINGS",
   // ── Fallback ──────────────────────────────────────────────────────────────
   "UNKNOWN",
 ];
@@ -150,7 +162,7 @@ export function ColumnMappingModal({ row, onClose, onSaved }: Props) {
                 const s = REPORT_TYPE_SPECS[v];
                 return (
                   <option key={v} value={v}>
-                    {s.shortLabel}
+                    {s?.shortLabel ?? v}
                   </option>
                 );
               })}

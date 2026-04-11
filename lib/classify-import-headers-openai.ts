@@ -69,11 +69,33 @@ SUPPORTED Amazon report types (report_type must be one of these):
   canonical: transaction_type, total_product_charges, order_id, sku, posted_date
 - REPORTS_REPOSITORY: signals = "date/time" AND "settlement id" AND "type" AND "order id" AND "sku" AND "description" AND "total"
   canonical: date_time, settlement_id, transaction_type, order_id, sku, description, total_amount
+- ALL_ORDERS: signals = "amazon-order-id" AND "purchase-date" AND "order-status"
+  canonical: order_id, purchase_date, order_status, fulfillment_channel, sales_channel
+- REPLACEMENTS: signals = "replacement-order-id" OR ("original-order-id" AND "replacement")
+  canonical: order_id, replacement_order_id, asin, sku, order_date
+- FBA_GRADE_AND_RESELL: signals = "grade" AND ("fnsku" OR "asin") AND ("units" OR "quantity")
+  canonical: asin, fnsku, sku, grade, units
+- MANAGE_FBA_INVENTORY: signals = ("afn-fulfillable-quantity" OR "afn-reserved-quantity") AND "fnsku"
+  canonical: asin, fnsku, sku, afn_fulfillable_quantity
+- FBA_INVENTORY: signals = "available" AND "fnsku" AND ("reserved-customerorders" OR "inv-age" OR "unfulfillable-quantity")
+  canonical: asin, fnsku, sku, quantity
+- RESERVED_INVENTORY: signals = ("reserved-customerorders" OR "reserved-fc-transfers") AND ("fnsku" OR "asin")
+  canonical: asin, fnsku, sku, reserved_quantity
+- FEE_PREVIEW: signals = ("estimated-referral-fee-per-unit" OR "expected-fulfillment-fee-per-unit") AND ("fnsku" OR "asin")
+  canonical: asin, fnsku, sku, price, estimated_fee, currency
+- MONTHLY_STORAGE_FEES: signals = ("average-quantity-charged" OR "monthly-storage-fee") AND ("fnsku" OR "asin")
+  canonical: asin, fnsku, sku, storage_month, storage_rate, currency
+- CATEGORY_LISTINGS: signals = "seller sku" AND ("asin1" OR "asin") AND ("browse node" OR "product category")
+  canonical: seller_sku, asin, item_name, price, quantity, status, open_date, fnsku (optional)
+- ALL_LISTINGS: signals = "seller sku" AND ("asin1" OR "asin") AND "item name" — broad merchant listing export
+  canonical: same as CATEGORY_LISTINGS
+- ACTIVE_LISTINGS: signals = "seller sku" AND ("asin1" OR "asin") AND "item name" AND "status"
+  canonical: same as CATEGORY_LISTINGS
 - UNKNOWN: use when none of the above match with 85%+ confidence
 
 Respond ONLY with a single valid JSON object:
 {
-  "report_type": "FBA_RETURNS" | "REMOVAL_ORDER" | "REMOVAL_SHIPMENT" | "INVENTORY_LEDGER" | "REIMBURSEMENTS" | "SETTLEMENT" | "SAFET_CLAIMS" | "TRANSACTIONS" | "REPORTS_REPOSITORY" | "UNKNOWN",
+  "report_type": "FBA_RETURNS" | "REMOVAL_ORDER" | "REMOVAL_SHIPMENT" | "INVENTORY_LEDGER" | "REIMBURSEMENTS" | "SETTLEMENT" | "SAFET_CLAIMS" | "TRANSACTIONS" | "REPORTS_REPOSITORY" | "ALL_ORDERS" | "REPLACEMENTS" | "FBA_GRADE_AND_RESELL" | "MANAGE_FBA_INVENTORY" | "FBA_INVENTORY" | "RESERVED_INVENTORY" | "FEE_PREVIEW" | "MONTHLY_STORAGE_FEES" | "CATEGORY_LISTINGS" | "ALL_LISTINGS" | "ACTIVE_LISTINGS" | "UNKNOWN",
   "detected_file_type": "Human-readable name of the file, e.g. 'Amazon Removal Shipment Detail', 'Walmart Sales Report', 'Shopify Inventory Export', 'Unknown File'",
   "is_supported": true or false (true ONLY if report_type is not UNKNOWN),
   "mapping": { "<canonical_field>": "<exact CSV header string>" },

@@ -70,6 +70,26 @@ export type RawReportUploadMetadata = {
    * Used to display "X / Y rows" progress during Phase 2.
    */
   total_rows?: number;
+  /** Listing import: raw_archive → canonical_sync → done (POST /imports/process). */
+  catalog_listing_import_phase?: "raw_archive" | "canonical_sync" | "done";
+  /** Physical data lines after header (pass 1). */
+  catalog_listing_file_rows_seen?: number;
+  /** Non-empty data lines after header (physical lines minus empty lines). User-facing row count. */
+  catalog_listing_data_rows_seen?: number;
+  /** Rows inserted into amazon_listing_report_rows_raw. */
+  catalog_listing_raw_rows_stored?: number;
+  catalog_listing_raw_rows_skipped_empty?: number;
+  catalog_listing_raw_rows_skipped_malformed?: number;
+  /** True new catalog rows this run (same as legacy inserted when re-import unchanged). */
+  catalog_listing_canonical_rows_new?: number;
+  catalog_listing_canonical_rows_updated?: number;
+  catalog_listing_canonical_rows_unchanged?: number;
+  catalog_listing_canonical_rows_invalid_for_merge?: number;
+  /** @deprecated Use catalog_listing_canonical_rows_new */
+  catalog_listing_canonical_rows_inserted?: number;
+  catalog_listing_canonical_rows_unchanged_or_merged?: number;
+  /** @deprecated Use catalog_listing_file_rows_seen */
+  catalog_listing_total_rows_seen?: number;
   /**
    * Rows that passed the date filter and were actually inserted into staging during Phase 2.
    * May be less than total_rows when a date range is applied.

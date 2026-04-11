@@ -1,3 +1,5 @@
+import { isUuidString } from "./uuid";
+
 /**
  * Map CSV rows to amazon_ domain tables for the Phase-3 Sync pipeline.
  *
@@ -202,11 +204,70 @@ export const NATIVE_COLUMNS_SAFET = new Set([
   "created_at", "raw_data",
 ]);
 
-/** amazon_transactions — physical DB columns */
+/** amazon_transactions — physical DB columns (source_line_hash added in migration 20260605) */
 export const NATIVE_COLUMNS_TRANSACTIONS = new Set([
   "id", "organization_id", "upload_id",
+  "source_line_hash",
   "settlement_id", "order_id", "transaction_type", "amount", "sku", "posted_date",
   "created_at", "raw_data",
+]);
+
+// ── New raw-archive tables (migration 20260604) ───────────────────────────────
+
+/** amazon_all_orders — physical DB columns */
+export const NATIVE_COLUMNS_ALL_ORDERS = new Set([
+  "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "order_id", "purchase_date", "order_status", "fulfillment_channel", "sales_channel",
+  "raw_data", "created_at", "updated_at",
+]);
+
+/** amazon_replacements — physical DB columns */
+export const NATIVE_COLUMNS_REPLACEMENTS = new Set([
+  "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "order_id", "replacement_order_id", "asin", "sku", "order_date",
+  "raw_data", "created_at", "updated_at",
+]);
+
+/** amazon_fba_grade_and_resell — physical DB columns */
+export const NATIVE_COLUMNS_FBA_GRADE_AND_RESELL = new Set([
+  "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "asin", "fnsku", "sku", "grade", "units",
+  "raw_data", "created_at", "updated_at",
+]);
+
+/** amazon_manage_fba_inventory — physical DB columns */
+export const NATIVE_COLUMNS_MANAGE_FBA_INVENTORY = new Set([
+  "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "asin", "fnsku", "sku", "afn_fulfillable_quantity",
+  "raw_data", "created_at", "updated_at",
+]);
+
+/** amazon_fba_inventory — physical DB columns */
+export const NATIVE_COLUMNS_FBA_INVENTORY = new Set([
+  "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "asin", "fnsku", "sku", "quantity",
+  "raw_data", "created_at", "updated_at",
+]);
+
+/** amazon_reserved_inventory — physical DB columns */
+export const NATIVE_COLUMNS_RESERVED_INVENTORY = new Set([
+  "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "asin", "fnsku", "sku", "reserved_quantity",
+  "raw_data", "created_at", "updated_at",
+]);
+
+/** amazon_fee_preview — physical DB columns */
+export const NATIVE_COLUMNS_FEE_PREVIEW = new Set([
+  "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "asin", "fnsku", "sku", "price", "estimated_fee", "currency",
+  "raw_data", "created_at", "updated_at",
+]);
+
+/** amazon_monthly_storage_fees — physical DB columns */
+export const NATIVE_COLUMNS_MONTHLY_STORAGE_FEES = new Set([
+  "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "asin", "fnsku", "sku", "storage_month", "storage_rate", "currency",
+  "raw_data", "created_at", "updated_at",
 ]);
 
 /** amazon_reports_repository — physical DB columns */
@@ -543,6 +604,208 @@ export function mapRowToProductFromLedger(
     barcode: fnsku,
     product_name: title || fnsku,
     source: "Amazon Inventory Ledger",
+  };
+}
+
+/** Physical columns on `public.catalog_products` (listing export upserts). */
+export const NATIVE_COLUMNS_CATALOG_PRODUCTS = new Set([
+  "id",
+  "organization_id",
+  "store_id",
+  "source_report_type",
+  "source_upload_id",
+  "seller_sku",
+  "asin",
+  "fnsku",
+  "item_name",
+  "item_description",
+  "fulfillment_channel",
+  "listing_status",
+  "listing_id",
+  "product_id",
+  "product_id_type",
+  "item_condition",
+  "merchant_shipping_group",
+  "price",
+  "quantity",
+  "open_date",
+  "raw_payload",
+  "first_seen_at",
+  "last_seen_at",
+  "created_at",
+  "updated_at",
+]);
+
+const SELLER_SKU_LISTING_ALIASES = [
+  "seller-sku",
+  "seller sku",
+  "seller_sku",
+  "sku",
+  "SKU",
+];
+/** ASIN for the canonical key — use asin1 / asin, not product-id (stored separately). */
+const ASIN_LISTING_ALIASES = ["asin1", "asin1-value", "asin", "ASIN"];
+const PRODUCT_ID_LISTING_ALIASES = ["product-id", "product id", "product_id"];
+const LISTING_ID_ALIASES = ["listing-id", "listing id", "listing_id"];
+const PRODUCT_ID_TYPE_ALIASES = ["product-id-type", "product id type", "product_id_type"];
+const ITEM_CONDITION_ALIASES = [
+  "item-condition",
+  "item condition",
+  "item_condition",
+  "condition",
+];
+const MERCHANT_SHIPPING_GROUP_ALIASES = [
+  "merchant-shipping-group",
+  "merchant shipping group",
+  "merchant_shipping_group",
+];
+const ITEM_NAME_LISTING_ALIASES = [
+  "item-name",
+  "item name",
+  "item_name",
+  "product-name",
+  "product name",
+  "title",
+];
+const ITEM_DESC_LISTING_ALIASES = ["item-description", "item description", "item_description"];
+const FULFILLMENT_CHANNEL_ALIASES = [
+  "fulfillment-channel",
+  "fulfillment channel",
+  "fulfillment_channel",
+  "fulfilment-channel",
+];
+const LISTING_STATUS_ALIASES = ["status", "listing-status", "listing status", "listing_status"];
+const PRICE_ALIASES = ["price", "your-price", "your price", "standard-price", "standard price"];
+const LISTING_QTY_ALIASES = ["quantity", "qty", "available"];
+const OPEN_DATE_ALIASES = [
+  "open-date",
+  "open date",
+  "open_date",
+  "start-date",
+  "start date",
+  "listing-created-date",
+];
+
+export type CatalogListingSource = "category_listings" | "all_listings" | "active_listings";
+
+export type CatalogProductUpsert = {
+  organization_id: string;
+  store_id: string | null;
+  source_report_type: CatalogListingSource;
+  /** Provenance: raw_report_uploads.id for this import when available. */
+  source_upload_id: string | null;
+  seller_sku: string;
+  asin: string;
+  fnsku: string | null;
+  item_name: string | null;
+  item_description: string | null;
+  fulfillment_channel: string | null;
+  listing_status: string | null;
+  listing_id: string | null;
+  product_id: string | null;
+  product_id_type: string | null;
+  item_condition: string | null;
+  merchant_shipping_group: string | null;
+  price: number | null;
+  quantity: number | null;
+  open_date: string | null;
+  raw_payload: Record<string, string>;
+};
+
+/**
+ * Maps Amazon Category / All / Active Listings CSV rows → `catalog_products`.
+ * FNSKU is optional. Rows without both seller_sku and asin are skipped.
+ */
+/** Maps `raw_report_uploads.report_type` → `catalog_products.source_report_type`. */
+export function catalogReportTypeToSource(reportType: string | null | undefined): CatalogListingSource {
+  const rt = String(reportType ?? "").trim();
+  if (rt === "CATEGORY_LISTINGS") return "category_listings";
+  if (rt === "ACTIVE_LISTINGS") return "active_listings";
+  return "all_listings";
+}
+
+/** Denormalized identifiers for amazon_listing_report_rows_raw (every file line; optional columns). */
+export function extractListingIdentifiersForRawRow(row: Record<string, string>): {
+  seller_sku: string | null;
+  asin: string | null;
+  listing_id: string | null;
+} {
+  const sku = pick(row, SELLER_SKU_LISTING_ALIASES)?.trim();
+  const asin = pick(row, ASIN_LISTING_ALIASES)?.trim();
+  const lid = pick(row, LISTING_ID_ALIASES)?.trim();
+  return {
+    seller_sku: sku ? sku : null,
+    asin: asin ? asin : null,
+    listing_id: lid ? lid : null,
+  };
+}
+
+/** Full normalized row for raw_payload JSONB (string values per cell). */
+export function listingMappedRowToRawPayload(row: Record<string, string>): Record<string, string> {
+  const o: Record<string, string> = {};
+  for (const [k, v] of Object.entries(row)) {
+    o[k] = v ?? "";
+  }
+  return o;
+}
+
+export function mapRowToCatalogProduct(
+  row: Record<string, string>,
+  orgId: string,
+  storeId: string | null,
+  source: CatalogListingSource,
+  sourceUploadId: string | null,
+): CatalogProductUpsert | null {
+  const seller_sku = pick(row, SELLER_SKU_LISTING_ALIASES);
+  const asin = pick(row, ASIN_LISTING_ALIASES);
+  if (!seller_sku?.trim() || !asin?.trim()) {
+    return null;
+  }
+
+  const raw_payload: Record<string, string> = {};
+  for (const [k, v] of Object.entries(row)) {
+    raw_payload[k] = v ?? "";
+  }
+
+  const qtyStr = pick(row, LISTING_QTY_ALIASES);
+  let quantity: number | null = parseQty(qtyStr);
+  if (quantity === null && qtyStr) {
+    const n = parseNum(qtyStr);
+    if (n !== null) quantity = Math.round(n);
+  }
+
+  const priceStr = pick(row, PRICE_ALIASES);
+  const price = priceStr ? parseNum(priceStr) : null;
+
+  const openRaw = pick(row, OPEN_DATE_ALIASES);
+  const open_date = openRaw ? parseIsoDateTime(openRaw) : null;
+
+  const nz = (s: string | undefined) => {
+    const t = (s ?? "").trim();
+    return t === "" ? null : t;
+  };
+
+  return {
+    organization_id: orgId,
+    store_id: storeId,
+    source_report_type: source,
+    source_upload_id: sourceUploadId && isUuidString(sourceUploadId) ? sourceUploadId : null,
+    seller_sku: seller_sku.trim(),
+    asin: asin.trim(),
+    fnsku: (pick(row, FNSKU_ALIASES) || "").trim() || null,
+    item_name: pick(row, ITEM_NAME_LISTING_ALIASES) || null,
+    item_description: pick(row, ITEM_DESC_LISTING_ALIASES) || null,
+    fulfillment_channel: pick(row, FULFILLMENT_CHANNEL_ALIASES) || null,
+    listing_status: pick(row, LISTING_STATUS_ALIASES) || null,
+    listing_id: nz(pick(row, LISTING_ID_ALIASES)),
+    product_id: nz(pick(row, PRODUCT_ID_LISTING_ALIASES)),
+    product_id_type: nz(pick(row, PRODUCT_ID_TYPE_ALIASES)),
+    item_condition: nz(pick(row, ITEM_CONDITION_ALIASES)),
+    merchant_shipping_group: nz(pick(row, MERCHANT_SHIPPING_GROUP_ALIASES)),
+    price,
+    quantity,
+    open_date,
+    raw_payload,
   };
 }
 
@@ -962,6 +1225,32 @@ function settlementAmazonLineKey(parts: string[]): string {
   return `${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}_${s.length.toString(16)}`;
 }
 
+/**
+ * Deterministic FNV content fingerprint for a CSV row.
+ * Combines organization_id + sorted key=value pairs of the full raw row.
+ * Same row from any upload/file → same hash → idempotent upsert.
+ * Different rows (different amounts, SKUs, fee types) → different hashes.
+ *
+ * Used as `source_line_hash` in amazon_transactions and all raw-archive tables.
+ * Does NOT use node:crypto so it is safe in both client and server contexts.
+ */
+export function computeSourceLineHash(orgId: string, row: Record<string, string>): string {
+  const parts = Object.keys(row)
+    .sort()
+    .map((k) => `${k}=${String(row[k] ?? "").trim()}`);
+  parts.unshift(orgId);
+  const s = parts.join("\x1f");
+  let h1 = 2166136261 >>> 0;
+  let h2 = 374761393 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h1 ^= s.charCodeAt(i);
+    h1 = Math.imul(h1, 16777619) >>> 0;
+    h2 += (s.charCodeAt(i) * (i + 1)) >>> 0;
+    h2 = Math.imul(h2, 2654435761) >>> 0;
+  }
+  return `${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}_${s.length.toString(16)}`;
+}
+
 function isAmazonSettlementTxtFlatRow(row: Record<string, string>): boolean {
   return Object.prototype.hasOwnProperty.call(row, "settlement_start_date");
 }
@@ -1144,6 +1433,8 @@ export function mapRowToAmazonSafetClaim(
 export type AmazonTransactionInsert = {
   organization_id: string;
   upload_id: string;
+  /** Deterministic content fingerprint — new dedup key replacing the old (org, order_id, tx_type, amount) constraint. */
+  source_line_hash: string;
   settlement_id: string | null;
   transaction_type: string;
   order_id: string | null;
@@ -1162,6 +1453,10 @@ export function mapRowToAmazonTransaction(
   const consumed = new Set<string>();
   const base_tx = pickT(row, TX_TYPE_ALIASES, consumed);
   if (!base_tx?.trim()) return null;
+
+  // Compute hash from FULL raw row BEFORE extracting fields — prevents collapse
+  // of distinct rows that share order_id + transaction_type + amount.
+  const source_line_hash = computeSourceLineHash(orgId, row);
 
   const settlement_id = pickT(row, TX_SETTLEMENT_ID_ALIASES, consumed) || null;
   const order_id = pickT(row, ORDER_ALIASES, consumed) || null;
@@ -1197,6 +1492,7 @@ export function mapRowToAmazonTransaction(
   return {
     organization_id: orgId,
     upload_id: uploadId,
+    source_line_hash,
     settlement_id,
     transaction_type,
     order_id,
@@ -1274,5 +1570,65 @@ export function mapRowToAmazonReportsRepository(
     description,
     total_amount,
     raw_data: buildRawData(row, consumed),
+  };
+}
+
+// =============================================================================
+// ── Generic raw-archive mapper (ALL_ORDERS / REPLACEMENTS / FBA_GRADE_AND_RESELL /
+//    MANAGE_FBA_INVENTORY / FBA_INVENTORY / RESERVED_INVENTORY / FEE_PREVIEW /
+//    MONTHLY_STORAGE_FEES)
+//
+// Strategy:
+//   • source_line_hash computed from full row — idempotent dedup key.
+//   • A handful of universal columns (order_id, asin, fnsku, sku) extracted for
+//     direct querying; all other values land in raw_data JSONB.
+//   • packPayloadForSupabase() in sync/route.ts ensures only native columns reach
+//     Postgres; extras stay in raw_data.
+//   • Mapper NEVER returns null for these append-only reports — every non-blank
+//     row is archived regardless of missing anchor fields.
+// =============================================================================
+
+export type AmazonRawArchiveInsert = {
+  organization_id: string;
+  store_id: string | null;
+  source_upload_id: string;
+  source_line_hash: string;
+  order_id: string | null;
+  asin: string | null;
+  fnsku: string | null;
+  sku: string | null;
+  raw_data: Record<string, string>;
+};
+
+/**
+ * Generic raw-archive mapper shared by all 8 new report types.
+ * Returns null only if the entire row is blank (skip empty CSV lines).
+ */
+export function mapRowToAmazonRawArchive(
+  row: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+  storeId: string | null,
+): AmazonRawArchiveInsert | null {
+  const hasContent = Object.values(row).some((v) => v?.trim() !== "");
+  if (!hasContent) return null;
+
+  const source_line_hash = computeSourceLineHash(orgId, row);
+
+  const raw_data: Record<string, string> = {};
+  for (const [k, v] of Object.entries(row)) {
+    if (v != null && String(v).trim() !== "") raw_data[k] = String(v);
+  }
+
+  return {
+    organization_id: orgId,
+    store_id: storeId || null,
+    source_upload_id: uploadId,
+    source_line_hash,
+    order_id: pick(row, ORDER_ALIASES) || null,
+    asin: pick(row, ASIN_ALIASES) || null,
+    fnsku: pick(row, FNSKU_ALIASES) || null,
+    sku: pick(row, SKU_ALIASES) || null,
+    raw_data,
   };
 }

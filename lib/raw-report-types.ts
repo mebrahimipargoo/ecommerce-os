@@ -20,7 +20,19 @@ export const RAW_REPORT_TYPES = [
   "SAFET_CLAIMS",
   "TRANSACTIONS",
   "REPORTS_REPOSITORY",
+  // ── Additional report types (raw-archive landing tables) ─────────────────
+  "ALL_ORDERS",
+  "REPLACEMENTS",
+  "FBA_GRADE_AND_RESELL",
+  "MANAGE_FBA_INVENTORY",
+  "FBA_INVENTORY",
+  "RESERVED_INVENTORY",
+  "FEE_PREVIEW",
+  "MONTHLY_STORAGE_FEES",
   "UNKNOWN",
+  "CATEGORY_LISTINGS",
+  "ALL_LISTINGS",
+  "ACTIVE_LISTINGS",
   // ── Legacy slugs (kept for backward-compat with older rows) ───────────────
   "fba_customer_returns",
   "reimbursements",
@@ -33,3 +45,11 @@ export const RAW_REPORT_TYPES = [
 export type RawReportType = (typeof RAW_REPORT_TYPES)[number];
 
 export const RAW_REPORT_TYPE_ORDER: RawReportType[] = [...RAW_REPORT_TYPES];
+
+/** Listing exports → `catalog_products` via `/api/settings/imports/process` (not staging/sync). */
+export const LISTING_REPORT_TYPES = ["CATEGORY_LISTINGS", "ALL_LISTINGS", "ACTIVE_LISTINGS"] as const;
+
+export function isListingReportType(rt: string | null | undefined): boolean {
+  const s = String(rt ?? "").trim();
+  return (LISTING_REPORT_TYPES as readonly string[]).includes(s);
+}

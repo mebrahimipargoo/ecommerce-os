@@ -9,7 +9,7 @@ import { ColumnMappingModal } from "./ColumnMappingModal";
 import { useUserRole } from "../../../components/UserRoleContext";
 import type { RawReportType } from "../../../lib/raw-report-types";
 import { REPORT_TYPE_SPECS } from "../../../lib/csv-import-mapping";
-import { RAW_REPORT_TYPE_ORDER } from "../../../lib/raw-report-types";
+import { isListingReportType, RAW_REPORT_TYPE_ORDER } from "../../../lib/raw-report-types";
 import { useDebugMode } from "../../../components/DebugModeContext";
 import { DatabaseTag } from "../../../components/DatabaseTag";
 
@@ -19,23 +19,36 @@ function num(v: unknown, fallback = 0): number {
 }
 
 // Status badge label
-function statusLabel(status: string, uploadProgress?: number): string {
+function statusLabel(status: string, uploadProgress?: number, opts?: { listing?: boolean }): string {
+  const listing = opts?.listing ?? false;
   switch (status) {
-    case "mapped":       return "Phase 2: Process";
-    case "staged":       return "Phase 3: Sync";
-    case "ready":        return "Ready";
-    case "uploaded":     return "Uploaded";
+    case "mapped":
+      return listing ? "Ready — Process Data" : "Phase 2: Process";
+    case "staged":
+      return "Phase 3: Sync";
+    case "ready":
+      return "Ready";
+    case "uploaded":
+      return "Uploaded";
     case "pending":
       if (uploadProgress != null && uploadProgress >= 100) return "Ready";
       return "Pending";
-    case "uploading":    return "Uploading…";
-    case "processing":   return "Processing…";
-    case "synced":       return "Synced";
-    case "complete":     return "Complete";
-    case "failed":       return "Failed";
-    case "cancelled":    return "Cancelled";
-    case "needs_mapping":return "Needs Mapping";
-    default:             return status;
+    case "uploading":
+      return "Uploading…";
+    case "processing":
+      return "Processing…";
+    case "synced":
+      return listing ? "Complete (listing)" : "Synced";
+    case "complete":
+      return "Complete";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
+    case "needs_mapping":
+      return "Needs Mapping";
+    default:
+      return status;
   }
 }
 
@@ -64,7 +77,7 @@ const LEGACY_REPORT_TYPE: Record<string, RawReportType> = {
 
 function coerceReportType(v: string): RawReportType {
   if (RAW_REPORT_TYPE_ORDER.includes(v as RawReportType)) return v as RawReportType;
-  return LEGACY_REPORT_TYPE[v] ?? "FBA_RETURNS";
+  return LEGACY_REPORT_TYPE[v] ?? "UNKNOWN";
 }
 
 type RawReportImportsPanelProps = {
@@ -131,6 +144,15 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
     };
   }, [refresh]);
 
+  /** Faster refresh while Process is running so listing progress updates are visible. */
+  useEffect(() => {
+    if (processingIds.size === 0) return;
+    const t = setInterval(() => {
+      void refresh();
+    }, 700);
+    return () => clearInterval(t);
+  }, [processingIds.size, refresh]);
+
   // ── Single row delete ────────────────────────────────────────────────────
   const runDeleteUpload = async (r: RawReportUploadRow) => {
     if (!window.confirm(`Delete "${r.file_name}" and all associated data? This cannot be undone.`)) return;
@@ -168,17 +190,27 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
     }
   };
 
-  // ── Phase 2: Process (CSV -> amazon_staging) ──────────────────────────────
+  // ── Phase 2: Process — staging (most types) OR direct catalog import (listing exports) ──
   const runProcess = async (r: RawReportUploadRow) => {
     setProcessingIds((prev) => new Set([...prev, r.id]));
     setLoadErr(null);
     try {
-      const res = await fetch("/api/settings/imports/stage", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ upload_id: r.id }),
-      });
-      const json = (await res.json()) as { ok?: boolean; error?: string; rowsStaged?: number };
+      const rt = String(r.report_type ?? "").trim();
+      const listing = isListingReportType(rt);
+      const res = await fetch(
+        listing ? "/api/settings/imports/process" : "/api/settings/imports/stage",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ upload_id: r.id }),
+        },
+      );
+      const json = (await res.json()) as {
+        ok?: boolean;
+        error?: string;
+        rowsStaged?: number;
+        rowsProcessed?: number;
+      };
       if (!res.ok || !json.ok) {
         setLoadErr(json.error ?? "Processing failed.");
         return;
@@ -308,17 +340,26 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
         </div>
 
         {/* Sub-description */}
-        <p className="px-5 pt-2 pb-3 text-xs text-muted-foreground">
-          New uploads appear instantly after Phase 1. Click{" "}
-          <strong>Process</strong> (Phase 2) to stage data, then{" "}
-          <strong>Sync</strong> (Phase 3) to move it into destination tables.
-          Delete performs full cleanup across Storage, staging, and domain tables.
-          {debugMode && (
-            <span className="ml-2 font-mono text-[10px] text-muted-foreground/70">
-              [<code>raw_report_uploads</code>]
-            </span>
-          )}
-        </p>
+        <div className="space-y-2 px-5 pt-2 pb-3 text-xs text-muted-foreground">
+          <p>
+            <strong className="text-foreground">Amazon listing exports:</strong> Phase 1 upload, then{" "}
+            <strong>Process Data</strong> (parse raw rows + sync catalog). There is no separate Sync step and no
+            Generate step.
+          </p>
+          <p>
+            <strong className="text-foreground">Other report types:</strong> after upload,{" "}
+            <strong>Process</strong> stages rows, then <strong>Sync</strong> writes domain tables (removal flows may
+            add Generate Worklist).
+          </p>
+          <p>
+            Delete performs full cleanup across Storage, staging, and domain tables.
+            {debugMode && (
+              <span className="ml-2 font-mono text-[10px] text-muted-foreground/70">
+                [<code>raw_report_uploads</code>]
+              </span>
+            )}
+          </p>
+        </div>
 
         {/* ── Scrollable table ─────────────────────────────────────────────────── */}
         <div className="relative max-h-[400px] overflow-x-auto overflow-y-auto rounded-b-2xl">
@@ -369,6 +410,7 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                 }
                 return filteredRows.map((r) => {
                 const rt = coerceReportType(r.report_type);
+                const isListing = isListingReportType(rt);
                 const metaObj =
                   r.metadata && typeof r.metadata === "object" && !Array.isArray(r.metadata)
                     ? (r.metadata as Record<string, unknown>)
@@ -454,9 +496,13 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                         >
                           {RAW_REPORT_TYPE_ORDER.map((v) => {
                             const s = REPORT_TYPE_SPECS[v];
+                            const label =
+                              s != null
+                                ? `${s.shortLabel} (${s.description})`
+                                : String(v);
                             return (
                               <option key={v} value={v}>
-                                {s.shortLabel} ({s.description})
+                                {label}
                               </option>
                             );
                           })}
@@ -530,7 +576,7 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                               statusColorClass(r.status),
                             ].join(" ")}
                           >
-                            <span>{statusLabel(r.status, r.upload_progress)}</span>
+                            <span>{statusLabel(r.status, r.upload_progress, { listing: isListing })}</span>
                             {(r.status === "uploading" || r.status === "processing") &&
                               r.upload_progress > 0 && r.upload_progress < 100 && (
                                 <span className="font-normal tabular-nums text-muted-foreground">
@@ -550,6 +596,36 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                     {/* Row count — Phase 3+: sync/stage when present; else row_count / CSV total */}
                     <td className="px-4 py-3 text-right tabular-nums text-xs text-muted-foreground">
                       {(() => {
+                        const listingRaw = num(metaObj?.catalog_listing_raw_rows_stored, -1);
+                        const listingData = num(metaObj?.catalog_listing_data_rows_seen, -1);
+                        const listingNew = num(
+                          metaObj?.catalog_listing_canonical_rows_new ?? metaObj?.catalog_listing_canonical_rows_inserted,
+                          -1,
+                        );
+                        const listingUnchanged = num(
+                          metaObj?.catalog_listing_canonical_rows_unchanged ??
+                            metaObj?.catalog_listing_canonical_rows_unchanged_or_merged,
+                          -1,
+                        );
+                        if (
+                          isListing &&
+                          listingRaw >= 0 &&
+                          listingData >= 0 &&
+                          (r.status === "synced" || r.status === "processing" || r.status === "complete")
+                        ) {
+                          const syncNote =
+                            r.status === "synced" && listingNew >= 0 && listingUnchanged >= 0
+                              ? ` · new ${listingNew.toLocaleString()} · unchanged ${listingUnchanged.toLocaleString()}`
+                              : "";
+                          return (
+                            <span
+                              title="Listing import: raw rows stored vs non-empty data lines; canonical counts after Process Data."
+                              className="cursor-help"
+                            >
+                              {`${listingRaw.toLocaleString()} raw / ${listingData.toLocaleString()} data${syncNote}`}
+                            </span>
+                          );
+                        }
                         const stagedCount = num(
                           (metaObj as { staging_row_count?: unknown } | undefined)?.staging_row_count,
                           -1,
@@ -616,7 +692,11 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                             type="button"
                             disabled={busy}
                             onClick={() => void runProcess(r)}
-                            aria-label={`Process ${r.file_name} to staging`}
+                            aria-label={
+                              isListing
+                                ? `Process Data for ${r.file_name} (listing catalog)`
+                                : `Process ${r.file_name} to staging`
+                            }
                             className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-sky-400/60 bg-sky-50 px-3 text-xs font-semibold text-sky-800 shadow-sm transition hover:bg-sky-100 disabled:opacity-50 dark:border-sky-600/40 dark:bg-sky-950/30 dark:text-sky-300"
                           >
                             {processingIds.has(r.id) ? (
@@ -624,6 +704,8 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                                 <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
                                 Processing…
                               </>
+                            ) : isListing ? (
+                              "Process Data"
                             ) : (
                               "Process"
                             )}

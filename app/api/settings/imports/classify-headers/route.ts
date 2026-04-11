@@ -107,6 +107,30 @@ function applyRemovalShipmentFallbackMapping(
   return result;
 }
 
+/** Gap-fill for listing exports (seller-sku / asin1 column spellings). */
+const LISTING_FALLBACK_ALIASES: Record<string, string[]> = {
+  seller_sku: ["seller-sku", "seller sku", "seller_sku", "sku", "SKU"],
+  asin: ["asin1", "asin1-value", "asin", "ASIN", "product-id", "product id"],
+};
+
+function applyListingFallbackMapping(
+  headers: string[],
+  existing: Record<string, string>,
+): Record<string, string> {
+  const result = { ...existing };
+  for (const [canonical, aliases] of Object.entries(LISTING_FALLBACK_ALIASES)) {
+    if (result[canonical]) continue;
+    const normalizedAliases = aliases.map(normH);
+    for (const header of headers) {
+      if (normalizedAliases.includes(normH(header))) {
+        result[canonical] = header;
+        break;
+      }
+    }
+  }
+  return result;
+}
+
 const SETTLEMENT_FLAT_FALLBACK_ALIASES: Record<string, string[]> = {
   settlement_id:         ["settlement-id", "settlement id", "Settlement ID"],
   settlement_start_date: ["settlement-start-date", "settlement start date"],
@@ -244,6 +268,9 @@ export async function POST(req: Request): Promise<Response> {
       SAFET_CLAIMS:       "Amazon SAFE-T Claims Report",
       TRANSACTIONS:       "Amazon Transactions Report",
       REPORTS_REPOSITORY: "Amazon Reports Repository Export",
+      CATEGORY_LISTINGS:  "Amazon Category Listings Report",
+      ALL_LISTINGS:       "Amazon All Listings Report",
+      ACTIVE_LISTINGS:    "Amazon Active Listings Report",
     };
 
     // ── Step 1: Rule-based classification (ALWAYS runs first) ─────────────────
@@ -339,6 +366,12 @@ export async function POST(req: Request): Promise<Response> {
       column_mapping = applyTransactionsFallbackMapping(headers, merged);
     } else if ((reportType as string) === "REPORTS_REPOSITORY") {
       column_mapping = applyReportsRepositoryFallbackMapping(headers, merged);
+    } else if (
+      (reportType as string) === "CATEGORY_LISTINGS" ||
+      (reportType as string) === "ALL_LISTINGS" ||
+      (reportType as string) === "ACTIVE_LISTINGS"
+    ) {
+      column_mapping = applyListingFallbackMapping(headers, merged);
     }
 
     // ── Step 3.6: Filename / content — do not mis-file Reports Repository as Settlement ─
@@ -360,6 +393,36 @@ export async function POST(req: Request): Promise<Response> {
         headers,
         { ...buildColumnMappingFromHeaders(headers, "REPORTS_REPOSITORY"), ...column_mapping },
       );
+    }
+
+    // Filename: "All+Listings+Report" / "All Listings" → prefer ALL_LISTINGS over ACTIVE when both match headers
+    const fileNorm = fileName.replace(/\+/g, " ").toLowerCase();
+    if (
+      fileNorm.length > 0 &&
+      /\ball\s+listings\b/.test(fileNorm) &&
+      (reportType === "ACTIVE_LISTINGS" || reportType === "UNKNOWN")
+    ) {
+      const ds = new Set(
+        headers.map((h) =>
+          h
+            .toLowerCase()
+            .replace(/[-_]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim(),
+        ),
+      );
+      if (ds.has("seller sku") && (ds.has("asin1") || ds.has("asin"))) {
+        reportType = "ALL_LISTINGS";
+        source = "filename";
+        isSupported = true;
+        column_mapping = applyListingFallbackMapping(
+          headers,
+          {
+            ...buildColumnMappingFromHeaders(headers, "ALL_LISTINGS"),
+            ...column_mapping,
+          },
+        );
+      }
     }
 
     // ── Step 4: Determine if manual intervention is required ───────────────────

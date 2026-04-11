@@ -11,7 +11,18 @@ export const CLASSIFIED_REPORT_TYPES = [
   "SAFET_CLAIMS",
   "TRANSACTIONS",
   "REPORTS_REPOSITORY",
+  "ALL_ORDERS",
+  "REPLACEMENTS",
+  "FBA_GRADE_AND_RESELL",
+  "MANAGE_FBA_INVENTORY",
+  "FBA_INVENTORY",
+  "RESERVED_INVENTORY",
+  "FEE_PREVIEW",
+  "MONTHLY_STORAGE_FEES",
   "UNKNOWN",
+  "CATEGORY_LISTINGS",
+  "ALL_LISTINGS",
+  "ACTIVE_LISTINGS",
 ] as const;
 
 /** Used by buildColumnMappingFromHeaders — hyphen-key form for column_mapping JSONB. */
@@ -471,6 +482,192 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
       aliases: ["total", "Total", "total-amount", "total amount"],
     },
   ],
+  CATEGORY_LISTINGS: [
+    {
+      key: "seller_sku",
+      label: "Seller SKU",
+      required: true,
+      aliases: ["seller-sku", "seller sku", "sku", "SKU"],
+    },
+    {
+      key: "asin",
+      label: "ASIN",
+      required: true,
+      aliases: ["asin1", "asin", "ASIN", "product-id", "product id"],
+    },
+    {
+      key: "item_name",
+      label: "Item name",
+      required: false,
+      aliases: ["item-name", "item name", "product-name", "product name", "title"],
+    },
+    {
+      key: "item_description",
+      label: "Item description",
+      required: false,
+      aliases: ["item-description", "item description"],
+    },
+    {
+      key: "fulfillment_channel",
+      label: "Fulfillment channel",
+      required: false,
+      aliases: ["fulfillment-channel", "fulfillment channel", "fulfilment-channel"],
+    },
+    {
+      key: "listing_status",
+      label: "Status",
+      required: false,
+      aliases: ["status", "listing-status", "listing status"],
+    },
+    {
+      key: "price",
+      label: "Price",
+      required: false,
+      aliases: ["price", "your-price", "your price"],
+    },
+    {
+      key: "quantity",
+      label: "Quantity",
+      required: false,
+      aliases: ["quantity", "qty", "available"],
+    },
+    {
+      key: "open_date",
+      label: "Open date",
+      required: false,
+      aliases: ["open-date", "open date", "open_date", "listing-created-date"],
+    },
+    {
+      key: "fnsku",
+      label: "FNSKU",
+      required: false,
+      aliases: ["fnsku", "FNSKU", "fulfillment-network-sku"],
+    },
+  ],
+  ALL_LISTINGS: [
+    {
+      key: "seller_sku",
+      label: "Seller SKU",
+      required: true,
+      aliases: ["seller-sku", "seller sku", "sku", "SKU"],
+    },
+    {
+      key: "asin",
+      label: "ASIN",
+      required: true,
+      aliases: ["asin1", "asin", "ASIN", "product-id", "product id"],
+    },
+    {
+      key: "item_name",
+      label: "Item name",
+      required: false,
+      aliases: ["item-name", "item name", "product-name", "product name", "title"],
+    },
+    {
+      key: "item_description",
+      label: "Item description",
+      required: false,
+      aliases: ["item-description", "item description"],
+    },
+    {
+      key: "fulfillment_channel",
+      label: "Fulfillment channel",
+      required: false,
+      aliases: ["fulfillment-channel", "fulfillment channel", "fulfilment-channel"],
+    },
+    {
+      key: "listing_status",
+      label: "Status",
+      required: false,
+      aliases: ["status", "listing-status", "listing status"],
+    },
+    {
+      key: "price",
+      label: "Price",
+      required: false,
+      aliases: ["price", "your-price", "your price"],
+    },
+    {
+      key: "quantity",
+      label: "Quantity",
+      required: false,
+      aliases: ["quantity", "qty", "available"],
+    },
+    {
+      key: "open_date",
+      label: "Open date",
+      required: false,
+      aliases: ["open-date", "open date", "open_date", "listing-created-date"],
+    },
+    {
+      key: "fnsku",
+      label: "FNSKU",
+      required: false,
+      aliases: ["fnsku", "FNSKU", "fulfillment-network-sku"],
+    },
+  ],
+  ACTIVE_LISTINGS: [
+    {
+      key: "seller_sku",
+      label: "Seller SKU",
+      required: true,
+      aliases: ["seller-sku", "seller sku", "sku", "SKU"],
+    },
+    {
+      key: "asin",
+      label: "ASIN",
+      required: true,
+      aliases: ["asin1", "asin", "ASIN", "product-id", "product id"],
+    },
+    {
+      key: "item_name",
+      label: "Item name",
+      required: false,
+      aliases: ["item-name", "item name", "product-name", "product name", "title"],
+    },
+    {
+      key: "item_description",
+      label: "Item description",
+      required: false,
+      aliases: ["item-description", "item description"],
+    },
+    {
+      key: "fulfillment_channel",
+      label: "Fulfillment channel",
+      required: false,
+      aliases: ["fulfillment-channel", "fulfillment channel", "fulfilment-channel"],
+    },
+    {
+      key: "listing_status",
+      label: "Status",
+      required: false,
+      aliases: ["status", "listing-status", "listing status"],
+    },
+    {
+      key: "price",
+      label: "Price",
+      required: false,
+      aliases: ["price", "your-price", "your price"],
+    },
+    {
+      key: "quantity",
+      label: "Quantity",
+      required: false,
+      aliases: ["quantity", "qty", "available"],
+    },
+    {
+      key: "open_date",
+      label: "Open date",
+      required: false,
+      aliases: ["open-date", "open date", "open_date", "listing-created-date"],
+    },
+    {
+      key: "fnsku",
+      label: "FNSKU",
+      required: false,
+      aliases: ["fnsku", "FNSKU", "fulfillment-network-sku"],
+    },
+  ],
 };
 
 /**
@@ -645,6 +842,44 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
     return { reportType: "TRANSACTIONS", matchedRule: "transaction type+total product charges" };
   }
 
+  // Rule 9: Category Listings Report — browse / category columns plus seller SKU + ASIN
+  if (
+    ds.has("seller sku") &&
+    (ds.has("asin1") || ds.has("asin")) &&
+    (ds.has("browse node") || ds.has("product category") || ds.has("browse tree"))
+  ) {
+    return {
+      reportType: "CATEGORY_LISTINGS",
+      matchedRule: "seller sku+asin+browse node or product category",
+    };
+  }
+
+  // Rule 10: Active Listings — status + item name + identity (no browse node fingerprint)
+  if (
+    ds.has("seller sku") &&
+    (ds.has("asin1") || ds.has("asin")) &&
+    ds.has("item name") &&
+    ds.has("status") &&
+    !ds.has("browse node")
+  ) {
+    return {
+      reportType: "ACTIVE_LISTINGS",
+      matchedRule: "seller sku+asin+item name+status (no browse node)",
+    };
+  }
+
+  // Rule 11: All Listings Report — broad merchant listing export
+  if (
+    ds.has("seller sku") &&
+    (ds.has("asin1") || ds.has("asin")) &&
+    (ds.has("item name") || ds.has("open date") || ds.has("product name"))
+  ) {
+    return {
+      reportType: "ALL_LISTINGS",
+      matchedRule: "seller sku+asin+item name or open date (all listings superset)",
+    };
+  }
+
   // Rule 8b: Amazon settlement flat-file detail report (.txt TSV).
   //
   // Columns are hyphenated: settlement-id, transaction-type, order-id, total-amount,
@@ -683,11 +918,23 @@ export function parseGptReportType(raw: string): RawReportType {
   const u = raw.toUpperCase();
   if (/\bFBA_RETURNS\b/.test(u)) return "FBA_RETURNS";
   if (/\bREMOVAL_ORDER\b/.test(u)) return "REMOVAL_ORDER";
+  if (/\bREMOVAL_SHIPMENT\b/.test(u)) return "REMOVAL_SHIPMENT";
   if (/\bINVENTORY_LEDGER\b/.test(u)) return "INVENTORY_LEDGER";
   if (/\bREIMBURSEMENTS\b/.test(u)) return "REIMBURSEMENTS";
   if (/\bSETTLEMENT\b/.test(u)) return "SETTLEMENT";
   if (/\bSAFET_CLAIMS\b/.test(u)) return "SAFET_CLAIMS";
   if (/\bTRANSACTIONS\b/.test(u)) return "TRANSACTIONS";
   if (/\bREPORTS_REPOSITORY\b/.test(u)) return "REPORTS_REPOSITORY";
+  if (/\bALL_ORDERS\b/.test(u)) return "ALL_ORDERS";
+  if (/\bREPLACEMENTS\b/.test(u)) return "REPLACEMENTS";
+  if (/\bFBA_GRADE_AND_RESELL\b/.test(u)) return "FBA_GRADE_AND_RESELL";
+  if (/\bMANAGE_FBA_INVENTORY\b/.test(u)) return "MANAGE_FBA_INVENTORY";
+  if (/\bFBA_INVENTORY\b/.test(u)) return "FBA_INVENTORY";
+  if (/\bRESERVED_INVENTORY\b/.test(u)) return "RESERVED_INVENTORY";
+  if (/\bFEE_PREVIEW\b/.test(u)) return "FEE_PREVIEW";
+  if (/\bMONTHLY_STORAGE_FEES\b/.test(u)) return "MONTHLY_STORAGE_FEES";
+  if (/\bCATEGORY_LISTINGS\b/.test(u)) return "CATEGORY_LISTINGS";
+  if (/\bALL_LISTINGS\b/.test(u)) return "ALL_LISTINGS";
+  if (/\bACTIVE_LISTINGS\b/.test(u)) return "ACTIVE_LISTINGS";
   return "UNKNOWN";
 }

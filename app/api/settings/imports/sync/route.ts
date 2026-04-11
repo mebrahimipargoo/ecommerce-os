@@ -42,6 +42,7 @@ import {
   mapRowToAmazonSettlement,
   mapRowToAmazonTransaction,
   mapRowToAmazonReportsRepository,
+  mapRowToAmazonRawArchive,
   packPayloadForSupabase,
   NATIVE_COLUMNS_RETURNS,
   NATIVE_COLUMNS_REMOVALS,
@@ -51,6 +52,14 @@ import {
   NATIVE_COLUMNS_SAFET,
   NATIVE_COLUMNS_TRANSACTIONS,
   NATIVE_COLUMNS_REPORTS_REPOSITORY,
+  NATIVE_COLUMNS_ALL_ORDERS,
+  NATIVE_COLUMNS_REPLACEMENTS,
+  NATIVE_COLUMNS_FBA_GRADE_AND_RESELL,
+  NATIVE_COLUMNS_MANAGE_FBA_INVENTORY,
+  NATIVE_COLUMNS_FBA_INVENTORY,
+  NATIVE_COLUMNS_RESERVED_INVENTORY,
+  NATIVE_COLUMNS_FEE_PREVIEW,
+  NATIVE_COLUMNS_MONTHLY_STORAGE_FEES,
 } from "../../../../../lib/import-sync-mappers";
 import { removeOlderRemovalImportsWithSameFileContent } from "@/app/(admin)/imports/import-actions";
 import { mergeUploadMetadata } from "../../../../../lib/raw-report-upload-metadata";
@@ -79,21 +88,36 @@ type SyncKind =
   | "SAFET_CLAIMS"
   | "TRANSACTIONS"
   | "REPORTS_REPOSITORY"
+  | "ALL_ORDERS"
+  | "REPLACEMENTS"
+  | "FBA_GRADE_AND_RESELL"
+  | "MANAGE_FBA_INVENTORY"
+  | "FBA_INVENTORY"
+  | "RESERVED_INVENTORY"
+  | "FEE_PREVIEW"
+  | "MONTHLY_STORAGE_FEES"
   | "UNKNOWN";
 
 /** amazon_ domain table for each report kind (null = no table yet / UNKNOWN). */
 const DOMAIN_TABLE: Record<SyncKind, string | null> = {
-  FBA_RETURNS:        "amazon_returns",
-  REMOVAL_ORDER:      "amazon_removals",
-  // Primary Phase 3 target for REMOVAL_SHIPMENT is amazon_removal_shipments (+ tracker updates on amazon_removals).
-  REMOVAL_SHIPMENT:   "amazon_removal_shipments",
-  INVENTORY_LEDGER:   "amazon_inventory_ledger",
-  REIMBURSEMENTS:     "amazon_reimbursements",
-  SETTLEMENT:         "amazon_settlements",
-  SAFET_CLAIMS:       "amazon_safet_claims",
-  TRANSACTIONS:       "amazon_transactions",
-  REPORTS_REPOSITORY: "amazon_reports_repository",
-  UNKNOWN:            null,
+  FBA_RETURNS:           "amazon_returns",
+  REMOVAL_ORDER:         "amazon_removals",
+  REMOVAL_SHIPMENT:      "amazon_removal_shipments",
+  INVENTORY_LEDGER:      "amazon_inventory_ledger",
+  REIMBURSEMENTS:        "amazon_reimbursements",
+  SETTLEMENT:            "amazon_settlements",
+  SAFET_CLAIMS:          "amazon_safet_claims",
+  TRANSACTIONS:          "amazon_transactions",
+  REPORTS_REPOSITORY:    "amazon_reports_repository",
+  ALL_ORDERS:            "amazon_all_orders",
+  REPLACEMENTS:          "amazon_replacements",
+  FBA_GRADE_AND_RESELL:  "amazon_fba_grade_and_resell",
+  MANAGE_FBA_INVENTORY:  "amazon_manage_fba_inventory",
+  FBA_INVENTORY:         "amazon_fba_inventory",
+  RESERVED_INVENTORY:    "amazon_reserved_inventory",
+  FEE_PREVIEW:           "amazon_fee_preview",
+  MONTHLY_STORAGE_FEES:  "amazon_monthly_storage_fees",
+  UNKNOWN:               null,
 };
 
 /**
@@ -115,32 +139,48 @@ const DOMAIN_TABLE: Record<SyncKind, string | null> = {
  */
 const CONFLICT_KEY: Record<SyncKind, string | null> = {
   FBA_RETURNS:        "organization_id,lpn",
-  // Wave 1: business-line dedupe (uq_amazon_removals_business_line); upload/staging idempotency via same upsert updating source_staging_id.
   REMOVAL_ORDER:      "organization_id,store_id,order_id,sku,fnsku,disposition,requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date,order_type",
-  // Unused for REMOVAL_SHIPMENT (custom path: `runRemovalShipmentSync` upserts `amazon_staging_id`).
   REMOVAL_SHIPMENT:   "organization_id,upload_id,amazon_staging_id",
   INVENTORY_LEDGER:   "organization_id,fnsku,disposition,location,event_type",
-  REIMBURSEMENTS:   "organization_id,reimbursement_id,sku", // matches uq_amazon_reimbursements_org_reimb_sku
-  SETTLEMENT:       "organization_id,upload_id,amazon_line_key",
-  SAFET_CLAIMS:     "organization_id,safet_claim_id",
-  TRANSACTIONS:     "organization_id,order_id,transaction_type,amount",
-  REPORTS_REPOSITORY:
-    "organization_id,date_time,transaction_type,order_id,sku,description",
-  UNKNOWN:          null,
+  REIMBURSEMENTS:     "organization_id,reimbursement_id,sku",
+  SETTLEMENT:         "organization_id,upload_id,amazon_line_key",
+  SAFET_CLAIMS:       "organization_id,safet_claim_id",
+  // Fixed in migration 20260605: was (org, order_id, tx_type, amount) — too narrow,
+  // collapsed distinct rows with same order+type+amount but different SKU/dates.
+  TRANSACTIONS:       "organization_id,source_line_hash",
+  REPORTS_REPOSITORY: "organization_id,date_time,transaction_type,order_id,sku,description",
+  // New raw-archive tables: idempotent dedup via content fingerprint
+  ALL_ORDERS:           "organization_id,source_line_hash",
+  REPLACEMENTS:         "organization_id,source_line_hash",
+  FBA_GRADE_AND_RESELL: "organization_id,source_line_hash",
+  MANAGE_FBA_INVENTORY: "organization_id,source_line_hash",
+  FBA_INVENTORY:        "organization_id,source_line_hash",
+  RESERVED_INVENTORY:   "organization_id,source_line_hash",
+  FEE_PREVIEW:          "organization_id,source_line_hash",
+  MONTHLY_STORAGE_FEES: "organization_id,source_line_hash",
+  UNKNOWN:              null,
 };
 
 /** NATIVE_COLUMNS set for each sync kind — passed to packPayloadForSupabase(). */
 const NATIVE_COLUMNS_MAP: Record<SyncKind, Set<string> | null> = {
-  FBA_RETURNS:        NATIVE_COLUMNS_RETURNS,
-  REMOVAL_ORDER:      NATIVE_COLUMNS_REMOVALS,
-  REMOVAL_SHIPMENT:   NATIVE_COLUMNS_REMOVALS,  // same schema as REMOVAL_ORDER
-  INVENTORY_LEDGER:   NATIVE_COLUMNS_LEDGER,
-  REIMBURSEMENTS:     NATIVE_COLUMNS_REIMBURSEMENTS,
-  SETTLEMENT:         NATIVE_COLUMNS_SETTLEMENTS,
-  SAFET_CLAIMS:       NATIVE_COLUMNS_SAFET,
-  TRANSACTIONS:       NATIVE_COLUMNS_TRANSACTIONS,
-  REPORTS_REPOSITORY: NATIVE_COLUMNS_REPORTS_REPOSITORY,
-  UNKNOWN:            null,
+  FBA_RETURNS:           NATIVE_COLUMNS_RETURNS,
+  REMOVAL_ORDER:         NATIVE_COLUMNS_REMOVALS,
+  REMOVAL_SHIPMENT:      NATIVE_COLUMNS_REMOVALS,
+  INVENTORY_LEDGER:      NATIVE_COLUMNS_LEDGER,
+  REIMBURSEMENTS:        NATIVE_COLUMNS_REIMBURSEMENTS,
+  SETTLEMENT:            NATIVE_COLUMNS_SETTLEMENTS,
+  SAFET_CLAIMS:          NATIVE_COLUMNS_SAFET,
+  TRANSACTIONS:          NATIVE_COLUMNS_TRANSACTIONS,
+  REPORTS_REPOSITORY:    NATIVE_COLUMNS_REPORTS_REPOSITORY,
+  ALL_ORDERS:            NATIVE_COLUMNS_ALL_ORDERS,
+  REPLACEMENTS:          NATIVE_COLUMNS_REPLACEMENTS,
+  FBA_GRADE_AND_RESELL:  NATIVE_COLUMNS_FBA_GRADE_AND_RESELL,
+  MANAGE_FBA_INVENTORY:  NATIVE_COLUMNS_MANAGE_FBA_INVENTORY,
+  FBA_INVENTORY:         NATIVE_COLUMNS_FBA_INVENTORY,
+  RESERVED_INVENTORY:    NATIVE_COLUMNS_RESERVED_INVENTORY,
+  FEE_PREVIEW:           NATIVE_COLUMNS_FEE_PREVIEW,
+  MONTHLY_STORAGE_FEES:  NATIVE_COLUMNS_MONTHLY_STORAGE_FEES,
+  UNKNOWN:               null,
 };
 
 /** Match Postgres NULLS NOT DISTINCT text normalization (see Python _pg_text_unique_field). */
@@ -607,6 +647,14 @@ function resolveImportKind(reportType: string | null | undefined): SyncKind {
   if (rt === "SAFET_CLAIMS" || rt === "safe_t_claims")         return "SAFET_CLAIMS";
   if (rt === "TRANSACTIONS" || rt === "transaction_view")      return "TRANSACTIONS";
   if (rt === "REPORTS_REPOSITORY")                              return "REPORTS_REPOSITORY";
+  if (rt === "ALL_ORDERS")                                      return "ALL_ORDERS";
+  if (rt === "REPLACEMENTS")                                    return "REPLACEMENTS";
+  if (rt === "FBA_GRADE_AND_RESELL")                            return "FBA_GRADE_AND_RESELL";
+  if (rt === "MANAGE_FBA_INVENTORY")                            return "MANAGE_FBA_INVENTORY";
+  if (rt === "FBA_INVENTORY")                                   return "FBA_INVENTORY";
+  if (rt === "RESERVED_INVENTORY")                              return "RESERVED_INVENTORY";
+  if (rt === "FEE_PREVIEW")                                     return "FEE_PREVIEW";
+  if (rt === "MONTHLY_STORAGE_FEES")                            return "MONTHLY_STORAGE_FEES";
   return "UNKNOWN";
 }
 
@@ -874,6 +922,17 @@ export async function POST(req: Request): Promise<Response> {
               string,
               unknown
             > | null;
+          } else if (
+            kind === "ALL_ORDERS" ||
+            kind === "REPLACEMENTS" ||
+            kind === "FBA_GRADE_AND_RESELL" ||
+            kind === "MANAGE_FBA_INVENTORY" ||
+            kind === "FBA_INVENTORY" ||
+            kind === "RESERVED_INVENTORY" ||
+            kind === "FEE_PREVIEW" ||
+            kind === "MONTHLY_STORAGE_FEES"
+          ) {
+            insertRow = mapRowToAmazonRawArchive(mappedRow, orgId, uploadId, importStoreId) as Record<string, unknown> | null;
           }
 
           if (insertRow) {
@@ -1248,18 +1307,10 @@ function deduplicateByConflictKey(
         key = `${norm(row.organization_id)}|${norm(row.safet_claim_id)}`;
         break;
       case "TRANSACTIONS":
-        // Must match the DB unique constraint exactly:
-        //   (organization_id, order_id, transaction_type, amount)
-        // Using a broader key (e.g. including settlement_id/sku/posted_date) meant
-        // that rows the DB considers duplicates passed JS dedup unchanged — the
-        // second DB upsert silently overwrote the first, causing data loss.
-        // NULL fields normalise to "" so that NULL == NULL matches DB NULLS NOT DISTINCT.
-        key = [
-          norm(row.organization_id),
-          norm(row.order_id),
-          norm(row.transaction_type),
-          norm(row.amount),
-        ].join("|");
+        // Fixed key: use source_line_hash (content fingerprint).
+        // Old key (org+order_id+tx_type+amount) collapsed distinct rows with the
+        // same order+type+amount but different SKU/settlement/date.
+        key = `${norm(row.organization_id)}|${String(row.source_line_hash ?? "")}`;
         break;
       case "REPORTS_REPOSITORY":
         key = [
@@ -1270,6 +1321,17 @@ function deduplicateByConflictKey(
           norm(row.sku),
           norm(row.description),
         ].join("|");
+        break;
+      // Raw-archive types: all use source_line_hash — guaranteed unique per content
+      case "ALL_ORDERS":
+      case "REPLACEMENTS":
+      case "FBA_GRADE_AND_RESELL":
+      case "MANAGE_FBA_INVENTORY":
+      case "FBA_INVENTORY":
+      case "RESERVED_INVENTORY":
+      case "FEE_PREVIEW":
+      case "MONTHLY_STORAGE_FEES":
+        key = `${norm(row.organization_id)}|${String(row.source_line_hash ?? "")}`;
         break;
       default:
         // UNKNOWN — give every row a unique key so nothing is silently dropped

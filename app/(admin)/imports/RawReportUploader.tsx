@@ -265,9 +265,11 @@ export function RawReportUploader({ onUploadComplete }: RawReportUploaderProps) 
           >
             {RAW_REPORT_TYPE_ORDER.map((v) => {
               const s = REPORT_TYPE_SPECS[v];
+              const label =
+                s != null ? `${s.shortLabel} (${s.description})` : String(v);
               return (
                 <option key={v} value={v}>
-                  {s.shortLabel} ({s.description})
+                  {label}
                 </option>
               );
             })}

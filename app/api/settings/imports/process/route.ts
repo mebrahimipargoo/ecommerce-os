@@ -1,7 +1,14 @@
 import csv from "csv-parser";
+import { Readable } from "node:stream";
 import { NextResponse } from "next/server";
 
 import { createConcatenatedPartsReadable } from "../../../../../lib/import-raw-report-stream";
+import { syncListingRawRowsToCatalogProducts } from "../../../../../lib/import-listing-canonical-sync";
+import {
+  buildRawRowInsertForPhysicalLine,
+  splitPhysicalLines,
+  streamToBuffer,
+} from "../../../../../lib/import-listing-physical-lines";
 import {
   applyColumnMappingToRow,
   mapRowToExpectedRemoval,
@@ -14,6 +21,7 @@ import {
   mergeUploadMetadata,
   parseRawReportMetadata,
 } from "../../../../../lib/raw-report-upload-metadata";
+import { isListingReportType } from "../../../../../lib/raw-report-types";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 
@@ -24,6 +32,9 @@ export const maxDuration = 300;
 
 const BATCH_SIZE = 1000;
 const PROGRESS_UPDATE_EVERY = 1000;
+/** Listing imports: flush progress more often so the bar tracks rows read, not only batch boundaries. */
+/** How often to persist listing pass-1 progress (physical lines); smaller = smoother bar. */
+const LISTING_PROGRESS_EVERY = 8;
 
 type Body = { upload_id?: string };
 
@@ -36,14 +47,34 @@ function num(v: unknown, fallback = 0): number {
   return fallback;
 }
 
+function resolveImportStoreId(meta: Record<string, unknown>): string | null {
+  const a = typeof meta.import_store_id === "string" ? meta.import_store_id.trim() : "";
+  if (a && isUuidString(a)) return a;
+  const b = typeof meta.ledger_store_id === "string" ? meta.ledger_store_id.trim() : "";
+  if (b && isUuidString(b)) return b;
+  return null;
+}
+
 /**
  * Pipeline kind from `raw_report_uploads.report_type` only (canonical + legacy slugs).
  */
-function resolveImportKind(reportType: string | null | undefined): "FBA_RETURNS" | "REMOVAL_ORDER" | "INVENTORY_LEDGER" | "UNKNOWN" {
+function resolveImportKind(
+  reportType: string | null | undefined,
+):
+  | "FBA_RETURNS"
+  | "REMOVAL_ORDER"
+  | "INVENTORY_LEDGER"
+  | "CATEGORY_LISTINGS"
+  | "ALL_LISTINGS"
+  | "ACTIVE_LISTINGS"
+  | "UNKNOWN" {
   const rt = String(reportType ?? "").trim();
   if (rt === "FBA_RETURNS" || rt === "fba_customer_returns") return "FBA_RETURNS";
   if (rt === "REMOVAL_ORDER") return "REMOVAL_ORDER";
   if (rt === "INVENTORY_LEDGER" || rt === "inventory_ledger") return "INVENTORY_LEDGER";
+  if (rt === "CATEGORY_LISTINGS") return "CATEGORY_LISTINGS";
+  if (rt === "ALL_LISTINGS") return "ALL_LISTINGS";
+  if (rt === "ACTIVE_LISTINGS") return "ACTIVE_LISTINGS";
   return "UNKNOWN";
 }
 
@@ -93,6 +124,8 @@ export async function POST(req: Request): Promise<Response> {
     const meta = (row as { metadata?: unknown }).metadata;
     const parsed = parseRawReportMetadata(meta);
     const metaObj = meta && typeof meta === "object" && !Array.isArray(meta) ? (meta as Record<string, unknown>) : {};
+    const rawFilePath =
+      typeof metaObj.raw_file_path === "string" ? metaObj.raw_file_path.trim() : "";
 
     // Ledger uploads are processed in the browser during import; History "Sync" is a no-op once complete.
     if (metaObj.source === AMAZON_LEDGER_UPLOAD_SOURCE) {
@@ -118,8 +151,13 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     const status = String((row as { status?: unknown }).status ?? "");
-    // Accept "ready" (Record-First model), "uploaded" (alias), and legacy "pending".
-    const isSyncable = status === "ready" || status === "uploaded" || status === "pending";
+    const reportTypeRaw = String((row as { report_type?: string | null }).report_type ?? "").trim();
+    const listingImport = isListingReportType(reportTypeRaw);
+    // Non-listing: unchanged — ready / uploaded / pending (legacy RawReportUploader path).
+    // Listing (catalog_products): Universal Importer leaves rows as "mapped" after classify; allow retry from "failed".
+    const isSyncable = listingImport
+      ? ["mapped", "ready", "uploaded", "pending", "failed"].includes(status)
+      : status === "ready" || status === "uploaded" || status === "pending";
     if (!isSyncable) {
       if (status === "needs_mapping") {
         return NextResponse.json(
@@ -134,13 +172,18 @@ export async function POST(req: Request): Promise<Response> {
       return NextResponse.json(
         {
           ok: false,
-          error: `Cannot process while status is "${status}". Expected "ready", "uploaded", or "pending".`,
+          error: listingImport
+            ? `Cannot process while status is "${status}". For listing imports, expected "mapped", "ready", "uploaded", "pending", or "failed".`
+            : `Cannot process while status is "${status}". Expected "ready", "uploaded", or "pending".`,
         },
         { status: 409 },
       );
     }
 
-    const extRaw = typeof metaObj.file_extension === "string" ? metaObj.file_extension.trim().toLowerCase() : "";
+    let extRaw = typeof metaObj.file_extension === "string" ? metaObj.file_extension.trim().toLowerCase() : "";
+    if (!extRaw && rawFilePath) {
+      extRaw = (rawFilePath.split(".").pop() ?? "").toLowerCase();
+    }
     const ext = extRaw.replace(/^\./, "");
     if (ext === "xlsx") {
       return NextResponse.json(
@@ -156,17 +199,25 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     const storagePrefix = parsed.storagePrefix?.trim() ?? "";
-    if (!storagePrefix) {
-      return NextResponse.json({ ok: false, error: "Missing storage prefix in upload metadata." }, { status: 400 });
-    }
 
-    const totalParts =
+    let totalParts =
       num(metaObj.total_parts, 0) > 0
         ? Math.floor(num(metaObj.total_parts, 0))
         : Math.max(1, Math.floor(num(metaObj.upload_chunks_count, 0)));
 
-    if (!Number.isFinite(totalParts) || totalParts < 1) {
-      return NextResponse.json({ ok: false, error: "Missing part count in upload metadata." }, { status: 400 });
+    // Universal Importer (and similar) store one object at metadata.raw_file_path (e.g. …/original.txt).
+    // Chunked uploads use storage_prefix + part-000000 without raw_file_path.
+    if (rawFilePath) {
+      if (!Number.isFinite(totalParts) || totalParts < 1) {
+        totalParts = 1;
+      }
+    } else {
+      if (!storagePrefix) {
+        return NextResponse.json({ ok: false, error: "Missing storage prefix in upload metadata." }, { status: 400 });
+      }
+      if (!Number.isFinite(totalParts) || totalParts < 1) {
+        return NextResponse.json({ ok: false, error: "Missing part count in upload metadata." }, { status: 400 });
+      }
     }
 
     const columnMapping =
@@ -178,13 +229,13 @@ export async function POST(req: Request): Promise<Response> {
 
     const estimatedRows = parsed.rowCount ?? null;
 
-    const kind = resolveImportKind((row as { report_type?: string | null }).report_type);
+    const kind = resolveImportKind(reportTypeRaw);
     if (kind === "UNKNOWN") {
       return NextResponse.json(
         {
           ok: false,
           error:
-            "Could not determine import kind (FBA returns, removal order, or inventory ledger). Set the Type in History or re-upload so headers can be classified.",
+            "Could not determine import kind (FBA returns, removal order, inventory ledger, or listing export). Set the Type in History or re-upload so headers can be classified.",
         },
         { status: 422 },
       );
@@ -202,7 +253,12 @@ export async function POST(req: Request): Promise<Response> {
       })
       .eq("id", uploadId)
       .eq("organization_id", orgId)
-      .in("status", ["ready", "uploaded", "pending"])   // accept all syncable states
+      .in(
+        "status",
+        listingImport
+          ? ["mapped", "ready", "uploaded", "pending", "failed"]
+          : ["ready", "uploaded", "pending"],
+      )
       .select("id");
 
     if (lockErr) {
@@ -236,7 +292,306 @@ export async function POST(req: Request): Promise<Response> {
       { onConflict: "upload_id" },
     );
 
-    const source = createConcatenatedPartsReadable(supabaseServer, storagePrefix, totalParts);
+    const importStoreId = resolveImportStoreId(metaObj);
+
+    const RAW_REPORTS_BUCKET = "raw-reports";
+
+    let source: Readable;
+    if (rawFilePath) {
+      console.info(
+        JSON.stringify({
+          tag: "import.process.storage_source",
+          upload_id: uploadId,
+          mode: "raw_file_path",
+          path: rawFilePath,
+        }),
+      );
+      const { data: blob, error: dlErr } = await supabaseServer.storage.from(RAW_REPORTS_BUCKET).download(rawFilePath);
+      if (dlErr || !blob) {
+        throw new Error(dlErr?.message ?? `Object not found or inaccessible at raw_file_path: ${rawFilePath}`);
+      }
+      const arrayBuf = await blob.arrayBuffer();
+      source = Readable.from(Buffer.from(arrayBuf));
+    } else {
+      console.info(
+        JSON.stringify({
+          tag: "import.process.storage_source",
+          upload_id: uploadId,
+          mode: "concatenated_parts",
+          storage_prefix: storagePrefix,
+          total_parts: totalParts,
+        }),
+      );
+      source = createConcatenatedPartsReadable(supabaseServer, storagePrefix, totalParts);
+    }
+
+    // ── Listing imports: pass 1 = one raw DB row per *physical* file line (not csv-parser logical rows).
+    //    Pass 2 = canonical merge into catalog_products only (identifiers optional in raw).
+    if (listingImport) {
+      const { error: rawDelErr } = await supabaseServer
+        .from("amazon_listing_report_rows_raw")
+        .delete()
+        .eq("source_upload_id", uploadId);
+      if (rawDelErr) {
+        return NextResponse.json({ ok: false, error: rawDelErr.message }, { status: 500 });
+      }
+
+      const fileBuf = await streamToBuffer(source);
+      const text = fileBuf.toString("utf8");
+      const lines = splitPhysicalLines(text);
+      if (lines.length === 0) {
+        return NextResponse.json({ ok: false, error: "Empty file." }, { status: 400 });
+      }
+
+      const sep = (ext === "txt" ? "\t" : ",") as "\t" | ",";
+      const pass1Metrics = {
+        file_rows_seen: Math.max(0, lines.length - 1),
+        raw_rows_stored: 0,
+        raw_rows_skipped_empty: 0,
+        raw_rows_skipped_malformed: 0,
+      };
+
+      let rawBatch: Record<string, unknown>[] = [];
+      let lastListingProgressWrite = 0;
+
+      const flushRawRowsBatch = async () => {
+        if (rawBatch.length === 0) return;
+        const chunk = rawBatch;
+        rawBatch = [];
+        const { error: insErr } = await supabaseServer.from("amazon_listing_report_rows_raw").insert(chunk);
+        if (insErr) throw new Error(insErr.message);
+        pass1Metrics.raw_rows_stored += chunk.length;
+      };
+
+      const flushListingProgressPass1 = async (force: boolean, physicalLinesProcessed: number) => {
+        if (!force && physicalLinesProcessed - lastListingProgressWrite < LISTING_PROGRESS_EVERY) return;
+        lastListingProgressWrite = physicalLinesProcessed;
+        // Pass 1 maps to 0–50% of overall process_progress; pass 2 (canonical) uses 50–99%.
+        const totalPhysical = Math.max(1, pass1Metrics.file_rows_seen);
+        let pct = Math.min(50, Math.ceil((physicalLinesProcessed / totalPhysical) * 50));
+        if (physicalLinesProcessed > 0 && pct < 1) pct = 1;
+        const { data: prevRow } = await supabaseServer
+          .from("raw_report_uploads")
+          .select("metadata")
+          .eq("id", uploadId)
+          .eq("organization_id", orgId)
+          .maybeSingle();
+        const prevMeta = (prevRow as { metadata?: unknown } | null)?.metadata;
+        const dataRowsSeenLive = Math.max(
+          0,
+          pass1Metrics.file_rows_seen - pass1Metrics.raw_rows_skipped_empty,
+        );
+        await supabaseServer
+          .from("raw_report_uploads")
+          .update({
+            metadata: mergeUploadMetadata(prevMeta, {
+              row_count: physicalLinesProcessed,
+              total_rows: pass1Metrics.file_rows_seen,
+              process_progress: pct,
+              catalog_listing_import_phase: "raw_archive",
+              catalog_listing_file_rows_seen: pass1Metrics.file_rows_seen,
+              catalog_listing_data_rows_seen: dataRowsSeenLive,
+              catalog_listing_raw_rows_stored: pass1Metrics.raw_rows_stored + rawBatch.length,
+              catalog_listing_raw_rows_skipped_empty: pass1Metrics.raw_rows_skipped_empty,
+              catalog_listing_raw_rows_skipped_malformed: pass1Metrics.raw_rows_skipped_malformed,
+            }),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", uploadId)
+          .eq("organization_id", orgId);
+
+        await supabaseServer.from("file_processing_status").upsert(
+          {
+            upload_id: uploadId,
+            organization_id: orgId,
+            status: "processing",
+            upload_pct: 100,
+            process_pct: pct,
+            processed_rows: physicalLinesProcessed,
+            total_rows: pass1Metrics.file_rows_seen,
+          },
+          { onConflict: "upload_id" },
+        );
+      };
+
+      let physicalLinesProcessed = 0;
+      for (let lineIdx = 1; lineIdx < lines.length; lineIdx++) {
+        physicalLinesProcessed += 1;
+        const rawLine = lines[lineIdx] ?? "";
+        if (rawLine.trim() === "") {
+          pass1Metrics.raw_rows_skipped_empty += 1;
+          void flushListingProgressPass1(false, physicalLinesProcessed).catch(() => {});
+          continue;
+        }
+
+        const insert = buildRawRowInsertForPhysicalLine({
+          lines,
+          lineIdx,
+          rawLine,
+          separator: sep,
+          columnMapping,
+          organizationId: orgId,
+          storeId: importStoreId,
+          sourceUploadId: uploadId,
+          sourceReportType: reportTypeRaw,
+        });
+        if (!insert) continue;
+
+        if ((insert as { parse_status?: string }).parse_status === "skipped_malformed") {
+          pass1Metrics.raw_rows_skipped_malformed += 1;
+        }
+
+        rawBatch.push(insert);
+
+        if (rawBatch.length >= BATCH_SIZE) {
+          await flushRawRowsBatch();
+          await flushListingProgressPass1(true, physicalLinesProcessed);
+        }
+        void flushListingProgressPass1(false, physicalLinesProcessed).catch(() => {});
+      }
+
+      await flushRawRowsBatch();
+      await flushListingProgressPass1(true, physicalLinesProcessed);
+
+      const dataRowsSeen = Math.max(
+        0,
+        pass1Metrics.file_rows_seen - pass1Metrics.raw_rows_skipped_empty,
+      );
+
+      const canonicalMetrics = await syncListingRawRowsToCatalogProducts({
+        supabase: supabaseServer,
+        organizationId: orgId,
+        storeId: importStoreId,
+        sourceUploadId: uploadId,
+        reportTypeRaw,
+        fileRowsSeen: pass1Metrics.file_rows_seen,
+        storedRawRows: pass1Metrics.raw_rows_stored,
+        onProgress: async (pct, pass2RowsDone) => {
+          const approxRows = dataRowsSeen + pass2RowsDone;
+          const listingPassTotal = dataRowsSeen + pass1Metrics.raw_rows_stored;
+          const { data: prevRow } = await supabaseServer
+            .from("raw_report_uploads")
+            .select("metadata")
+            .eq("id", uploadId)
+            .eq("organization_id", orgId)
+            .maybeSingle();
+          await supabaseServer
+            .from("raw_report_uploads")
+            .update({
+              metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
+                row_count: approxRows,
+                total_rows: listingPassTotal,
+                process_progress: pct,
+                catalog_listing_import_phase: "canonical_sync",
+              }),
+              updated_at: new Date().toISOString(),
+            })
+            .eq("id", uploadId)
+            .eq("organization_id", orgId);
+          await supabaseServer.from("file_processing_status").upsert(
+            {
+              upload_id: uploadId,
+              organization_id: orgId,
+              status: "processing",
+              upload_pct: 100,
+              process_pct: pct,
+              processed_rows: approxRows,
+              total_rows: listingPassTotal,
+            },
+            { onConflict: "upload_id" },
+          );
+        },
+      });
+
+      const { data: prevRowFinal } = await supabaseServer
+        .from("raw_report_uploads")
+        .select("metadata")
+        .eq("id", uploadId)
+        .eq("organization_id", orgId)
+        .maybeSingle();
+
+      const finalRowCount = dataRowsSeen;
+      await supabaseServer
+        .from("raw_report_uploads")
+        .update({
+          status: "synced",
+          metadata: mergeUploadMetadata((prevRowFinal as { metadata?: unknown } | null)?.metadata, {
+            row_count: finalRowCount,
+            process_progress: 100,
+            error_message: undefined,
+            catalog_listing_import_phase: "done",
+            catalog_listing_file_rows_seen: pass1Metrics.file_rows_seen,
+            catalog_listing_data_rows_seen: dataRowsSeen,
+            catalog_listing_raw_rows_stored: pass1Metrics.raw_rows_stored,
+            catalog_listing_raw_rows_skipped_empty: pass1Metrics.raw_rows_skipped_empty,
+            catalog_listing_raw_rows_skipped_malformed: pass1Metrics.raw_rows_skipped_malformed,
+            catalog_listing_canonical_rows_new: canonicalMetrics.canonical_rows_new,
+            catalog_listing_canonical_rows_updated: canonicalMetrics.canonical_rows_updated,
+            catalog_listing_canonical_rows_unchanged: canonicalMetrics.canonical_rows_unchanged,
+            catalog_listing_canonical_rows_invalid_for_merge: canonicalMetrics.canonical_rows_invalid_for_merge,
+            catalog_listing_canonical_rows_inserted: canonicalMetrics.canonical_rows_new,
+            catalog_listing_canonical_rows_unchanged_or_merged: canonicalMetrics.canonical_rows_unchanged,
+            total_rows: dataRowsSeen,
+          }),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", uploadId)
+        .eq("organization_id", orgId);
+
+      await supabaseServer.from("file_processing_status").upsert(
+        {
+          upload_id: uploadId,
+          organization_id: orgId,
+          status: "complete",
+          upload_pct: 100,
+          process_pct: 100,
+          processed_rows: finalRowCount,
+          total_rows: dataRowsSeen,
+          error_message: null,
+        },
+        { onConflict: "upload_id" },
+      );
+
+      await audit(orgId, null, "import.process_completed", uploadId, {
+        kind,
+        listingImport: {
+          ...pass1Metrics,
+          data_rows_seen: dataRowsSeen,
+          ...canonicalMetrics,
+        },
+      });
+
+      const catalogListingPayload = {
+        data_rows_seen: dataRowsSeen,
+        physical_lines_after_header: pass1Metrics.file_rows_seen,
+        raw_rows_stored: pass1Metrics.raw_rows_stored,
+        raw_rows_skipped_empty: pass1Metrics.raw_rows_skipped_empty,
+        raw_rows_skipped_malformed: pass1Metrics.raw_rows_skipped_malformed,
+        canonical_new: canonicalMetrics.canonical_rows_new,
+        canonical_updated: canonicalMetrics.canonical_rows_updated,
+        canonical_unchanged: canonicalMetrics.canonical_rows_unchanged,
+        canonical_invalid_for_merge: canonicalMetrics.canonical_rows_invalid_for_merge,
+        message: [
+          `Data rows: ${dataRowsSeen.toLocaleString()}`,
+          `Raw stored: ${pass1Metrics.raw_rows_stored.toLocaleString()}`,
+          `Empty skipped: ${pass1Metrics.raw_rows_skipped_empty.toLocaleString()}`,
+          `Malformed skipped: ${pass1Metrics.raw_rows_skipped_malformed.toLocaleString()}`,
+          `Canonical new: ${canonicalMetrics.canonical_rows_new.toLocaleString()}`,
+          `Canonical updated: ${canonicalMetrics.canonical_rows_updated.toLocaleString()}`,
+          `Canonical unchanged: ${canonicalMetrics.canonical_rows_unchanged.toLocaleString()}`,
+          `Canonical invalid: ${canonicalMetrics.canonical_rows_invalid_for_merge.toLocaleString()}`,
+        ].join("\n"),
+      };
+
+      return NextResponse.json({
+        ok: true,
+        rowsProcessed: dataRowsSeen,
+        totalRows: dataRowsSeen,
+        kind,
+        catalogListing: catalogListingPayload,
+      });
+    }
+
     const processSeparator: string = ext === "txt" ? "\t" : ",";
     const parser = csv({
       mapHeaders: ({ header }) => String(header).replace(/^\uFEFF/, "").trim(),
@@ -247,12 +602,18 @@ export async function POST(req: Request): Promise<Response> {
     let batch: Record<string, unknown>[] = [];
     let lastProgressWrite = 0;
 
+    let progressFlushChain: Promise<void> = Promise.resolve();
+    const scheduleFlushProgress = (force: boolean) => {
+      progressFlushChain = progressFlushChain.then(() => flushProgress(force));
+    };
+
     const flushProgress = async (force: boolean) => {
-      if (!force && processed - lastProgressWrite < PROGRESS_UPDATE_EVERY) return;
-      lastProgressWrite = processed;
+      const pr = processed;
+      if (!force && pr - lastProgressWrite < PROGRESS_UPDATE_EVERY) return;
+      lastProgressWrite = pr;
       const pct =
         estimatedRows && estimatedRows > 0
-          ? Math.min(99, Math.round((processed / estimatedRows) * 100))
+          ? Math.min(99, Math.round((pr / estimatedRows) * 100))
           : 0;
       const { data: prevRow } = await supabaseServer
         .from("raw_report_uploads")
@@ -260,11 +621,12 @@ export async function POST(req: Request): Promise<Response> {
         .eq("id", uploadId)
         .eq("organization_id", orgId)
         .maybeSingle();
+      const prevMeta = (prevRow as { metadata?: unknown } | null)?.metadata;
       await supabaseServer
         .from("raw_report_uploads")
         .update({
-          metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
-            row_count: processed,
+          metadata: mergeUploadMetadata(prevMeta, {
+            row_count: pr,
             process_progress: pct,
           }),
           updated_at: new Date().toISOString(),
@@ -279,7 +641,7 @@ export async function POST(req: Request): Promise<Response> {
           status: "processing",
           upload_pct: 100,
           process_pct: pct,
-          processed_rows: processed,
+          processed_rows: pr,
           ...(estimatedRows != null ? { total_rows: estimatedRows } : {}),
         },
         { onConflict: "upload_id" },
@@ -310,6 +672,7 @@ export async function POST(req: Request): Promise<Response> {
           onConflict: "organization_id,barcode",
         });
         if (upErr) throw new Error(upErr.message);
+        return;
       }
     };
 
@@ -345,7 +708,7 @@ export async function POST(req: Request): Promise<Response> {
           const chunk = batch;
           batch = [];
           void flushBatch(chunk)
-            .then(() => flushProgress(false))
+            .then(() => scheduleFlushProgress(false))
             .then(() => parser.resume())
             .catch(reject);
         }
@@ -354,6 +717,7 @@ export async function POST(req: Request): Promise<Response> {
       parser.on("end", () => {
         void (async () => {
           try {
+            await progressFlushChain;
             await flushBatch(batch);
             batch = [];
 
@@ -364,12 +728,13 @@ export async function POST(req: Request): Promise<Response> {
               .eq("organization_id", orgId)
               .maybeSingle();
 
+            const finalRowCount = processed;
             await supabaseServer
               .from("raw_report_uploads")
               .update({
                 status: "synced",
                 metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
-                  row_count: processed,
+                  row_count: finalRowCount,
                   process_progress: 100,
                   error_message: undefined,
                 }),
@@ -385,16 +750,16 @@ export async function POST(req: Request): Promise<Response> {
                 status: "complete",
                 upload_pct: 100,
                 process_pct: 100,
-                processed_rows: processed,
-                ...(estimatedRows != null ? { total_rows: estimatedRows } : {}),
+                processed_rows: finalRowCount,
+                total_rows: estimatedRows ?? finalRowCount,
                 error_message: null,
               },
               { onConflict: "upload_id" },
             );
 
             await audit(orgId, null, "import.process_completed", uploadId, {
-              rowsInserted: processed,
               kind,
+              rowsInserted: processed,
             });
             resolve();
           } catch (e) {
@@ -406,7 +771,11 @@ export async function POST(req: Request): Promise<Response> {
       source.pipe(parser);
     });
 
-    return NextResponse.json({ ok: true, rowsProcessed: processed, kind });
+    return NextResponse.json({
+      ok: true,
+      rowsProcessed: processed,
+      kind,
+    });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Processing failed.";
     if (uploadIdForFail && isUuidString(uploadIdForFail)) {

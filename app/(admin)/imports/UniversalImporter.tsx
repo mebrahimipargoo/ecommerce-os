@@ -40,6 +40,7 @@ import {
 } from "../../../lib/reports-repository-header";
 import { supabase } from "../../../src/lib/supabase";
 import type { RawReportType } from "../../../lib/raw-report-types";
+import { isListingReportType } from "../../../lib/raw-report-types";
 import { listStores } from "../../settings/adapters/actions";
 
 const RAW_REPORTS_BUCKET = "raw-reports";
@@ -53,7 +54,10 @@ type ReportTypeChoice =
   | "SETTLEMENT"
   | "SAFET_CLAIMS"
   | "TRANSACTIONS"
-  | "TRANSACTIONS_REPORTS_REPO";
+  | "TRANSACTIONS_REPORTS_REPO"
+  | "CATEGORY_LISTINGS"
+  | "ALL_LISTINGS"
+  | "ACTIVE_LISTINGS";
 
 const REPORT_TYPE_OPTIONS: { value: ReportTypeChoice; label: string }[] = [
   { value: "AUTO",           label: "✨ Auto-Detect (Recommended)" },
@@ -65,6 +69,9 @@ const REPORT_TYPE_OPTIONS: { value: ReportTypeChoice; label: string }[] = [
   { value: "SAFET_CLAIMS",   label: "SAFE-T Claims" },
   { value: "TRANSACTIONS",   label: "Transactions" },
   { value: "TRANSACTIONS_REPORTS_REPO", label: "Transactions (Reports Repository)" },
+  { value: "CATEGORY_LISTINGS", label: "Category Listings" },
+  { value: "ALL_LISTINGS", label: "All Listings" },
+  { value: "ACTIVE_LISTINGS", label: "Active Listings" },
 ];
 
 type Phase =
@@ -129,6 +136,9 @@ function choiceToInitialReportType(choice: ReportTypeChoice): RawReportType {
   if (choice === "SAFET_CLAIMS") return "SAFET_CLAIMS";
   if (choice === "TRANSACTIONS") return "TRANSACTIONS";
   if (choice === "TRANSACTIONS_REPORTS_REPO") return "REPORTS_REPOSITORY";
+  if (choice === "CATEGORY_LISTINGS") return "CATEGORY_LISTINGS";
+  if (choice === "ALL_LISTINGS") return "ALL_LISTINGS";
+  if (choice === "ACTIVE_LISTINGS") return "ACTIVE_LISTINGS";
   return "UNKNOWN";
 }
 
@@ -195,6 +205,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   const [worklistPct, setWorklistPct] = useState(0);
   /** Remount Phase 4 bar so width/transition does not carry over from Phase 3’s completed state. */
   const [worklistBarEpoch, setWorklistBarEpoch] = useState(0);
+  /** Listing process: raw_archive | canonical_sync | done — from upload metadata while processing. */
+  const [listingImportSubphase, setListingImportSubphase] = useState<string | null>(null);
 
   const pollRef2 = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -211,6 +223,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
 
   const isRemovalReport =
     detectedType === "REMOVAL_ORDER" || detectedType === "REMOVAL_SHIPMENT";
+  const isListingCatalogReport = detectedType != null && isListingReportType(detectedType);
 
   const dateRangeValid = importFullFile || (!!startDate && !!endDate && startDate <= endDate);
   const needsDateRange = reportTypeChoice === "INVENTORY_LEDGER" && !importFullFile;
@@ -320,6 +333,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     setSyncPct(0);
     setWorklistPct(0);
     setWorklistBarEpoch(0);
+    setListingImportSubphase(null);
     stopRef.current = false;
     if (pollRef2.current) { clearInterval(pollRef2.current); pollRef2.current = null; }
   }
@@ -344,7 +358,13 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     setPhase("processing");
     setProcessPct(0);
     setProcessedRows(0);
-    setProgressMsg("Processing CSV into staging table…");
+    // Listing imports use /process → catalog_products; others use /stage. Prefer UI state
+    // (detectedType) because the client read of report_type can be null/late vs. what Phase 1 set.
+    const listingFromUi = isListingReportType(detectedType);
+    setProgressMsg(
+      listingFromUi ? "Parsing file lines and storing raw rows…" : "Processing CSV into staging table…",
+    );
+    setListingImportSubphase("raw_archive");
 
     // Poll DB every 1.5 s so the progress bar updates while the server streams the CSV
     const uploadIdSnap = sessionUploadId;
@@ -361,38 +381,79 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           if (typeof m.process_progress === "number") setProcessPct(m.process_progress);
           if (typeof m.row_count === "number") setProcessedRows(m.row_count);
           if (typeof m.total_rows === "number" && m.total_rows > 0) setTotalRows(m.total_rows as number);
+          const lip = m.catalog_listing_import_phase;
+          if (typeof lip === "string") setListingImportSubphase(lip);
         });
-    }, 1500);
+    }, listingFromUi ? 350 : 1500);
 
     try {
-      const res = await fetch("/api/settings/imports/stage", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          upload_id: sessionUploadId,
-          start_date: importFullFile ? null : (startDate || null),
-          end_date: importFullFile ? null : (endDate || null),
-          import_full_file: importFullFile,
-        }),
-      });
+      const { data: upRow } = await supabase
+        .from("raw_report_uploads")
+        .select("report_type")
+        .eq("id", sessionUploadId)
+        .maybeSingle();
+      const sessionRt = String((upRow as { report_type?: string } | null)?.report_type ?? "").trim();
+      const useListingProcess = listingFromUi || isListingReportType(sessionRt);
+
+      const res = await fetch(
+        useListingProcess ? "/api/settings/imports/process" : "/api/settings/imports/stage",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            useListingProcess
+              ? { upload_id: sessionUploadId }
+              : {
+                  upload_id: sessionUploadId,
+                  start_date: importFullFile ? null : (startDate || null),
+                  end_date: importFullFile ? null : (endDate || null),
+                  import_full_file: importFullFile,
+                },
+          ),
+        },
+      );
       const json = (await res.json()) as {
         ok?: boolean;
         error?: string;
         rowsStaged?: number;
+        rowsProcessed?: number;
         totalRows?: number;
+        catalogListing?: {
+          message?: string;
+          data_rows_seen?: number;
+          physical_lines_after_header?: number;
+          raw_rows_stored?: number;
+          raw_rows_skipped_empty?: number;
+          raw_rows_skipped_malformed?: number;
+          canonical_new?: number;
+          canonical_updated?: number;
+          canonical_unchanged?: number;
+          canonical_invalid_for_merge?: number;
+        };
       };
       if (!res.ok || !json.ok) throw new Error(json.error ?? "Processing failed.");
-      const staged = json.rowsStaged ?? 0;
-      const total = json.totalRows ?? totalRows;
+      const staged = json.rowsStaged ?? json.rowsProcessed ?? 0;
+      const total = json.totalRows ?? json.catalogListing?.data_rows_seen ?? totalRows;
       setProcessPct(100);
       setProcessedRows(staged);
       if (total > 0) setTotalRows(total);
-      setProgressMsg(
-        total > 0 && total !== staged
-          ? `Staged ${staged.toLocaleString()} / ${total.toLocaleString()} rows (date filter applied). Ready to Sync.`
-          : `Staged ${staged.toLocaleString()} rows. Ready to Sync.`,
-      );
-      setPhase("staged");
+      if (useListingProcess) {
+        const cat = json.catalogListing;
+        setListingImportSubphase("done");
+        setProgressMsg(
+          typeof cat?.message === "string" && cat.message.trim() !== ""
+            ? cat.message
+            : `Data rows: ${staged.toLocaleString()}`,
+        );
+        setPhase("synced");
+      } else {
+        setProgressMsg(
+          total > 0 && total !== staged
+            ? `Staged ${staged.toLocaleString()} / ${total.toLocaleString()} rows (date filter applied). Ready to Sync.`
+            : `Staged ${staged.toLocaleString()} rows. Ready to Sync.`,
+        );
+        setPhase("staged");
+      }
       bumpHistory();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Processing failed.");
@@ -1016,7 +1077,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
             {/* Upload progress */}
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span>Phase 1 — Upload</span>
+                <span>{isListingCatalogReport ? "Phase 1 — Upload raw file" : "Phase 1 — Upload"}</span>
                 <span className={uploadPct === 100 ? "text-emerald-500" : ""}>{uploadPct}%</span>
               </div>
               <div className="relative h-2 overflow-hidden rounded-full bg-muted">
@@ -1113,7 +1174,15 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
             phase === "worklisted") && (
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span>Phase 2 — Processing to Staging</span>
+                <span>
+                  {isListingCatalogReport
+                    ? phase === "synced"
+                      ? "✓ Phases 2–3 complete"
+                      : listingImportSubphase === "canonical_sync"
+                        ? "Phase 3 — Sync canonical catalog"
+                        : "Phase 2 — Parse and store raw rows"
+                    : "Phase 2 — Processing to staging"}
+                </span>
                 <span className={phase !== "processing" ? "text-emerald-500" : "tabular-nums"}>
                   {phase === "processing"
                     ? totalRows > 0
@@ -1138,11 +1207,12 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
             </div>
           )}
 
-          {/* ── Phase 3 bar (Sync) ────────────────────────────────────────────── */}
-          {(phase === "syncing" ||
-            phase === "synced" ||
-            phase === "worklisting" ||
-            phase === "worklisted") && (
+          {/* ── Phase 3 bar (Sync) — not used for listing catalog imports (raw + catalog run in Process). ── */}
+          {!isListingCatalogReport &&
+            (phase === "syncing" ||
+              phase === "synced" ||
+              phase === "worklisting" ||
+              phase === "worklisted") && (
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
                 <span>Phase 3 — Sync to amazon_removals</span>
@@ -1323,9 +1393,14 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         )}
 
         {/* Completion notes */}
-        {phase === "synced" && !isRemovalReport && (
+        {phase === "synced" && !isRemovalReport && !isListingCatalogReport && (
           <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">
             All 3 phases complete. Data is in the destination tables.
+          </p>
+        )}
+        {phase === "synced" && isListingCatalogReport && progressMsg && (
+          <p className="whitespace-pre-line text-xs font-semibold text-emerald-600 dark:text-emerald-400">
+            {progressMsg}
           </p>
         )}
         {phase === "synced" && isRemovalReport && (

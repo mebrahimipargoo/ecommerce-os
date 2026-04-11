@@ -27,6 +27,7 @@ import {
 import { mergeUploadMetadata, parseRawReportMetadata } from "../../../../../lib/raw-report-upload-metadata";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
+import { isListingReportType } from "../../../../../lib/raw-report-types";
 
 /** Staging table name — renamed from amazon_ledger_staging in migration 20260430. */
 const STAGING_TABLE = "amazon_staging";
@@ -161,9 +162,21 @@ export async function POST(req: Request): Promise<Response> {
 
     // Validate report_type early so Phase 3 (Sync) won't fail with "unknown type".
     const reportTypeRaw = String((row as { report_type?: unknown }).report_type ?? "").trim();
+    if (isListingReportType(reportTypeRaw)) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "Listing exports (Category / All / Active Listings) import directly into catalog_products and do not use staging. Use Process from the Importer (refresh the page if this message persists).",
+        },
+        { status: 422 },
+      );
+    }
     const knownTypes = [
       "FBA_RETURNS", "REMOVAL_ORDER", "REMOVAL_SHIPMENT", "INVENTORY_LEDGER",
       "REIMBURSEMENTS", "SETTLEMENT", "SAFET_CLAIMS", "TRANSACTIONS", "REPORTS_REPOSITORY",
+      "ALL_ORDERS", "REPLACEMENTS", "FBA_GRADE_AND_RESELL", "MANAGE_FBA_INVENTORY",
+      "FBA_INVENTORY", "RESERVED_INVENTORY", "FEE_PREVIEW", "MONTHLY_STORAGE_FEES",
       "fba_customer_returns", "inventory_ledger", "safe_t_claims",
       "reimbursements", "settlement_repository", "transaction_view",
     ];
@@ -325,6 +338,21 @@ export async function POST(req: Request): Promise<Response> {
         })
         .eq("id", uploadId)
         .eq("organization_id", orgId);
+
+      // Keep file_processing_status in sync so the primary Realtime channel
+      // (useImportProgress) reflects staging progress rather than freezing.
+      await supabaseServer.from("file_processing_status").upsert(
+        {
+          upload_id: uploadId,
+          organization_id: orgId,
+          status: "processing",
+          upload_pct: 100,
+          process_pct: pct,
+          processed_rows: staged,
+          ...(estimatedRows != null ? { total_rows: estimatedRows } : {}),
+        },
+        { onConflict: "upload_id" },
+      );
     };
 
     const flushBatch = async (rows: Record<string, unknown>[]) => {
@@ -424,6 +452,22 @@ export async function POST(req: Request): Promise<Response> {
               .eq("id", uploadId)
               .eq("organization_id", orgId);
 
+            // Mark file_processing_status as complete so the primary Realtime
+            // channel (useImportProgress) transitions to 100% and "staged".
+            await supabaseServer.from("file_processing_status").upsert(
+              {
+                upload_id: uploadId,
+                organization_id: orgId,
+                status: "complete",
+                upload_pct: 100,
+                process_pct: 100,
+                processed_rows: staged,
+                total_rows: totalSeen,
+                error_message: null,
+              },
+              { onConflict: "upload_id" },
+            );
+
             await audit(orgId, "import.stage_completed", uploadId, {
               rowsStaged: staged,
               totalSeen,
@@ -460,6 +504,18 @@ export async function POST(req: Request): Promise<Response> {
         })
         .eq("id", uploadIdForFail)
         .eq("organization_id", orgId);
+
+      await supabaseServer.from("file_processing_status").upsert(
+        {
+          upload_id: uploadIdForFail,
+          organization_id: orgId,
+          status: "failed",
+          upload_pct: 100,
+          process_pct: 0,
+          error_message: message,
+        },
+        { onConflict: "upload_id" },
+      );
     }
     return NextResponse.json({ ok: false, error: message }, { status: 500 });
   }
