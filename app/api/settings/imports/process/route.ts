@@ -1,21 +1,14 @@
-import csv from "csv-parser";
 import { Readable } from "node:stream";
 import { NextResponse } from "next/server";
 
 import { createConcatenatedPartsReadable } from "../../../../../lib/import-raw-report-stream";
 import { syncListingRawRowsToCatalogProducts } from "../../../../../lib/import-listing-canonical-sync";
+import { executeAmazonPhase2Staging } from "../../../../../lib/pipeline/amazon-phase2-staging";
 import {
   buildRawRowInsertForPhysicalLine,
   splitPhysicalLines,
   streamToBuffer,
 } from "../../../../../lib/import-listing-physical-lines";
-import {
-  applyColumnMappingToRow,
-  mapRowToExpectedRemoval,
-  mapRowToExpectedReturn,
-  mapRowToProductFromLedger,
-  normalizeAmazonReportRowKeys,
-} from "../../../../../lib/import-sync-mappers";
 import {
   AMAZON_LEDGER_UPLOAD_SOURCE,
   mergeUploadMetadata,
@@ -31,12 +24,16 @@ export const runtime = "nodejs";
 export const maxDuration = 300;
 
 const BATCH_SIZE = 1000;
-const PROGRESS_UPDATE_EVERY = 1000;
 /** Listing imports: flush progress more often so the bar tracks rows read, not only batch boundaries. */
 /** How often to persist listing pass-1 progress (physical lines); smaller = smoother bar. */
 const LISTING_PROGRESS_EVERY = 8;
 
-type Body = { upload_id?: string };
+type Body = {
+  upload_id?: string;
+  start_date?: string | null;
+  end_date?: string | null;
+  import_full_file?: boolean | null;
+};
 
 function num(v: unknown, fallback = 0): number {
   if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -57,13 +54,29 @@ function resolveImportStoreId(meta: Record<string, unknown>): string | null {
 
 /**
  * Pipeline kind from `raw_report_uploads.report_type` only (canonical + legacy slugs).
+ * Kept aligned with `resolveImportKind` in sync/route.ts for Amazon reports; listing types
+ * are listed explicitly so Process routing matches the sync/staging registry.
  */
 function resolveImportKind(
   reportType: string | null | undefined,
 ):
   | "FBA_RETURNS"
   | "REMOVAL_ORDER"
+  | "REMOVAL_SHIPMENT"
   | "INVENTORY_LEDGER"
+  | "REIMBURSEMENTS"
+  | "SETTLEMENT"
+  | "SAFET_CLAIMS"
+  | "TRANSACTIONS"
+  | "REPORTS_REPOSITORY"
+  | "ALL_ORDERS"
+  | "REPLACEMENTS"
+  | "FBA_GRADE_AND_RESELL"
+  | "MANAGE_FBA_INVENTORY"
+  | "FBA_INVENTORY"
+  | "RESERVED_INVENTORY"
+  | "FEE_PREVIEW"
+  | "MONTHLY_STORAGE_FEES"
   | "CATEGORY_LISTINGS"
   | "ALL_LISTINGS"
   | "ACTIVE_LISTINGS"
@@ -71,7 +84,21 @@ function resolveImportKind(
   const rt = String(reportType ?? "").trim();
   if (rt === "FBA_RETURNS" || rt === "fba_customer_returns") return "FBA_RETURNS";
   if (rt === "REMOVAL_ORDER") return "REMOVAL_ORDER";
+  if (rt === "REMOVAL_SHIPMENT") return "REMOVAL_SHIPMENT";
   if (rt === "INVENTORY_LEDGER" || rt === "inventory_ledger") return "INVENTORY_LEDGER";
+  if (rt === "REIMBURSEMENTS" || rt === "reimbursements") return "REIMBURSEMENTS";
+  if (rt === "SETTLEMENT" || rt === "settlement_repository") return "SETTLEMENT";
+  if (rt === "SAFET_CLAIMS" || rt === "safe_t_claims") return "SAFET_CLAIMS";
+  if (rt === "TRANSACTIONS" || rt === "transaction_view") return "TRANSACTIONS";
+  if (rt === "REPORTS_REPOSITORY") return "REPORTS_REPOSITORY";
+  if (rt === "ALL_ORDERS") return "ALL_ORDERS";
+  if (rt === "REPLACEMENTS") return "REPLACEMENTS";
+  if (rt === "FBA_GRADE_AND_RESELL") return "FBA_GRADE_AND_RESELL";
+  if (rt === "MANAGE_FBA_INVENTORY") return "MANAGE_FBA_INVENTORY";
+  if (rt === "FBA_INVENTORY") return "FBA_INVENTORY";
+  if (rt === "RESERVED_INVENTORY") return "RESERVED_INVENTORY";
+  if (rt === "FEE_PREVIEW") return "FEE_PREVIEW";
+  if (rt === "MONTHLY_STORAGE_FEES") return "MONTHLY_STORAGE_FEES";
   if (rt === "CATEGORY_LISTINGS") return "CATEGORY_LISTINGS";
   if (rt === "ALL_LISTINGS") return "ALL_LISTINGS";
   if (rt === "ACTIVE_LISTINGS") return "ACTIVE_LISTINGS";
@@ -153,18 +180,15 @@ export async function POST(req: Request): Promise<Response> {
     const status = String((row as { status?: unknown }).status ?? "");
     const reportTypeRaw = String((row as { report_type?: string | null }).report_type ?? "").trim();
     const listingImport = isListingReportType(reportTypeRaw);
-    // Non-listing: unchanged — ready / uploaded / pending (legacy RawReportUploader path).
-    // Listing (catalog_products): Universal Importer leaves rows as "mapped" after classify; allow retry from "failed".
-    const isSyncable = listingImport
-      ? ["mapped", "ready", "uploaded", "pending", "failed"].includes(status)
-      : status === "ready" || status === "uploaded" || status === "pending";
-    if (!isSyncable) {
+    /** Unified Phase-2 entry: same statuses for listing and Amazon staging (History + uploader). */
+    const processableStatuses = ["mapped", "ready", "uploaded", "pending", "failed"];
+    if (!processableStatuses.includes(status)) {
       if (status === "needs_mapping") {
         return NextResponse.json(
           {
             ok: false,
             error:
-              'This upload needs column mapping before it can be synced. Click "Map Columns" in the History table to assign fields.',
+              'This upload needs column mapping before it can be processed. Click "Map Columns" in the History table to assign fields.',
           },
           { status: 409 },
         );
@@ -172,9 +196,7 @@ export async function POST(req: Request): Promise<Response> {
       return NextResponse.json(
         {
           ok: false,
-          error: listingImport
-            ? `Cannot process while status is "${status}". For listing imports, expected "mapped", "ready", "uploaded", "pending", or "failed".`
-            : `Cannot process while status is "${status}". Expected "ready", "uploaded", or "pending".`,
+          error: `Cannot process while status is "${status}". Expected one of: ${processableStatuses.join(", ")}.`,
         },
         { status: 409 },
       );
@@ -227,7 +249,13 @@ export async function POST(req: Request): Promise<Response> {
         ? ((row as { column_mapping?: unknown }).column_mapping as Record<string, string>)
         : null;
 
-    const estimatedRows = parsed.rowCount ?? null;
+    const totalRowsFromMeta =
+      typeof metaObj.total_rows === "number" && Number.isFinite(metaObj.total_rows) && metaObj.total_rows > 0
+        ? Math.floor(metaObj.total_rows)
+        : typeof metaObj.total_rows === "string" && String(metaObj.total_rows).trim() !== ""
+          ? Math.floor(num(metaObj.total_rows, 0))
+          : 0;
+    const estimatedRows = totalRowsFromMeta > 0 ? totalRowsFromMeta : null;
 
     const kind = resolveImportKind(reportTypeRaw);
     if (kind === "UNKNOWN") {
@@ -241,24 +269,25 @@ export async function POST(req: Request): Promise<Response> {
       );
     }
 
+    /** All non-listing reports: single Phase-2 implementation (staging); must run before we set status=processing here. */
+    if (!listingImport) {
+      return executeAmazonPhase2Staging(body);
+    }
+
     const { data: locked, error: lockErr } = await supabaseServer
       .from("raw_report_uploads")
       .update({
         status: "processing",
         metadata: mergeUploadMetadata(meta, {
           process_progress: 0,
+          row_count: 0,
           error_message: "",
         }),
         updated_at: new Date().toISOString(),
       })
       .eq("id", uploadId)
       .eq("organization_id", orgId)
-      .in(
-        "status",
-        listingImport
-          ? ["mapped", "ready", "uploaded", "pending", "failed"]
-          : ["ready", "uploaded", "pending"],
-      )
+      .in("status", processableStatuses)
       .select("id");
 
     if (lockErr) {
@@ -283,11 +312,13 @@ export async function POST(req: Request): Promise<Response> {
         upload_id: uploadId,
         organization_id: orgId,
         status: "processing",
+        current_phase: "staging",
         upload_pct: 100,
         process_pct: 0,
         total_rows: estimatedRows ?? null,
         processed_rows: 0,
         error_message: null,
+        import_metrics: { current_phase: "staging" },
       },
       { onConflict: "upload_id" },
     );
@@ -405,10 +436,12 @@ export async function POST(req: Request): Promise<Response> {
             upload_id: uploadId,
             organization_id: orgId,
             status: "processing",
+            current_phase: "staging",
             upload_pct: 100,
             process_pct: pct,
             processed_rows: physicalLinesProcessed,
             total_rows: pass1Metrics.file_rows_seen,
+            import_metrics: { current_phase: "staging" },
           },
           { onConflict: "upload_id" },
         );
@@ -493,10 +526,12 @@ export async function POST(req: Request): Promise<Response> {
               upload_id: uploadId,
               organization_id: orgId,
               status: "processing",
+              current_phase: "processing",
               upload_pct: 100,
               process_pct: pct,
               processed_rows: approxRows,
               total_rows: listingPassTotal,
+              import_metrics: { current_phase: "processing" },
             },
             { onConflict: "upload_id" },
           );
@@ -592,190 +627,10 @@ export async function POST(req: Request): Promise<Response> {
       });
     }
 
-    const processSeparator: string = ext === "txt" ? "\t" : ",";
-    const parser = csv({
-      mapHeaders: ({ header }) => String(header).replace(/^\uFEFF/, "").trim(),
-      separator: processSeparator,
-    });
-
-    let processed = 0;
-    let batch: Record<string, unknown>[] = [];
-    let lastProgressWrite = 0;
-
-    let progressFlushChain: Promise<void> = Promise.resolve();
-    const scheduleFlushProgress = (force: boolean) => {
-      progressFlushChain = progressFlushChain.then(() => flushProgress(force));
-    };
-
-    const flushProgress = async (force: boolean) => {
-      const pr = processed;
-      if (!force && pr - lastProgressWrite < PROGRESS_UPDATE_EVERY) return;
-      lastProgressWrite = pr;
-      const pct =
-        estimatedRows && estimatedRows > 0
-          ? Math.min(99, Math.round((pr / estimatedRows) * 100))
-          : 0;
-      const { data: prevRow } = await supabaseServer
-        .from("raw_report_uploads")
-        .select("metadata")
-        .eq("id", uploadId)
-        .eq("organization_id", orgId)
-        .maybeSingle();
-      const prevMeta = (prevRow as { metadata?: unknown } | null)?.metadata;
-      await supabaseServer
-        .from("raw_report_uploads")
-        .update({
-          metadata: mergeUploadMetadata(prevMeta, {
-            row_count: pr,
-            process_progress: pct,
-          }),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", uploadId)
-        .eq("organization_id", orgId);
-
-      await supabaseServer.from("file_processing_status").upsert(
-        {
-          upload_id: uploadId,
-          organization_id: orgId,
-          status: "processing",
-          upload_pct: 100,
-          process_pct: pct,
-          processed_rows: pr,
-          ...(estimatedRows != null ? { total_rows: estimatedRows } : {}),
-        },
-        { onConflict: "upload_id" },
-      );
-    };
-
-    const flushBatch = async (rows: Record<string, unknown>[]) => {
-      if (rows.length === 0) return;
-
-      if (kind === "FBA_RETURNS") {
-        const { error: upErr } = await supabaseServer.from("expected_returns").upsert(rows, {
-          onConflict: "organization_id,lpn",
-        });
-        if (upErr) throw new Error(upErr.message);
-        return;
-      }
-
-      if (kind === "REMOVAL_ORDER") {
-        const { error: upErr } = await supabaseServer.from("expected_removals").upsert(rows, {
-          onConflict: "organization_id,order_id,sku",
-        });
-        if (upErr) throw new Error(upErr.message);
-        return;
-      }
-
-      if (kind === "INVENTORY_LEDGER") {
-        const { error: upErr } = await supabaseServer.from("products").upsert(rows, {
-          onConflict: "organization_id,barcode",
-        });
-        if (upErr) throw new Error(upErr.message);
-        return;
-      }
-    };
-
-    await new Promise<void>((resolve, reject) => {
-      source.on("error", reject);
-      parser.on("error", reject);
-
-      parser.on("data", (csvRow: Record<string, string>) => {
-        // Apply the saved column_mapping so user-verified header names resolve correctly
-        // even when the CSV uses non-standard column names.
-        const mappedRow = applyColumnMappingToRow(normalizeAmazonReportRowKeys(csvRow), columnMapping);
-
-        let insertRow: Record<string, unknown> | null = null;
-
-        if (kind === "FBA_RETURNS") {
-          insertRow = mapRowToExpectedReturn(mappedRow, orgId, uploadId) as unknown as Record<string, unknown> | null;
-        } else if (kind === "REMOVAL_ORDER") {
-          insertRow = mapRowToExpectedRemoval(mappedRow, orgId, uploadId) as unknown as Record<string, unknown> | null;
-        } else if (kind === "INVENTORY_LEDGER") {
-          const p = mapRowToProductFromLedger(mappedRow, orgId);
-          insertRow = p ? { ...p } : null;
-        }
-
-        if (!insertRow) {
-          return;
-        }
-
-        batch.push(insertRow);
-        processed += 1;
-
-        if (batch.length >= BATCH_SIZE) {
-          parser.pause();
-          const chunk = batch;
-          batch = [];
-          void flushBatch(chunk)
-            .then(() => scheduleFlushProgress(false))
-            .then(() => parser.resume())
-            .catch(reject);
-        }
-      });
-
-      parser.on("end", () => {
-        void (async () => {
-          try {
-            await progressFlushChain;
-            await flushBatch(batch);
-            batch = [];
-
-            const { data: prevRow } = await supabaseServer
-              .from("raw_report_uploads")
-              .select("metadata")
-              .eq("id", uploadId)
-              .eq("organization_id", orgId)
-              .maybeSingle();
-
-            const finalRowCount = processed;
-            await supabaseServer
-              .from("raw_report_uploads")
-              .update({
-                status: "synced",
-                metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
-                  row_count: finalRowCount,
-                  process_progress: 100,
-                  error_message: undefined,
-                }),
-                updated_at: new Date().toISOString(),
-              })
-              .eq("id", uploadId)
-              .eq("organization_id", orgId);
-
-            await supabaseServer.from("file_processing_status").upsert(
-              {
-                upload_id: uploadId,
-                organization_id: orgId,
-                status: "complete",
-                upload_pct: 100,
-                process_pct: 100,
-                processed_rows: finalRowCount,
-                total_rows: estimatedRows ?? finalRowCount,
-                error_message: null,
-              },
-              { onConflict: "upload_id" },
-            );
-
-            await audit(orgId, null, "import.process_completed", uploadId, {
-              kind,
-              rowsInserted: processed,
-            });
-            resolve();
-          } catch (e) {
-            reject(e instanceof Error ? e : new Error(String(e)));
-          }
-        })();
-      });
-
-      source.pipe(parser);
-    });
-
-    return NextResponse.json({
-      ok: true,
-      rowsProcessed: processed,
-      kind,
-    });
+    return NextResponse.json(
+      { ok: false, error: "Expected listing import path after non-listing early return." },
+      { status: 500 },
+    );
   } catch (e) {
     const message = e instanceof Error ? e.message : "Processing failed.";
     if (uploadIdForFail && isUuidString(uploadIdForFail)) {

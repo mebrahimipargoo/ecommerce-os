@@ -128,6 +128,7 @@ function buildRawData(
 /** amazon_returns — physical DB columns */
 export const NATIVE_COLUMNS_RETURNS = new Set([
   "id", "organization_id", "upload_id", "return_date",
+  "source_file_sha256", "source_physical_row_number",
   "order_id", "sku", "asin", "lpn",
   "product_name", "disposition", "reason", "status",
   "created_at", "raw_data",
@@ -160,6 +161,8 @@ export const NATIVE_COLUMNS_REMOVALS = new Set([
  */
 export const NATIVE_COLUMNS_LEDGER = new Set([
   "id", "organization_id", "upload_id",
+  "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "fnsku", "disposition", "location", "event_type", "quantity",
   "created_at", "raw_data",
 ]);
@@ -167,6 +170,8 @@ export const NATIVE_COLUMNS_LEDGER = new Set([
 /** amazon_reimbursements — physical DB columns */
 export const NATIVE_COLUMNS_REIMBURSEMENTS = new Set([
   "id", "organization_id", "upload_id",
+  "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "order_id", "reimbursement_id", "sku", "amount_reimbursed",
   "created_at", "raw_data",
 ]);
@@ -176,6 +181,8 @@ export const NATIVE_COLUMNS_SETTLEMENTS = new Set([
   "id",
   "organization_id",
   "upload_id",
+  "source_file_sha256",
+  "source_physical_row_number",
   "amazon_line_key",
   "settlement_id",
   "settlement_start_date",
@@ -199,6 +206,7 @@ export const NATIVE_COLUMNS_SETTLEMENTS = new Set([
 /** amazon_safet_claims — physical DB columns */
 export const NATIVE_COLUMNS_SAFET = new Set([
   "id", "organization_id", "upload_id", "claim_date",
+  "source_file_sha256", "source_physical_row_number",
   "safet_claim_id", "order_id", "asin", "item_name",
   "claim_reason", "claim_status", "claim_amount", "total_reimbursement_amount",
   "created_at", "raw_data",
@@ -208,6 +216,7 @@ export const NATIVE_COLUMNS_SAFET = new Set([
 export const NATIVE_COLUMNS_TRANSACTIONS = new Set([
   "id", "organization_id", "upload_id",
   "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "settlement_id", "order_id", "transaction_type", "amount", "sku", "posted_date",
   "created_at", "raw_data",
 ]);
@@ -217,6 +226,7 @@ export const NATIVE_COLUMNS_TRANSACTIONS = new Set([
 /** amazon_all_orders — physical DB columns */
 export const NATIVE_COLUMNS_ALL_ORDERS = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "order_id", "purchase_date", "order_status", "fulfillment_channel", "sales_channel",
   "raw_data", "created_at", "updated_at",
 ]);
@@ -224,6 +234,7 @@ export const NATIVE_COLUMNS_ALL_ORDERS = new Set([
 /** amazon_replacements — physical DB columns */
 export const NATIVE_COLUMNS_REPLACEMENTS = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "order_id", "replacement_order_id", "asin", "sku", "order_date",
   "raw_data", "created_at", "updated_at",
 ]);
@@ -231,6 +242,7 @@ export const NATIVE_COLUMNS_REPLACEMENTS = new Set([
 /** amazon_fba_grade_and_resell — physical DB columns */
 export const NATIVE_COLUMNS_FBA_GRADE_AND_RESELL = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "asin", "fnsku", "sku", "grade", "units",
   "raw_data", "created_at", "updated_at",
 ]);
@@ -238,6 +250,7 @@ export const NATIVE_COLUMNS_FBA_GRADE_AND_RESELL = new Set([
 /** amazon_manage_fba_inventory — physical DB columns */
 export const NATIVE_COLUMNS_MANAGE_FBA_INVENTORY = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "asin", "fnsku", "sku", "afn_fulfillable_quantity",
   "raw_data", "created_at", "updated_at",
 ]);
@@ -245,6 +258,7 @@ export const NATIVE_COLUMNS_MANAGE_FBA_INVENTORY = new Set([
 /** amazon_fba_inventory — physical DB columns */
 export const NATIVE_COLUMNS_FBA_INVENTORY = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "asin", "fnsku", "sku", "quantity",
   "raw_data", "created_at", "updated_at",
 ]);
@@ -252,6 +266,7 @@ export const NATIVE_COLUMNS_FBA_INVENTORY = new Set([
 /** amazon_reserved_inventory — physical DB columns */
 export const NATIVE_COLUMNS_RESERVED_INVENTORY = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "asin", "fnsku", "sku", "reserved_quantity",
   "raw_data", "created_at", "updated_at",
 ]);
@@ -259,6 +274,7 @@ export const NATIVE_COLUMNS_RESERVED_INVENTORY = new Set([
 /** amazon_fee_preview — physical DB columns */
 export const NATIVE_COLUMNS_FEE_PREVIEW = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "asin", "fnsku", "sku", "price", "estimated_fee", "currency",
   "raw_data", "created_at", "updated_at",
 ]);
@@ -266,6 +282,7 @@ export const NATIVE_COLUMNS_FEE_PREVIEW = new Set([
 /** amazon_monthly_storage_fees — physical DB columns */
 export const NATIVE_COLUMNS_MONTHLY_STORAGE_FEES = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "asin", "fnsku", "sku", "storage_month", "storage_rate", "currency",
   "raw_data", "created_at", "updated_at",
 ]);
@@ -273,6 +290,8 @@ export const NATIVE_COLUMNS_MONTHLY_STORAGE_FEES = new Set([
 /** amazon_reports_repository — physical DB columns */
 export const NATIVE_COLUMNS_REPORTS_REPOSITORY = new Set([
   "id", "organization_id", "upload_id",
+  "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
   "date_time", "settlement_id", "transaction_type", "order_id", "sku", "description",
   "total_amount", "created_at", "raw_data",
 ]);
@@ -825,7 +844,8 @@ export function mapRowToCatalogProduct(
 export type AmazonReturnInsert = {
   organization_id: string;
   upload_id: string;
-  lpn: string;
+  /** Lookup only — import identity is (organization_id, source_file_sha256, source_physical_row_number). */
+  lpn: string | null;
   order_id: string | null;
   sku: string | null;
   asin: string | null;
@@ -842,10 +862,10 @@ export function mapRowToAmazonReturn(
   row: Record<string, string>,
   orgId: string,
   uploadId: string,
-): AmazonReturnInsert | null {
+): AmazonReturnInsert {
   const consumed = new Set<string>();
-  const lpn = pickT(row, LPN_ALIASES, consumed);
-  if (!lpn) return null;
+  const lpnRaw = pickT(row, LPN_ALIASES, consumed);
+  const lpn = lpnRaw === "" ? null : lpnRaw;
   return {
     organization_id: orgId,
     upload_id: uploadId,
@@ -1109,6 +1129,8 @@ export function mapRowToAmazonRemoval(
 export type AmazonInventoryLedgerInsert = {
   organization_id: string;
   upload_id: string;
+  /** Line-level dedupe — full-row fingerprint (migration 20260613). */
+  source_line_hash: string;
   fnsku: string;
   /** Physical DB column: `disposition` */
   disposition: string | null;
@@ -1126,6 +1148,7 @@ export function mapRowToAmazonInventoryLedger(
   orgId: string,
   uploadId: string,
 ): AmazonInventoryLedgerInsert | null {
+  const source_line_hash = computeSourceLineHash(orgId, row);
   const consumed = new Set<string>();
   // fnsku is the primary anchor — skip row if missing
   const fnsku = pickT(row, FNSKU_ALIASES, consumed).trim();
@@ -1149,6 +1172,7 @@ export function mapRowToAmazonInventoryLedger(
   return {
     organization_id: orgId,
     upload_id: uploadId,
+    source_line_hash,
     fnsku,
     disposition,
     location,
@@ -1167,6 +1191,7 @@ export function mapRowToAmazonInventoryLedger(
 export type AmazonReimbursementInsert = {
   organization_id: string;
   upload_id: string;
+  source_line_hash: string;
   reimbursement_id: string;
   order_id: string | null;
   /** DB column: `sku` — part of the unique constraint (organization_id, reimbursement_id, sku). */
@@ -1181,12 +1206,14 @@ export function mapRowToAmazonReimbursement(
   orgId: string,
   uploadId: string,
 ): AmazonReimbursementInsert | null {
+  const source_line_hash = computeSourceLineHash(orgId, row);
   const consumed = new Set<string>();
   const reimbursement_id = pickT(row, REIMBURSEMENT_ID_ALIASES, consumed);
   if (!reimbursement_id) return null;
   return {
     organization_id:  orgId,
     upload_id:        uploadId,
+    source_line_hash,
     reimbursement_id,
     order_id:         pickT(row, ORDER_ALIASES, consumed) || null,
     sku:              pickT(row, SKU_ALIASES, consumed) || null,
@@ -1529,6 +1556,7 @@ const REPORTS_REPO_TOTAL_ALIASES = ["total", "total-amount", "total amount", "to
 export type AmazonReportsRepositoryInsert = {
   organization_id: string;
   upload_id: string;
+  source_line_hash: string;
   date_time: string | null;
   settlement_id: string | null;
   transaction_type: string;
@@ -1544,6 +1572,7 @@ export function mapRowToAmazonReportsRepository(
   orgId: string,
   uploadId: string,
 ): AmazonReportsRepositoryInsert | null {
+  const source_line_hash = computeSourceLineHash(orgId, row);
   const consumed = new Set<string>();
   const transaction_type = pickT(row, REPORTS_REPO_TYPE_ALIASES, consumed).trim();
   if (!transaction_type) return null;
@@ -1562,6 +1591,7 @@ export function mapRowToAmazonReportsRepository(
   return {
     organization_id: orgId,
     upload_id: uploadId,
+    source_line_hash,
     date_time,
     settlement_id,
     transaction_type,

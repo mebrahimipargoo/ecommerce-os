@@ -8,14 +8,10 @@
  * staging rows.  Sets status → "synced" on completion.
  *
  * Domain table routing (amazon_ prefix standard):
- *   FBA_RETURNS      → amazon_returns          (upsert on organization_id, lpn)
- *   REMOVAL_ORDER    → amazon_removals         (upsert on organization_id, upload_id, source_staging_id)
- *   INVENTORY_LEDGER → amazon_inventory_ledger (upsert on organization_id, fnsku, disposition, location, event_type)
- *   REIMBURSEMENTS   → amazon_reimbursements   (upsert on organization_id, reimbursement_id)
- *   SETTLEMENT       → amazon_settlements      (upsert on organization_id, upload_id, amazon_line_key)
- *   SAFET_CLAIMS     → amazon_safet_claims     (upsert on organization_id, safet_claim_id)
- *   TRANSACTIONS        → amazon_transactions        (upsert on organization_id, order_id, transaction_type, amount)
- *   REPORTS_REPOSITORY  → amazon_reports_repository  (upsert on organization_id, date_time, transaction_type, order_id, sku, description)
+ *   FBA_RETURNS … MONTHLY_STORAGE_FEES → raw landing upsert on
+ *   (organization_id, source_file_sha256, source_physical_row_number) — one domain row per physical CSV line.
+ *   REMOVAL_ORDER    → amazon_removals         (business line — see `uq_amazon_removals_business_line`)
+ *   REMOVAL_SHIPMENT → amazon_removal_shipments (staging-line identity; unchanged)
  *
  * JSONB Fallback: any CSV column not matched by the typed mapper is stored in
  * the `raw_data` JSONB column — this permanently prevents schema cache crashes.
@@ -61,6 +57,21 @@ import {
   NATIVE_COLUMNS_FEE_PREVIEW,
   NATIVE_COLUMNS_MONTHLY_STORAGE_FEES,
 } from "../../../../../lib/import-sync-mappers";
+import {
+  applyCanonicalRemovalOrderBusinessColumns,
+  dateKey,
+  listDuplicateRemovalOrderBusinessKeys,
+  pgTextUniqueField,
+  qtyKey,
+  removalAmazonRemovalsBusinessDedupKey,
+  uniqueBusinessKeyCount,
+  uniqueKeyCount,
+} from "../../../../../lib/pipeline/amazon-removals-business-key";
+import { CONFLICT_KEY, DOMAIN_TABLE, type AmazonSyncKind } from "../../../../../lib/pipeline/amazon-report-registry";
+import {
+  measureBatchUpsertMetrics,
+  type BatchUpsertMetricDelta,
+} from "../../../../../lib/pipeline/amazon-sync-batch-metrics";
 import { removeOlderRemovalImportsWithSameFileContent } from "@/app/(admin)/imports/import-actions";
 import { mergeUploadMetadata } from "../../../../../lib/raw-report-upload-metadata";
 import { supabaseServer } from "../../../../../lib/supabase-server";
@@ -76,90 +87,117 @@ const UPSERT_CHUNK_SIZE = 500;
 const STAGING_READ_BATCH = 1000;
 const STAGING_TABLE = "amazon_staging";
 
-type Body = { upload_id?: string };
+/** File fingerprint from Phase-1 metadata; stable across re-import of the same bytes. */
+function resolveSourceFileSha256(meta: unknown, uploadId: string): string {
+  const m = meta && typeof meta === "object" ? (meta as Record<string, unknown>) : {};
+  const s = String(m.content_sha256 ?? "").trim().toLowerCase();
+  if (s) return s;
+  return `legacy-upload-${uploadId}`;
+}
 
-type SyncKind =
-  | "FBA_RETURNS"
-  | "REMOVAL_ORDER"
-  | "REMOVAL_SHIPMENT"
-  | "INVENTORY_LEDGER"
-  | "REIMBURSEMENTS"
-  | "SETTLEMENT"
-  | "SAFET_CLAIMS"
-  | "TRANSACTIONS"
-  | "REPORTS_REPOSITORY"
-  | "ALL_ORDERS"
-  | "REPLACEMENTS"
-  | "FBA_GRADE_AND_RESELL"
-  | "MANAGE_FBA_INVENTORY"
-  | "FBA_INVENTORY"
-  | "RESERVED_INVENTORY"
-  | "FEE_PREVIEW"
-  | "MONTHLY_STORAGE_FEES"
-  | "UNKNOWN";
+function attachPhysicalRowIdentity(
+  row: Record<string, unknown> | null,
+  stagingRowNumber: number,
+  fileSha: string,
+): void {
+  if (!row) return;
+  row.source_file_sha256 = fileSha;
+  row.source_physical_row_number = stagingRowNumber;
+}
 
-/** amazon_ domain table for each report kind (null = no table yet / UNKNOWN). */
-const DOMAIN_TABLE: Record<SyncKind, string | null> = {
-  FBA_RETURNS:           "amazon_returns",
-  REMOVAL_ORDER:         "amazon_removals",
-  REMOVAL_SHIPMENT:      "amazon_removal_shipments",
-  INVENTORY_LEDGER:      "amazon_inventory_ledger",
-  REIMBURSEMENTS:        "amazon_reimbursements",
-  SETTLEMENT:            "amazon_settlements",
-  SAFET_CLAIMS:          "amazon_safet_claims",
-  TRANSACTIONS:          "amazon_transactions",
-  REPORTS_REPOSITORY:    "amazon_reports_repository",
-  ALL_ORDERS:            "amazon_all_orders",
-  REPLACEMENTS:          "amazon_replacements",
-  FBA_GRADE_AND_RESELL:  "amazon_fba_grade_and_resell",
-  MANAGE_FBA_INVENTORY:  "amazon_manage_fba_inventory",
-  FBA_INVENTORY:         "amazon_fba_inventory",
-  RESERVED_INVENTORY:    "amazon_reserved_inventory",
-  FEE_PREVIEW:           "amazon_fee_preview",
-  MONTHLY_STORAGE_FEES:  "amazon_monthly_storage_fees",
-  UNKNOWN:               null,
-};
+/** Aligns with Postgres `integer` / `uuid` comparison on `uq_amazon_returns_org_file_row` (LPN is not identity). */
+function normalizeFbaReturnsPhysicalRowNumberForKey(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "number" && Number.isFinite(v)) return String(Math.trunc(v));
+  const s = String(v).trim();
+  if (s === "") return "";
+  const n = Number(s.replace(/,/g, ""));
+  if (Number.isFinite(n)) return String(Math.trunc(n));
+  return s;
+}
+
+/** Canonical tuple for `uq_amazon_returns_org_file_row` — must match `ON CONFLICT` / in-batch dedupe. */
+function fbaReturnsFileRowIdentityKey(row: Record<string, unknown>): string {
+  const org = String(row.organization_id ?? "")
+    .trim()
+    .replace(/^\{|\}$/g, "")
+    .toLowerCase();
+  const sha = String(row.source_file_sha256 ?? "").trim().toLowerCase();
+  const pr = normalizeFbaReturnsPhysicalRowNumberForKey(row.source_physical_row_number);
+  return `${org}|${sha}|${pr}`;
+}
+
+const FBA_RETURNS_DEDUPE_LOG_SAMPLES = 8;
+
+function listDuplicateFbaReturnsFileRowKeys(rows: Record<string, unknown>[]): string[] {
+  const counts = new Map<string, number>();
+  for (const r of rows) {
+    const k = fbaReturnsFileRowIdentityKey(r);
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  return [...counts.entries()].filter(([, c]) => c > 1).map(([k]) => k);
+}
 
 /**
- * Upsert conflict key for each domain table.
- * Each value must exactly match a UNIQUE constraint that exists in Postgres.
- *
- * Supabase translates onConflict: "col_a,col_b" →
- *   INSERT … ON CONFLICT (col_a, col_b) DO UPDATE SET …
- *
- * Constraints as of migration 20260502+:
- *   amazon_returns          → (organization_id, lpn)
- *   amazon_removals         → (organization_id, upload_id, source_staging_id) — one row per staging line (60519)
- *   amazon_inventory_ledger → (organization_id, fnsku, disposition, location, event_type)
- *   amazon_reimbursements   → (organization_id, reimbursement_id, sku)
- *   amazon_settlements      → (organization_id, upload_id, amazon_line_key)
- *   amazon_safet_claims     → (organization_id, safet_claim_id)
- *   amazon_transactions     → (organization_id, order_id, transaction_type, amount)
- *   amazon_reports_repository → (organization_id, date_time, transaction_type, order_id, sku, description)
+ * Collapse rows that share the same `(organization_id, source_file_sha256, source_physical_row_number)`;
+ * last row wins (same staging line should not appear twice).
  */
-const CONFLICT_KEY: Record<SyncKind, string | null> = {
-  FBA_RETURNS:        "organization_id,lpn",
-  REMOVAL_ORDER:      "organization_id,store_id,order_id,sku,fnsku,disposition,requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date,order_type",
-  REMOVAL_SHIPMENT:   "organization_id,upload_id,amazon_staging_id",
-  INVENTORY_LEDGER:   "organization_id,fnsku,disposition,location,event_type",
-  REIMBURSEMENTS:     "organization_id,reimbursement_id,sku",
-  SETTLEMENT:         "organization_id,upload_id,amazon_line_key",
-  SAFET_CLAIMS:       "organization_id,safet_claim_id",
-  // Fixed in migration 20260605: was (org, order_id, tx_type, amount) — too narrow,
-  // collapsed distinct rows with same order+type+amount but different SKU/dates.
-  TRANSACTIONS:       "organization_id,source_line_hash",
-  REPORTS_REPOSITORY: "organization_id,date_time,transaction_type,order_id,sku,description",
-  // New raw-archive tables: idempotent dedup via content fingerprint
-  ALL_ORDERS:           "organization_id,source_line_hash",
-  REPLACEMENTS:         "organization_id,source_line_hash",
-  FBA_GRADE_AND_RESELL: "organization_id,source_line_hash",
-  MANAGE_FBA_INVENTORY: "organization_id,source_line_hash",
-  FBA_INVENTORY:        "organization_id,source_line_hash",
-  RESERVED_INVENTORY:   "organization_id,source_line_hash",
-  FEE_PREVIEW:          "organization_id,source_line_hash",
-  MONTHLY_STORAGE_FEES: "organization_id,source_line_hash",
-  UNKNOWN:              null,
-};
+function dedupeFbaReturnsRowsByFileRowKey(packed: Record<string, unknown>[]): {
+  rows: Record<string, unknown>[];
+  collapsedCount: number;
+  duplicateKeySamples: string[];
+} {
+  const seen = new Map<string, Record<string, unknown>>();
+  const duplicateKeySamples: string[] = [];
+  for (const row of packed) {
+    const key = fbaReturnsFileRowIdentityKey(row);
+    if (seen.has(key) && duplicateKeySamples.length < FBA_RETURNS_DEDUPE_LOG_SAMPLES) {
+      duplicateKeySamples.push(key);
+    }
+    seen.set(key, row);
+  }
+  const rows = [...seen.values()];
+  return {
+    rows,
+    collapsedCount: Math.max(0, packed.length - rows.length),
+    duplicateKeySamples,
+  };
+}
+
+/** `finalRows.length === uniqueKeyCount(finalRows)` for FBA_RETURNS physical-line keys. */
+function uniqueFbaReturnsFileRowKeyCount(rows: Record<string, unknown>[]): number {
+  return new Set(rows.map(fbaReturnsFileRowIdentityKey)).size;
+}
+
+function guardFbaReturnsPhysicalRowBatchUniqueness(
+  rows: Record<string, unknown>[],
+  label: string,
+): Record<string, unknown>[] {
+  let out = rows;
+  for (let iter = 0; iter < 8; iter++) {
+    const u = uniqueFbaReturnsFileRowKeyCount(out);
+    if (u === out.length) return out;
+    const dupKeys = listDuplicateFbaReturnsFileRowKeys(out);
+    console.warn(
+      `[FBA_RETURNS] ${label}: length ${out.length} !== uniqueKeyCount ${u} — re-collapsing (iter ${iter}); ` +
+        `duplicate_file_row_keys(sample)=${JSON.stringify(dupKeys.slice(0, FBA_RETURNS_DEDUPE_LOG_SAMPLES))}`,
+    );
+    out = dedupeFbaReturnsRowsByFileRowKey(out).rows;
+  }
+  const u = uniqueFbaReturnsFileRowKeyCount(out);
+  if (out.length !== u) {
+    const dupKeys = listDuplicateFbaReturnsFileRowKeys(out);
+    throw new Error(
+      `[FBA_RETURNS] ${label}: finalRows.length (${out.length}) !== uniqueKeyCount (${u}); ` +
+        `duplicate_file_row_keys(sample)=${JSON.stringify(dupKeys.slice(0, FBA_RETURNS_DEDUPE_LOG_SAMPLES))}`,
+    );
+  }
+  return out;
+}
+
+type Body = { upload_id?: string };
+
+type SyncKind = AmazonSyncKind;
 
 /** NATIVE_COLUMNS set for each sync kind — passed to packPayloadForSupabase(). */
 const NATIVE_COLUMNS_MAP: Record<SyncKind, Set<string> | null> = {
@@ -183,51 +221,7 @@ const NATIVE_COLUMNS_MAP: Record<SyncKind, Set<string> | null> = {
   UNKNOWN:               null,
 };
 
-/** Match Postgres NULLS NOT DISTINCT text normalization (see Python _pg_text_unique_field). */
-function pgTextUniqueField(val: unknown): string | null {
-  if (val === null || val === undefined) return null;
-  const s = String(val).trim();
-  return s === "" ? null : s;
-}
-
-/** Stable string for integer quantity columns (matches Postgres NULL / int semantics). */
-function qtyKey(v: unknown): string {
-  if (v === null || v === undefined) return "\0n";
-  if (typeof v === "number" && Number.isFinite(v)) return `i:${Math.trunc(v)}`;
-  const s = String(v).trim();
-  if (s === "") return "\0n";
-  const n = parseInt(s, 10);
-  if (!Number.isNaN(n)) return `i:${n}`;
-  return `s:${s}`;
-}
-
-/** Date column — align with Postgres date / NULLS NOT DISTINCT (YYYY-MM-DD or null). */
-function dateKey(v: unknown): string {
-  if (v === null || v === undefined) return "\0n";
-  const s = String(v).trim();
-  if (s === "") return "\0n";
-  return s.length >= 10 ? s.slice(0, 10) : s;
-}
-
-/**
- * Logical-line fields for REMOVAL_SHIPMENT ↔ NULL-tracking matching (not the DB upsert key after 60519).
- */
-function removalLineKeyFromMapped(row: Record<string, unknown>): string {
-  return [
-    pgTextUniqueField(row.order_id) ?? "",
-    pgTextUniqueField(row.sku) ?? "",
-    pgTextUniqueField(row.fnsku) ?? "",
-    pgTextUniqueField(row.disposition) ?? "",
-    qtyKey(row.requested_quantity),
-    qtyKey(row.shipped_quantity),
-    qtyKey(row.disposed_quantity),
-    qtyKey(row.cancelled_quantity),
-    dateKey(row.order_date),
-    pgTextUniqueField(row.order_type) ?? "",
-  ].join("\x1e");
-}
-
-/** Fallback batch key when source_staging_id is missing (legacy); REMOVAL_ORDER normally uses staging id. */
+/** Fallback batch key when source_staging_id is missing (REMOVAL_SHIPMENT legacy paths). */
 function removalLogicalLineDedupKey(row: Record<string, unknown>): string {
   return [
     String(row.organization_id ?? "").trim(),
@@ -261,23 +255,37 @@ function resolveImportStoreId(meta: unknown): string | null {
 }
 
 /**
- * Within-batch dedupe key aligned with `uq_amazon_removals_business_line` (store-scoped logical line).
+ * Merge two mapped removal rows that share the same business upsert key (prefer non-null / non-empty).
+ * `upload_id` + `source_staging_id` use last-wins so lineage reflects the latest contributing CSV line.
  */
-function removalBusinessDedupKey(row: Record<string, unknown>): string {
-  return [
-    String(row.organization_id ?? "").trim(),
-    String(row.store_id ?? "").trim(),
-    pgTextUniqueField(row.order_id) ?? "",
-    pgTextUniqueField(row.sku) ?? "",
-    pgTextUniqueField(row.fnsku) ?? "",
-    pgTextUniqueField(row.disposition) ?? "",
-    qtyKey(row.requested_quantity),
-    qtyKey(row.shipped_quantity),
-    qtyKey(row.disposed_quantity),
-    qtyKey(row.cancelled_quantity),
-    dateKey(row.order_date),
-    pgTextUniqueField(row.order_type) ?? "",
-  ].join("|");
+function mergeRemovalOrderRowsPreferNonNull(
+  prev: Record<string, unknown>,
+  next: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...prev };
+  for (const [k, v] of Object.entries(next)) {
+    if (k === "raw_data") continue;
+    if (v === null || v === undefined) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    const ex = out[k];
+    const exEmpty =
+      ex === null ||
+      ex === undefined ||
+      (typeof ex === "string" && ex.trim() === "");
+    if (exEmpty) out[k] = v;
+  }
+  const pr = prev.raw_data;
+  const nr = next.raw_data;
+  if (nr && typeof nr === "object" && !Array.isArray(nr)) {
+    const po =
+      pr && typeof pr === "object" && !Array.isArray(pr) ? (pr as Record<string, unknown>) : {};
+    out.raw_data = { ...po, ...(nr as Record<string, unknown>) };
+  }
+  const u = next.upload_id;
+  if (u !== null && u !== undefined && String(u).trim() !== "") out.upload_id = u;
+  const sid = next.source_staging_id;
+  if (sid !== null && sid !== undefined && String(sid).trim() !== "") out.source_staging_id = sid;
+  return out;
 }
 
 /**
@@ -354,6 +362,35 @@ type RemovalShipmentSyncOpts = {
   syncUpserted: { value: number };
 };
 
+/** One active REMOVAL_SHIPMENT sync per (org, store) — avoids shipment tree rebuild races. */
+async function acquireRemovalPipelineLock(orgId: string, storeId: string, uploadId: string): Promise<void> {
+  await supabaseServer.from("import_pipeline_locks").delete().eq("upload_id", uploadId);
+  const { error } = await supabaseServer.from("import_pipeline_locks").insert({
+    organization_id: orgId,
+    store_id: storeId,
+    upload_id: uploadId,
+  });
+  if (!error) return;
+  if (error.code === "23505") {
+    const { data } = await supabaseServer
+      .from("import_pipeline_locks")
+      .select("upload_id")
+      .eq("organization_id", orgId)
+      .eq("store_id", storeId)
+      .maybeSingle();
+    const existing = data && typeof data === "object" ? String((data as { upload_id?: string }).upload_id ?? "") : "";
+    if (existing === uploadId) return;
+    throw new Error(
+      "Another removal shipment import is running for this store. Wait for it to finish, then retry.",
+    );
+  }
+  throw new Error(`Removal pipeline lock failed: ${error.message}`);
+}
+
+async function releaseRemovalPipelineLock(uploadId: string): Promise<void> {
+  await supabaseServer.from("import_pipeline_locks").delete().eq("upload_id", uploadId);
+}
+
 /**
  * REMOVAL_SHIPMENT: for each staging line, upsert into `amazon_removal_shipments` (raw archive) using
  * staging identity only (`organization_id`, `upload_id`, `amazon_staging_id`). After sync, shipment
@@ -365,6 +402,9 @@ async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
 }> {
   const { uploadId, orgId, storeId, totalStagingRows, columnMapping, syncUpserted } = opts;
 
+  await acquireRemovalPipelineLock(orgId, storeId, uploadId);
+
+  try {
   let shipmentArchiveRowsAttempted = 0;
   let shipmentArchiveRowsWritten = 0;
 
@@ -515,7 +555,7 @@ async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
     for (const k of REMOVAL_ENRICH_VERIFY_FIELDS) enrichPayloadFieldCounts[k] = 0;
 
     const removalShipmentsUpsertRowCount = archiveRows.length;
-    await deleteFromStaging(ids);
+    await deleteFromStaging(ids, orgId);
 
     verifyAStagingFetched += stagingRows.length;
     verifyAShipmentWritten += removalShipmentsUpsertRowCount;
@@ -633,6 +673,9 @@ async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
   );
 
   return { synced: archived, mapperNullCount: mapperNull };
+  } finally {
+    await releaseRemovalPipelineLock(uploadId);
+  }
 }
 
 /** Maps raw_report_uploads.report_type → canonical SyncKind. */
@@ -688,12 +731,23 @@ async function markFailed(uploadId: string, orgId: string, message: string): Pro
         status: "failed",
         metadata: mergeUploadMetadata(
           (prevRow as { metadata?: unknown } | null)?.metadata,
-          { error_message: message, failed_phase: "sync" },
+          { error_message: message, failed_phase: "sync", import_metrics: { current_phase: "failed", failure_reason: message } },
         ),
         updated_at: new Date().toISOString(),
       })
       .eq("id", uploadId)
       .eq("organization_id", orgId);
+
+    await supabaseServer.from("file_processing_status").upsert(
+      {
+        upload_id: uploadId,
+        organization_id: orgId,
+        status: "failed",
+        current_phase: "failed",
+        error_message: message,
+      },
+      { onConflict: "upload_id" },
+    );
   } catch (inner) {
     console.error("[sync] markFailed write error:", inner);
   }
@@ -769,6 +823,7 @@ export async function POST(req: Request): Promise<Response> {
         : null;
 
     const meta = (row as { metadata?: unknown }).metadata;
+    const sourceFileSha256 = resolveSourceFileSha256(meta, uploadId);
 
     const importStoreId = resolveImportStoreId(meta);
     if ((kind === "REMOVAL_ORDER" || kind === "REMOVAL_SHIPMENT") && !importStoreId) {
@@ -850,6 +905,13 @@ export async function POST(req: Request): Promise<Response> {
     const totalStagingRows = typeof stagingRowCount === "number" ? stagingRowCount : 0;
     const syncUpserted = { value: 0 };
 
+    const syncMetricTotals: BatchUpsertMetricDelta = {
+      rows_synced_new: 0,
+      rows_synced_updated: 0,
+      rows_synced_unchanged: 0,
+      rows_duplicate_against_existing: 0,
+    };
+
     console.log(`[sync][${kind}] Starting sync — staging rows: ${totalStagingRows}, domain table: ${DOMAIN_TABLE[kind] ?? "none"}`);
 
     // ── Phase 3 core: read → map → upsert → delete (strictly sequenced) ───────
@@ -868,6 +930,23 @@ export async function POST(req: Request): Promise<Response> {
     // field). These are removed from staging in the final cleanup but are never
     // written to the domain table — logged as a warning so data loss is visible.
     let mapperNullCount = 0;
+    /** Staging lines merged in JS because they shared a conflict key in the same Postgres batch. */
+    let syncDuplicateInBatchTotal = 0;
+
+    await supabaseServer.from("file_processing_status").upsert(
+      {
+        upload_id: uploadId,
+        organization_id: orgId,
+        status: "syncing",
+        current_phase: "sync",
+        sync_pct: 0,
+        upload_pct: 100,
+        process_pct: 100,
+        total_rows: totalStagingRows,
+        processed_rows: 0,
+      },
+      { onConflict: "upload_id" },
+    );
 
     if (kind === "REMOVAL_SHIPMENT") {
       const r = await runRemovalShipmentSync({
@@ -884,7 +963,7 @@ export async function POST(req: Request): Promise<Response> {
       // ── Read next chunk: always from the start — prior rows were deleted from staging. ──
       const { data: stagingRows, error: readErr } = await supabaseServer
         .from(STAGING_TABLE)
-        .select("id, raw_row")
+        .select("id, row_number, raw_row")
         .eq("upload_id", uploadId)
         .eq("organization_id", orgId)
         .range(0, STAGING_READ_BATCH - 1);
@@ -895,7 +974,11 @@ export async function POST(req: Request): Promise<Response> {
       const domainBatch: Record<string, unknown>[] = [];
       const batchStagingIds: string[] = [];
 
-      for (const sr of stagingRows as { id: string; raw_row: Record<string, string> }[]) {
+      for (const sr of stagingRows as {
+        id: string;
+        row_number: number;
+        raw_row: Record<string, string>;
+      }[]) {
         if (hasDomainTable) {
           const rawRow = (sr.raw_row ?? {}) as Record<string, string>;
           const mappedRow = applyColumnMappingToRow(rawRow, columnMapping);
@@ -903,7 +986,7 @@ export async function POST(req: Request): Promise<Response> {
           let insertRow: Record<string, unknown> | null = null;
 
           if (kind === "FBA_RETURNS") {
-            insertRow = mapRowToAmazonReturn(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
+            insertRow = mapRowToAmazonReturn(mappedRow, orgId, uploadId) as Record<string, unknown>;
           } else if (kind === "REMOVAL_ORDER") {
             insertRow = mapRowToAmazonRemoval(mappedRow, orgId, uploadId, importStoreId!) as Record<string, unknown> | null;
             if (insertRow) insertRow.source_staging_id = sr.id;
@@ -935,6 +1018,10 @@ export async function POST(req: Request): Promise<Response> {
             insertRow = mapRowToAmazonRawArchive(mappedRow, orgId, uploadId, importStoreId) as Record<string, unknown> | null;
           }
 
+          if (insertRow && kind !== "REMOVAL_ORDER") {
+            attachPhysicalRowIdentity(insertRow, sr.row_number, sourceFileSha256);
+          }
+
           if (insertRow) {
             domainBatch.push(insertRow);
             batchStagingIds.push(sr.id);
@@ -950,14 +1037,15 @@ export async function POST(req: Request): Promise<Response> {
           if (domainBatch.length >= BATCH_SIZE) {
             const inputBatch = domainBatch.splice(0, BATCH_SIZE);
             const stagingIdsForBatch = batchStagingIds.splice(0, inputBatch.length);
-            const flushedCount = await flushDomainBatch(kind, inputBatch, {
+            const flushResult = await flushDomainBatch(kind, inputBatch, {
               uploadId,
               orgId,
               totalStagingRows,
               upserted: syncUpserted,
-            });
-            synced += flushedCount;
-            await deleteFromStaging(stagingIdsForBatch);
+            }, syncMetricTotals);
+            synced += flushResult.flushed;
+            syncDuplicateInBatchTotal += flushResult.collapsedInBatch;
+            await deleteFromStaging(stagingIdsForBatch, orgId);
           }
         } else {
           // Recognized kind but no domain table — acknowledge as synced
@@ -970,19 +1058,20 @@ export async function POST(req: Request): Promise<Response> {
       if (domainBatch.length > 0) {
         const inputBatch = domainBatch.splice(0);
         const stagingIdsForBatch = batchStagingIds.splice(0, inputBatch.length);
-        const flushedCount = await flushDomainBatch(kind, inputBatch, {
+        const flushResult = await flushDomainBatch(kind, inputBatch, {
           uploadId,
           orgId,
           totalStagingRows,
           upserted: syncUpserted,
-        });
-        synced += flushedCount;
-        await deleteFromStaging(stagingIdsForBatch);
+        }, syncMetricTotals);
+        synced += flushResult.flushed;
+        syncDuplicateInBatchTotal += flushResult.collapsedInBatch;
+        await deleteFromStaging(stagingIdsForBatch, orgId);
       }
 
       // Acknowledge no-domain rows
       if (batchStagingIds.length > 0) {
-        await deleteFromStaging(batchStagingIds);
+        await deleteFromStaging(batchStagingIds, orgId);
       }
     }
 
@@ -1054,6 +1143,21 @@ export async function POST(req: Request): Promise<Response> {
         ? Math.max(0, totalStagingRows - synced - mapperNullCount)
         : 0;
 
+    const importMetrics = {
+      physical_lines_seen: totalStagingRows,
+      data_rows_seen: totalStagingRows,
+      rows_staged: totalStagingRows,
+      rows_synced_upserted: synced,
+      rows_mapper_invalid: mapperNullCount,
+      rows_duplicate_in_file: syncDuplicateInBatchTotal,
+      rows_net_collapsed_vs_staging: syncCollapsedByDedupe,
+      rows_synced_new: syncMetricTotals.rows_synced_new,
+      rows_synced_updated: syncMetricTotals.rows_synced_updated,
+      rows_synced_unchanged: syncMetricTotals.rows_synced_unchanged,
+      rows_duplicate_against_existing: syncMetricTotals.rows_duplicate_against_existing,
+      current_phase: "complete" as const,
+    };
+
     const wave1Extra =
       kind === "REMOVAL_ORDER" || kind === "REMOVAL_SHIPMENT"
         ? {
@@ -1072,6 +1176,7 @@ export async function POST(req: Request): Promise<Response> {
       .from("raw_report_uploads")
       .update({
         status: "synced",
+        import_pipeline_completed_at: new Date().toISOString(),
         metadata: mergeUploadMetadata(
           (prevRow as { metadata?: unknown } | null)?.metadata,
           {
@@ -1080,6 +1185,8 @@ export async function POST(req: Request): Promise<Response> {
             sync_row_count: synced,
             sync_mapper_null_count: mapperNullCount,
             sync_collapsed_by_dedupe: syncCollapsedByDedupe,
+            sync_duplicate_in_batch_rows: syncDuplicateInBatchTotal,
+            import_metrics: importMetrics,
             process_progress: 100,
             sync_progress: 100,
             etl_phase: "sync",
@@ -1093,6 +1200,23 @@ export async function POST(req: Request): Promise<Response> {
       .eq("organization_id", orgId);
 
     if (markErr) throw new Error(`Sync succeeded but failed to save status: ${markErr.message}`);
+
+    await supabaseServer.from("file_processing_status").upsert(
+      {
+        upload_id: uploadId,
+        organization_id: orgId,
+        status: "complete",
+        current_phase: "complete",
+        upload_pct: 100,
+        process_pct: 100,
+        sync_pct: 100,
+        processed_rows: totalStagingRows,
+        total_rows: totalStagingRows,
+        error_message: null,
+        import_metrics: importMetrics,
+      },
+      { onConflict: "upload_id" },
+    );
 
     await audit(orgId, "import.sync_completed", uploadId, {
       rowsSynced: synced,
@@ -1125,7 +1249,7 @@ export async function POST(req: Request): Promise<Response> {
  * Deletes staging rows by ID in chunks of 200.
  * Only called AFTER the corresponding domain batch has been confirmed written.
  */
-async function deleteFromStaging(ids: string[]): Promise<void> {
+async function deleteFromStaging(ids: string[], organizationId: string): Promise<void> {
   if (ids.length === 0) return;
   const chunk_size = 200;
   for (let i = 0; i < ids.length; i += chunk_size) {
@@ -1133,7 +1257,8 @@ async function deleteFromStaging(ids: string[]): Promise<void> {
     const { error } = await supabaseServer
       .from(STAGING_TABLE)
       .delete()
-      .in("id", chunk);
+      .in("id", chunk)
+      .eq("organization_id", organizationId);
     if (error) throw new Error(`Staging cleanup failed: ${error.message}`);
   }
 }
@@ -1158,17 +1283,326 @@ async function bumpSyncProgressMetadata(opts: SyncProgressOpts, chunkRowCount: n
     99,
     Math.round((opts.upserted.value / Math.max(1, opts.totalStagingRows)) * 100),
   );
+  const prevMeta = (prevRow as { metadata?: unknown } | null)?.metadata;
+  const prevIm =
+    prevMeta && typeof prevMeta === "object" && prevMeta !== null && "import_metrics" in prevMeta
+      ? {
+          ...((prevMeta as { import_metrics?: Record<string, unknown> }).import_metrics ?? {}),
+        }
+      : {};
   await supabaseServer
     .from("raw_report_uploads")
     .update({
-      metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
+      metadata: mergeUploadMetadata(prevMeta, {
         sync_progress: pct,
         etl_phase: "sync",
+        import_metrics: {
+          ...prevIm,
+          current_phase: "sync",
+          rows_synced: opts.upserted.value,
+          total_staging_rows: opts.totalStagingRows,
+        },
       }),
       updated_at: new Date().toISOString(),
     })
     .eq("id", opts.uploadId)
     .eq("organization_id", opts.orgId);
+
+  await supabaseServer
+    .from("file_processing_status")
+    .upsert(
+      {
+        upload_id: opts.uploadId,
+        organization_id: opts.orgId,
+        status: "syncing",
+        current_phase: "sync",
+        upload_pct: 100,
+        process_pct: 100,
+        sync_pct: pct,
+        processed_rows: opts.upserted.value,
+        total_rows: opts.totalStagingRows,
+        import_metrics: {
+          current_phase: "sync",
+          rows_synced: opts.upserted.value,
+          total_staging_rows: opts.totalStagingRows,
+        },
+      },
+      { onConflict: "upload_id" },
+    );
+}
+
+/** Max business-key samples logged when duplicates are collapsed (REMOVAL_ORDER debug). */
+const REMOVAL_ORDER_DEDUPE_LOG_SAMPLES = 8;
+
+/** Ignore lineage + surrogate keys when deciding “unchanged” vs DB row (cross-file re-import). */
+const REMOVAL_ORDER_COMPARABLE_VOLATILE = new Set([
+  "id",
+  "created_at",
+  "updated_at",
+  "upload_id",
+  "source_staging_id",
+]);
+
+function removalOrderComparableSnapshot(row: Record<string, unknown>): string {
+  const o: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(row)) {
+    if (REMOVAL_ORDER_COMPARABLE_VOLATILE.has(k)) continue;
+    o[k] = v;
+  }
+  const keys = Object.keys(o).sort();
+  return JSON.stringify(keys.map((k) => [k, o[k]]));
+}
+
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Preload `amazon_removals` for the batch’s `order_id` set, then split:
+ * - inserts: business key not present in DB
+ * - upserts: key exists and payload differs (lineage excluded) from DB row
+ * - skipped: key exists and payload is unchanged → no write
+ */
+async function partitionRemovalOrderRowsAgainstDatabase(
+  orgId: string,
+  deduped: Record<string, unknown>[],
+): Promise<{
+  inserts: Record<string, unknown>[];
+  upserts: Record<string, unknown>[];
+  skippedUnchanged: number;
+}> {
+  const orderIds = [
+    ...new Set(deduped.map((r) => String(r.order_id ?? "").trim()).filter((x) => x.length > 0)),
+  ];
+  const existingByBizKey = new Map<string, Record<string, unknown>>();
+
+  for (const part of chunkArray(orderIds, 200)) {
+    const { data, error } = await supabaseServer
+      .from("amazon_removals")
+      .select("*")
+      .eq("organization_id", orgId)
+      .in("order_id", part);
+    if (error) {
+      throw new Error(`[REMOVAL_ORDER] preload amazon_removals failed: ${error.message}`);
+    }
+    for (const row of data ?? []) {
+      const rec = row as Record<string, unknown>;
+      const recCanon = applyCanonicalRemovalOrderBusinessColumns(rec);
+      const k = removalAmazonRemovalsBusinessDedupKey(recCanon);
+      if (!existingByBizKey.has(k)) existingByBizKey.set(k, recCanon);
+    }
+  }
+
+  const insertByBizKey = new Map<string, Record<string, unknown>>();
+  const upsertByBizKey = new Map<string, Record<string, unknown>>();
+  let skippedUnchanged = 0;
+
+  for (const row of deduped) {
+    const canon = applyCanonicalRemovalOrderBusinessColumns(row);
+    const k = removalAmazonRemovalsBusinessDedupKey(canon);
+    const ex = existingByBizKey.get(k);
+    if (!ex) {
+      const prev = insertByBizKey.get(k);
+      insertByBizKey.set(
+        k,
+        prev
+          ? applyCanonicalRemovalOrderBusinessColumns(mergeRemovalOrderRowsPreferNonNull(prev, canon))
+          : canon,
+      );
+      continue;
+    }
+    if (removalOrderComparableSnapshot(canon) === removalOrderComparableSnapshot(ex)) {
+      skippedUnchanged++;
+      continue;
+    }
+    const prevU = upsertByBizKey.get(k);
+    upsertByBizKey.set(
+      k,
+      prevU
+        ? applyCanonicalRemovalOrderBusinessColumns(mergeRemovalOrderRowsPreferNonNull(prevU, canon))
+        : canon,
+    );
+  }
+
+  return {
+    inserts: [...insertByBizKey.values()],
+    upserts: [...upsertByBizKey.values()],
+    skippedUnchanged,
+  };
+}
+
+/**
+ * Final guard: Postgres INSERT rejects duplicate unique keys in one statement.
+ * Collapse by `removalAmazonRemovalsBusinessDedupKey` (same as `uq_amazon_removals_business_line`).
+ * Always runs before insert/upsert — not only when a Set detects duplicate *strings* (the old guard
+ * missed cases where two payloads matched the same DB tuple but keyed differently).
+ */
+function finalizeRemovalOrderWriteBatchForUniqueness(
+  rows: Record<string, unknown>[],
+  label: "insert" | "upsert",
+): Record<string, unknown>[] {
+  let out = rows.map(applyCanonicalRemovalOrderBusinessColumns);
+  for (let iter = 0; iter < 8; iter++) {
+    const step = dedupeRemovalOrderPayloadsForUpsert(out);
+    out = step.rows;
+    const u = uniqueBusinessKeyCount(out);
+    if (u === out.length) {
+      if (step.collapsedCount > 0) {
+        console.warn(
+          `[REMOVAL_ORDER] finalize ${label}: collapsed ${step.collapsedCount} duplicate row(s); ` +
+            `duplicate_key_samples=${JSON.stringify(step.duplicateKeySamples)}`,
+        );
+      }
+      return out;
+    }
+    const dupKeys = listDuplicateRemovalOrderBusinessKeys(out);
+    console.warn(
+      `[REMOVAL_ORDER] invariant ${label}: length ${out.length} !== uniqueBusinessKeyCount ${u} — ` +
+        `re-collapsing (iter ${iter}); duplicate_business_keys(sample)=${JSON.stringify(dupKeys.slice(0, REMOVAL_ORDER_DEDUPE_LOG_SAMPLES))}`,
+    );
+  }
+  const dupKeys = listDuplicateRemovalOrderBusinessKeys(out);
+  throw new Error(
+    `[REMOVAL_ORDER] invariant ${label}: cannot collapse to unique business keys after retries; ` +
+      `duplicate_business_keys(sample)=${JSON.stringify(dupKeys.slice(0, REMOVAL_ORDER_DEDUPE_LOG_SAMPLES))}`,
+  );
+}
+
+/**
+ * Last line of defense before PostgREST: length must equal distinct `removalAmazonRemovalsBusinessDedupKey` values.
+ * If not, log duplicates, collapse with merge rules, canonicalize again, and retry.
+ */
+function enforceRemovalOrderChunkBusinessKeyInvariant(
+  rows: Record<string, unknown>[],
+  label: "insert" | "upsert",
+): Record<string, unknown>[] {
+  let out = rows;
+  for (let iter = 0; iter < 8; iter++) {
+    const u = uniqueBusinessKeyCount(out);
+    if (u === out.length) return out;
+    const dupKeys = listDuplicateRemovalOrderBusinessKeys(out);
+    console.warn(
+      `[REMOVAL_ORDER] ${label} chunk invariant: length ${out.length} !== uniqueBusinessKeyCount ${u} — ` +
+        `collapsing (iter ${iter}); duplicate_business_keys(sample)=${JSON.stringify(dupKeys.slice(0, REMOVAL_ORDER_DEDUPE_LOG_SAMPLES))}`,
+    );
+    const step = dedupeRemovalOrderPayloadsForUpsert(out);
+    out = step.rows.map(applyCanonicalRemovalOrderBusinessColumns);
+  }
+  const u = uniqueBusinessKeyCount(out);
+  const dupKeys = listDuplicateRemovalOrderBusinessKeys(out);
+  if (u !== out.length) {
+    throw new Error(
+      `[REMOVAL_ORDER] ${label} chunk: still have duplicate business keys after collapse; ` +
+        `length=${out.length} unique=${u} duplicate_business_keys(sample)=${JSON.stringify(dupKeys.slice(0, REMOVAL_ORDER_DEDUPE_LOG_SAMPLES))}`,
+    );
+  }
+  return out;
+}
+
+/**
+ * Final guard before a PostgREST statement: `finalRows.length === uniqueKeyCount(finalRows)` for the business line.
+ * Used for both INSERT and UPSERT chunks so Postgres never sees duplicate `uq_amazon_removals_business_line` keys.
+ */
+function guardFinalRemovalOrderInsertArray(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+  if (rows.length === 0) return rows;
+  let out = rows.map(applyCanonicalRemovalOrderBusinessColumns);
+  for (let iter = 0; iter < 8; iter++) {
+    const u = uniqueKeyCount(out);
+    if (u === out.length) {
+      return out;
+    }
+    const dupKeys = listDuplicateRemovalOrderBusinessKeys(out);
+    console.warn(
+      `[REMOVAL_ORDER] final INSERT array: length ${out.length} !== uniqueKeyCount ${u} — ` +
+        `re-collapsing (iter ${iter}); duplicate_business_keys(sample)=${JSON.stringify(dupKeys.slice(0, REMOVAL_ORDER_DEDUPE_LOG_SAMPLES))}`,
+    );
+    out = dedupeRemovalOrderPayloadsForUpsert(out).rows.map(applyCanonicalRemovalOrderBusinessColumns);
+  }
+  const u = uniqueKeyCount(out);
+  if (out.length !== u) {
+    const dupKeys = listDuplicateRemovalOrderBusinessKeys(out);
+    throw new Error(
+      `[REMOVAL_ORDER] final INSERT invariant: finalRows.length (${out.length}) !== uniqueKeyCount (${u}); ` +
+        `duplicate_business_keys(sample)=${JSON.stringify(dupKeys.slice(0, REMOVAL_ORDER_DEDUPE_LOG_SAMPLES))}`,
+    );
+  }
+  return out;
+}
+
+async function writeRemovalOrderPartitionedBatches(
+  partition: { inserts: Record<string, unknown>[]; upserts: Record<string, unknown>[] },
+  conflictKey: string,
+  syncProgress?: SyncProgressOpts,
+): Promise<void> {
+  for (let off = 0; off < partition.inserts.length; off += UPSERT_CHUNK_SIZE) {
+    const rawChunk = partition.inserts.slice(off, off + UPSERT_CHUNK_SIZE);
+    let chunk = finalizeRemovalOrderWriteBatchForUniqueness(rawChunk, "insert");
+    chunk = enforceRemovalOrderChunkBusinessKeyInvariant(chunk, "insert");
+    chunk = guardFinalRemovalOrderInsertArray(chunk);
+    if (chunk.length === 0) continue;
+    const { error } = await supabaseServer.from("amazon_removals").insert(chunk);
+    if (error) {
+      throw new Error(`[REMOVAL_ORDER] insert into amazon_removals failed: ${error.message} (chunk size: ${chunk.length})`);
+    }
+    if (syncProgress) await bumpSyncProgressMetadata(syncProgress, chunk.length);
+  }
+
+  for (let off = 0; off < partition.upserts.length; off += UPSERT_CHUNK_SIZE) {
+    const rawChunk = partition.upserts.slice(off, off + UPSERT_CHUNK_SIZE);
+    let chunk = finalizeRemovalOrderWriteBatchForUniqueness(rawChunk, "upsert");
+    chunk = enforceRemovalOrderChunkBusinessKeyInvariant(chunk, "upsert");
+    chunk = guardFinalRemovalOrderInsertArray(chunk);
+    if (chunk.length === 0) continue;
+    const { error } = await supabaseServer
+      .from("amazon_removals")
+      .upsert(chunk, { onConflict: conflictKey, ignoreDuplicates: false });
+    if (error) {
+      throw new Error(
+        `[REMOVAL_ORDER] upsert into amazon_removals failed: ${error.message}` +
+          ` (conflict key: ${conflictKey}, chunk size: ${chunk.length})`,
+      );
+    }
+    if (syncProgress) await bumpSyncProgressMetadata(syncProgress, chunk.length);
+  }
+}
+
+/**
+ * Collapse rows that share the same `uq_amazon_removals_business_line` key before a single upsert statement.
+ * (Postgres rejects two identical business keys in one INSERT; PostgREST upsert sends one statement per chunk.)
+ */
+function dedupeRemovalOrderPayloadsForUpsert(packed: Record<string, unknown>[]): {
+  rows: Record<string, unknown>[];
+  collapsedCount: number;
+  duplicateKeySamples: string[];
+} {
+  const seen = new Map<string, Record<string, unknown>>();
+  const duplicateKeySamples: string[] = [];
+
+  for (const row of packed) {
+    const canon = applyCanonicalRemovalOrderBusinessColumns(row);
+    const key = removalAmazonRemovalsBusinessDedupKey(canon);
+    const existing = seen.get(key);
+    if (existing) {
+      if (duplicateKeySamples.length < REMOVAL_ORDER_DEDUPE_LOG_SAMPLES) {
+        duplicateKeySamples.push(key);
+      }
+      seen.set(
+        key,
+        applyCanonicalRemovalOrderBusinessColumns(mergeRemovalOrderRowsPreferNonNull(existing, canon)),
+      );
+    } else {
+      seen.set(key, canon);
+    }
+  }
+
+  const rows = [...seen.values()];
+  return {
+    rows,
+    collapsedCount: Math.max(0, packed.length - rows.length),
+    duplicateKeySamples,
+  };
 }
 
 /**
@@ -1178,32 +1612,120 @@ async function bumpSyncProgressMetadata(opts: SyncProgressOpts, chunkRowCount: n
  *    Any key NOT in NATIVE_COLUMNS_MAP[kind] is redirected into the raw_data
  *    JSONB column.  This is the permanent guard against schema cache errors.
  *
- *  Step 2 — deduplicateByConflictKey():
- *    Removes same-batch duplicates before the Postgres upsert to avoid
- *    "ON CONFLICT DO UPDATE command cannot affect a row a second time".
+ *  Step 2 — deduplication:
+ *    REMOVAL_ORDER: `dedupeRemovalOrderPayloadsForUpsert()` (business key for `uq_amazon_removals_business_line`).
+ *    FBA_RETURNS: `deduplicateByConflictKey()` + `guardFbaReturnsPhysicalRowBatchUniqueness()` (file row key; LPN not used).
+ *    Other kinds: `deduplicateByConflictKey()`.
  *
- *  Step 3 — supabase.upsert({ onConflict }) in chunks of UPSERT_CHUNK_SIZE:
- *    Writes progress to metadata.sync_progress after each chunk.
+ *  Step 3 — DB write:
+ *    REMOVAL_ORDER: preload by `order_id`, partition into insert (new keys) / upsert (changed) / skip (unchanged).
+ *    Other kinds: supabase.upsert({ onConflict }) or insert in chunks of UPSERT_CHUNK_SIZE.
  *
- * @returns Number of rows actually written (after deduplication).
+ * @returns Rows written after batch dedupe + how many staging lines collapsed in-batch.
  */
 async function flushDomainBatch(
   kind: SyncKind,
   rows: Record<string, unknown>[],
   syncProgress?: SyncProgressOpts,
-): Promise<number> {
-  if (rows.length === 0) return 0;
+  metricTotals?: BatchUpsertMetricDelta,
+): Promise<{ flushed: number; collapsedInBatch: number }> {
+  if (rows.length === 0) return { flushed: 0, collapsedInBatch: 0 };
 
   const table = DOMAIN_TABLE[kind];
-  if (!table) return rows.length; // no-op for UNKNOWN
+  if (!table) return { flushed: rows.length, collapsedInBatch: 0 }; // no-op for UNKNOWN
 
   // ── Step 1: JSONB packing ──────────────────────────────────────────────────
   const nativeCols = NATIVE_COLUMNS_MAP[kind];
   const packed = nativeCols ? packPayloadForSupabase(rows, nativeCols) : rows;
 
-  // ── Step 2: JS-level deduplication (normalised + quantity-summing for ledger)
-  const deduped = deduplicateByConflictKey(kind, packed);
-  console.log(`[${kind}] Original batch size: ${packed.length}, Cleaned batch size: ${deduped.length}`);
+  // ── Step 2: JS-level deduplication (same conflict key in one INSERT must be collapsed)
+  let deduped: Record<string, unknown>[];
+  let collapsedInBatch: number;
+
+  if (kind === "REMOVAL_ORDER") {
+    const ro = dedupeRemovalOrderPayloadsForUpsert(packed);
+    deduped = ro.rows;
+    collapsedInBatch = ro.collapsedCount;
+    let uniqKeys = uniqueBusinessKeyCount(deduped);
+    if (uniqKeys !== deduped.length) {
+      console.warn(
+        `[REMOVAL_ORDER] invariant: ${deduped.length} rows but ${uniqKeys} unique business keys after dedupe — forcing second collapse`,
+      );
+      const again = dedupeRemovalOrderPayloadsForUpsert(deduped);
+      deduped = again.rows;
+      collapsedInBatch += again.collapsedCount;
+      uniqKeys = uniqueBusinessKeyCount(deduped);
+    }
+    console.log(
+      `[REMOVAL_ORDER] sync dedupe: mapped_rows=${packed.length} after_business_dedupe=${deduped.length} ` +
+        `unique_business_keys=${uniqKeys} collapsed=${collapsedInBatch} ` +
+        `duplicate_key_samples=${JSON.stringify(ro.duplicateKeySamples)}`,
+    );
+  } else {
+    deduped = deduplicateByConflictKey(kind, packed);
+    collapsedInBatch = Math.max(0, packed.length - deduped.length);
+    if (kind === "FBA_RETURNS") {
+      const before = deduped.length;
+      deduped = guardFbaReturnsPhysicalRowBatchUniqueness(deduped, "pre-write");
+      collapsedInBatch += Math.max(0, before - deduped.length);
+    }
+    console.log(`[${kind}] Original batch size: ${packed.length}, Cleaned batch size: ${deduped.length}`);
+  }
+
+  if (kind === "REMOVAL_ORDER") {
+    if (!syncProgress) {
+      throw new Error("[REMOVAL_ORDER] syncProgress is required for partitioned amazon_removals write");
+    }
+    const partition = await partitionRemovalOrderRowsAgainstDatabase(syncProgress.orgId, deduped);
+    const insertsCanonical = finalizeRemovalOrderWriteBatchForUniqueness(partition.inserts, "insert");
+    const upsertsCanonical = finalizeRemovalOrderWriteBatchForUniqueness(partition.upserts, "upsert");
+    if (
+      insertsCanonical.length !== partition.inserts.length ||
+      upsertsCanonical.length !== partition.upserts.length
+    ) {
+      console.warn(
+        `[REMOVAL_ORDER] post-partition canonical finalize: inserts ${partition.inserts.length}->${insertsCanonical.length}, ` +
+          `upserts ${partition.upserts.length}->${upsertsCanonical.length}`,
+      );
+    }
+    console.log(
+      `[REMOVAL_ORDER] partition: inserts=${insertsCanonical.length} upserts=${upsertsCanonical.length} ` +
+        `skipped_unchanged=${partition.skippedUnchanged}`,
+    );
+
+    if (metricTotals && syncProgress) {
+      metricTotals.rows_synced_new += insertsCanonical.length;
+      metricTotals.rows_synced_updated += upsertsCanonical.length;
+      metricTotals.rows_synced_unchanged += partition.skippedUnchanged;
+      metricTotals.rows_duplicate_against_existing += partition.skippedUnchanged;
+    }
+
+    const roConflict = CONFLICT_KEY.REMOVAL_ORDER;
+    if (!roConflict) {
+      throw new Error("[REMOVAL_ORDER] CONFLICT_KEY.REMOVAL_ORDER is not configured");
+    }
+    await writeRemovalOrderPartitionedBatches(
+      { inserts: insertsCanonical, upserts: upsertsCanonical },
+      roConflict,
+      syncProgress,
+    );
+    return { flushed: deduped.length, collapsedInBatch };
+  }
+
+  if (metricTotals && syncProgress && deduped.length > 0) {
+    const d = await measureBatchUpsertMetrics(
+      supabaseServer,
+      kind,
+      table,
+      syncProgress.orgId,
+      syncProgress.uploadId,
+      deduped,
+    );
+    metricTotals.rows_synced_new += d.rows_synced_new;
+    metricTotals.rows_synced_updated += d.rows_synced_updated;
+    metricTotals.rows_synced_unchanged += d.rows_synced_unchanged;
+    metricTotals.rows_duplicate_against_existing += d.rows_duplicate_against_existing;
+  }
 
   // ── Step 3: chunked upsert / insert ────────────────────────────────────────
   const conflictKey = CONFLICT_KEY[kind];
@@ -1234,32 +1756,27 @@ async function flushDomainBatch(
     }
   }
 
-  return deduped.length;
+  return { flushed: deduped.length, collapsedInBatch };
+}
+
+/**
+ * Same tuple as raw-landing `ON CONFLICT` targets — for FBA_RETURNS this is `uq_amazon_returns_org_file_row`
+ * `(organization_id, source_file_sha256, source_physical_row_number)`.
+ */
+function physicalLineDedupKey(row: Record<string, unknown>): string {
+  const norm = (v: unknown): string => String(v ?? "").trim().toLowerCase();
+  return `${norm(row.organization_id)}|${String(row.source_file_sha256 ?? "").trim().toLowerCase()}|${String(row.source_physical_row_number ?? "")}`;
 }
 
 /**
  * Removes duplicate rows within a batch using the same composite key that
- * Postgres would use for ON CONFLICT.
+ * Postgres would use on ON CONFLICT.
  *
- * INVENTORY_LEDGER special behaviour:
- *   • All key fields (fnsku, disposition, location, event_type) are normalised
- *     to trimmed-lowercase before comparison — prevents "Sellable" vs "sellable"
- *     from slipping through as two different keys.
- *   • When a duplicate is found, quantities are SUMMED (additive merge) rather
- *     than last-wins, which matches Amazon ledger semantics where the same
- *     FNSKU can appear multiple times in the same export with partial quantities.
+ * Raw landing tables: (organization_id, source_file_sha256, source_physical_row_number).
+ * REMOVAL_ORDER: handled only in `flushDomainBatch` via `dedupeRemovalOrderPayloadsForUpsert()`.
+ * REMOVAL_SHIPMENT: staging-line keys unchanged.
  *
- * REPORTS_REPOSITORY: duplicate natural keys in the same batch merge by SUMMING
- * total_amount (matches pre-upsert dedupe spec).
- *
- * REMOVAL_ORDER: keyed by Wave 1 business line (store + logical line) — within-batch last-wins on same key.
- *
- * All other tables use last-occurrence-wins (standard upsert semantics).
- *
- * This prevents the Postgres error:
- *   "ON CONFLICT DO UPDATE command cannot affect row a second time"
- * which fires when the same conflict-key appears more than once in a single
- * INSERT statement — common with Amazon CSVs that contain duplicates.
+ * Prevents: "ON CONFLICT DO UPDATE command cannot affect row a second time".
  */
 function deduplicateByConflictKey(
   kind: SyncKind,
@@ -1274,55 +1791,15 @@ function deduplicateByConflictKey(
   for (const row of rows) {
     let key: string;
     switch (kind) {
-      case "FBA_RETURNS":
-        key = `${norm(row.organization_id)}|${norm(row.lpn)}`;
-        break;
-      case "REMOVAL_ORDER":
-        key = removalBusinessDedupKey(row);
-        break;
-      case "REMOVAL_SHIPMENT":
-        key =
-          row.source_staging_id != null && String(row.source_staging_id).trim() !== ""
-            ? `sid|${String(row.organization_id)}|${String(row.upload_id)}|${String(row.source_staging_id)}`
-            : removalLogicalLineDedupKey(row);
+      case "FBA_RETURNS": // uq_amazon_returns_org_file_row — never key on LPN
+        key = fbaReturnsFileRowIdentityKey(row);
         break;
       case "INVENTORY_LEDGER":
-        // Normalise every component of the 5-column unique constraint.
-        // Case-insensitive comparison prevents "Sellable" / "SELLABLE" split.
-        key = [
-          norm(row.organization_id),
-          norm(row.fnsku),
-          norm(row.disposition),
-          norm(row.location),
-          norm(row.event_type),
-        ].join("|");
-        break;
       case "REIMBURSEMENTS":
-        key = `${norm(row.organization_id)}|${norm(row.reimbursement_id)}|${norm(row.sku)}`;
-        break;
       case "SETTLEMENT":
-        key = `${norm(row.organization_id)}|${norm(row.upload_id)}|${norm(row.amazon_line_key)}`;
-        break;
       case "SAFET_CLAIMS":
-        key = `${norm(row.organization_id)}|${norm(row.safet_claim_id)}`;
-        break;
       case "TRANSACTIONS":
-        // Fixed key: use source_line_hash (content fingerprint).
-        // Old key (org+order_id+tx_type+amount) collapsed distinct rows with the
-        // same order+type+amount but different SKU/settlement/date.
-        key = `${norm(row.organization_id)}|${String(row.source_line_hash ?? "")}`;
-        break;
       case "REPORTS_REPOSITORY":
-        key = [
-          norm(row.organization_id),
-          String(row.date_time ?? ""),
-          norm(row.transaction_type),
-          norm(row.order_id),
-          norm(row.sku),
-          norm(row.description),
-        ].join("|");
-        break;
-      // Raw-archive types: all use source_line_hash — guaranteed unique per content
       case "ALL_ORDERS":
       case "REPLACEMENTS":
       case "FBA_GRADE_AND_RESELL":
@@ -1331,36 +1808,24 @@ function deduplicateByConflictKey(
       case "RESERVED_INVENTORY":
       case "FEE_PREVIEW":
       case "MONTHLY_STORAGE_FEES":
-        key = `${norm(row.organization_id)}|${String(row.source_line_hash ?? "")}`;
+        key = physicalLineDedupKey(row);
+        break;
+      case "REMOVAL_ORDER":
+        throw new Error(
+          "REMOVAL_ORDER deduplication is handled in flushDomainBatch via dedupeRemovalOrderPayloadsForUpsert()",
+        );
+      case "REMOVAL_SHIPMENT":
+        key =
+          row.source_staging_id != null && String(row.source_staging_id).trim() !== ""
+            ? `sid|${String(row.organization_id)}|${String(row.upload_id)}|${String(row.source_staging_id)}`
+            : removalLogicalLineDedupKey(row);
         break;
       default:
         // UNKNOWN — give every row a unique key so nothing is silently dropped
         key = `${norm(row.organization_id)}|__unknown__|${Math.random()}`;
     }
 
-    if (kind === "INVENTORY_LEDGER" && seen.has(key)) {
-      // Additive quantity merge: sum quantities from all duplicate rows so no
-      // ledger movement is silently discarded.
-      const existing = seen.get(key)!;
-      const existingQty =
-        typeof existing.quantity === "number" ? existing.quantity : 0;
-      const incomingQty =
-        typeof row.quantity === "number" ? row.quantity : 0;
-      seen.set(key, { ...row, quantity: existingQty + incomingQty });
-    } else if (kind === "REPORTS_REPOSITORY" && seen.has(key)) {
-      const existing = seen.get(key)!;
-      const existingAmt =
-        typeof existing.total_amount === "number" ? existing.total_amount : 0;
-      const incomingAmt =
-        typeof row.total_amount === "number" ? row.total_amount : 0;
-      seen.set(key, { ...row, total_amount: existingAmt + incomingAmt });
-    } else if (kind === "REMOVAL_ORDER" && seen.has(key)) {
-      const existing = seen.get(key)!;
-      // With source_staging_id keys, duplicates should not occur; keep last-wins for fallback.
-      seen.set(key, { ...existing, ...row });
-    } else {
-      seen.set(key, row);
-    }
+    seen.set(key, row);
   }
 
   return [...seen.values()];

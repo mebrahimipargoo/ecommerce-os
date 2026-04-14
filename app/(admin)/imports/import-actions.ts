@@ -346,6 +346,26 @@ export async function createRawReportUploadSession(input: {
       hasMapping: !!column_mapping,
     });
 
+    // Fresh progress row for this upload_id only — never inherit counters from another import.
+    await supabaseServer.from("file_processing_status").upsert(
+      {
+        upload_id: data.id as string,
+        organization_id: orgId,
+        status: "uploading",
+        current_phase: "upload",
+        upload_pct: 0,
+        process_pct: 0,
+        sync_pct: 0,
+        processed_rows: 0,
+        total_rows: null,
+        file_size_bytes: input.fileSizeBytes ?? input.totalBytes,
+        uploaded_bytes: 0,
+        error_message: null,
+        import_metrics: {},
+      },
+      { onConflict: "upload_id" },
+    );
+
     return { ok: true, id: data.id as string, storagePrefix };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Create failed." };
@@ -416,6 +436,7 @@ export async function updateUploadSessionClassification(input: {
   }
   if (typeof input.totalRows === "number" && Number.isFinite(input.totalRows)) {
     metaPatch.total_rows = input.totalRows;
+    metaPatch.row_count = 0;
   }
   if (input.importFullFile != null) {
     metaPatch.import_full_file = input.importFullFile;
@@ -663,6 +684,29 @@ export async function finalizeRawReportUpload(input: {
     .eq("organization_id", orgId);
 
   if (error) return { ok: false, error: error.message };
+
+  const parsedMeta = parseRawReportMetadata(metadata);
+  const byteTotal =
+    parsedMeta.totalBytes > 0
+      ? parsedMeta.totalBytes
+      : Math.max(parsedMeta.uploadedBytes ?? 0, 0);
+
+  await supabaseServer.from("file_processing_status").upsert(
+    {
+      upload_id: input.uploadId,
+      organization_id: orgId,
+      status: "pending",
+      current_phase: null,
+      upload_pct: 100,
+      process_pct: 0,
+      sync_pct: 0,
+      processed_rows: 0,
+      file_size_bytes: byteTotal > 0 ? byteTotal : null,
+      uploaded_bytes: byteTotal > 0 ? byteTotal : null,
+      error_message: null,
+    },
+    { onConflict: "upload_id" },
+  );
 
   await audit(orgId, userId, "import.upload_finalized", input.uploadId, {
     rowCount: input.rowCount ?? null,

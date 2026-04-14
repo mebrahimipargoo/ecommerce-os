@@ -36,6 +36,8 @@ export type ImportProgressStatus =
   | "pending"
   | "uploading"
   | "processing"
+  | "syncing"
+  | "staged"
   | "synced"
   | "complete"
   | "failed";
@@ -43,9 +45,13 @@ export type ImportProgressStatus =
 export type ImportProgressState = {
   /** 0–100: bytes uploaded to Supabase Storage. */
   uploadPct: number;
-  /** 0–100: rows processed on the server. */
+  /** 0–100: CSV rows staged (Phase 2). */
   processPct: number;
-  /** Current status from `raw_report_uploads.status`. */
+  /** 0–100: domain rows flushed (Phase 3). */
+  syncPct: number;
+  /** file_processing_status.current_phase when present (upload | process | staged | sync | complete | failed). */
+  currentPhase: string | null;
+  /** Current status from `raw_report_uploads.status` (and fps while uploading). */
   status: ImportProgressStatus;
   /** Error message if status === "failed". */
   error: string | null;
@@ -56,6 +62,8 @@ export type ImportProgressState = {
 const IDLE_STATE: ImportProgressState = {
   uploadPct:  0,
   processPct: 0,
+  syncPct:    0,
+  currentPhase: null,
   status:     "idle",
   error:      null,
   rowCount:   null,
@@ -70,7 +78,7 @@ function rowToState(row: Record<string, unknown>): ImportProgressState {
   const parsed = parseRawReportMetadata(row.metadata);
   const rawStatus = String(row.status ?? "pending").toLowerCase();
   const status = [
-    "idle", "pending", "uploading", "processing", "complete", "failed",
+    "idle", "pending", "uploading", "processing", "staged", "synced", "complete", "failed",
   ].includes(rawStatus)
     ? (rawStatus as ImportProgressStatus)
     : "pending";
@@ -78,6 +86,8 @@ function rowToState(row: Record<string, unknown>): ImportProgressState {
   return {
     uploadPct:  parsed.uploadProgress,
     processPct: parsed.processProgress,
+    syncPct:    parsed.syncProgress,
+    currentPhase: null,
     status,
     error:      parsed.errorMessage,
     rowCount:   parsed.rowCount,
@@ -92,15 +102,24 @@ function rowToState(row: Record<string, unknown>): ImportProgressState {
  */
 function fpsRowToState(row: Record<string, unknown>, fallback: ImportProgressState): ImportProgressState {
   const rawStatus = String(row.status ?? "pending").toLowerCase();
-  const status = [
-    "idle", "pending", "uploading", "processing", "synced", "complete", "failed",
-  ].includes(rawStatus)
-    ? (rawStatus as ImportProgressStatus)
-    : fallback.status;
+  let status: ImportProgressStatus = fallback.status;
+  if (rawStatus === "uploading") status = "uploading";
+  else if (rawStatus === "processing") status = "processing";
+  else if (rawStatus === "syncing") status = "syncing";
+  else if (rawStatus === "complete") status = "complete";
+  else if (rawStatus === "failed") status = "failed";
+  else if (rawStatus === "pending") status = "pending";
+
+  const phase =
+    typeof row.current_phase === "string" && row.current_phase.trim() !== ""
+      ? row.current_phase.trim()
+      : fallback.currentPhase;
 
   return {
-    uploadPct:  Number(row.upload_pct  ?? fallback.uploadPct),
+    uploadPct:  Number(row.upload_pct ?? fallback.uploadPct),
     processPct: Number(row.process_pct ?? fallback.processPct),
+    syncPct:    Number(row.sync_pct ?? fallback.syncPct),
+    currentPhase: phase,
     status,
     error:      typeof row.error_message === "string" && row.error_message ? row.error_message : fallback.error,
     rowCount:   row.processed_rows != null ? Number(row.processed_rows) : fallback.rowCount,
@@ -123,13 +142,27 @@ export function useImportProgress(uploadId: string | null): ImportProgressState 
   const pollTimerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchOnce = useCallback(async (id: string) => {
-    const { data, error } = await supabase
-      .from("raw_report_uploads")
-      .select("status, metadata")
-      .eq("id", id)
-      .maybeSingle();
-    if (error || !data) return;
-    setState(rowToState(data as Record<string, unknown>));
+    const [rpu, fps] = await Promise.all([
+      supabase.from("raw_report_uploads").select("status, metadata").eq("id", id).maybeSingle(),
+      supabase.from("file_processing_status").select("*").eq("upload_id", id).maybeSingle(),
+    ]);
+    if (rpu.error || !rpu.data) return;
+    let next = rowToState(rpu.data as Record<string, unknown>);
+    if (!fps.error && fps.data) {
+      next = fpsRowToState(fps.data as Record<string, unknown>, next);
+    }
+    // Prefer raw_report_uploads lifecycle for terminal states (synced / failed).
+    const rStatus = String((rpu.data as { status?: string }).status ?? "").toLowerCase();
+    if (rStatus === "staged") {
+      next = { ...next, status: "staged", processPct: Math.max(next.processPct, 100) };
+    } else if (rStatus === "synced" || rStatus === "complete") {
+      next = { ...next, status: rStatus as ImportProgressStatus, syncPct: 100 };
+    } else if (rStatus === "failed") {
+      next = { ...next, status: "failed" };
+    } else if (rStatus === "processing" && next.currentPhase === "staged") {
+      next = { ...next, status: "staged" };
+    }
+    setState(next);
   }, []);
 
   const stopPoll = useCallback(() => {
@@ -170,23 +203,27 @@ export function useImportProgress(uploadId: string | null): ImportProgressState 
       return;
     }
 
+    // New upload_id must never show the previous session's percentages or row counts.
+    setState(IDLE_STATE);
+
     // 1. Immediate snapshot so the UI never starts blank.
     void fetchOnce(uploadId);
 
     // 2a. Primary Realtime: file_processing_status (slim, tiny payloads).
-    //     Provides the freshest upload_pct / process_pct values.
+    //     INSERT + UPDATE — session create upserts a fresh row per upload_id.
     const fpsChannel = supabase
       .channel(`fps-progress:${uploadId}`)
       .on(
         "postgres_changes",
         {
-          event:  "UPDATE",
+          event:  "*",
           schema: "public",
           table:  "file_processing_status",
           filter: `upload_id=eq.${uploadId}`,
         },
         (payload) => {
-          const row = payload.new as Record<string, unknown>;
+          const row = payload.new as Record<string, unknown> | undefined;
+          if (!row || typeof row !== "object") return;
           setState((prev) => fpsRowToState(row, prev));
         },
       )
@@ -212,14 +249,12 @@ export function useImportProgress(uploadId: string | null): ImportProgressState 
         },
         (payload) => {
           const row = payload.new as Record<string, unknown>;
-          // Only overwrite if fps didn't already push a more-granular update.
           setState((prev) => {
             const next = rowToState(row);
-            // Prefer fps pct values when the fps channel is alive and has real data.
             return {
               ...next,
-              uploadPct:  prev.uploadPct  > next.uploadPct  ? prev.uploadPct  : next.uploadPct,
-              processPct: prev.processPct > next.processPct ? prev.processPct : next.processPct,
+              // Upload bytes can legitimately lag behind in metadata; do not let old process/sync % stick.
+              uploadPct: Math.max(prev.uploadPct, next.uploadPct),
             };
           });
         },

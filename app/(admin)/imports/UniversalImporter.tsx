@@ -42,6 +42,7 @@ import { supabase } from "../../../src/lib/supabase";
 import type { RawReportType } from "../../../lib/raw-report-types";
 import { isListingReportType } from "../../../lib/raw-report-types";
 import { listStores } from "../../settings/adapters/actions";
+import { formatImportPhaseLabel } from "../../../lib/pipeline/import-phase-labels";
 
 const RAW_REPORTS_BUCKET = "raw-reports";
 
@@ -207,6 +208,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   const [worklistBarEpoch, setWorklistBarEpoch] = useState(0);
   /** Listing process: raw_archive | canonical_sync | done — from upload metadata while processing. */
   const [listingImportSubphase, setListingImportSubphase] = useState<string | null>(null);
+  const [phaseLabel, setPhaseLabel] = useState<string>("");
 
   const pollRef2 = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -310,12 +312,20 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       setErr("Select a target store before choosing a file.");
       return;
     }
+    if (pollRef2.current) {
+      clearInterval(pollRef2.current);
+      pollRef2.current = null;
+    }
     setFile(f);
     setErr(null);
     setPhase("idle");
     setUploadPct(0);
     setProgressMsg("");
     setSessionUploadId(null);
+    setTotalRows(0);
+    setProcessedRows(0);
+    setProcessPct(0);
+    setSyncPct(0);
     stopRef.current = false;
   }
 
@@ -334,6 +344,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     setWorklistPct(0);
     setWorklistBarEpoch(0);
     setListingImportSubphase(null);
+    setPhaseLabel("");
     stopRef.current = false;
     if (pollRef2.current) { clearInterval(pollRef2.current); pollRef2.current = null; }
   }
@@ -365,26 +376,46 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       listingFromUi ? "Parsing file lines and storing raw rows…" : "Processing CSV into staging table…",
     );
     setListingImportSubphase("raw_archive");
+    setPhaseLabel(listingFromUi ? "Staging" : "Staging");
 
-    // Poll DB every 1.5 s so the progress bar updates while the server streams the CSV
+    // Poll DB frequently; prefer `file_processing_status` (true progress source).
     const uploadIdSnap = sessionUploadId;
     if (pollRef2.current) clearInterval(pollRef2.current);
     pollRef2.current = setInterval(() => {
-      void supabase
-        .from("raw_report_uploads")
-        .select("metadata")
-        .eq("id", uploadIdSnap)
-        .maybeSingle()
-        .then(({ data }) => {
-          const m = data?.metadata as Record<string, unknown> | null;
-          if (!m) return;
+      void Promise.all([
+        supabase.from("raw_report_uploads").select("metadata").eq("id", uploadIdSnap).maybeSingle(),
+        supabase.from("file_processing_status").select("*").eq("upload_id", uploadIdSnap).maybeSingle(),
+      ]).then(([rpu, fps]) => {
+        const m = rpu.data?.metadata as Record<string, unknown> | null;
+        const fpsRow = fps.data as Record<string, unknown> | null | undefined;
+        if (fpsRow && typeof fpsRow.process_pct === "number") {
+          setProcessPct(Math.min(100, Math.max(0, Number(fpsRow.process_pct))));
+          if (typeof fpsRow.sync_pct === "number") {
+            setSyncPct(Math.min(100, Math.max(0, Number(fpsRow.sync_pct))));
+          }
+          if (typeof fpsRow.upload_pct === "number") {
+            setUploadPct(Math.min(100, Math.max(0, Number(fpsRow.upload_pct))));
+          }
+          if (typeof fpsRow.processed_rows === "number") setProcessedRows(Number(fpsRow.processed_rows));
+          if (typeof fpsRow.total_rows === "number" && fpsRow.total_rows > 0) setTotalRows(Number(fpsRow.total_rows));
+          const cp = typeof fpsRow.current_phase === "string" ? fpsRow.current_phase : null;
+          if (cp) setPhaseLabel(formatImportPhaseLabel(cp));
+        } else if (m) {
           if (typeof m.process_progress === "number") setProcessPct(m.process_progress);
           if (typeof m.row_count === "number") setProcessedRows(m.row_count);
           if (typeof m.total_rows === "number" && m.total_rows > 0) setTotalRows(m.total_rows as number);
+          const im = m.import_metrics as { current_phase?: string } | undefined;
+          if (im?.current_phase) setPhaseLabel(formatImportPhaseLabel(im.current_phase));
+        }
+        if (m) {
           const lip = m.catalog_listing_import_phase;
-          if (typeof lip === "string") setListingImportSubphase(lip);
-        });
-    }, listingFromUi ? 350 : 1500);
+          if (typeof lip === "string") {
+            setListingImportSubphase(lip);
+            setPhaseLabel(formatImportPhaseLabel(lip === "raw_archive" ? "staging" : lip === "canonical_sync" ? "processing" : lip));
+          }
+        }
+      });
+    }, listingFromUi ? 350 : 400);
 
     try {
       const { data: upRow } = await supabase
@@ -395,23 +426,20 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       const sessionRt = String((upRow as { report_type?: string } | null)?.report_type ?? "").trim();
       const useListingProcess = listingFromUi || isListingReportType(sessionRt);
 
-      const res = await fetch(
-        useListingProcess ? "/api/settings/imports/process" : "/api/settings/imports/stage",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(
-            useListingProcess
-              ? { upload_id: sessionUploadId }
-              : {
-                  upload_id: sessionUploadId,
-                  start_date: importFullFile ? null : (startDate || null),
-                  end_date: importFullFile ? null : (endDate || null),
-                  import_full_file: importFullFile,
-                },
-          ),
-        },
-      );
+      const res = await fetch("/api/settings/imports/process", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          useListingProcess
+            ? { upload_id: sessionUploadId }
+            : {
+                upload_id: sessionUploadId,
+                start_date: importFullFile ? null : (startDate || null),
+                end_date: importFullFile ? null : (endDate || null),
+                import_full_file: importFullFile,
+              },
+        ),
+      });
       const json = (await res.json()) as {
         ok?: boolean;
         error?: string;
@@ -471,19 +499,37 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     setPhase("syncing");
     setSyncPct(0);
     setProgressMsg("Syncing to final tables…");
+    setPhaseLabel("Syncing");
     const uploadIdSnap = sessionUploadId;
     if (pollRef2.current) clearInterval(pollRef2.current);
     pollRef2.current = setInterval(() => {
-      void supabase
-        .from("raw_report_uploads")
-        .select("metadata")
-        .eq("id", uploadIdSnap)
-        .maybeSingle()
-        .then(({ data }) => {
-          const m = data?.metadata as Record<string, unknown> | null;
-          if (!m) return;
-          if (typeof m.sync_progress === "number") setSyncPct(m.sync_progress);
-        });
+      void Promise.all([
+        supabase.from("raw_report_uploads").select("metadata").eq("id", uploadIdSnap).maybeSingle(),
+        supabase.from("file_processing_status").select("*").eq("upload_id", uploadIdSnap).maybeSingle(),
+      ]).then(([rpu, fps]) => {
+        const fpsRow = fps.data as Record<string, unknown> | null | undefined;
+        if (fpsRow && typeof fpsRow.sync_pct === "number") {
+          setSyncPct(Math.min(100, Math.max(0, Number(fpsRow.sync_pct))));
+        } else {
+          const m = rpu.data?.metadata as Record<string, unknown> | null;
+          if (m && typeof m.sync_progress === "number") setSyncPct(m.sync_progress);
+        }
+        if (fpsRow && typeof fpsRow.current_phase === "string") {
+          setPhaseLabel(formatImportPhaseLabel(fpsRow.current_phase));
+        }
+        const im = fpsRow?.import_metrics as
+          | { rows_synced?: number; total_staging_rows?: number }
+          | undefined;
+        const tr = fpsRow && typeof fpsRow.total_rows === "number" ? Number(fpsRow.total_rows) : 0;
+        const pr = fpsRow && typeof fpsRow.processed_rows === "number" ? Number(fpsRow.processed_rows) : 0;
+        if (im && typeof im.rows_synced === "number" && typeof im.total_staging_rows === "number") {
+          setProgressMsg(
+            `Syncing… ${im.rows_synced.toLocaleString()} / ${im.total_staging_rows.toLocaleString()} rows`,
+          );
+        } else if (tr > 0 && pr >= 0) {
+          setProgressMsg(`Syncing… ${pr.toLocaleString()} / ${tr.toLocaleString()} rows`);
+        }
+      });
     }, 400);
     try {
       const res = await fetch("/api/settings/imports/sync", {
@@ -583,6 +629,10 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     setErr(null);
     setPhase("uploading");
     setUploadPct(0);
+    setTotalRows(0);
+    setProcessedRows(0);
+    setProcessPct(0);
+    setSyncPct(0);
     setProgressMsg("Creating import record…");
     stopRef.current = false;
 
@@ -663,12 +713,52 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         throw new Error(signedRes.error ?? "Could not create upload URL.");
       }
 
-      const { error: upErr } = await supabase.storage
-        .from(RAW_REPORTS_BUCKET)
-        .uploadToSignedUrl(filePath, signedRes.token, file, {
-          contentType: file.type || "text/csv",
+      const totalSz = file.size > 0 ? file.size : 1;
+      let lastProgressPost = 0;
+      const postByteProgress = (loaded: number, total: number) => {
+        const pct = total > 0 ? Math.min(99, Math.round((loaded / total) * 100)) : 0;
+        setUploadPct(pct);
+        const now = Date.now();
+        if (now - lastProgressPost < 120 && loaded < total) return;
+        lastProgressPost = now;
+        void fetch("/api/settings/imports/upload-progress", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            upload_id: uploadId,
+            uploaded_bytes: loaded,
+            total_bytes: total,
+          }),
         });
-      if (upErr) throw new Error(upErr.message);
+      };
+
+      const putUrl = signedRes.signedUrl?.trim() ?? "";
+      if (putUrl.startsWith("http")) {
+        await new Promise<void>((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open("PUT", putUrl);
+          xhr.upload.onprogress = (ev) => {
+            if (ev.lengthComputable) postByteProgress(ev.loaded, ev.total);
+          };
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) resolve();
+            else reject(new Error(xhr.statusText || `Upload failed (${xhr.status})`));
+          };
+          xhr.onerror = () => reject(new Error("Network error during upload"));
+          const ct = file.type && file.type.length > 0 ? file.type : "text/csv";
+          xhr.setRequestHeader("Content-Type", ct);
+          xhr.send(file);
+        });
+        postByteProgress(totalSz, totalSz);
+      } else {
+        const { error: upErr } = await supabase.storage
+          .from(RAW_REPORTS_BUCKET)
+          .uploadToSignedUrl(filePath, signedRes.token, file, {
+            contentType: file.type || "text/csv",
+          });
+        if (upErr) throw new Error(upErr.message);
+        postByteProgress(totalSz, totalSz);
+      }
 
       setUploadPct(100);
 
@@ -1181,7 +1271,9 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                       : listingImportSubphase === "canonical_sync"
                         ? "Phase 3 — Sync canonical catalog"
                         : "Phase 2 — Parse and store raw rows"
-                    : "Phase 2 — Processing to staging"}
+                    : phaseLabel
+                      ? `${phaseLabel} — staging`
+                      : "Staging — copy rows to amazon_staging"}
                 </span>
                 <span className={phase !== "processing" ? "text-emerald-500" : "tabular-nums"}>
                   {phase === "processing"

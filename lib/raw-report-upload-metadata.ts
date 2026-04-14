@@ -6,7 +6,38 @@
 /** Client ledger sessions — must live outside `"use server"` modules (only async exports allowed there). */
 export const AMAZON_LEDGER_UPLOAD_SOURCE = "amazon_ledger_uploader" as const;
 
+/** Per-run counters surfaced in Import History (written by stage/sync routes). */
+export type ImportRunMetrics = {
+  physical_lines_seen?: number;
+  data_rows_seen?: number;
+  rows_staged?: number;
+  rows_synced_upserted?: number;
+  rows_mapper_invalid?: number;
+  /** Lines merged in JS before upsert (duplicate conflict key in same batch). */
+  rows_duplicate_in_file?: number;
+  rows_net_collapsed_vs_staging?: number;
+  rows_synced_new?: number;
+  rows_synced_updated?: number;
+  rows_synced_unchanged?: number;
+  rows_duplicate_against_existing?: number;
+  /** Live Phase 3 flush progress (sync route bump). */
+  rows_synced?: number;
+  total_staging_rows?: number;
+  rows_invalid?: number;
+  rows_skipped_empty?: number;
+  rows_skipped_malformed?: number;
+  current_phase?: "upload" | "staging" | "process" | "staged" | "sync" | "complete" | "failed";
+  failure_reason?: string;
+};
+
 export type RawReportUploadMetadata = {
+  /** Structured counters for the operator-facing import summary. */
+  import_metrics?: ImportRunMetrics;
+  /** Lines seen in the CSV (including blanks); see stage route. */
+  physical_lines_seen?: number;
+  /** Lines that passed date filter and were staged (Phase 2). */
+  data_rows_seen?: number;
+  sync_duplicate_in_batch_rows?: number;
   total_bytes?: number;
   storage_prefix?: string;
   upload_progress?: number;
@@ -128,19 +159,30 @@ export function parseRawReportMetadata(raw: unknown): {
   totalBytes: number;
   uploadProgress: number;
   processProgress: number;
+  syncProgress: number;
   uploadedBytes: number;
   errorMessage: string | null;
   rowCount: number | null;
 } {
   const m = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   const rc = m.row_count;
-  const rowCount =
+  const tr = m.total_rows;
+  const rowCountFromRowCount =
     rc != null && (typeof rc === "number" || typeof rc === "string") ? num(rc, NaN) : NaN;
+  const rowCountFromTotal =
+    tr != null && (typeof tr === "number" || typeof tr === "string") ? num(tr, NaN) : NaN;
+  const rowCount =
+    Number.isFinite(rowCountFromRowCount) && rowCountFromRowCount >= 0
+      ? rowCountFromRowCount
+      : Number.isFinite(rowCountFromTotal) && rowCountFromTotal >= 0
+        ? rowCountFromTotal
+        : NaN;
   return {
     storagePrefix: typeof m.storage_prefix === "string" ? m.storage_prefix : null,
     totalBytes: num(m.total_bytes, 0),
     uploadProgress: Math.min(100, Math.max(0, num(m.upload_progress, 0))),
     processProgress: Math.min(100, Math.max(0, num(m.process_progress, 0))),
+    syncProgress: Math.min(100, Math.max(0, num(m.sync_progress, 0))),
     uploadedBytes: num(m.uploaded_bytes, 0),
     errorMessage: typeof m.error_message === "string" ? m.error_message : null,
     rowCount: Number.isFinite(rowCount) ? rowCount : null,

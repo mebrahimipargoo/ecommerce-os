@@ -10,6 +10,7 @@ import { useUserRole } from "../../../components/UserRoleContext";
 import type { RawReportType } from "../../../lib/raw-report-types";
 import { REPORT_TYPE_SPECS } from "../../../lib/csv-import-mapping";
 import { isListingReportType, RAW_REPORT_TYPE_ORDER } from "../../../lib/raw-report-types";
+import { formatImportPhaseLabel } from "../../../lib/pipeline/import-phase-labels";
 import { useDebugMode } from "../../../components/DebugModeContext";
 import { DatabaseTag } from "../../../components/DatabaseTag";
 
@@ -144,14 +145,14 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
     };
   }, [refresh]);
 
-  /** Faster refresh while Process is running so listing progress updates are visible. */
+  /** Faster refresh while Process or Sync is running so progress metadata updates visibly. */
   useEffect(() => {
-    if (processingIds.size === 0) return;
+    if (processingIds.size === 0 && syncingIds.size === 0) return;
     const t = setInterval(() => {
       void refresh();
     }, 700);
     return () => clearInterval(t);
-  }, [processingIds.size, refresh]);
+  }, [processingIds.size, syncingIds.size, refresh]);
 
   // ── Single row delete ────────────────────────────────────────────────────
   const runDeleteUpload = async (r: RawReportUploadRow) => {
@@ -190,21 +191,16 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
     }
   };
 
-  // ── Phase 2: Process — staging (most types) OR direct catalog import (listing exports) ──
+  // ── Phase 2: Process — unified route (staging for Amazon reports; listing branch for catalog exports) ──
   const runProcess = async (r: RawReportUploadRow) => {
     setProcessingIds((prev) => new Set([...prev, r.id]));
     setLoadErr(null);
     try {
-      const rt = String(r.report_type ?? "").trim();
-      const listing = isListingReportType(rt);
-      const res = await fetch(
-        listing ? "/api/settings/imports/process" : "/api/settings/imports/stage",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ upload_id: r.id }),
-        },
-      );
+      const res = await fetch("/api/settings/imports/process", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_id: r.id }),
+      });
       const json = (await res.json()) as {
         ok?: boolean;
         error?: string;
@@ -526,21 +522,27 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                     {/* Status badge / live progress */}
                     <td className="px-4 py-3">
                       {processingIds.has(r.id) ? (
-                        // Live Phase 2 progress — shows X / Y rows
+                        // Live Phase 2 progress — shows X / Y rows (FPS + metadata; guard stale Phase-1 totals)
                         (() => {
                           const pct  = num(metaObj?.process_progress, 0);
                           const done = num(metaObj?.row_count,         0);
-                          const tot  = num(metaObj?.total_rows,        0);
+                          const rawTot  = num(metaObj?.total_rows,        0);
+                          const im = metaObj?.import_metrics as { current_phase?: string } | undefined;
+                          const phaseLbl = formatImportPhaseLabel(im?.current_phase ?? "staging");
+                          const tot =
+                            rawTot > 0 && done > 0 && rawTot > done * 1.18
+                              ? done
+                              : rawTot;
                           return (
                             <div className="min-w-[120px]">
-                              <div className="mb-1 flex items-center justify-between gap-2 text-[10px] font-medium text-sky-600">
+                              <div className="mb-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[10px] font-medium text-sky-600">
                                 <span className="flex items-center gap-1">
                                   <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                                  Processing
+                                  {phaseLbl}
                                 </span>
                                 <span className="tabular-nums text-muted-foreground">
                                   {done > 0 || tot > 0
-                                    ? `${done.toLocaleString()}${tot > 0 ? ` / ${tot.toLocaleString()}` : ""}`
+                                    ? `rows ${done.toLocaleString()} / ${tot > 0 ? tot.toLocaleString() : "…"}`
                                     : pct > 0 ? `${pct}%` : "…"}
                                 </span>
                               </div>
@@ -557,17 +559,39 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                           );
                         })()
                       ) : syncingIds.has(r.id) ? (
-                        // Live Phase 3 progress
-                        <div className="min-w-[120px]">
-                          <div className="mb-1 flex items-center gap-1 text-[10px] font-medium text-violet-600">
-                            <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                            Syncing…
-                          </div>
-                          <div className="relative h-1.5 overflow-hidden rounded-full bg-muted">
-                            <div className="absolute inset-0 animate-pulse rounded-full bg-violet-400/40" />
-                            <div className="h-1.5 w-1/2 rounded-full bg-violet-500" />
-                          </div>
-                        </div>
+                        (() => {
+                          const syncPct = num(metaObj?.sync_progress, 0);
+                          const im = metaObj?.import_metrics as {
+                            current_phase?: string;
+                            rows_synced?: number;
+                            total_staging_rows?: number;
+                          } | undefined;
+                          const phaseLbl = formatImportPhaseLabel(im?.current_phase ?? "sync");
+                          const rs = num(im?.rows_synced, -1);
+                          const ts = num(im?.total_staging_rows, -1);
+                          const rowHint =
+                            rs >= 0 && ts >= 0
+                              ? `rows ${rs.toLocaleString()} / ${ts.toLocaleString()}`
+                              : `${syncPct}%`;
+                          return (
+                            <div className="min-w-[120px]">
+                              <div className="mb-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[10px] font-medium text-violet-600">
+                                <span className="flex items-center gap-1">
+                                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                                  {phaseLbl}
+                                </span>
+                                <span className="tabular-nums text-muted-foreground">{rowHint}</span>
+                              </div>
+                              <div className="relative h-1.5 overflow-hidden rounded-full bg-muted">
+                                <div className="absolute inset-0 animate-pulse rounded-full bg-violet-400/40" />
+                                <div
+                                  className="h-full rounded-full bg-violet-500 transition-all duration-500"
+                                  style={{ width: `${Math.max(5, Math.min(100, syncPct))}%` }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })()
                       ) : (
                         <div className="flex flex-col gap-0.5">
                           <span
@@ -642,21 +666,53 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                         const processed = num(metaObj?.row_count, -1);
                         const total = num(metaObj?.total_rows, 0);
                         if (stagedCount >= 0 && syncCount >= 0) {
+                          const dupInFile = num(metaObj?.sync_duplicate_in_batch_rows, -1);
+                          const im = metaObj?.import_metrics as
+                            | {
+                                rows_synced_new?: number;
+                                rows_synced_updated?: number;
+                                rows_synced_unchanged?: number;
+                                rows_duplicate_against_existing?: number;
+                              }
+                            | undefined;
+                          const nNew = num(im?.rows_synced_new, -1);
+                          const nUpd = num(im?.rows_synced_updated, -1);
+                          const nUn = num(im?.rows_synced_unchanged, -1);
+                          const nDupDb = num(im?.rows_duplicate_against_existing, -1);
                           const extra =
                             collapsed > 0
-                              ? ` — ${collapsed.toLocaleString()} staging line(s) merged (same unique key)`
+                              ? ` — ${collapsed.toLocaleString()} net merged vs staging (key collision)`
+                              : "";
+                          const dupNote =
+                            dupInFile > 0 ? ` · ${dupInFile.toLocaleString()} dup key in batch` : "";
+                          const metricNote =
+                            nNew >= 0 && nUpd >= 0 && nUn >= 0 && nDupDb >= 0
+                              ? ` · new ${nNew.toLocaleString()} · upd ${nUpd.toLocaleString()} · same ${nUn.toLocaleString()} · dup DB ${nDupDb.toLocaleString()}`
                               : "";
                           return (
                             <span
                               title={
-                                "Phase 3: unique rows upserted / rows in staging. " +
+                                "Phase 3: domain rows upserted / staging rows. " +
                                 (collapsed > 0
-                                  ? `${collapsed} CSV lines shared a key with another line and did not add a new DB row.`
-                                  : "")
+                                  ? `Net ${collapsed} lines did not add a distinct row (duplicate key vs staging). `
+                                  : "") +
+                                (dupInFile > 0
+                                  ? `${dupInFile} duplicate conflict key(s) collapsed inside a single upsert batch.`
+                                  : "") +
+                                (metricNote ? " Metrics: new / updated / unchanged / duplicate vs DB." : "")
                               }
-                              className="cursor-help"
+                              className="flex max-w-[min(100%,22rem)] cursor-help flex-wrap justify-end gap-x-1 gap-y-0.5 text-right leading-snug"
                             >
-                              {`${syncCount.toLocaleString()} / ${stagedCount.toLocaleString()}${extra}`}
+                              <span className="tabular-nums">
+                                rows {syncCount.toLocaleString()} / {stagedCount.toLocaleString()}
+                              </span>
+                              {(extra || dupNote || metricNote) && (
+                                <span className="block w-full text-[10px] text-muted-foreground">
+                                  {extra}
+                                  {dupNote}
+                                  {metricNote}
+                                </span>
+                              )}
                             </span>
                           );
                         }
