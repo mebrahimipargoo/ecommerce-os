@@ -102,20 +102,19 @@ export function resolveImportUiActionState(input: ImportUiActionInput): ImportUi
   const needsP4 = requiresPhase4Generic(kind);
 
   /**
-   * Listing Phase 4 is complete when `phase4_status` says so, or when metadata + etl both
-   * reflect a finished generic (avoids treating `catalog_listing_import_phase` alone as done
-   * while FPS still shows Phase 4 pending — that hid Generic on the top card).
+   * Listing “Phase 4” is catalog merge inside the single Process step — done when FPS/metadata/row status agree.
    */
   const listingPhase4Done =
     isListingReportType(input.reportType) &&
-    (p4 || (catalogDone && etlPhase === "complete"));
+    (p4 ||
+      (catalogDone && (etlPhase === "complete" || status === "synced" || status === "complete")));
 
   /** Avoid treating legacy status alone as Phase 4 done (was hiding Generic while the bar showed "complete"). */
   const shipmentPhase4Done =
     kind === "REMOVAL_SHIPMENT" &&
     (p4 || (etlPhase === "complete" && (status === "synced" || status === "complete")));
 
-  const phase4Complete = !needsP4 ? true : isListingReportType(input.reportType) ? listingPhase4Done : shipmentPhase4Done;
+  const phase4Complete = !needsP4 ? (listing ? listingPhase4Done : true) : shipmentPhase4Done;
 
   const registry = AMAZON_REPORT_REGISTRY[kind];
   const wantsWorklist = registry.generateWorklistAfterSync === true;
@@ -129,10 +128,10 @@ export function resolveImportUiActionState(input: ImportUiActionInput): ImportUi
    */
   const removalShipment = kind === "REMOVAL_SHIPMENT";
 
-  /** Sync is required for listing/removal-shipment pipelines whenever Phase 3 is not done — independent of Generic. */
+  /** Listing finishes in Process only; removal shipment still uses Sync after staging. */
   const showSync =
     !isLedger &&
-    (listing || removalShipment
+    (removalShipment
       ? !phase3Complete &&
         (status === "staged" || (status === "failed" && failedPhaseRaw === "sync"))
       : status === "staged" || (status === "failed" && failedPhaseRaw === "sync"));
@@ -142,7 +141,7 @@ export function resolveImportUiActionState(input: ImportUiActionInput): ImportUi
     needsP4 &&
     !phase4Complete &&
     !genericInFlight &&
-    (listing || removalShipment ? phase3Complete : status === "raw_synced");
+    (removalShipment ? phase3Complete : status === "raw_synced");
 
   const showWorklist =
     !isLedger &&
@@ -152,9 +151,13 @@ export function resolveImportUiActionState(input: ImportUiActionInput): ImportUi
     phase3Complete &&
     !worklistCompleted;
 
-  const showRetryProcess = status === "failed" && !isLedger && failedPhaseRaw === "process";
+  const showRetryProcess =
+    status === "failed" &&
+    !isLedger &&
+    (failedPhaseRaw === "process" ||
+      (listing && (failedPhaseRaw === "sync" || failedPhaseRaw === "generic")));
 
-  const showRetrySync = status === "failed" && failedPhaseRaw === "sync" && !phase3Complete;
+  const showRetrySync = status === "failed" && failedPhaseRaw === "sync" && !phase3Complete && !listing;
 
   /** Phase 4 Generic retry after a failed generic attempt (listing + removal shipment). */
   const showRetryGeneric =
@@ -241,6 +244,7 @@ export function inferUniversalImporterPhase(input: ImportUiActionInput): Univers
   if (status === "raw_synced") return "raw_synced";
 
   if (status === "processing") {
+    if (listing) return "processing";
     if (etlPhase === "generic") return "genericing";
     if (etlPhase === "worklist") return "worklisting";
     if (cp === "sync" || fpsRowStatus === "syncing") return "syncing";
@@ -259,7 +263,7 @@ export function inferUniversalImporterPhase(input: ImportUiActionInput): Univers
       return "synced";
     }
     if (
-      (listing || kind === "REMOVAL_SHIPMENT") &&
+      kind === "REMOVAL_SHIPMENT" &&
       requiresPhase4Generic(kind) &&
       failedPhaseRaw === "generic" &&
       st.phase3Complete &&

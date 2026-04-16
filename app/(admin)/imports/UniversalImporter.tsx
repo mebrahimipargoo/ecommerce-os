@@ -18,7 +18,7 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { CheckCircle2, FileText, Loader2, RefreshCw, SquareX, Trash2, UploadCloud, X, Zap } from "lucide-react";
+import { CheckCircle2, FileText, Loader2, Lock, MapPin, RefreshCw, SquareX, Trash2, UploadCloud, X, Zap } from "lucide-react";
 import { isAdminRole, useUserRole } from "../../../components/UserRoleContext";
 import { isUuidString } from "../../../lib/uuid";
 import {
@@ -57,6 +57,7 @@ import {
   resolveRemovalShipmentPrimaryCta,
 } from "../../../lib/import-removal-shipment-ui";
 import {
+  buildListingPipelineSteps,
   buildListingTopCardResultMessage,
   LISTING_IMPORT_UI_LABELS,
   resolveListingImportUiState,
@@ -439,6 +440,32 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   ]);
 
   const listingProgress = listingUi?.progress ?? null;
+
+  const listingPipelineSteps = useMemo(() => {
+    if (!listingImportUi || removalShipmentUi) return null;
+    if (!importActionInput && !(sessionUploadId && isUploading)) return null;
+    const status =
+      importActionInput?.status ??
+      (isUploading ? "uploading" : sessionUploadId ? "pending" : "pending");
+    const meta = (importActionInput?.metadata ?? null) as Record<string, unknown> | null;
+    return buildListingPipelineSteps({
+      status,
+      metadata: meta,
+      fps: sessionFpsRow,
+      localUploadPct: isUploading ? uploadPct : undefined,
+      localFileSizeBytes: file?.size,
+    });
+  }, [
+    listingImportUi,
+    removalShipmentUi,
+    importActionInput,
+    sessionFpsRow,
+    isUploading,
+    uploadPct,
+    file?.size,
+    sessionUploadId,
+  ]);
+
   const listingTopLine = useMemo(() => {
     if (!listingImportUi || removalShipmentUi || !importActionInput) return null;
     return buildListingTopCardResultMessage({
@@ -462,11 +489,15 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     isUploading,
   ]);
 
+  /** Listing: show logical Sync/Generic controls (disabled) alongside Process — server runs them inside one Process. */
+  const showListingPhaseActionRow = listingImportUi && !removalShipmentUi && phase !== "idle";
+  const showMapListingTop = showListingPhaseActionRow && phase === "needs_mapping";
+
   const showSyncTop =
     removalShipmentUi
       ? rsCta != null && !isSyncing && (rsCta === "sync" || rsCta === "retry_sync")
       : listingImportUi && !removalShipmentUi
-        ? Boolean(listingUi?.showSyncCta)
+        ? showListingPhaseActionRow
         : !isSyncing &&
           phase !== "raw_synced" &&
           phase !== "synced" &&
@@ -476,7 +507,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     removalShipmentUi
       ? rsCta != null && !isGenericing && (rsCta === "generic" || rsCta === "generic_retry")
       : listingImportUi && !removalShipmentUi
-        ? Boolean(listingUi?.showGenericCta)
+        ? showListingPhaseActionRow
         : !isGenericing &&
           (topUi
             ? topUi.showGeneric || topUi.showRetryGeneric
@@ -500,6 +531,20 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   function bumpHistory() {
     onUploadComplete?.();
     router.refresh();
+  }
+
+  function scrollToSessionInHistory() {
+    const id = sessionUploadId;
+    window.requestAnimationFrame(() => {
+      if (id) {
+        const el = document.querySelector(`[data-upload-id="${id}"]`);
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          return;
+        }
+      }
+      document.getElementById("data-import-history")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   }
 
   /** Validate the dropped/selected file and set state — no DB interaction here. */
@@ -575,10 +620,12 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     // (detectedType) because the client read of report_type can be null/late vs. what Phase 1 set.
     const listingFromUi = isListingReportType(detectedType);
     setProgressMsg(
-      listingFromUi ? "Parsing file lines and storing raw rows…" : "Processing CSV into staging table…",
+      listingFromUi
+        ? "Processing listing import (raw archive + catalog)…"
+        : "Processing CSV into staging table…",
     );
     setListingImportSubphase("raw_archive");
-    setPhaseLabel(listingFromUi ? "Staging" : "Staging");
+    setPhaseLabel(listingFromUi ? "Process listing import" : "Staging");
 
     // Poll DB frequently; prefer `file_processing_status` (true progress source).
     const uploadIdSnap = sessionUploadId;
@@ -590,6 +637,34 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       ]).then(([rpu, fps]) => {
         const m = rpu.data?.metadata as Record<string, unknown> | null;
         const fpsRow = fps.data as Record<string, unknown> | null | undefined;
+        if (listingFromUi && rpu.data) {
+          const row = rpu.data as { report_type?: string; status?: string; metadata?: unknown };
+          const metaPoll =
+            row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
+              ? (row.metadata as Record<string, unknown>)
+              : null;
+          setSessionFpsRow(fpsRow && typeof fpsRow === "object" ? fpsRow : null);
+          const fpsSnap = fpsRow
+            ? {
+                phase2_status: fpsRow.phase2_status != null ? String(fpsRow.phase2_status) : null,
+                phase3_status: fpsRow.phase3_status != null ? String(fpsRow.phase3_status) : null,
+                phase4_status: fpsRow.phase4_status != null ? String(fpsRow.phase4_status) : null,
+                current_phase: fpsRow.current_phase != null ? String(fpsRow.current_phase) : null,
+                current_phase_label:
+                  fpsRow.current_phase_label != null ? String(fpsRow.current_phase_label) : null,
+                current_target_table:
+                  fpsRow.current_target_table != null ? String(fpsRow.current_target_table) : null,
+                row_status: fpsRow.status != null ? String(fpsRow.status) : null,
+              }
+            : null;
+          setServerImportInput({
+            reportType: String(row.report_type ?? ""),
+            status: String(row.status ?? ""),
+            metadata: metaPoll,
+            fps: fpsSnap,
+            isLedgerSession: metaPoll?.source === AMAZON_LEDGER_UPLOAD_SOURCE,
+          });
+        }
         if (fpsRow && typeof fpsRow.process_pct === "number") {
           setProcessPct(Math.min(100, Math.max(0, Number(fpsRow.process_pct))));
           if (typeof fpsRow.sync_pct === "number") {
@@ -668,13 +743,13 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       setProcessedRows(staged);
       if (total > 0) setTotalRows(total);
       if (useListingProcess) {
-        setListingImportSubphase("staged");
+        setListingImportSubphase("done");
         setProgressMsg(
           total > 0 && total !== staged
-            ? `Staged ${staged.toLocaleString()} / ${total.toLocaleString()} listing lines to amazon_staging. Run Sync to land raw rows and merge catalog.`
-            : `Staged ${staged.toLocaleString()} listing lines to amazon_staging. Run Sync to land raw rows and merge catalog.`,
+            ? `Listing import complete — ${staged.toLocaleString()} data row(s) processed (${total.toLocaleString()} lines in file). Raw archive and catalog snapshot are updated.`
+            : `Listing import complete — ${staged.toLocaleString()} data row(s). Raw archive and catalog snapshot are updated.`,
         );
-        setPhase("staged");
+        setPhase("synced");
       } else {
         setProgressMsg(
           total > 0 && total !== staged
@@ -1450,7 +1525,83 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
             );
           })()}
 
+          {listingImportUi && !removalShipmentUi && listingPipelineSteps && (
+            <div className="rounded-xl border border-border/80 bg-background/80 px-4 py-3 shadow-sm">
+              <div className="mb-3 flex items-center justify-between gap-2 border-b border-border/60 pb-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                  Listing pipeline
+                </h3>
+                <span className="text-[10px] text-muted-foreground">
+                  Live progress from storage + row counts
+                </span>
+              </div>
+              <ol className="space-y-3">
+                {listingPipelineSteps.map((step, idx) => {
+                  const barTint =
+                    step.tone === "active"
+                      ? "bg-sky-500"
+                      : step.tone === "done"
+                        ? "bg-emerald-500"
+                        : step.tone === "warning"
+                          ? "bg-amber-500"
+                          : "bg-muted-foreground/40";
+                  const ring =
+                    step.tone === "active"
+                      ? "ring-2 ring-sky-500/35 bg-sky-500/[0.06]"
+                      : step.tone === "warning"
+                        ? "ring-2 ring-amber-500/35 bg-amber-500/[0.06]"
+                        : step.tone === "done"
+                          ? "border border-emerald-500/25 bg-emerald-500/[0.04]"
+                          : "border border-border/70 bg-muted/20";
+                  return (
+                    <li key={step.key} className={`rounded-lg px-3 py-2.5 ${ring}`}>
+                      <div className="mb-1.5 flex items-start gap-3">
+                        <span
+                          className={[
+                            "flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[11px] font-bold",
+                            step.tone === "done"
+                              ? "bg-emerald-600 text-white"
+                              : step.tone === "active"
+                                ? "bg-sky-600 text-white"
+                                : step.tone === "warning"
+                                  ? "bg-amber-600 text-white"
+                                  : "bg-muted text-muted-foreground",
+                          ].join(" ")}
+                        >
+                          {idx + 1}
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5">
+                            <div>
+                              <p className="text-sm font-semibold text-foreground">{step.title}</p>
+                              <p className="text-[11px] text-muted-foreground">{step.subtitle}</p>
+                            </div>
+                            <p className="text-right text-[11px] font-medium tabular-nums text-foreground">
+                              {step.rightLabel}
+                            </p>
+                          </div>
+                          {step.subLabel ? (
+                            <p className="mt-0.5 text-[10px] font-medium text-violet-700 dark:text-violet-300">
+                              {step.subLabel}
+                            </p>
+                          ) : null}
+                        </div>
+                      </div>
+                      <div className="relative h-2 overflow-hidden rounded-full bg-muted pl-9">
+                        <div
+                          className={`h-full rounded-full transition-[width] duration-500 ease-out ${barTint}`}
+                          style={{ width: `${Math.max(step.tone === "upcoming" ? 0 : 2, Math.min(100, step.pct))}%` }}
+                        />
+                      </div>
+                    </li>
+                  );
+                })}
+              </ol>
+            </div>
+          )}
+
           {/* ── Phase 1 bars ───────────────────────────────────────────────── */}
+          {!(listingImportUi && !removalShipmentUi) && (
           <div className="space-y-2">
             {/* Upload progress */}
             <div>
@@ -1549,6 +1700,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
               </div>
             </div>
           </div>
+          )}
 
           {/* ── AI detected label ─────────────────────────────────────────────── */}
           {detectedType &&
@@ -1583,6 +1735,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
             </div>
           )}
 
+          {!(listingImportUi && !removalShipmentUi) && (
+          <>
           {/* ── Phase 2 bar (Process) ─────────────────────────────────────────── */}
           {(phase === "processing" ||
             phase === "staged" ||
@@ -1675,7 +1829,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
             phase === "genericing" ||
             phase === "synced" ||
             phase === "worklisting" ||
-            phase === "worklisted") && (
+            phase === "worklisted") &&
+            !(listingImportUi && !removalShipmentUi) && (
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
                 <span
@@ -1747,7 +1902,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
             phase === "synced" ||
             phase === "worklisting" ||
             phase === "worklisted") &&
-            (removalShipmentUi || (listingImportUi && !removalShipmentUi)) && (
+            removalShipmentUi && (
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
                 <span
@@ -1862,6 +2017,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                 </div>
               </div>
             )}
+          </>
+          )}
         </div>
       )}
 
@@ -1918,15 +2075,45 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           </button>
         )}
 
+        {showMapListingTop && (
+          <button
+            type="button"
+            onClick={() => scrollToSessionInHistory()}
+            title="Scrolls to Import History. Use Map Columns on this file’s row to fix column mapping."
+            className="inline-flex items-center gap-2 rounded-xl border border-amber-400/70 bg-amber-500/10 px-5 py-2.5 text-sm font-semibold text-amber-900 shadow-sm transition hover:bg-amber-500/15 dark:border-amber-600/50 dark:text-amber-100"
+          >
+            <MapPin className="h-4 w-4 shrink-0" aria-hidden />
+            Map Columns
+          </button>
+        )}
+
         {/* Phase 3: Sync to Final Tables — appears after Phase 2 succeeds */}
         {showSyncTop && (
           <button
             type="button"
-            disabled={listingImportUi && !removalShipmentUi && listingUi?.busyAction === "sync"}
-            onClick={() => void runSync()}
-            className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-emerald-700 disabled:opacity-70"
+            disabled={
+              (listingImportUi && !removalShipmentUi) ||
+              (!(listingImportUi && !removalShipmentUi) && isSyncing)
+            }
+            onClick={() => {
+              if (listingImportUi && !removalShipmentUi) return;
+              void runSync();
+            }}
+            title={
+              listingImportUi && !removalShipmentUi
+                ? "Listing imports run raw archive (amazon_listing_report_rows_raw) inside Process — no separate Sync."
+                : undefined
+            }
+            className={[
+              "inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-semibold shadow transition",
+              listingImportUi && !removalShipmentUi
+                ? "cursor-not-allowed border border-emerald-500/35 bg-emerald-500/10 text-emerald-900 opacity-80 dark:text-emerald-100"
+                : "bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-70",
+            ].join(" ")}
           >
-            {listingImportUi && !removalShipmentUi && listingUi?.busyAction === "sync" ? (
+            {listingImportUi && !removalShipmentUi ? (
+              <Lock className="h-4 w-4 shrink-0 opacity-80" aria-hidden />
+            ) : isSyncing ? (
               <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
             ) : (
               <CheckCircle2 className="h-4 w-4" aria-hidden />
@@ -1935,8 +2122,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
               ? rsCta === "retry_sync"
                 ? "Retry Sync"
                 : "Sync"
-              : listingImportUi && !removalShipmentUi && listingUi
-                ? listingUi.topCardButtonLabel
+              : listingImportUi && !removalShipmentUi
+                ? "Sync — raw archive (in Process)"
                 : "Sync to Final Tables"}
           </button>
         )}
@@ -1950,11 +2137,29 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         {showGenericTop && (
           <button
             type="button"
-            disabled={listingImportUi && !removalShipmentUi && listingUi?.busyAction === "generic"}
-            onClick={() => void runGeneric()}
-            className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-violet-700 disabled:opacity-70"
+            disabled={
+              (listingImportUi && !removalShipmentUi) ||
+              (!(listingImportUi && !removalShipmentUi) && isGenericing)
+            }
+            onClick={() => {
+              if (listingImportUi && !removalShipmentUi) return;
+              void runGeneric();
+            }}
+            title={
+              listingImportUi && !removalShipmentUi
+                ? "Listing catalog merge (e.g. catalog_products) runs inside Process — no separate Generic."
+                : undefined
+            }
+            className={[
+              "inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-semibold shadow transition",
+              listingImportUi && !removalShipmentUi
+                ? "cursor-not-allowed border border-violet-500/35 bg-violet-500/10 text-violet-950 opacity-85 dark:text-violet-100"
+                : "bg-violet-600 text-white hover:bg-violet-700 disabled:opacity-70",
+            ].join(" ")}
           >
-            {listingImportUi && !removalShipmentUi && listingUi?.busyAction === "generic" ? (
+            {listingImportUi && !removalShipmentUi ? (
+              <Lock className="h-4 w-4 shrink-0 opacity-80" aria-hidden />
+            ) : isGenericing ? (
               <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
             ) : (
               <CheckCircle2 className="h-4 w-4" aria-hidden />
@@ -1963,8 +2168,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
               ? rsCta === "generic_retry"
                 ? "Retry Generic (shipments)"
                 : "Generic (shipments)"
-              : listingImportUi && !removalShipmentUi && listingUi
-                ? listingUi.topCardButtonLabel
+              : listingImportUi && !removalShipmentUi
+                ? "Generic — catalog (in Process)"
                 : topUi?.showRetryGeneric
                   ? "Retry Generic Phase"
                   : "Run Generic Phase"}

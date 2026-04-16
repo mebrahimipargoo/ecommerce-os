@@ -932,6 +932,17 @@ export async function POST(req: Request): Promise<Response> {
       );
     }
 
+    if (isListingAmazonSyncKind(kind)) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "Listing exports finish in a single Process step (raw archive + catalog). Sync is not used for listing imports.",
+        },
+        { status: 409 },
+      );
+    }
+
     const hasDomainTable = DOMAIN_TABLE[kind] !== null;
 
     const columnMapping =

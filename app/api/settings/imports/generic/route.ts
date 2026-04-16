@@ -1,13 +1,11 @@
 /**
  * POST /api/settings/imports/generic
  *
- * Phase 4 — post-raw actions (per report type).
- * Listing imports: Phase 4 merges `amazon_listing_report_rows_raw` → `catalog_products` (after Phase 3 raw_synced).
+ * Phase 4 — post-raw actions (per report type). Listing imports use Process only; this route rejects listing kinds.
  */
 
 import { NextResponse } from "next/server";
 
-import { syncListingRawRowsToCatalogProducts } from "../../../../../lib/import-listing-canonical-sync";
 import {
   isListingAmazonSyncKind,
   resolveAmazonImportSyncKind,
@@ -46,14 +44,6 @@ function resolveImportStoreId(meta: unknown): string | null {
   const b = typeof m.ledger_store_id === "string" ? m.ledger_store_id.trim() : "";
   if (b && isUuidString(b)) return b;
   return null;
-}
-
-/** Same fingerprint as Phase 3 sync (`raw_report_uploads.metadata.content_sha256`). */
-function resolveSourceFileSha256(meta: unknown, uploadId: string): string {
-  const m = meta && typeof meta === "object" && !Array.isArray(meta) ? (meta as Record<string, unknown>) : {};
-  const s = String(m.content_sha256 ?? "").trim().toLowerCase();
-  if (s) return s;
-  return `legacy-upload-${uploadId}`;
 }
 
 async function acquireRemovalPipelineLock(orgId: string, storeId: string, uploadId: string): Promise<void> {
@@ -152,6 +142,17 @@ export async function POST(req: Request): Promise<Response> {
     const rt = String((row as { report_type?: string }).report_type ?? "").trim();
     const kind = resolveAmazonImportSyncKind(rt);
 
+    if (isListingAmazonSyncKind(kind)) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "Listing exports finish in a single Process step (raw archive + catalog). Generic is not used for listing imports.",
+        },
+        { status: 409 },
+      );
+    }
+
     const meta = (row as { metadata?: unknown }).metadata;
     const importStoreId = resolveImportStoreId(meta);
     const failedPhaseRaw =
@@ -167,25 +168,8 @@ export async function POST(req: Request): Promise<Response> {
 
     const phase3Done = phase3CompleteDb(fpsGate?.phase3_status);
     const phase4Done = phase4CompleteDb(fpsGate?.phase4_status);
-    const catalogListingDone =
-      meta && typeof meta === "object" && !Array.isArray(meta)
-        ? normLower((meta as Record<string, unknown>).catalog_listing_import_phase) === "done"
-        : false;
 
-    if (isListingAmazonSyncKind(kind)) {
-      if (!phase3Done) {
-        return NextResponse.json(
-          {
-            ok: false,
-            error: `Phase 4 requires Phase 3 complete (phase3_status on file_processing_status). Current: "${String(fpsGate?.phase3_status ?? "missing")}". Finish Sync first.`,
-          },
-          { status: 409 },
-        );
-      }
-      if (phase4Done && catalogListingDone) {
-        return NextResponse.json({ ok: true, kind, skipped: true });
-      }
-    } else if (kind === "REMOVAL_SHIPMENT") {
+    if (kind === "REMOVAL_SHIPMENT") {
       if (!phase3Done) {
         return NextResponse.json(
           {
@@ -226,41 +210,7 @@ export async function POST(req: Request): Promise<Response> {
     let locked: { id?: string }[] | null = null;
     let lockErr: { message: string } | null = null;
 
-    if (isListingAmazonSyncKind(kind)) {
-      const listingLockable =
-        status === "raw_synced" || (status === "failed" && failedPhaseRaw === "generic");
-      if (!listingLockable) {
-        return NextResponse.json(
-          {
-            ok: false,
-            error: `Listing Phase 4 cannot start from status "${status}". Expected raw_synced after Sync, or failed after a Generic attempt.`,
-          },
-          { status: 409 },
-        );
-      }
-      if (status === "raw_synced") {
-        const r = await supabaseServer
-          .from("raw_report_uploads")
-          .update(lockUpdate)
-          .eq("id", uploadId)
-          .eq("organization_id", orgId)
-          .eq("status", "raw_synced")
-          .select("id");
-        locked = r.data as { id?: string }[] | null;
-        if (r.error) lockErr = r.error;
-      }
-      if ((!locked || locked.length === 0) && status === "failed" && failedPhaseRaw === "generic") {
-        const r = await supabaseServer
-          .from("raw_report_uploads")
-          .update(lockUpdate)
-          .eq("id", uploadId)
-          .eq("organization_id", orgId)
-          .eq("status", "failed")
-          .select("id");
-        locked = r.data as { id?: string }[] | null;
-        if (r.error) lockErr = r.error;
-      }
-    } else if (kind === "REMOVAL_SHIPMENT") {
+    if (kind === "REMOVAL_SHIPMENT") {
       const shipmentLockable =
         status === "raw_synced" || (status === "failed" && failedPhaseRaw === "generic");
       if (!shipmentLockable) {
@@ -329,107 +279,6 @@ export async function POST(req: Request): Promise<Response> {
       },
       { onConflict: "upload_id" },
     );
-
-    if (isListingAmazonSyncKind(kind)) {
-      const sourceFileSha = resolveSourceFileSha256(meta, uploadId);
-      const { count: rawCount } = await supabaseServer
-        .from("amazon_listing_report_rows_raw")
-        .select("*", { count: "exact", head: true })
-        .eq("organization_id", orgId)
-        .eq("source_file_sha256", sourceFileSha);
-      const storedRawRows = typeof rawCount === "number" ? rawCount : 0;
-
-      const m =
-        meta && typeof meta === "object" && !Array.isArray(meta) ? (meta as Record<string, unknown>) : {};
-      const fileRowsSeen = Math.max(
-        storedRawRows,
-        typeof m.catalog_listing_file_rows_seen === "number" ? m.catalog_listing_file_rows_seen : 0,
-      );
-
-      const canonicalMetrics = await syncListingRawRowsToCatalogProducts({
-        supabase: supabaseServer,
-        organizationId: orgId,
-        storeId: importStoreId,
-        sourceUploadId: uploadId,
-        sourceFileSha256: sourceFileSha,
-        reportTypeRaw: rt,
-        fileRowsSeen,
-        storedRawRows,
-        progressScale: "full",
-        onProgress: async (pct, pass2Done) => {
-          await supabaseServer.from("file_processing_status").upsert(
-            {
-              upload_id: uploadId,
-              organization_id: orgId,
-              status: "processing",
-              current_phase: "generic",
-              current_phase_label: "Phase 4 — catalog_products",
-              current_target_table: "catalog_products",
-              phase4_generic_pct: Math.min(100, Math.max(0, Math.round(pct))),
-              generic_rows_written: pass2Done,
-              process_pct: pct,
-            },
-            { onConflict: "upload_id" },
-          );
-        },
-      });
-
-      const { data: prevRowFinal } = await supabaseServer
-        .from("raw_report_uploads")
-        .select("metadata")
-        .eq("id", uploadId)
-        .maybeSingle();
-
-      await supabaseServer
-        .from("raw_report_uploads")
-        .update({
-          status: "synced",
-          import_pipeline_completed_at: new Date().toISOString(),
-          metadata: mergeUploadMetadata((prevRowFinal as { metadata?: unknown } | null)?.metadata, {
-            process_progress: 100,
-            catalog_listing_import_phase: "done",
-            catalog_listing_canonical_rows_new: canonicalMetrics.canonical_rows_new,
-            catalog_listing_canonical_rows_updated: canonicalMetrics.canonical_rows_updated,
-            catalog_listing_canonical_rows_unchanged: canonicalMetrics.canonical_rows_unchanged,
-            catalog_listing_canonical_rows_invalid_for_merge: canonicalMetrics.canonical_rows_invalid_for_merge,
-            catalog_listing_canonical_rows_inserted: canonicalMetrics.canonical_rows_new,
-            catalog_listing_canonical_rows_unchanged_or_merged: canonicalMetrics.canonical_rows_unchanged,
-            ...(canonicalMetrics.identifier_map_sync_error
-              ? { catalog_listing_identifier_map_sync_error: canonicalMetrics.identifier_map_sync_error }
-              : { catalog_listing_identifier_map_sync_error: null }),
-            import_metrics: { current_phase: "complete" },
-            etl_phase: "complete",
-            error_message: "",
-          }),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", uploadId)
-        .eq("organization_id", orgId);
-
-      await supabaseServer.from("file_processing_status").upsert(
-        {
-          upload_id: uploadId,
-          organization_id: orgId,
-          status: "complete",
-          current_phase: "complete",
-          current_phase_label: "Complete",
-          current_target_table: "catalog_products",
-          upload_pct: 100,
-          process_pct: 100,
-          sync_pct: 100,
-          phase1_upload_pct: 100,
-          phase2_stage_pct: 100,
-          phase3_raw_sync_pct: 100,
-          phase4_generic_pct: 100,
-          phase4_status: "complete",
-          phase4_completed_at: new Date().toISOString(),
-          generic_rows_written: storedRawRows,
-        },
-        { onConflict: "upload_id" },
-      );
-
-      return NextResponse.json({ ok: true, kind, listing: canonicalMetrics });
-    }
 
     if (kind === "REMOVAL_SHIPMENT") {
       if (!importStoreId) {

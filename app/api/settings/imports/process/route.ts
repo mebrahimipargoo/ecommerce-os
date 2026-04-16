@@ -1,10 +1,13 @@
 import { NextResponse } from "next/server";
 
+import { completeListingImportFromStaging } from "../../../../../lib/pipeline/listing-import-complete-from-staging";
 import { executeAmazonPhase2Staging } from "../../../../../lib/pipeline/amazon-phase2-staging";
 import {
   AMAZON_LEDGER_UPLOAD_SOURCE,
+  mergeUploadMetadata,
   parseRawReportMetadata,
 } from "../../../../../lib/raw-report-upload-metadata";
+import { isListingReportType } from "../../../../../lib/raw-report-types";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 
@@ -75,9 +78,9 @@ function resolveImportKind(
 /**
  * POST /api/settings/imports/process
  *
- * Phase 2 only: parse file and stage rows into `amazon_staging` (all Amazon file imports
- * including listing exports). Canonical/raw domain tables and generic actions run in
- * later endpoints.
+ * Non-listing: parse file → `amazon_staging` (then Sync / Generic as applicable).
+ * Listing exports: one step — staging → `amazon_listing_report_rows_raw` → `catalog_products`
+ * (see `listing-import-complete-from-staging.ts`). Legacy rows at `staged` resume here.
  */
 export async function POST(req: Request): Promise<Response> {
   try {
@@ -129,6 +132,75 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     const status = String((row as { status?: unknown }).status ?? "");
+    const reportTypeRaw = String((row as { report_type?: string | null }).report_type ?? "").trim();
+
+    /** Legacy rows left at `staged` before the one-step listing pipeline: finish raw + catalog via Process. */
+    if (isListingReportType(reportTypeRaw) && status === "staged") {
+      const { data: locked, error: lockErr } = await supabaseServer
+        .from("raw_report_uploads")
+        .update({
+          status: "processing",
+          metadata: mergeUploadMetadata(meta, {
+            sync_progress: 0,
+            etl_phase: "sync",
+            error_message: "",
+          }),
+          import_pipeline_started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", uploadId)
+        .eq("organization_id", orgId)
+        .eq("status", "staged")
+        .select("id");
+
+      if (lockErr) {
+        return NextResponse.json({ ok: false, error: lockErr.message }, { status: 500 });
+      }
+      if (!locked || locked.length === 0) {
+        return NextResponse.json(
+          { ok: false, error: "Listing import is not in a resumable state (expected status staged)." },
+          { status: 409 },
+        );
+      }
+
+      try {
+        await completeListingImportFromStaging({ uploadId, orgId });
+        return NextResponse.json({ ok: true, pipeline: "listing_import_resume_from_staged" });
+      } catch (e) {
+        const message = e instanceof Error ? e.message : "Listing resume failed.";
+        const { data: prevRow } = await supabaseServer
+          .from("raw_report_uploads")
+          .select("metadata")
+          .eq("id", uploadId)
+          .maybeSingle();
+        await supabaseServer
+          .from("raw_report_uploads")
+          .update({
+            status: "failed",
+            import_pipeline_failed_at: new Date().toISOString(),
+            metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
+              error_message: message,
+              failed_phase: "process",
+              import_metrics: { current_phase: "failed", failure_reason: message },
+            }),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", uploadId)
+          .eq("organization_id", orgId);
+        await supabaseServer.from("file_processing_status").upsert(
+          {
+            upload_id: uploadId,
+            organization_id: orgId,
+            status: "failed",
+            error_message: message,
+            import_metrics: { current_phase: "failed", failure_reason: message },
+          },
+          { onConflict: "upload_id" },
+        );
+        return NextResponse.json({ ok: false, error: message }, { status: 500 });
+      }
+    }
+
     const processableStatuses = ["mapped", "ready", "uploaded", "pending", "failed"];
     if (!processableStatuses.includes(status)) {
       if (status === "needs_mapping") {
@@ -150,7 +222,6 @@ export async function POST(req: Request): Promise<Response> {
       );
     }
 
-    const reportTypeRaw = String((row as { report_type?: string | null }).report_type ?? "").trim();
     const kind = resolveImportKind(reportTypeRaw);
     if (kind === "UNKNOWN") {
       return NextResponse.json(

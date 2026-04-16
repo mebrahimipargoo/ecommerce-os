@@ -1,10 +1,10 @@
 /**
- * Phase 2 — Process raw file → `amazon_staging` (unified for all Amazon report types
- * except listing exports, which use the listing branch in /api/settings/imports/process).
+ * Phase 2 — Process raw file → `amazon_staging` (unified for all Amazon report types).
+ * Listing exports: after staging, chains raw archive + catalog merge in-process (no Sync/Generic).
  *
- * Single implementation shared by:
- *   POST /api/settings/imports/stage  (thin wrapper)
- *   POST /api/settings/imports/process (non-listing path)
+ * Shared by:
+ *   POST /api/settings/imports/stage  (thin wrapper; rejects listing kinds)
+ *   POST /api/settings/imports/process
  */
 
 import csv from "csv-parser";
@@ -23,6 +23,7 @@ import { mergeUploadMetadata, parseRawReportMetadata } from "../raw-report-uploa
 import { supabaseServer } from "../supabase-server";
 import { isUuidString } from "../uuid";
 import { isListingReportType } from "../raw-report-types";
+import { completeListingImportFromStaging } from "./listing-import-complete-from-staging";
 
 const STAGING_TABLE = "amazon_staging";
 const BATCH_SIZE = 500;
@@ -481,76 +482,18 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         .eq("organization_id", orgId);
       const rowsInDb = typeof stagingCount === "number" ? stagingCount : approxStaged;
 
-      const { data: prevRow } = await supabaseServer
-        .from("raw_report_uploads")
-        .select("metadata")
-        .eq("id", uploadId)
-        .maybeSingle();
-
-      await supabaseServer
-        .from("raw_report_uploads")
-        .update({
-          status: "staged",
-          import_pipeline_completed_at: null,
-          metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
-            row_count: dataLinesPassed,
-            total_rows: dataRowsTotal,
-            processed_rows: rowsInDb,
-            process_progress: 100,
-            physical_lines_seen: fileRowsTotal,
-            data_rows_seen: dataLinesPassed,
-            staging_row_count: rowsInDb,
-            catalog_listing_file_rows_seen: fileRowsTotal,
-            catalog_listing_data_rows_seen: dataLinesPassed,
-            catalog_listing_raw_rows_stored: 0,
-            catalog_listing_import_phase: "staged",
-            error_message: undefined,
-            import_metrics: {
-              current_phase: "staged",
-              physical_lines_seen: fileRowsTotal,
-              data_rows_seen: dataLinesPassed,
-              rows_staged: rowsInDb,
-              rows_skipped_empty: skippedEmpty,
-            },
-          }),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", uploadId)
-        .eq("organization_id", orgId);
-
-      await supabaseServer.from("file_processing_status").upsert(
-        {
-          upload_id: uploadId,
-          organization_id: orgId,
-          status: "processing",
-          current_phase: "staged",
-          current_phase_label: "Phase 2 complete — ready for raw sync",
-          upload_pct: 100,
-          process_pct: 100,
-          phase1_upload_pct: 100,
-          phase2_stage_pct: 100,
-          phase3_raw_sync_pct: 0,
-          phase4_generic_pct: 0,
-          sync_pct: 0,
-          processed_rows: rowsInDb,
-          total_rows: Math.max(rowsInDb, dataLinesPassed, 1),
-          staged_rows_written: rowsInDb,
-          file_rows_total: fileRowsTotal,
-          data_rows_total: dataRowsTotal,
-          phase2_status: "complete",
-          phase2_completed_at: new Date().toISOString(),
-          error_message: null,
-          import_metrics: {
-            physical_lines_seen: fileRowsTotal,
-            data_rows_seen: dataLinesPassed,
-            rows_staged: rowsInDb,
-            current_phase: "staged",
-          },
+      await completeListingImportFromStaging({
+        uploadId,
+        orgId,
+        phase2: {
+          fileRowsTotal,
+          dataRowsPassed: dataLinesPassed,
+          rowsStaged: rowsInDb,
+          skippedEmpty,
         },
-        { onConflict: "upload_id" },
-      );
+      });
 
-      await audit(orgId, "import.stage_completed", uploadId, {
+      await audit(orgId, "import.listing_pipeline_completed", uploadId, {
         rowsStaged: rowsInDb,
         totalSeen: fileRowsTotal,
         listing: true,
@@ -561,7 +504,7 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         ok: true,
         rowsStaged: rowsInDb,
         totalRows: fileRowsTotal,
-        pipeline: "phase2_staging_listing",
+        pipeline: "listing_import_complete",
       });
     }
 

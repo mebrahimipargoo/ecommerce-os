@@ -23,17 +23,275 @@ function num(v: unknown, fallback = 0): number {
   return fallback;
 }
 
-/** Phase titles aligned with product spec (listing imports only). */
+/** Copy for listing pipeline (single Process on the server; UI shows logical sub-steps). */
 export const LISTING_IMPORT_UI_LABELS = {
   phase1Title: "Phase 1 — Upload raw file",
   phase1Subtitle: "bytes uploaded / file size",
-  phase2Title: "Phase 2 — Parse and store physical rows in amazon_staging",
-  phase2Subtitle: "staged_rows_written / data_rows_total",
-  phase3Title: "Phase 3 — Raw sync → amazon_listing_report_rows_raw",
-  phase3Subtitle: "(raw_rows_written + raw_rows_skipped_existing) / staged_rows_written",
-  phase4Title: "Phase 4 — Catalog sync → catalog_products",
-  phase4Subtitle: "catalog rows processed / rows eligible for catalog sync",
+  phase2Title: "Phase 2 — Process listing import",
+  phase2Subtitle: "raw archive + canonical catalog",
+  phase3Title: "",
+  phase3Subtitle: "",
+  phase4Title: "",
+  phase4Subtitle: "",
 } as const;
+
+export type ListingPipelineStepKey = "upload" | "mapping" | "staging" | "raw_archive" | "catalog";
+
+export type ListingPipelineStepUi = {
+  key: ListingPipelineStepKey;
+  title: string;
+  subtitle: string;
+  /** 0–100 width for the progress bar */
+  pct: number;
+  /** Primary right-hand summary, e.g. "1.2 / 8.0 MB (15%)" or "420 / 1,200 rows" */
+  rightLabel: string;
+  /** Optional second line (e.g. target table during generic) */
+  subLabel?: string;
+  /** Visual state for the step row */
+  tone: "upcoming" | "active" | "done" | "warning";
+};
+
+export function formatListingBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "—";
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Five-step listing pipeline view model — same source for top card + history column.
+ * Progress is driven only by `metadata`, `file_processing_status`, and row `status` (no fake jumps).
+ */
+export function buildListingPipelineSteps(opts: {
+  status: string;
+  metadata: Record<string, unknown> | null | undefined;
+  fps: Record<string, unknown> | null | undefined;
+  /** Browser upload progress0–100 when DB row not updated yet */
+  localUploadPct?: number;
+  /** Selected file size during client upload */
+  localFileSizeBytes?: number;
+}): ListingPipelineStepUi[] {
+  const st = norm(opts.status);
+  const m = opts.metadata && typeof opts.metadata === "object" && !Array.isArray(opts.metadata)
+    ? opts.metadata
+    : {};
+  const f = opts.fps && typeof opts.fps === "object" ? opts.fps : {};
+
+  const totalBytes = Math.max(
+    0,
+    num(m.total_bytes ?? m.file_size_bytes ?? f.total_bytes ?? opts.localFileSizeBytes, 0),
+  );
+  const uploadedBytes = Math.max(0, num(m.uploaded_bytes ?? f.uploaded_bytes, 0));
+  const upProgMeta = num(m.upload_progress, -1);
+  const upProgFps = num(f.upload_pct, -1);
+  const localUp = num(opts.localUploadPct, -1);
+  let uploadPct = 0;
+  if (st === "pending" || st === "uploading") {
+    if (upProgFps >= 0) uploadPct = Math.min(100, Math.round(upProgFps));
+    else if (upProgMeta >= 0) uploadPct = Math.min(100, Math.round(upProgMeta));
+    else if (localUp >= 0) uploadPct = Math.min(100, Math.round(localUp));
+    else if (totalBytes > 0 && uploadedBytes > 0) uploadPct = Math.min(100, Math.round((uploadedBytes / totalBytes) * 100));
+  } else {
+    uploadPct = 100;
+  }
+  const uploadDone = st !== "pending" && st !== "uploading";
+  const uploadActive = !uploadDone;
+  const uploadRight =
+    totalBytes > 0
+      ? `${formatListingBytes(uploadedBytes)} / ${formatListingBytes(totalBytes)} (${uploadPct}%)`
+      : `${uploadPct}%`;
+
+  const p2s = norm(f.phase2_status);
+  const p3s = norm(f.phase3_status);
+  const p4s = norm(f.phase4_status);
+  const curPhase = norm(f.current_phase ?? m.etl_phase);
+  const im = m.import_metrics as { current_phase?: string; rows_synced?: number; total_staging_rows?: number } | undefined;
+  const imPhase = norm(im?.current_phase);
+
+  const dataRowsTotal = Math.max(
+    0,
+    num(f.data_rows_total, 0) ||
+      num(f.file_rows_total, 0) ||
+      num(m.data_rows_seen, 0) ||
+      num(m.catalog_listing_data_rows_seen, 0) ||
+      num(m.total_rows, 0),
+  );
+  const stagedRows = Math.max(
+    0,
+    num(f.staged_rows_written, 0) ||
+      num(f.processed_rows, 0) ||
+      num(m.staging_row_count, 0),
+  );
+  const p2f = num(f.phase2_stage_pct, -1);
+  const p2proc = num(f.process_pct, -1);
+  let stagingPct = 0;
+  if (p2f >= 0) stagingPct = Math.min(100, Math.round(p2f));
+  else if (p2proc >= 0 && (curPhase === "staging" || imPhase === "staging")) stagingPct = Math.min(100, Math.round(p2proc));
+  else if (dataRowsTotal > 0 && stagedRows > 0) stagingPct = Math.min(100, Math.round((stagedRows / dataRowsTotal) * 100));
+
+  const totalStaging = Math.max(1, num(f.staged_rows_written, 0) || num(m.staging_row_count, 0) || dataRowsTotal || 1);
+  const rowsSynced = num(im?.rows_synced, -1);
+  const totalStgMeta = num(im?.total_staging_rows, -1);
+  const rawWritten = Math.max(0, num(f.raw_rows_written, 0));
+  const rawSkipped = Math.max(0, num(f.raw_rows_skipped_existing, 0));
+
+  const lipEarly = norm(m.catalog_listing_import_phase);
+  const stagingComplete =
+    p2s === "complete" ||
+    p3s === "running" ||
+    p3s === "complete" ||
+    curPhase === "sync" ||
+    curPhase === "generic" ||
+    curPhase === "raw_synced" ||
+    curPhase === "complete" ||
+    rawWritten > 0 ||
+    lipEarly === "raw_archived" ||
+    lipEarly === "done";
+  const stagingActive =
+    curPhase === "staging" ||
+    imPhase === "staging" ||
+    (st === "processing" && !stagingComplete && (p2s === "running" || p2s === ""));
+  const p3f = num(f.phase3_raw_sync_pct, -1);
+  const syncProgMeta = num(m.sync_progress, -1);
+  const syncPctFps = num(f.sync_pct, -1);
+  let rawPct = 0;
+  if (p3f >= 0) rawPct = Math.min(100, Math.round(p3f));
+  else if (syncPctFps >= 0 && curPhase === "sync") rawPct = Math.min(100, Math.round(syncPctFps));
+  else if (syncProgMeta >= 0) rawPct = Math.min(100, Math.round(syncProgMeta));
+  else if (totalStaging > 0 && rawWritten + rawSkipped > 0) {
+    rawPct = Math.min(100, Math.round(((rawWritten + rawSkipped) / totalStaging) * 100));
+  }
+  const lip = lipEarly;
+  const rawComplete =
+    p3s === "complete" ||
+    curPhase === "generic" ||
+    curPhase === "complete" ||
+    lip === "raw_archived" ||
+    lip === "done";
+  const rawActive =
+    curPhase === "sync" ||
+    imPhase === "sync" ||
+    (st === "processing" &&
+      (norm(m.etl_phase) === "sync" || (!rawComplete && stagingComplete && curPhase !== "staging")));
+
+  const genPct = Math.min(100, Math.max(0, num(f.phase4_generic_pct, -1) >= 0 ? Math.round(num(f.phase4_generic_pct, 0)) : num(m.process_progress, 0)));
+  const genRows = Math.max(0, num(f.generic_rows_written, 0));
+  const catEligible = Math.max(1, num(m.catalog_listing_file_rows_seen, 0) || totalStaging);
+  const targetTable =
+    typeof f.current_target_table === "string" && f.current_target_table.trim() !== ""
+      ? f.current_target_table.trim()
+      : "catalog_products";
+  const catalogComplete = lip === "done" || p4s === "complete" || st === "synced" || st === "complete";
+  const catalogActive =
+    curPhase === "generic" ||
+    norm(m.etl_phase) === "generic" ||
+    (st === "processing" && !catalogComplete && rawComplete);
+
+  const catalogPct =
+    num(f.phase4_generic_pct, -1) >= 0
+      ? Math.min(100, Math.round(num(f.phase4_generic_pct, 0)))
+      : catalogComplete
+        ? 100
+        : genRows > 0 && catEligible > 0
+          ? Math.min(100, Math.round((genRows / catEligible) * 100))
+          : genPct;
+
+  const mappingNeedsAttention = st === "needs_mapping";
+  const mappingUpcoming = st === "pending" || st === "uploading";
+
+  const rawRightLabel = (() => {
+    if (rawComplete) {
+      const touched = rawWritten + rawSkipped;
+      return touched > 0
+        ? `${touched.toLocaleString()} rows · done`
+        : "Done";
+    }
+    if (!rawActive) return "—";
+    if (rowsSynced >= 0 && totalStgMeta >= 0) {
+      return `${rowsSynced.toLocaleString()} / ${totalStgMeta.toLocaleString()} rows · ${rawPct}%`;
+    }
+    return `${rawPct}% · ${(rawWritten + rawSkipped).toLocaleString()} / ${totalStaging.toLocaleString()} lines`;
+  })();
+
+  const catalogRightLabel = (() => {
+    if (catalogComplete) {
+      const cn = num(m.catalog_listing_canonical_rows_new ?? m.catalog_listing_canonical_rows_inserted, 0);
+      const cu = num(m.catalog_listing_canonical_rows_updated, 0);
+      const cunch = num(
+        m.catalog_listing_canonical_rows_unchanged ?? m.catalog_listing_canonical_rows_unchanged_or_merged,
+        0,
+      );
+      if (cn + cu + cunch > 0) {
+        return `new ${cn.toLocaleString()} · upd ${cu.toLocaleString()} · same ${cunch.toLocaleString()}`;
+      }
+      return "Done";
+    }
+    if (!catalogActive) return "—";
+    return `${genRows.toLocaleString()} / ~${catEligible.toLocaleString()} rows · ${catalogPct}%`;
+  })();
+
+  const steps: ListingPipelineStepUi[] = [
+    {
+      key: "upload",
+      title: "Upload",
+      subtitle: "Copy file to storage",
+      pct: uploadActive ? Math.max(3, uploadPct) : 100,
+      rightLabel: uploadRight,
+      tone: uploadActive ? "active" : "done",
+    },
+    {
+      key: "mapping",
+      title: "Map & classify",
+      subtitle: "Report type + column mapping",
+      pct: mappingNeedsAttention ? 100 : mappingUpcoming ? 8 : 100,
+      rightLabel: mappingNeedsAttention
+        ? "Review required"
+        : mappingUpcoming
+          ? "Waiting…"
+          : "Ready",
+      tone: mappingNeedsAttention ? "warning" : mappingUpcoming ? "upcoming" : "done",
+    },
+    {
+      key: "staging",
+      title: "Process — staging",
+      subtitle: "amazon_staging",
+      pct: stagingComplete ? 100 : stagingActive ? Math.max(4, stagingPct) : 0,
+      rightLabel:
+        dataRowsTotal > 0
+          ? `${stagedRows.toLocaleString()} / ${dataRowsTotal.toLocaleString()} rows · ${stagingComplete ? 100 : stagingPct}%`
+          : stagedRows > 0
+            ? `${stagedRows.toLocaleString()} rows`
+            : stagingComplete
+              ? "Done"
+              : "—",
+      tone: stagingActive ? "active" : stagingComplete || stagedRows > 0 ? "done" : "upcoming",
+    },
+    {
+      key: "raw_archive",
+      title: "Sync — raw archive",
+      subtitle: "amazon_listing_report_rows_raw",
+      pct: rawComplete ? 100 : rawActive ? Math.max(4, rawPct) : 0,
+      rightLabel: rawRightLabel,
+      tone: rawActive ? "active" : rawComplete ? "done" : "upcoming",
+    },
+    {
+      key: "catalog",
+      title: "Generic — catalog",
+      subtitle: "Merge into canonical snapshot",
+      pct: catalogComplete ? 100 : catalogActive ? Math.max(4, catalogPct) : 0,
+      rightLabel: catalogRightLabel,
+      subLabel: catalogActive || catalogComplete ? `Target table: ${targetTable}` : undefined,
+      tone: catalogActive ? "active" : catalogComplete ? "done" : "upcoming",
+    },
+  ];
+
+  // Fix mapping step logic: "mappingDone" was wrong — re-evaluate tones
+  steps[1].tone = mappingNeedsAttention ? "warning" : !uploadDone ? "upcoming" : "done";
+  steps[1].pct = mappingNeedsAttention ? 100 : !uploadDone ? 5 : 100;
+  steps[1].rightLabel = mappingNeedsAttention ? "Open Map Columns" : !uploadDone ? "After upload" : "Mapped";
+
+  return steps;
+}
 
 export type ListingImportFpsRow = Record<string, unknown> | null | undefined;
 
@@ -61,9 +319,7 @@ export type ListingImportProgressModel = {
   catalogRowsUnchanged: number;
   listingRawArchived: number;
   listingRawSkipped: number;
-  /** Phase 3 denominator per spec — may be 0 (then UI shows 0%). */
   phase3StagedDenominator: number;
-  /** Phase 4 eligible rows — may be 0 (then UI shows 0%). */
   catalogEligibleRows: number;
   phase1PctListing: number;
   phase2PctListing: number;
@@ -162,7 +418,6 @@ export function buildListingImportProgressModel(
   const immNew = num(im?.rows_synced_new, -1);
   const immUpd = num(im?.rows_synced_updated, -1);
   const immSkip = num(im?.rows_duplicate_against_existing, -1);
-  /** Prefer post-sync import_metrics split when present; else FPS counters. */
   const listingRawArchived = immNew >= 0 && immUpd >= 0 ? immNew + immUpd : rawRowsWritten;
   const listingRawSkipped = immSkip >= 0 ? immSkip : rawRowsSkippedExisting;
 
@@ -229,10 +484,6 @@ export function buildListingImportProgressModel(
 export type ListingPrimaryCta =
   | "process"
   | "retry_process"
-  | "sync"
-  | "retry_sync"
-  | "generic_catalog"
-  | "retry_generic_catalog"
   | "complete"
   | null;
 
@@ -247,7 +498,7 @@ export type ListingImportUiClient = {
 
 export type ListingImportUiInput = ImportUiActionInput & { client?: ListingImportUiClient };
 
-export type ListingImportCurrentPhase = 1 | 2 | 3 | 4 | "complete" | "failed";
+export type ListingImportCurrentPhase = 1 | 2 | "complete" | "failed";
 
 export type ListingImportUiState = {
   currentPhase: ListingImportCurrentPhase;
@@ -263,7 +514,7 @@ export type ListingImportUiState = {
   phase4Pct: number;
   isComplete: boolean;
   isFailed: boolean;
-  busyAction: null | "process" | "sync" | "generic";
+  busyAction: null | "process";
   showProcessCta: boolean;
   showSyncCta: boolean;
   showGenericCta: boolean;
@@ -276,11 +527,7 @@ function deriveListingNextAction(st: ImportUiActionState, statusRaw: string): Li
   const status = norm(statusRaw);
   if (st.phase4Complete && (status === "synced" || status === "complete")) return "complete";
   if (st.showRetryProcess) return "retry_process";
-  if (st.showRetrySync) return "retry_sync";
-  if (st.showRetryGeneric) return "retry_generic_catalog";
-  if (st.showGeneric) return "generic_catalog";
-  if (st.showSync) return "sync";
-  if (["mapped", "ready", "uploaded", "needs_mapping"].includes(status)) return "process";
+  if (["mapped", "ready", "uploaded", "needs_mapping", "staged"].includes(status)) return "process";
   return null;
 }
 
@@ -298,27 +545,20 @@ function applyLocalPhaseFallback(
   ) {
     return "process";
   }
-  if (lp === "staged" && status === "staged") return "sync";
-  if (lp === "raw_synced" && (status === "raw_synced" || status === "synced")) return "generic_catalog";
+  if (lp === "staged" && status === "staged") return "process";
+  if (lp === "synced" && (status === "synced" || status === "complete")) return "complete";
   return next;
 }
 
 function deriveBusyAction(
   st: ImportUiActionState,
   statusRaw: string,
-  meta: Record<string, unknown>,
   client: ListingImportUiClient | undefined,
-): null | "process" | "sync" | "generic" {
+): null | "process" {
   const status = norm(statusRaw);
-  const etl = norm(meta.etl_phase);
-  if (client?.isGenericing || st.genericInFlight) return "generic";
-  if (client?.isSyncing || (status === "processing" && etl === "sync")) return "sync";
-  if (
-    client?.isProcessing ||
-    (status === "processing" && etl !== "sync" && etl !== "generic" && etl !== "complete" && etl !== "worklist")
-  ) {
-    return "process";
-  }
+  if (client?.isProcessing || client?.isSyncing || client?.isGenericing) return "process";
+  if (status === "processing") return "process";
+  if (st.genericInFlight) return "process";
   return null;
 }
 
@@ -332,7 +572,7 @@ function buildListingRowMetricsLine(
     `raw new ${pm.listingRawArchived.toLocaleString()}`,
     `raw skipped ${pm.listingRawSkipped.toLocaleString()}`,
   ];
-  if (st.phase3Complete) {
+  if (st.phase4Complete) {
     parts.push(
       `catalog new ${pm.catalogRowsNew.toLocaleString()}`,
       `updated ${pm.catalogRowsUpdated.toLocaleString()}`,
@@ -363,7 +603,7 @@ export function resolveListingImportUiState(input: ListingImportUiInput): Listin
 
   let next = deriveListingNextAction(st, statusRaw);
   next = applyLocalPhaseFallback(next, statusRaw, client);
-  const busyAction = deriveBusyAction(st, statusRaw, meta, client);
+  const busyAction = deriveBusyAction(st, statusRaw, client);
 
   const isFailed = status === "failed";
   const isComplete =
@@ -373,31 +613,19 @@ export function resolveListingImportUiState(input: ListingImportUiInput): Listin
   if (isFailed) currentPhase = "failed";
   else if (isComplete) currentPhase = "complete";
   else if (["pending", "uploading"].includes(status)) currentPhase = 1;
-  else if (!st.phase2Complete) currentPhase = 2;
-  else if (!st.phase3Complete) currentPhase = 3;
-  else if (!st.phase4Complete) currentPhase = 4;
-  else currentPhase = "complete";
+  else currentPhase = 2;
 
   const showProcessCta =
     next === "process" ||
     next === "retry_process" ||
     busyAction === "process";
-  const showSyncCta = next === "sync" || next === "retry_sync" || busyAction === "sync";
-  const showGenericCta =
-    next === "generic_catalog" ||
-    next === "retry_generic_catalog" ||
-    busyAction === "generic";
+  const showSyncCta = false;
+  const showGenericCta = false;
 
   let topCardButtonLabel = "";
-  if (busyAction === "generic") topCardButtonLabel = "Generic (catalog)…";
-  else if (busyAction === "sync") topCardButtonLabel = "Syncing…";
-  else if (busyAction === "process") topCardButtonLabel = "Processing…";
-  else if (next === "process") topCardButtonLabel = "Process Data";
+  if (busyAction === "process") topCardButtonLabel = "Processing…";
+  else if (next === "process") topCardButtonLabel = "Process listing import";
   else if (next === "retry_process") topCardButtonLabel = "Retry Process";
-  else if (next === "sync") topCardButtonLabel = "Sync";
-  else if (next === "retry_sync") topCardButtonLabel = "Retry Sync";
-  else if (next === "generic_catalog") topCardButtonLabel = "Generic (catalog)";
-  else if (next === "retry_generic_catalog") topCardButtonLabel = "Retry Generic (catalog)";
   else if (next === "complete") topCardButtonLabel = "Complete";
 
   const rowActionLabel = topCardButtonLabel;
@@ -405,35 +633,31 @@ export function resolveListingImportUiState(input: ListingImportUiInput): Listin
   let phaseBadgeText = "Listing import";
   if (isComplete) phaseBadgeText = "Complete";
   else if (isFailed) {
-    if (st.showRetryProcess) phaseBadgeText = "Failed — retry Process";
-    else if (st.showRetrySync) phaseBadgeText = "Failed — retry Sync";
-    else if (st.showRetryGeneric) phaseBadgeText = "Failed — retry Generic (catalog)";
-    else phaseBadgeText = "Failed";
-  } else if (busyAction === "generic" || next === "generic_catalog" || next === "retry_generic_catalog") {
-    phaseBadgeText =
-      next === "retry_generic_catalog" || st.showRetryGeneric
-        ? "Phase 4: Retry Generic (catalog)"
-        : "Phase 4: Generic (catalog)";
-  } else if (busyAction === "sync" || next === "sync" || next === "retry_sync") {
-    phaseBadgeText = next === "retry_sync" ? "Phase 3: Retry Sync" : "Phase 3: Sync";
+    phaseBadgeText = st.showRetryProcess ? "Failed — retry Process" : "Failed";
   } else if (busyAction === "process" || next === "process" || next === "retry_process") {
-    phaseBadgeText = next === "retry_process" ? "Phase 2: Retry Process" : "Phase 2: Process";
+    phaseBadgeText = next === "retry_process" ? "Phase 2: Retry Process" : "Phase 2: Process listing import";
   } else if (["pending", "uploading"].includes(status)) phaseBadgeText = "Phase 1: Upload";
 
-  const phase2Line = formatListingPhase2CompleteMessage(pm.stagedRowsWritten);
-  const phase3Line = `Phase 3 complete — raw archived ${pm.listingRawArchived.toLocaleString()}, skipped existing ${pm.listingRawSkipped.toLocaleString()}.`;
-  const phase4PendingLine = "Phase 4 pending — run Generic (catalog) to sync catalog_products.";
-  const phase4DoneLine = `Phase 4 complete — new ${pm.catalogRowsNew.toLocaleString()}, updated ${pm.catalogRowsUpdated.toLocaleString()}, unchanged ${pm.catalogRowsUnchanged.toLocaleString()}.`;
+  const completeLine = `Complete — raw archive + catalog snapshot (new ${pm.catalogRowsNew.toLocaleString()}, updated ${pm.catalogRowsUpdated.toLocaleString()}, unchanged ${pm.catalogRowsUnchanged.toLocaleString()}).`;
 
   let phaseSummaryText = "";
-  if (isComplete) phaseSummaryText = phase4DoneLine;
+  if (isComplete) phaseSummaryText = completeLine;
   else if (isFailed) phaseSummaryText = phaseBadgeText;
-  else if (st.phase4Complete) phaseSummaryText = phase4DoneLine;
-  else if (st.phase3Complete && (st.showGeneric || st.showRetryGeneric)) phaseSummaryText = phase4PendingLine;
-  else if (st.phase3Complete) phaseSummaryText = phase3Line;
-  else if (st.phase2Complete) phaseSummaryText = phase2Line;
+  else if (busyAction === "process") {
+    phaseSummaryText = "Processing — raw rows to amazon_listing_report_rows_raw, then catalog_products.";
+  } else if (next === "process" || next === "retry_process") {
+    phaseSummaryText =
+      "Run Process once: rows are archived to the listing raw table and merged into catalog_products.";
+  }
 
   const rowMetricsLine = buildListingRowMetricsLine(pm, st, meta);
+
+  const fpsRow =
+    input.fps && typeof input.fps === "object" ? (input.fps as Record<string, unknown>) : null;
+  const combinedPhase2Pct = Math.min(
+    100,
+    Math.max(pm.phase2PctListing, pm.phase3PctListing, pm.phase4PctListing, num(fpsRow?.process_pct, 0)),
+  );
 
   return {
     currentPhase,
@@ -443,9 +667,9 @@ export function resolveListingImportUiState(input: ListingImportUiInput): Listin
     phaseBadgeText,
     phaseSummaryText,
     phase1Pct: pm.phase1PctListing,
-    phase2Pct: pm.phase2PctListing,
-    phase3Pct: pm.phase3PctListing,
-    phase4Pct: pm.phase4PctListing,
+    phase2Pct: combinedPhase2Pct,
+    phase3Pct: 0,
+    phase4Pct: 0,
     isComplete,
     isFailed,
     busyAction,
@@ -458,7 +682,7 @@ export function resolveListingImportUiState(input: ListingImportUiInput): Listin
 }
 
 export function formatListingPhase2CompleteMessage(stagedRows: number): string {
-  return `Phase 2 complete — ${stagedRows.toLocaleString()} row(s) staged.`;
+  return `Staged ${stagedRows.toLocaleString()} row(s) — continuing with raw archive and catalog merge.`;
 }
 
 export function formatListingPhase3CompleteMessage(
@@ -467,23 +691,23 @@ export function formatListingPhase3CompleteMessage(
   stagingLinesProcessed: number,
 ): string {
   if (rawSkippedExisting > 0 && rawArchived === 0) {
-    return `Phase 3 complete — 0 new raw row(s) archived, ${rawSkippedExisting.toLocaleString()} skipped (already archived).`;
+    return `Raw archive complete — 0 new row(s), ${rawSkippedExisting.toLocaleString()} skipped (already archived).`;
   }
   if (rawSkippedExisting > 0) {
-    return `Phase 3 complete — ${rawArchived.toLocaleString()} new raw row(s) archived, ${rawSkippedExisting.toLocaleString()} skipped (already archived).`;
+    return `Raw archive complete — ${rawArchived.toLocaleString()} new row(s), ${rawSkippedExisting.toLocaleString()} skipped (already archived).`;
   }
   if (stagingLinesProcessed > 0) {
-    return `Phase 3 complete — ${rawArchived.toLocaleString()} raw row(s) archived (${stagingLinesProcessed.toLocaleString()} line(s) processed).`;
+    return `Raw archive complete — ${rawArchived.toLocaleString()} row(s) (${stagingLinesProcessed.toLocaleString()} line(s) processed).`;
   }
-  return `Phase 3 complete — ${rawArchived.toLocaleString()} raw row(s) archived.`;
+  return `Raw archive complete — ${rawArchived.toLocaleString()} row(s).`;
 }
 
 export function formatListingPhase4PendingMessage(): string {
-  return "Phase 4 pending — run Generic (catalog) to sync catalog_products.";
+  return "";
 }
 
 export function formatListingPhase4CompleteMessage(newRows: number, updated: number, unchanged: number): string {
-  return `Phase 4 complete — ${newRows.toLocaleString()} new, ${updated.toLocaleString()} updated, ${unchanged.toLocaleString()} unchanged.`;
+  return `Catalog complete — ${newRows.toLocaleString()} new, ${updated.toLocaleString()} updated, ${unchanged.toLocaleString()} unchanged.`;
 }
 
 /** Badge / status chip for Import History (listing) — same resolver as top card. */

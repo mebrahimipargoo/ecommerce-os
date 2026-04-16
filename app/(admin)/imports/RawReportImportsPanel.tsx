@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Check, CheckSquare, FileSpreadsheet, Loader2, MapPin, RefreshCw, RotateCcw, Search, Square, Trash2 } from "lucide-react";
+import { Check, CheckCircle2, CheckSquare, FileSpreadsheet, Loader2, Lock, MapPin, RefreshCw, RotateCcw, Search, Square, Trash2 } from "lucide-react";
 import { AMAZON_LEDGER_UPLOAD_SOURCE } from "../../../lib/raw-report-upload-metadata";
 import type { RawReportUploadRow } from "../../../lib/raw-report-upload-row";
 import { deleteRawReportUpload, listRawReportUploads, resetStuckUpload, updateRawReportType } from "./import-actions";
@@ -18,13 +18,90 @@ import {
   resolveRemovalShipmentPhaseBadgeLabel,
   resolveRemovalShipmentPrimaryCta,
 } from "../../../lib/import-removal-shipment-ui";
-import { resolveListingImportUiState } from "../../../lib/listing-import-ui";
+import { buildListingPipelineSteps, resolveListingImportUiState } from "../../../lib/listing-import-ui";
 import { useDebugMode } from "../../../components/DebugModeContext";
 import { DatabaseTag } from "../../../components/DatabaseTag";
 
 function num(v: unknown, fallback = 0): number {
   if (typeof v === "number" && Number.isFinite(v)) return v;
   return fallback;
+}
+
+/** Listing-only: same step model as the top importer card, compact for the history table. */
+function ListingPipelineHistoryCell({
+  status,
+  metadata,
+  fps,
+}: {
+  status: string;
+  metadata: Record<string, unknown> | null;
+  fps: RawReportUploadRow["file_processing_status"];
+}) {
+  const steps = buildListingPipelineSteps({
+    status,
+    metadata,
+    fps: fps && typeof fps === "object" ? (fps as Record<string, unknown>) : null,
+  });
+  const focus =
+    steps.find((s) => s.tone === "active") ??
+    steps.find((s) => s.tone === "warning") ??
+    [...steps].reverse().find((s) => s.tone === "done") ??
+    steps[0];
+  return (
+    <div className="min-w-[168px] max-w-[240px] space-y-1.5">
+      <div className="flex items-center justify-between gap-2 text-[10px] font-semibold leading-tight text-foreground">
+        <span className="min-w-0 truncate" title={`${focus.title} — ${focus.subtitle}`}>
+          {focus.title}
+        </span>
+        <span className="shrink-0 tabular-nums text-muted-foreground">{Math.round(focus.pct)}%</span>
+      </div>
+      <div className="relative h-1.5 overflow-hidden rounded-full bg-muted">
+        <div
+          className={[
+            "h-full rounded-full transition-all duration-500",
+            focus.tone === "active"
+              ? "bg-sky-500"
+              : focus.tone === "warning"
+                ? "bg-amber-500"
+                : focus.tone === "done"
+                  ? "bg-emerald-500"
+                  : "bg-muted-foreground/40",
+          ].join(" ")}
+          style={{ width: `${Math.max(2, Math.min(100, focus.pct))}%` }}
+        />
+      </div>
+      <p className="line-clamp-2 text-[10px] leading-snug text-muted-foreground" title={[focus.rightLabel, focus.subLabel].filter(Boolean).join(" · ")}>
+        {focus.rightLabel}
+        {focus.subLabel ? <span className="text-violet-700 dark:text-violet-300"> · {focus.subLabel}</span> : null}
+      </p>
+      <div className="flex gap-0.5" role="list" aria-label="Listing pipeline steps">
+        {steps.map((s) => (
+          <div
+            key={s.key}
+            role="listitem"
+            className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted"
+            title={`${s.title}: ${Math.round(s.pct)}% — ${s.rightLabel}`}
+          >
+            <div
+              className={[
+                "h-full rounded-full",
+                s.tone === "done"
+                  ? "bg-emerald-500/90"
+                  : s.tone === "active"
+                    ? "bg-sky-500"
+                    : s.tone === "warning"
+                      ? "bg-amber-500"
+                      : "bg-muted-foreground/20",
+              ].join(" ")}
+              style={{
+                width: `${Math.max(s.tone === "upcoming" ? 0 : 6, Math.min(100, s.pct))}%`,
+              }}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 // Status badge label
@@ -34,7 +111,7 @@ function statusLabel(status: string, uploadProgress?: number, opts?: { listing?:
     case "mapped":
       return listing ? "Ready — Process Data" : "Phase 2: Process";
     case "staged":
-      return "Phase 3: Sync";
+      return listing ? "Ready — Process listing import" : "Phase 3: Sync";
     case "raw_synced":
       return "Phase 4: Generic";
     case "ready":
@@ -360,7 +437,7 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
         </div>
       )}
 
-      <div className="rounded-2xl border border-border bg-card shadow-sm">
+      <div id="data-import-history" className="rounded-2xl border border-border bg-card shadow-sm scroll-mt-20">
         {/* ── History panel header ─────────────────────────────────────────────── */}
         <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
           {/* Left: title + search */}
@@ -404,10 +481,10 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
         {/* Sub-description */}
         <div className="space-y-2 px-5 pt-2 pb-3 text-xs text-muted-foreground">
           <p>
-            <strong className="text-foreground">Amazon listing exports:</strong> Phase 1 upload →{" "}
-            <strong>Process</strong> (stage to <code className="text-xs">amazon_staging</code>) →{" "}
-            <strong>Sync</strong> (raw rows to <code className="text-xs">amazon_listing_report_rows_raw</code>) →{" "}
-            <strong>Generic (catalog)</strong> (<code className="text-xs">catalog_products</code>).
+            <strong className="text-foreground">Amazon listing exports:</strong> Phase 1 upload → one{" "}
+            <strong>Process listing import</strong> step (raw rows to{" "}
+            <code className="text-xs">amazon_listing_report_rows_raw</code>, then canonical{" "}
+            <code className="text-xs">catalog_products</code>).
           </p>
           <p>
             <strong className="text-foreground">Other report types:</strong> after upload,{" "}
@@ -428,7 +505,7 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
         {/* ── Scrollable table ─────────────────────────────────────────────────── */}
         <div className="relative max-h-[400px] overflow-x-auto overflow-y-auto rounded-b-2xl">
           <DatabaseTag table="raw_report_uploads" />
-          <table className="w-full min-w-[1080px] border-collapse text-left text-sm">
+          <table className="w-full min-w-[1220px] border-collapse text-left text-sm">
             <thead>
               <tr className="border-b border-border bg-muted/40 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 <th className="px-3 py-3">
@@ -450,6 +527,7 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                 <th className="px-4 py-3">Date</th>
                 <th className="px-4 py-3">Status</th>
                 <th className="px-4 py-3 text-right">Rows</th>
+                <th className="px-3 py-3">Pipeline</th>
                 <th className="px-4 py-3 text-right">Actions</th>
               </tr>
             </thead>
@@ -466,7 +544,7 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                 if (filteredRows.length === 0) {
                   return (
                     <tr>
-                      <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
+                      <td colSpan={9} className="px-4 py-8 text-center text-muted-foreground">
                         {rows.length === 0 ? "No imports yet." : `No results for "${tableSearch}".`}
                       </td>
                     </tr>
@@ -518,6 +596,11 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                     : null;
 
                 const showMapColumns = r.status === "needs_mapping";
+                const listingSyncGenericPlaceholders =
+                  isListing &&
+                  listingUi &&
+                  !isLedgerSession &&
+                  !["pending", "uploading"].includes(r.status);
                 const showProcess =
                   !isLedgerSession &&
                   (isRsRow
@@ -529,13 +612,13 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                   isRsRow && rsRowCta != null
                     ? rsRowCta === "sync" || rsRowCta === "retry_sync"
                     : isListing && listingUi
-                      ? listingUi.showSyncCta
+                      ? listingSyncGenericPlaceholders
                       : actionState.showSync;
                 const showGeneric =
                   isRsRow && rsRowCta != null
                     ? rsRowCta === "generic" || rsRowCta === "generic_retry"
                     : isListing && listingUi
-                      ? listingUi.showGenericCta
+                      ? listingSyncGenericPlaceholders
                       : actionState.showGeneric;
                 const showWorklist = actionState.showWorklist;
                 const showRetryProcess = !isRsRow && !isListing && actionState.showRetryProcess;
@@ -551,6 +634,7 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                 return (
                   <tr
                     key={r.id}
+                    data-upload-id={r.id}
                     className={[
                       "border-b border-border last:border-0",
                       selectedIds.has(r.id) ? "bg-muted/30" : "",
@@ -897,6 +981,15 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                       })()}
                     </td>
 
+                    {/* Listing pipeline — same resolver as top card */}
+                    <td className="px-3 py-3 align-top">
+                      {isListing && listingUi ? (
+                        <ListingPipelineHistoryCell status={r.status} metadata={metaObj} fps={r.file_processing_status} />
+                      ) : (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      )}
+                    </td>
+
                     {/* Actions */}
                     <td className="px-4 py-3 text-right">
                       <div className="inline-flex flex-wrap items-center justify-end gap-2">
@@ -947,18 +1040,37 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                         {showSync && (
                           <button
                             type="button"
-                            disabled={busy}
-                            onClick={() => void runSync(r)}
+                            disabled={busy || Boolean(isListing && listingUi)}
+                            title={
+                              isListing && listingUi
+                                ? "Raw archive runs inside Process for listing imports."
+                                : undefined
+                            }
+                            onClick={() => {
+                              if (isListing && listingUi) return;
+                              void runSync(r);
+                            }}
                             aria-label={`Sync ${r.file_name} to domain tables`}
-                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-violet-400/60 bg-violet-50 px-3 text-xs font-semibold text-violet-800 shadow-sm transition hover:bg-violet-100 disabled:opacity-50 dark:border-violet-600/40 dark:bg-violet-950/30 dark:text-violet-300"
+                            className={[
+                              "inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-semibold shadow-sm transition disabled:opacity-50",
+                              isListing && listingUi
+                                ? "cursor-not-allowed border-emerald-500/40 bg-emerald-500/10 text-emerald-900 dark:text-emerald-100"
+                                : "border-violet-400/60 bg-violet-50 text-violet-800 hover:bg-violet-100 dark:border-violet-600/40 dark:bg-violet-950/30 dark:text-violet-300",
+                            ].join(" ")}
                           >
-                            {syncingIds.has(r.id) ? (
-                              <>
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                                Syncing…
-                              </>
+                            {isListing && listingUi ? (
+                              <Lock className="h-3.5 w-3.5 shrink-0 opacity-80" aria-hidden />
+                            ) : syncingIds.has(r.id) ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                            ) : (
+                              <CheckCircle2 className="h-3.5 w-3.5 shrink-0 opacity-90" aria-hidden />
+                            )}
+                            {syncingIds.has(r.id) && !(isListing && listingUi) ? (
+                              <>Syncing…</>
                             ) : isRsRow && rsRowCta === "retry_sync" ? (
                               "Retry Sync"
+                            ) : isListing && listingUi ? (
+                              "Sync (in Process)"
                             ) : (
                               "Sync"
                             )}
@@ -968,20 +1080,35 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                         {showGeneric && (
                           <button
                             type="button"
-                            disabled={busy}
-                            onClick={() => void runGeneric(r)}
+                            disabled={busy || Boolean(isListing && listingUi)}
+                            title={
+                              isListing && listingUi
+                                ? "Catalog merge runs inside Process for listing imports."
+                                : undefined
+                            }
+                            onClick={() => {
+                              if (isListing && listingUi) return;
+                              void runGeneric(r);
+                            }}
                             aria-label={`Run generic phase for ${r.file_name}`}
-                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-emerald-400/60 bg-emerald-50 px-3 text-xs font-semibold text-emerald-900 shadow-sm transition hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-600/40 dark:bg-emerald-950/30 dark:text-emerald-200"
+                            className={[
+                              "inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-semibold shadow-sm transition disabled:opacity-50",
+                              isListing && listingUi
+                                ? "cursor-not-allowed border-violet-500/40 bg-violet-500/10 text-violet-950 dark:text-violet-100"
+                                : "border-emerald-400/60 bg-emerald-50 text-emerald-900 hover:bg-emerald-100 dark:border-emerald-600/40 dark:bg-emerald-950/30 dark:text-emerald-200",
+                            ].join(" ")}
                           >
-                            {genericIds.has(r.id) ? (
-                              <>
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                                Generic…
-                              </>
+                            {isListing && listingUi ? (
+                              <Lock className="h-3.5 w-3.5 shrink-0 opacity-80" aria-hidden />
+                            ) : genericIds.has(r.id) ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                            ) : null}
+                            {genericIds.has(r.id) && !(isListing && listingUi) ? (
+                              <>Generic…</>
                             ) : isRsRow ? (
                               rsRowCta === "generic_retry" ? "Retry Generic (shipments)" : "Generic (shipments)"
                             ) : isListing && listingUi ? (
-                              listingUi.rowActionLabel
+                              "Generic (in Process)"
                             ) : (
                               "Generic (shipments)"
                             )}

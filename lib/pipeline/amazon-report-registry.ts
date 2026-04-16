@@ -267,9 +267,9 @@ export function isListingAmazonSyncKind(kind: AmazonSyncKind): boolean {
   return kind === "CATEGORY_LISTINGS" || kind === "ALL_LISTINGS" || kind === "ACTIVE_LISTINGS";
 }
 
-/** Listing catalog merge and removal shipment tree run in POST /api/settings/imports/generic after raw_synced. */
+/** Removal shipment tree runs in POST /api/settings/imports/generic after raw_synced. Listing uses one Process step instead. */
 export function requiresPhase4Generic(kind: AmazonSyncKind): boolean {
-  return kind === "REMOVAL_SHIPMENT" || isListingAmazonSyncKind(kind);
+  return kind === "REMOVAL_SHIPMENT";
 }
 
 /** Maps `raw_report_uploads.report_type` (canonical + legacy slugs) → sync kind. */
