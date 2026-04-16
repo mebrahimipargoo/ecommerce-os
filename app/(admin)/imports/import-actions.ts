@@ -184,11 +184,37 @@ export async function listRawReportUploads(input?: {
       const { data: fpsRows, error: fpsErr } = await supabaseServer
         .from("file_processing_status")
         .select(
-          "upload_id, phase2_status, phase3_status, phase4_status, current_phase, current_phase_label, current_target_table, status",
+          [
+            "upload_id",
+            "phase2_status",
+            "phase3_status",
+            "phase4_status",
+            "current_phase",
+            "current_phase_label",
+            "current_target_table",
+            "status",
+            "upload_pct",
+            "process_pct",
+            "sync_pct",
+            "phase1_upload_pct",
+            "phase2_stage_pct",
+            "phase3_raw_sync_pct",
+            "phase4_generic_pct",
+            "staged_rows_written",
+            "raw_rows_written",
+            "raw_rows_skipped_existing",
+            "generic_rows_written",
+            "total_rows",
+            "processed_rows",
+            "file_rows_total",
+            "data_rows_total",
+          ].join(", "),
         )
         .in("upload_id", uploadIds);
+      const numOrNull = (v: unknown): number | null =>
+        typeof v === "number" && Number.isFinite(v) ? v : null;
       if (!fpsErr && fpsRows) {
-        for (const fr of fpsRows as Record<string, unknown>[]) {
+        for (const fr of fpsRows as unknown as Record<string, unknown>[]) {
           const uid = String(fr.upload_id ?? "").trim();
           if (!isUuidString(uid)) continue;
           fpsByUpload.set(uid, {
@@ -199,6 +225,21 @@ export async function listRawReportUploads(input?: {
             current_phase_label: fr.current_phase_label != null ? String(fr.current_phase_label) : null,
             current_target_table: fr.current_target_table != null ? String(fr.current_target_table) : null,
             row_status: fr.status != null ? String(fr.status) : null,
+            upload_pct: numOrNull(fr.upload_pct),
+            process_pct: numOrNull(fr.process_pct),
+            sync_pct: numOrNull(fr.sync_pct),
+            phase1_upload_pct: numOrNull(fr.phase1_upload_pct),
+            phase2_stage_pct: numOrNull(fr.phase2_stage_pct),
+            phase3_raw_sync_pct: numOrNull(fr.phase3_raw_sync_pct),
+            phase4_generic_pct: numOrNull(fr.phase4_generic_pct),
+            staged_rows_written: numOrNull(fr.staged_rows_written),
+            raw_rows_written: numOrNull(fr.raw_rows_written),
+            raw_rows_skipped_existing: numOrNull(fr.raw_rows_skipped_existing),
+            generic_rows_written: numOrNull(fr.generic_rows_written),
+            total_rows: numOrNull(fr.total_rows),
+            processed_rows: numOrNull(fr.processed_rows),
+            file_rows_total: numOrNull(fr.file_rows_total),
+            data_rows_total: numOrNull(fr.data_rows_total),
           });
         }
       }

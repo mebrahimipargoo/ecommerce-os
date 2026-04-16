@@ -233,6 +233,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
 
   const pollRef2 = useRef<ReturnType<typeof setInterval> | null>(null);
   const isActiveRef = useRef(false);
+  /** Only skip the 2s DB poll during browser upload — keep polling while server-side Process/Sync runs. */
+  const isUploadingRef = useRef(false);
 
   const stopRef = useRef(false);
   const [sessionUploadId, setSessionUploadId] = useState<string | null>(null);
@@ -250,6 +252,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   const isGenericing = phase === "genericing";
   const isActive = isUploading || isProcessing || isSyncing || isWorklisting || isGenericing;
   isActiveRef.current = isActive;
+  isUploadingRef.current = isUploading;
 
   const isRemovalReport =
     detectedType === "REMOVAL_ORDER" || detectedType === "REMOVAL_SHIPMENT";
@@ -331,7 +334,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     }
     let cancelled = false;
     async function tick() {
-      if (isActiveRef.current) return;
+      if (isUploadingRef.current) return;
       const { data: rpu, error: rErr } = await supabase
         .from("raw_report_uploads")
         .select("report_type, status, metadata")
@@ -520,7 +523,10 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         phase !== "needs_mapping" &&
         (rsCta === "process" || rsCta === "retry_process")
       : listingImportUi && !removalShipmentUi
-        ? Boolean(listingUi?.showProcessCta) && !isUploading
+        ? !isUploading &&
+          (Boolean(listingUi?.showProcessCta) ||
+            phase === "processing" ||
+            serverImportInput?.status === "processing")
         : phase === "mapped";
   const showWorklistPrimary =
     phase === "worklisting" ||
@@ -1587,10 +1593,10 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                           ) : null}
                         </div>
                       </div>
-                      <div className="relative h-2 overflow-hidden rounded-full bg-muted pl-9">
+                      <div className="h-2 w-full min-w-0 overflow-hidden rounded-full bg-muted/90 pl-9">
                         <div
                           className={`h-full rounded-full transition-[width] duration-500 ease-out ${barTint}`}
-                          style={{ width: `${Math.max(step.tone === "upcoming" ? 0 : 2, Math.min(100, step.pct))}%` }}
+                          style={{ width: `${Math.min(100, Math.max(0, step.pct))}%` }}
                         />
                       </div>
                     </li>

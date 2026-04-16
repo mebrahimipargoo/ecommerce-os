@@ -21,6 +21,22 @@ export type ImportFpsSnapshot = {
   current_target_table?: string | null;
   /** `file_processing_status.status` */
   row_status?: string | null;
+  /** Joined from `file_processing_status` for listing / live progress (optional). */
+  upload_pct?: number | null;
+  process_pct?: number | null;
+  sync_pct?: number | null;
+  phase1_upload_pct?: number | null;
+  phase2_stage_pct?: number | null;
+  phase3_raw_sync_pct?: number | null;
+  phase4_generic_pct?: number | null;
+  staged_rows_written?: number | null;
+  raw_rows_written?: number | null;
+  raw_rows_skipped_existing?: number | null;
+  generic_rows_written?: number | null;
+  total_rows?: number | null;
+  processed_rows?: number | null;
+  file_rows_total?: number | null;
+  data_rows_total?: number | null;
 };
 
 export type ImportUiActionInput = {

@@ -43,8 +43,8 @@ function ListingPipelineHistoryCell({
     fps: fps && typeof fps === "object" ? (fps as Record<string, unknown>) : null,
   });
   return (
-    <div className="min-w-[200px] max-w-[280px] space-y-1">
-      <ol className="space-y-1" aria-label="Listing pipeline steps">
+    <div className="w-full min-w-0 max-w-[280px] space-y-1">
+      <ol className="w-full min-w-0 space-y-1" aria-label="Listing pipeline steps">
         {steps.map((s) => {
           const barTint =
             s.tone === "active"
@@ -53,19 +53,20 @@ function ListingPipelineHistoryCell({
                 ? "bg-emerald-500"
                 : s.tone === "warning"
                   ? "bg-amber-500"
-                  : "bg-muted-foreground/30";
+                  : "bg-muted-foreground/35";
+          const fill = Math.min(100, Math.max(0, s.pct));
           return (
-                       <li key={s.key} className="space-y-0.5 text-[10px] leading-tight">
+            <li key={s.key} className="w-full min-w-0 space-y-0.5 text-[10px] leading-tight">
               <div className="flex items-baseline justify-between gap-1">
-                <span className="min-w-0 truncate font-medium text-foreground" title={`${s.title} — ${s.subtitle}`}>
+                <span className="min-w-0 break-words font-medium text-foreground" title={`${s.title} — ${s.subtitle}`}>
                   {s.title}
                 </span>
                 <span className="shrink-0 tabular-nums text-muted-foreground">{Math.round(s.pct)}%</span>
               </div>
-              <div className="relative h-1 overflow-hidden rounded-full bg-muted">
+              <div className="h-1.5 w-full min-w-0 overflow-hidden rounded-full bg-muted/90">
                 <div
-                  className={`h-full rounded-full transition-all duration-500 ${barTint}`}
-                  style={{ width: `${Math.max(s.tone === "upcoming" ? 0 : 2, Math.min(100, s.pct))}%` }}
+                  className={`h-full rounded-full transition-[width] duration-500 ease-out ${barTint}`}
+                  style={{ width: `${fill}%` }}
                 />
               </div>
               <span
@@ -486,10 +487,21 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
         {/* ── Scrollable table ─────────────────────────────────────────────────── */}
         <div className="relative max-h-[400px] overflow-x-auto overflow-y-auto rounded-b-2xl">
           <DatabaseTag table="raw_report_uploads" />
-          <table className="w-full min-w-[1220px] border-collapse text-left text-sm">
+          <table className="w-full min-w-0 table-fixed border-collapse text-left text-sm">
+            <colgroup>
+              <col className="w-10" />
+              <col className="w-[13%]" />
+              <col className="w-[15%]" />
+              <col className="w-[12%]" />
+              <col className="w-[10%]" />
+              <col className="w-[11%]" />
+              <col className="w-[9%]" />
+              <col className="w-[18%]" />
+              <col className="w-[12%]" />
+            </colgroup>
             <thead>
-              <tr className="border-b border-border bg-muted/40 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                <th className="px-3 py-3">
+              <tr className="border-b border-border bg-muted/40 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                <th className="px-2 py-2.5">
                   {/* Select-all checkbox */}
                   <button
                     type="button"
@@ -502,14 +514,14 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                       : <Square className="h-4 w-4" aria-hidden />}
                   </button>
                 </th>
-                <th className="px-4 py-3">Import</th>
-                <th className="px-4 py-3">Type</th>
-                <th className="px-4 py-3">Uploaded by</th>
-                <th className="px-4 py-3">Date</th>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3 text-right">Rows</th>
-                <th className="px-3 py-3">Pipeline</th>
-                <th className="px-4 py-3 text-right">Actions</th>
+                <th className="px-2 py-2.5">Import</th>
+                <th className="px-2 py-2.5">Type</th>
+                <th className="px-2 py-2.5">Uploaded by</th>
+                <th className="px-2 py-2.5">Date</th>
+                <th className="px-2 py-2.5">Status</th>
+                <th className="px-2 py-2.5 text-right">Rows</th>
+                <th className="px-2 py-2.5">Pipeline</th>
+                <th className="px-2 py-2.5 text-right">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -622,7 +634,7 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                     ].join(" ")}
                   >
                     {/* Checkbox */}
-                    <td className="px-3 py-3">
+                    <td className="px-2 py-2.5 align-top">
                       <button
                         type="button"
                         onClick={() => toggleRow(r.id)}
@@ -637,16 +649,16 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                     </td>
 
                     {/* File name / ID */}
-                    <td className="px-4 py-3">
-                      <div className="flex max-w-[160px] flex-col gap-0.5" title={`${r.id}\n${r.file_name}`}>
-                        <span className="truncate text-xs font-medium text-foreground">{r.file_name}</span>
-                        <span className="font-mono text-[10px] text-muted-foreground">{r.id.slice(0, 8)}…</span>
+                    <td className="px-2 py-2.5 align-top">
+                      <div className="flex min-w-0 flex-col gap-0.5 break-words" title={`${r.id}\n${r.file_name}`}>
+                        <span className="text-[11px] font-medium leading-snug text-foreground">{r.file_name}</span>
+                        <span className="font-mono text-[9px] text-muted-foreground">{r.id.slice(0, 8)}…</span>
                       </div>
                     </td>
 
                     {/* Report type dropdown */}
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-1.5">
+                    <td className="px-2 py-2.5 align-top">
+                      <div className="flex min-w-0 items-start gap-1">
                         <select
                           value={rt}
                           onChange={async (e) => {
@@ -670,7 +682,7 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                               setLoadErr(res.error ?? "Update failed");
                             }
                           }}
-                          className="h-8 max-w-[min(100%,22rem)] rounded-lg border border-border bg-background px-2 text-xs text-foreground"
+                          className="h-auto min-h-8 w-full min-w-0 max-w-full rounded-lg border border-border bg-background py-1 pl-1.5 pr-1 text-[10px] leading-tight text-foreground"
                         >
                           {RAW_REPORT_TYPE_ORDER.map((v) => {
                             const s = REPORT_TYPE_SPECS[v];
@@ -692,17 +704,17 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                     </td>
 
                     {/* Uploader */}
-                    <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
-                      {r.created_by_name ?? r.created_by ?? "—"}
+                    <td className="px-2 py-2.5 align-top font-mono text-[10px] leading-snug text-muted-foreground">
+                      <span className="break-all">{r.created_by_name ?? r.created_by ?? "—"}</span>
                     </td>
 
                     {/* Date */}
-                    <td className="whitespace-nowrap px-4 py-3 text-xs text-muted-foreground">
-                      {new Date(r.created_at).toLocaleString()}
+                    <td className="px-2 py-2.5 align-top text-[10px] leading-snug text-muted-foreground">
+                      <span className="break-words">{new Date(r.created_at).toLocaleString()}</span>
                     </td>
 
                     {/* Status badge / live progress */}
-                    <td className="px-4 py-3">
+                    <td className="px-2 py-2.5 align-top">
                       {processingIds.has(r.id) ? (
                         // Live Phase 2 progress — shows X / Y rows (FPS + metadata; guard stale Phase-1 totals)
                         (() => {
@@ -803,14 +815,14 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                           );
                         })()
                       ) : (
-                        <div className="flex flex-col gap-0.5">
+                        <div className="flex min-w-0 flex-col gap-0.5">
                           <span
                             className={[
-                              "inline-flex flex-wrap items-center gap-x-1.5 rounded-full px-2 py-0.5 text-xs font-medium",
+                              "flex w-full min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 rounded-md px-1.5 py-0.5 text-[10px] font-medium leading-snug",
                               statusColorClass(badgeStatus),
                             ].join(" ")}
                           >
-                            <span>
+                            <span className="min-w-0 break-words">
                               {rsBadge ??
                                 listingUi?.phaseBadgeText ??
                                 statusLabel(badgeStatus, r.upload_progress, { listing: isListing })}
@@ -832,14 +844,14 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                     </td>
 
                     {/* Row count — Phase 3+: sync/stage when present; else row_count / CSV total */}
-                    <td className="px-4 py-3 text-right tabular-nums text-xs text-muted-foreground">
+                    <td className="px-2 py-2.5 text-right align-top tabular-nums text-[10px] leading-snug text-muted-foreground">
                       {(() => {
                         if (isListing) {
                           if (!listingUi) return "—";
                           return (
                             <span
                               title="Listing metrics (shared resolver with top card)."
-                              className="block max-w-[min(100%,20rem)] cursor-help text-right text-[11px] leading-snug text-muted-foreground"
+                              className="block min-w-0 cursor-help break-words text-right text-[10px] leading-snug text-muted-foreground"
                             >
                               {listingUi.rowMetricsLine}
                             </span>
@@ -963,16 +975,16 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                     </td>
 
                     {/* Listing pipeline — same resolver as top card */}
-                    <td className="px-3 py-3 align-top">
+                    <td className="px-2 py-2.5 align-top">
                       {isListing && listingUi ? (
                         <ListingPipelineHistoryCell status={r.status} metadata={metaObj} fps={r.file_processing_status} />
                       ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
+                        <span className="text-[10px] text-muted-foreground">—</span>
                       )}
                     </td>
 
                     {/* Actions */}
-                    <td className="px-4 py-3 text-right">
+                    <td className="px-2 py-2.5 text-right align-top">
                       <div className="inline-flex flex-wrap items-center justify-end gap-2">
 
                         {/* Map Columns — Phase 1 gap fill */}

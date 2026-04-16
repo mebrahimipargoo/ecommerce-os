@@ -76,7 +76,7 @@ export function ImportsClient() {
   )?.display_name ?? null;
 
   return (
-    <div className="mx-auto w-full max-w-7xl space-y-6 px-4 py-6 md:px-8">
+    <div className="mx-auto w-full max-w-[min(100%,96rem)] space-y-6 px-3 py-6 sm:px-6 lg:px-10">
       {/* ── Page header ─────────────────────────────────────────────────────── */}
       <div>
         <div className="flex items-center gap-2 text-muted-foreground">
