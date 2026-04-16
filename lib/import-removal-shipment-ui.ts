@@ -6,6 +6,7 @@
 import type { ImportUiActionInput, ImportUiActionState } from "./import-ui-action-state";
 import { resolveImportUiActionState } from "./import-ui-action-state";
 import { resolveAmazonImportSyncKind } from "./pipeline/amazon-report-registry";
+import { isListingReportType } from "./raw-report-types";
 
 const RS = "REMOVAL_SHIPMENT";
 
@@ -48,6 +49,11 @@ export function buildImportUiActionInputForRemovalShipment(
   const rt = coerceRemovalShipmentReportTypeForResolver(input.reportType, sessionDetectedType);
   if (rt === RS) {
     return { ...input, reportType: RS };
+  }
+  const db = String(input.reportType ?? "").trim();
+  const hint = String(sessionDetectedType ?? "").trim();
+  if ((db === "" || db === "UNKNOWN") && hint && isListingReportType(hint)) {
+    return { ...input, reportType: hint };
   }
   return input;
 }

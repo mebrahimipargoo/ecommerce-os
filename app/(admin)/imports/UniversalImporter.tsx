@@ -632,7 +632,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     if (pollRef2.current) clearInterval(pollRef2.current);
     pollRef2.current = setInterval(() => {
       void Promise.all([
-        supabase.from("raw_report_uploads").select("metadata").eq("id", uploadIdSnap).maybeSingle(),
+        supabase.from("raw_report_uploads").select("report_type, status, metadata").eq("id", uploadIdSnap).maybeSingle(),
         supabase.from("file_processing_status").select("*").eq("upload_id", uploadIdSnap).maybeSingle(),
       ]).then(([rpu, fps]) => {
         const m = rpu.data?.metadata as Record<string, unknown> | null;
@@ -2023,7 +2023,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       )}
 
       {/* ── Action buttons ────────────────────────────────────────────────────── */}
-      <div className="mt-6 flex flex-wrap items-center gap-3">
+      <div className="mt-6 space-y-2">
+        <div className="flex flex-wrap items-center gap-3">
 
         {/* Phase 1: Upload & AI Map — visible only when idle */}
         {phase === "idle" && (
@@ -2214,6 +2215,17 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
             <RefreshCw className="h-3.5 w-3.5" aria-hidden />
             Reset / New Upload
           </button>
+        )}
+        </div>
+
+        {listingImportUi && !removalShipmentUi && showListingPhaseActionRow && (
+          <p className="max-w-3xl text-[11px] leading-relaxed text-muted-foreground">
+            <span className="font-medium text-foreground">Listing files:</span> Sync and Generic stay locked because the
+            server runs <strong className="font-semibold text-foreground">raw archive</strong> and{" "}
+            <strong className="font-semibold text-foreground">catalog merge</strong> inside the same{" "}
+            <strong className="font-semibold text-foreground">Process</strong> request (separate /sync and /generic calls
+            are not used). Live row counts and percentages for those steps are in the pipeline card above.
+          </p>
         )}
 
         {/* Delete Import — deletes DB row + Storage */}

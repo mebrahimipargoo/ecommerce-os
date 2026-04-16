@@ -42,64 +42,45 @@ function ListingPipelineHistoryCell({
     metadata,
     fps: fps && typeof fps === "object" ? (fps as Record<string, unknown>) : null,
   });
-  const focus =
-    steps.find((s) => s.tone === "active") ??
-    steps.find((s) => s.tone === "warning") ??
-    [...steps].reverse().find((s) => s.tone === "done") ??
-    steps[0];
   return (
-    <div className="min-w-[168px] max-w-[240px] space-y-1.5">
-      <div className="flex items-center justify-between gap-2 text-[10px] font-semibold leading-tight text-foreground">
-        <span className="min-w-0 truncate" title={`${focus.title} — ${focus.subtitle}`}>
-          {focus.title}
-        </span>
-        <span className="shrink-0 tabular-nums text-muted-foreground">{Math.round(focus.pct)}%</span>
-      </div>
-      <div className="relative h-1.5 overflow-hidden rounded-full bg-muted">
-        <div
-          className={[
-            "h-full rounded-full transition-all duration-500",
-            focus.tone === "active"
+    <div className="min-w-[200px] max-w-[280px] space-y-1">
+      <ol className="space-y-1" aria-label="Listing pipeline steps">
+        {steps.map((s) => {
+          const barTint =
+            s.tone === "active"
               ? "bg-sky-500"
-              : focus.tone === "warning"
-                ? "bg-amber-500"
-                : focus.tone === "done"
-                  ? "bg-emerald-500"
-                  : "bg-muted-foreground/40",
-          ].join(" ")}
-          style={{ width: `${Math.max(2, Math.min(100, focus.pct))}%` }}
-        />
-      </div>
-      <p className="line-clamp-2 text-[10px] leading-snug text-muted-foreground" title={[focus.rightLabel, focus.subLabel].filter(Boolean).join(" · ")}>
-        {focus.rightLabel}
-        {focus.subLabel ? <span className="text-violet-700 dark:text-violet-300"> · {focus.subLabel}</span> : null}
-      </p>
-      <div className="flex gap-0.5" role="list" aria-label="Listing pipeline steps">
-        {steps.map((s) => (
-          <div
-            key={s.key}
-            role="listitem"
-            className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-muted"
-            title={`${s.title}: ${Math.round(s.pct)}% — ${s.rightLabel}`}
-          >
-            <div
-              className={[
-                "h-full rounded-full",
-                s.tone === "done"
-                  ? "bg-emerald-500/90"
-                  : s.tone === "active"
-                    ? "bg-sky-500"
-                    : s.tone === "warning"
-                      ? "bg-amber-500"
-                      : "bg-muted-foreground/20",
-              ].join(" ")}
-              style={{
-                width: `${Math.max(s.tone === "upcoming" ? 0 : 6, Math.min(100, s.pct))}%`,
-              }}
-            />
-          </div>
-        ))}
-      </div>
+              : s.tone === "done"
+                ? "bg-emerald-500"
+                : s.tone === "warning"
+                  ? "bg-amber-500"
+                  : "bg-muted-foreground/30";
+          return (
+                       <li key={s.key} className="space-y-0.5 text-[10px] leading-tight">
+              <div className="flex items-baseline justify-between gap-1">
+                <span className="min-w-0 truncate font-medium text-foreground" title={`${s.title} — ${s.subtitle}`}>
+                  {s.title}
+                </span>
+                <span className="shrink-0 tabular-nums text-muted-foreground">{Math.round(s.pct)}%</span>
+              </div>
+              <div className="relative h-1 overflow-hidden rounded-full bg-muted">
+                <div
+                  className={`h-full rounded-full transition-all duration-500 ${barTint}`}
+                  style={{ width: `${Math.max(s.tone === "upcoming" ? 0 : 2, Math.min(100, s.pct))}%` }}
+                />
+              </div>
+              <span
+                className="line-clamp-2 text-[9px] text-muted-foreground"
+                title={[s.rightLabel, s.subLabel].filter(Boolean).join(" · ")}
+              >
+                {s.rightLabel}
+                {s.subLabel ? (
+                  <span className="text-violet-700 dark:text-violet-300"> · {s.subLabel}</span>
+                ) : null}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
     </div>
   );
 }
