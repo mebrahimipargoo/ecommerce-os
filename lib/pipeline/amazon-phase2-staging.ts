@@ -8,9 +8,16 @@
  */
 
 import csv from "csv-parser";
+import { Readable } from "node:stream";
 import { NextResponse } from "next/server";
 
 import { createConcatenatedPartsReadable } from "../import-raw-report-stream";
+import {
+  computeListingPhysicalStagingLineHash,
+  splitDataLineIntoCells,
+  splitPhysicalLines,
+  streamToBuffer,
+} from "../import-listing-physical-lines";
 import { applyColumnMappingToRow, computeSourceLineHash, normalizeAmazonReportRowKeys } from "../import-sync-mappers";
 import { mergeUploadMetadata, parseRawReportMetadata } from "../raw-report-upload-metadata";
 import { supabaseServer } from "../supabase-server";
@@ -21,6 +28,11 @@ const STAGING_TABLE = "amazon_staging";
 const BATCH_SIZE = 500;
 /** Minimum interval between progress writes when not forced (e.g. per batch forces a write). */
 const PROGRESS_EVERY = 25;
+const LISTING_PROGRESS_EVERY = 8;
+
+function trimHeaderCell(h: string): string {
+  return h.replace(/^\uFEFF/, "").trim();
+}
 
 export type StageRequestBody = {
   upload_id?: string;
@@ -102,6 +114,9 @@ const KNOWN_TYPES = new Set([
   "RESERVED_INVENTORY",
   "FEE_PREVIEW",
   "MONTHLY_STORAGE_FEES",
+  "CATEGORY_LISTINGS",
+  "ALL_LISTINGS",
+  "ACTIVE_LISTINGS",
   "fba_customer_returns",
   "inventory_ledger",
   "safe_t_claims",
@@ -170,16 +185,6 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
     }
 
     const reportTypeRaw = String((row as { report_type?: unknown }).report_type ?? "").trim();
-    if (isListingReportType(reportTypeRaw)) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error:
-            "Listing exports use the unified Process route with the listing pipeline, not amazon_staging.",
-        },
-        { status: 422 },
-      );
-    }
     if (!reportTypeRaw || reportTypeRaw === "UNKNOWN" || !KNOWN_TYPES.has(reportTypeRaw)) {
       return NextResponse.json(
         {
@@ -299,17 +304,265 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
     const fileExt = metaFileExt || rawFileExt;
     const csvSeparator: string = fileExt === "txt" ? "\t" : ",";
 
+    if (fileExt === "xlsx") {
+      return NextResponse.json(
+        { ok: false, error: "Excel imports are not processed by this pipeline. Export as CSV and re-upload." },
+        { status: 415 },
+      );
+    }
+    if (fileExt && fileExt !== "csv" && fileExt !== "txt") {
+      return NextResponse.json(
+        { ok: false, error: `Unsupported file type for processing: .${fileExt || "unknown"}` },
+        { status: 415 },
+      );
+    }
+
     let source: NodeJS.ReadableStream;
     if (rawFilePath) {
       const { data: blob, error: dlErr } = await supabaseServer.storage.from("raw-reports").download(rawFilePath);
       if (dlErr || !blob) {
         throw new Error(dlErr?.message ?? `Could not download file from storage: ${rawFilePath}`);
       }
-      const { Readable } = await import("stream");
       const arrayBuf = await blob.arrayBuffer();
       source = Readable.from(Buffer.from(arrayBuf));
     } else {
       source = createConcatenatedPartsReadable(supabaseServer, storagePrefix, totalParts);
+    }
+
+    // ── Listing exports: physical lines → amazon_staging (Phase 2 only) ─────
+    if (isListingReportType(reportTypeRaw)) {
+      const sep = csvSeparator as "\t" | ",";
+      const fileBuf = await streamToBuffer(source as Readable);
+      let lines = splitPhysicalLines(fileBuf.toString("utf8"));
+      if (headerRowIndex > 0 && headerRowIndex < lines.length) {
+        lines = lines.slice(headerRowIndex);
+      }
+      if (lines.length === 0) {
+        return NextResponse.json({ ok: false, error: "Empty file." }, { status: 400 });
+      }
+
+      let skippedEmpty = 0;
+      let dataLinesPassed = 0;
+      const fileRowsTotal = Math.max(0, lines.length - 1);
+      const dataRowsTotal = fileRowsTotal;
+      let approxStaged = 0;
+      let batch: Record<string, unknown>[] = [];
+      let lastListingProgressWrite = 0;
+
+      const flushListingProgress = async (force: boolean, physicalDone: number) => {
+        if (!force && physicalDone - lastListingProgressWrite < LISTING_PROGRESS_EVERY) return;
+        lastListingProgressWrite = physicalDone;
+        const denom = Math.max(1, dataRowsTotal, estimatedRows ?? 0, physicalDone);
+        const pct = Math.min(99, Math.round((physicalDone / denom) * 100));
+        const { data: prevRow } = await supabaseServer
+          .from("raw_report_uploads")
+          .select("metadata")
+          .eq("id", uploadId)
+          .maybeSingle();
+        await supabaseServer
+          .from("raw_report_uploads")
+          .update({
+            metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
+              row_count: physicalDone,
+              total_rows: dataRowsTotal,
+              process_progress: pct,
+              physical_lines_seen: fileRowsTotal,
+              data_rows_seen: dataLinesPassed,
+              import_metrics: {
+                current_phase: "staging",
+                physical_lines_seen: fileRowsTotal,
+                data_rows_seen: dataLinesPassed,
+                rows_staged: approxStaged + batch.length,
+              },
+            }),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", uploadId)
+          .eq("organization_id", orgId);
+
+        await supabaseServer.from("file_processing_status").upsert(
+          {
+            upload_id: uploadId,
+            organization_id: orgId,
+            status: "processing",
+            current_phase: "staging",
+            current_phase_label: "Phase 2 — Stage to amazon_staging",
+            upload_pct: 100,
+            process_pct: pct,
+            phase1_upload_pct: 100,
+            phase2_stage_pct: pct,
+            phase3_raw_sync_pct: 0,
+            phase4_generic_pct: 0,
+            sync_pct: 0,
+            processed_rows: physicalDone,
+            total_rows: denom,
+            staged_rows_written: approxStaged + batch.length,
+            file_rows_total: fileRowsTotal,
+            data_rows_total: dataRowsTotal,
+            phase2_status: "running",
+            phase2_started_at: new Date().toISOString(),
+            import_metrics: { current_phase: "staging" },
+          },
+          { onConflict: "upload_id" },
+        );
+      };
+
+      const flushBatch = async (rows: Record<string, unknown>[]) => {
+        if (rows.length === 0) return;
+        const { error: insErr } = await supabaseServer.from(STAGING_TABLE).insert(rows);
+        if (insErr) {
+          throw new Error(`Insert into ${STAGING_TABLE} failed: ${insErr.message}`);
+        }
+        approxStaged += rows.length;
+        await flushListingProgress(true, dataLinesPassed);
+      };
+
+      const headerLine = lines[0] ?? "";
+      const headerCells = splitDataLineIntoCells(trimHeaderCell(headerLine), sep).map(trimHeaderCell);
+
+      for (let lineIdx = 1; lineIdx < lines.length; lineIdx++) {
+        const rawLine = lines[lineIdx] ?? "";
+        if (rawLine.trim() === "") {
+          skippedEmpty += 1;
+          void flushListingProgress(false, dataLinesPassed).catch(() => {});
+          continue;
+        }
+        dataLinesPassed += 1;
+
+        /** 1-based physical line index in the original file (matches listing raw `row_number`). */
+        const fileLineNumber = headerRowIndex + lineIdx + 1;
+        const dataCells = splitDataLineIntoCells(rawLine, sep);
+        const row: Record<string, string> = {};
+        for (let j = 0; j < headerCells.length; j++) {
+          row[headerCells[j] ?? `column_${j}`] = dataCells[j] ?? "";
+        }
+        const mappedRow = applyColumnMappingToRow(normalizeAmazonReportRowKeys(row), columnMapping);
+        const source_line_hash = computeListingPhysicalStagingLineHash(uploadId, fileLineNumber, orgId, mappedRow);
+
+        const stagingRow: Record<string, unknown> = {
+          organization_id: orgId,
+          upload_id: uploadId,
+          report_type: reportTypeRaw,
+          row_number: fileLineNumber,
+          source_line_hash,
+          raw_row: mappedRow,
+        };
+        const dateVal =
+          mappedRow["Date"] ??
+          mappedRow["date"] ??
+          mappedRow["Date-Time"] ??
+          mappedRow["date-time"] ??
+          mappedRow["date_time"] ??
+          mappedRow["date/time"] ??
+          "";
+        if (dateVal) {
+          const d = new Date(String(dateVal));
+          if (!Number.isNaN(d.getTime())) {
+            stagingRow.snapshot_date = d.toISOString().slice(0, 10);
+          }
+        }
+
+        batch.push(stagingRow);
+        if (batch.length >= BATCH_SIZE) {
+          const chunk = batch;
+          batch = [];
+          await flushBatch(chunk);
+        }
+        void flushListingProgress(false, dataLinesPassed).catch(() => {});
+      }
+
+      await flushBatch(batch);
+      batch = [];
+
+      const { count: stagingCount } = await supabaseServer
+        .from(STAGING_TABLE)
+        .select("*", { count: "exact", head: true })
+        .eq("upload_id", uploadId)
+        .eq("organization_id", orgId);
+      const rowsInDb = typeof stagingCount === "number" ? stagingCount : approxStaged;
+
+      const { data: prevRow } = await supabaseServer
+        .from("raw_report_uploads")
+        .select("metadata")
+        .eq("id", uploadId)
+        .maybeSingle();
+
+      await supabaseServer
+        .from("raw_report_uploads")
+        .update({
+          status: "staged",
+          import_pipeline_completed_at: null,
+          metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
+            row_count: dataLinesPassed,
+            total_rows: dataRowsTotal,
+            processed_rows: rowsInDb,
+            process_progress: 100,
+            physical_lines_seen: fileRowsTotal,
+            data_rows_seen: dataLinesPassed,
+            staging_row_count: rowsInDb,
+            catalog_listing_file_rows_seen: fileRowsTotal,
+            catalog_listing_data_rows_seen: dataLinesPassed,
+            catalog_listing_raw_rows_stored: 0,
+            catalog_listing_import_phase: "staged",
+            error_message: undefined,
+            import_metrics: {
+              current_phase: "staged",
+              physical_lines_seen: fileRowsTotal,
+              data_rows_seen: dataLinesPassed,
+              rows_staged: rowsInDb,
+              rows_skipped_empty: skippedEmpty,
+            },
+          }),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", uploadId)
+        .eq("organization_id", orgId);
+
+      await supabaseServer.from("file_processing_status").upsert(
+        {
+          upload_id: uploadId,
+          organization_id: orgId,
+          status: "processing",
+          current_phase: "staged",
+          current_phase_label: "Phase 2 complete — ready for raw sync",
+          upload_pct: 100,
+          process_pct: 100,
+          phase1_upload_pct: 100,
+          phase2_stage_pct: 100,
+          phase3_raw_sync_pct: 0,
+          phase4_generic_pct: 0,
+          sync_pct: 0,
+          processed_rows: rowsInDb,
+          total_rows: Math.max(rowsInDb, dataLinesPassed, 1),
+          staged_rows_written: rowsInDb,
+          file_rows_total: fileRowsTotal,
+          data_rows_total: dataRowsTotal,
+          phase2_status: "complete",
+          phase2_completed_at: new Date().toISOString(),
+          error_message: null,
+          import_metrics: {
+            physical_lines_seen: fileRowsTotal,
+            data_rows_seen: dataLinesPassed,
+            rows_staged: rowsInDb,
+            current_phase: "staged",
+          },
+        },
+        { onConflict: "upload_id" },
+      );
+
+      await audit(orgId, "import.stage_completed", uploadId, {
+        rowsStaged: rowsInDb,
+        totalSeen: fileRowsTotal,
+        listing: true,
+        skippedEmpty,
+      });
+
+      return NextResponse.json({
+        ok: true,
+        rowsStaged: rowsInDb,
+        totalRows: fileRowsTotal,
+        pipeline: "phase2_staging_listing",
+      });
     }
 
     const parser = csv({

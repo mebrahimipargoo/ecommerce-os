@@ -15,6 +15,7 @@ function mustNotDowngradeLifecycleToUploading(statusRaw: unknown): boolean {
     s === "ready" ||
     s === "uploaded" ||
     s === "staged" ||
+    s === "raw_synced" ||
     s === "processing" ||
     s === "synced" ||
     s === "complete" ||
@@ -114,7 +115,9 @@ export async function updateUploadAfterChunk(input: {
         organization_id: orgId,
         status: "uploading",
         current_phase: "upload",
+        current_phase_label: "Phase 1 — Upload to storage",
         upload_pct: pct,
+        phase1_upload_pct: pct,
         process_pct: 0,
         sync_pct: 0,
         processed_rows: 0,
@@ -128,6 +131,7 @@ export async function updateUploadAfterChunk(input: {
       .from("file_processing_status")
       .update({
         upload_pct: pct,
+        phase1_upload_pct: pct,
         uploaded_bytes: uploadedBytes,
         file_size_bytes: totalBytes,
       })
@@ -203,7 +207,9 @@ export async function setUploadByteProgress(input: {
         organization_id: orgId,
         status: "uploading",
         current_phase: "upload",
+        current_phase_label: "Phase 1 — Upload to storage",
         upload_pct: pct,
+        phase1_upload_pct: pct,
         process_pct: 0,
         sync_pct: 0,
         processed_rows: 0,
@@ -217,6 +223,7 @@ export async function setUploadByteProgress(input: {
       .from("file_processing_status")
       .update({
         upload_pct: pct,
+        phase1_upload_pct: pct,
         uploaded_bytes: uploadedBytes,
         file_size_bytes: totalBytes,
       })

@@ -16,7 +16,7 @@
  * are triggered from this panel.
  */
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { CheckCircle2, FileText, Loader2, RefreshCw, SquareX, Trash2, UploadCloud, X, Zap } from "lucide-react";
 import { isAdminRole, useUserRole } from "../../../components/UserRoleContext";
@@ -43,6 +43,24 @@ import type { RawReportType } from "../../../lib/raw-report-types";
 import { isListingReportType } from "../../../lib/raw-report-types";
 import { listStores } from "../../settings/adapters/actions";
 import { formatImportPhaseLabel } from "../../../lib/pipeline/import-phase-labels";
+import { AMAZON_LEDGER_UPLOAD_SOURCE } from "../../../lib/raw-report-upload-metadata";
+import {
+  inferUniversalImporterPhase,
+  resolveImportUiActionState,
+  type ImportUiActionInput,
+} from "../../../lib/import-ui-action-state";
+import {
+  buildImportUiActionInputForRemovalShipment,
+  buildRemovalShipmentProgressModel,
+  buildRemovalShipmentTopCardResultMessage,
+  REMOVAL_SHIPMENT_UI_LABELS,
+  resolveRemovalShipmentPrimaryCta,
+} from "../../../lib/import-removal-shipment-ui";
+import {
+  buildListingTopCardResultMessage,
+  LISTING_IMPORT_UI_LABELS,
+  resolveListingImportUiState,
+} from "../../../lib/listing-import-ui";
 
 const RAW_REPORTS_BUCKET = "raw-reports";
 
@@ -84,9 +102,11 @@ type Phase =
   | "processing"      // Phase 2 in progress
   | "staged"          // Phase 2 done — ready for Sync
   | "syncing"         // Phase 3 in progress
-  | "synced"          // Phase 3 done (removal files: ready for Phase 4)
-  | "worklisting"     // Phase 4 in progress (expected_packages)
-  | "worklisted"      // Phase 4 done
+  | "synced"          // Pipeline sync complete (or after generic when applicable)
+  | "raw_synced"      // Phase 3 raw landing done — run Generic (listing / removal shipment)
+  | "genericing"      // Phase 4 generic in progress
+  | "worklisting"     // Generate worklist (FastAPI) in progress
+  | "worklisted"      // Worklist done
   | "error";
 
 type StoreOption = { id: string; name: string; platform: string; is_default?: boolean | null };
@@ -211,9 +231,14 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   const [phaseLabel, setPhaseLabel] = useState<string>("");
 
   const pollRef2 = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isActiveRef = useRef(false);
 
   const stopRef = useRef(false);
   const [sessionUploadId, setSessionUploadId] = useState<string | null>(null);
+  /** Latest server row + FPS — drives action buttons when not mid-flight. */
+  const [serverImportInput, setServerImportInput] = useState<ImportUiActionInput | null>(null);
+  /** Full `file_processing_status` row for REMOVAL_SHIPMENT progress (real counters). */
+  const [sessionFpsRow, setSessionFpsRow] = useState<Record<string, unknown> | null>(null);
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
   const effectiveActorId = actorUserId ?? sessionUserId;
 
@@ -221,7 +246,9 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   const isProcessing = phase === "processing";
   const isSyncing = phase === "syncing";
   const isWorklisting = phase === "worklisting";
-  const isActive = isUploading || isProcessing || isSyncing || isWorklisting;
+  const isGenericing = phase === "genericing";
+  const isActive = isUploading || isProcessing || isSyncing || isWorklisting || isGenericing;
+  isActiveRef.current = isActive;
 
   const isRemovalReport =
     detectedType === "REMOVAL_ORDER" || detectedType === "REMOVAL_SHIPMENT";
@@ -294,6 +321,181 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   useEffect(() => {
     if (storeId && isUuidString(storeId)) onTargetStoreChange?.(storeId);
   }, [storeId, onTargetStoreChange]);
+
+  useEffect(() => {
+    if (!sessionUploadId) {
+      setServerImportInput(null);
+      setSessionFpsRow(null);
+      return;
+    }
+    let cancelled = false;
+    async function tick() {
+      if (isActiveRef.current) return;
+      const { data: rpu, error: rErr } = await supabase
+        .from("raw_report_uploads")
+        .select("report_type, status, metadata")
+        .eq("id", sessionUploadId)
+        .maybeSingle();
+      if (cancelled || rErr || !rpu) return;
+      const { data: fps } = await supabase
+        .from("file_processing_status")
+        .select(
+          "phase2_status, phase3_status, phase4_status, current_phase, current_phase_label, current_target_table, status, upload_pct, process_pct, sync_pct, phase1_upload_pct, phase2_stage_pct, phase3_raw_sync_pct, phase4_generic_pct, staged_rows_written, raw_rows_written, raw_rows_skipped_existing, generic_rows_written, total_rows, processed_rows, file_rows_total, data_rows_total",
+        )
+        .eq("upload_id", sessionUploadId)
+        .maybeSingle();
+      if (cancelled) return;
+      setSessionFpsRow(fps && typeof fps === "object" ? (fps as Record<string, unknown>) : null);
+      const meta =
+        rpu.metadata && typeof rpu.metadata === "object" && !Array.isArray(rpu.metadata)
+          ? (rpu.metadata as Record<string, unknown>)
+          : null;
+      const fpsSnap = fps
+        ? {
+            phase2_status: fps.phase2_status != null ? String(fps.phase2_status) : null,
+            phase3_status: fps.phase3_status != null ? String(fps.phase3_status) : null,
+            phase4_status: fps.phase4_status != null ? String(fps.phase4_status) : null,
+            current_phase: fps.current_phase != null ? String(fps.current_phase) : null,
+            current_phase_label: fps.current_phase_label != null ? String(fps.current_phase_label) : null,
+            current_target_table: fps.current_target_table != null ? String(fps.current_target_table) : null,
+            row_status: fps.status != null ? String(fps.status) : null,
+          }
+        : null;
+      const input: ImportUiActionInput = {
+        reportType: String(rpu.report_type ?? ""),
+        status: String(rpu.status ?? ""),
+        metadata: meta,
+        fps: fpsSnap,
+        isLedgerSession: meta?.source === AMAZON_LEDGER_UPLOAD_SOURCE,
+      };
+      setServerImportInput(input);
+      const built = buildImportUiActionInputForRemovalShipment(input, detectedType);
+      const inferred = inferUniversalImporterPhase(built);
+      if (inferred != null) setPhase(inferred);
+      const rt = String(rpu.report_type ?? "").trim();
+      if (rt && rt !== "UNKNOWN") setDetectedType(rt);
+    }
+    const id = setInterval(() => void tick(), 2000);
+    void tick();
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [sessionUploadId, detectedType]);
+
+  const importActionInput = useMemo(
+    () =>
+      serverImportInput ? buildImportUiActionInputForRemovalShipment(serverImportInput, detectedType) : null,
+    [serverImportInput, detectedType],
+  );
+  const topUi = importActionInput ? resolveImportUiActionState(importActionInput) : null;
+  /** Prefer DB `report_type` from the poll snapshot so actions match Import History. */
+  const effectiveRt = (serverImportInput?.reportType || detectedType || "").trim();
+  const effectiveListing = effectiveRt !== "" && isListingReportType(effectiveRt);
+  const listingImportUi = isListingCatalogReport || effectiveListing;
+  /** Coerce UNKNOWN → REMOVAL_SHIPMENT when session detection matches (same source as top action resolver). */
+  const removalShipmentUi =
+    importActionInput != null
+      ? importActionInput.reportType === "REMOVAL_SHIPMENT"
+      : detectedType === "REMOVAL_SHIPMENT";
+  const importLedgerSession = serverImportInput?.isLedgerSession === true;
+  const rsCta =
+    removalShipmentUi && topUi && serverImportInput
+      ? resolveRemovalShipmentPrimaryCta(topUi, serverImportInput.status, importLedgerSession)
+      : null;
+  const removalProgress = useMemo(() => {
+    if (!removalShipmentUi || !serverImportInput) return null;
+    return buildRemovalShipmentProgressModel(
+      serverImportInput.metadata as Record<string, unknown> | null,
+      sessionFpsRow,
+    );
+  }, [removalShipmentUi, serverImportInput, sessionFpsRow]);
+  const removalResultLine = useMemo(() => {
+    if (!removalShipmentUi || !topUi || !removalProgress) return null;
+    return buildRemovalShipmentTopCardResultMessage(topUi, removalProgress);
+  }, [removalShipmentUi, topUi, removalProgress]);
+
+  const listingUi = useMemo(() => {
+    if (!listingImportUi || removalShipmentUi || !importActionInput) return null;
+    return resolveListingImportUiState({
+      ...importActionInput,
+      client: {
+        localPhase: phase,
+        isProcessing,
+        isSyncing,
+        isGenericing,
+        isUploading,
+      },
+    });
+  }, [
+    listingImportUi,
+    removalShipmentUi,
+    importActionInput,
+    phase,
+    isProcessing,
+    isSyncing,
+    isGenericing,
+    isUploading,
+  ]);
+
+  const listingProgress = listingUi?.progress ?? null;
+  const listingTopLine = useMemo(() => {
+    if (!listingImportUi || removalShipmentUi || !importActionInput) return null;
+    return buildListingTopCardResultMessage({
+      ...importActionInput,
+      client: {
+        localPhase: phase,
+        isProcessing,
+        isSyncing,
+        isGenericing,
+        isUploading,
+      },
+    });
+  }, [
+    listingImportUi,
+    removalShipmentUi,
+    importActionInput,
+    phase,
+    isProcessing,
+    isSyncing,
+    isGenericing,
+    isUploading,
+  ]);
+
+  const showSyncTop =
+    removalShipmentUi
+      ? rsCta != null && !isSyncing && (rsCta === "sync" || rsCta === "retry_sync")
+      : listingImportUi && !removalShipmentUi
+        ? Boolean(listingUi?.showSyncCta)
+        : !isSyncing &&
+          phase !== "raw_synced" &&
+          phase !== "synced" &&
+          phase !== "genericing" &&
+          (phase === "staged" || topUi?.showSync === true);
+  const showGenericTop =
+    removalShipmentUi
+      ? rsCta != null && !isGenericing && (rsCta === "generic" || rsCta === "generic_retry")
+      : listingImportUi && !removalShipmentUi
+        ? Boolean(listingUi?.showGenericCta)
+        : !isGenericing &&
+          (topUi
+            ? topUi.showGeneric || topUi.showRetryGeneric
+            : phase === "raw_synced" && effectiveListing);
+  const showProcessTop =
+    removalShipmentUi
+      ? rsCta != null &&
+        !isProcessing &&
+        !isUploading &&
+        phase !== "needs_mapping" &&
+        (rsCta === "process" || rsCta === "retry_process")
+      : listingImportUi && !removalShipmentUi
+        ? Boolean(listingUi?.showProcessCta) && !isUploading
+        : phase === "mapped";
+  const showWorklistPrimary =
+    phase === "worklisting" ||
+    (effectiveRt === "REMOVAL_ORDER" &&
+      phase !== "worklisted" &&
+      (topUi ? topUi.showWorklist : phase === "synced"));
 
   function bumpHistory() {
     onUploadComplete?.();
@@ -466,14 +668,13 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       setProcessedRows(staged);
       if (total > 0) setTotalRows(total);
       if (useListingProcess) {
-        const cat = json.catalogListing;
-        setListingImportSubphase("done");
+        setListingImportSubphase("staged");
         setProgressMsg(
-          typeof cat?.message === "string" && cat.message.trim() !== ""
-            ? cat.message
-            : `Data rows: ${staged.toLocaleString()}`,
+          total > 0 && total !== staged
+            ? `Staged ${staged.toLocaleString()} / ${total.toLocaleString()} listing lines to amazon_staging. Run Sync to land raw rows and merge catalog.`
+            : `Staged ${staged.toLocaleString()} listing lines to amazon_staging. Run Sync to land raw rows and merge catalog.`,
         );
-        setPhase("synced");
+        setPhase("staged");
       } else {
         setProgressMsg(
           total > 0 && total !== staged
@@ -541,6 +742,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         ok?: boolean;
         error?: string;
         rowsSynced?: number;
+        rowsSkippedCrossUploadDuplicate?: number;
         kind?: string;
       };
       if (!res.ok || !json.ok) throw new Error(json.error ?? "Sync failed.");
@@ -550,14 +752,33 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       setSyncPct(100);
       const rows = json.rowsSynced?.toLocaleString() ?? "?";
       const removal = json.kind === "REMOVAL_ORDER" || json.kind === "REMOVAL_SHIPMENT";
-      setProgressMsg(
-        removal
-          ? json.kind === "REMOVAL_SHIPMENT"
-            ? `Phase 3 complete — ${rows} shipment line(s) archived to amazon_removal_shipments; tracking applied to amazon_removals where rows matched. Run Generate Worklist (Phase 4) for expected_packages.`
-            : `Phase 3 complete — ${rows} row(s) synced to amazon_removals. Run Generate Worklist (Phase 4) for expected_packages.`
-          : `Sync complete — ${rows} rows written.`,
-      );
-      setPhase("synced");
+      const { data: upRow } = await supabase
+        .from("raw_report_uploads")
+        .select("status")
+        .eq("id", sessionUploadId)
+        .maybeSingle();
+      const st = String((upRow as { status?: string } | null)?.status ?? "");
+      const skipDup = json.rowsSkippedCrossUploadDuplicate ?? 0;
+      let syncMsg = `Sync complete — ${rows} rows written.`;
+      if (json.kind && isListingReportType(json.kind)) {
+        syncMsg =
+          st === "raw_synced"
+            ? `Phase 3 complete — raw rows synced to amazon_listing_report_rows_raw. Next: Generic (catalog) for catalog_products.`
+            : `Listing sync finished — ${rows} row(s).`;
+      } else if (removal) {
+        if (json.kind === "REMOVAL_SHIPMENT") {
+          const skipNote =
+            skipDup > 0 ? ` ${skipDup.toLocaleString()} line(s) skipped (already archived from another upload).` : "";
+          syncMsg =
+            st === "raw_synced"
+              ? `Phase 3 complete — ${rows} shipment line(s) written to amazon_removal_shipments.${skipNote} Run Generic for shipment tree / expected_packages enrich.`
+              : `Phase 3 complete — ${rows} shipment line(s) archived.${skipNote}`;
+        } else {
+          syncMsg = `Phase 3 complete — ${rows} row(s) in amazon_removals. Run Generate Worklist for expected_packages when ready.`;
+        }
+      }
+      setProgressMsg(syncMsg);
+      setPhase(st === "raw_synced" ? "raw_synced" : "synced");
       bumpHistory();
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Sync failed.");
@@ -568,6 +789,36 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         clearInterval(pollRef2.current);
         pollRef2.current = null;
       }
+    }
+  }
+
+  /** Phase 4 — listing catalog or removal shipment tree (after raw_synced). */
+  async function runGeneric() {
+    if (!sessionUploadId) return;
+    setErr(null);
+    setPhase("genericing");
+    setProgressMsg("Running generic phase…");
+    try {
+      const res = await fetch("/api/settings/imports/generic", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_id: sessionUploadId }),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string; skipped?: boolean; kind?: string };
+      if (!res.ok || !json.ok) throw new Error(json.error ?? "Generic phase failed.");
+      setProgressMsg(
+        json.skipped === true
+          ? json.kind === "REMOVAL_SHIPMENT"
+            ? "Shipment tree / expected_packages enrich already complete."
+            : "Generic phase already complete for this upload."
+          : "Generic phase complete.",
+      );
+      setPhase("synced");
+      bumpHistory();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Generic phase failed.");
+      setPhase("raw_synced");
+      bumpHistory();
     }
   }
 
@@ -1154,21 +1405,86 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       {phase !== "idle" && (
         <div className="mt-5 space-y-4 rounded-xl border border-border bg-muted/30 px-4 py-4">
 
-          {/* Status message */}
-          {progressMsg && (
-            <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              {isActive && <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden />}
-              {progressMsg}
-            </p>
-          )}
+          {/* Status message — REMOVAL_SHIPMENT uses FPS-backed result line when idle */}
+          {(() => {
+            const line = isActive
+              ? progressMsg
+              : removalShipmentUi
+                ? removalResultLine ?? progressMsg
+                : listingImportUi && !removalShipmentUi
+                  ? listingTopLine ?? progressMsg
+                  : progressMsg;
+            if (!line) return null;
+            const isRsResult =
+              !isActive && removalShipmentUi && removalResultLine != null && line === removalResultLine;
+            const isListingResult =
+              !isActive &&
+              listingImportUi &&
+              !removalShipmentUi &&
+              listingTopLine != null &&
+              line === listingTopLine;
+            const listingLines =
+              isListingResult && line.includes("\n") ? line.split("\n").filter(Boolean) : null;
+            return listingLines && listingLines.length > 1 ? (
+              <div className="space-y-1 text-xs font-semibold text-amber-800 dark:text-amber-200">
+                {listingLines.map((l, idx) => (
+                  <p key={idx} className="flex items-center gap-1.5 leading-snug">
+                    {idx === 0 && isActive && (
+                      <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden />
+                    )}
+                    {l}
+                  </p>
+                ))}
+              </div>
+            ) : (
+              <p
+                className={`flex items-center gap-1.5 text-xs ${
+                  isRsResult || isListingResult
+                    ? "font-semibold text-amber-800 dark:text-amber-200"
+                    : "text-muted-foreground"
+                }`}
+              >
+                {isActive && <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden />}
+                {line}
+              </p>
+            );
+          })()}
 
           {/* ── Phase 1 bars ───────────────────────────────────────────────── */}
           <div className="space-y-2">
             {/* Upload progress */}
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span>{isListingCatalogReport ? "Phase 1 — Upload raw file" : "Phase 1 — Upload"}</span>
-                <span className={uploadPct === 100 ? "text-emerald-500" : ""}>{uploadPct}%</span>
+                <span
+                  title={removalShipmentUi ? REMOVAL_SHIPMENT_UI_LABELS.phase1Subtitle : undefined}
+                >
+                  {removalShipmentUi
+                    ? REMOVAL_SHIPMENT_UI_LABELS.phase1Title
+                    : listingImportUi
+                      ? LISTING_IMPORT_UI_LABELS.phase1Title
+                      : "Phase 1 — Upload"}
+                </span>
+                <span
+                  className={
+                    removalShipmentUi && removalProgress && removalProgress.totalBytes > 0
+                      ? removalProgress.uploadPct >= 100
+                        ? "text-emerald-500"
+                        : "tabular-nums"
+                      : listingImportUi && !removalShipmentUi && listingProgress && listingProgress.totalBytes > 0
+                        ? listingProgress.uploadPct >= 100
+                          ? "text-emerald-500"
+                          : "tabular-nums"
+                        : uploadPct === 100
+                          ? "text-emerald-500"
+                          : ""
+                  }
+                >
+                  {removalShipmentUi && removalProgress && removalProgress.totalBytes > 0
+                    ? `${formatBytes(removalProgress.uploadedBytes)} / ${formatBytes(removalProgress.totalBytes)} (${removalProgress.uploadPct}%)`
+                    : listingImportUi && !removalShipmentUi && listingProgress && listingProgress.totalBytes > 0
+                      ? `${formatBytes(listingProgress.uploadedBytes)} / ${formatBytes(listingProgress.totalBytes)} (${listingProgress.uploadPct}%)`
+                      : `${uploadPct}%`}
+                </span>
               </div>
               <div className="relative h-2 overflow-hidden rounded-full bg-muted">
                 {isUploading && uploadPct < 100 && (
@@ -1176,7 +1492,15 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                 )}
                 <div
                   className="h-full rounded-full bg-sky-500 transition-all duration-500"
-                  style={{ width: `${uploadPct}%` }}
+                  style={{
+                    width: `${
+                      removalShipmentUi && removalProgress && removalProgress.totalBytes > 0
+                        ? removalProgress.uploadPct
+                        : listingImportUi && !removalShipmentUi && listingUi
+                          ? listingUi.phase1Pct
+                          : uploadPct
+                    }%`,
+                  }}
                 />
               </div>
             </div>
@@ -1205,7 +1529,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                     : "bg-violet-500"
                   }`}
                   style={{
-                    width: [
+                                       width: [
                       "mapped",
                       "needs_mapping",
                       "unsupported",
@@ -1213,6 +1537,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                       "staged",
                       "syncing",
                       "synced",
+                      "raw_synced",
+                      "genericing",
                       "worklisting",
                       "worklisted",
                     ].includes(phase)
@@ -1231,6 +1557,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
               phase === "staged" ||
               phase === "syncing" ||
               phase === "synced" ||
+              phase === "raw_synced" ||
+              phase === "genericing" ||
               phase === "worklisting" ||
               phase === "worklisted") && (
             <div className="flex items-center gap-2 rounded-lg border border-emerald-400/40 bg-emerald-500/10 px-3 py-2">
@@ -1259,32 +1587,60 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           {(phase === "processing" ||
             phase === "staged" ||
             phase === "syncing" ||
+            phase === "raw_synced" ||
+            phase === "genericing" ||
             phase === "synced" ||
             phase === "worklisting" ||
             phase === "worklisted") && (
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span>
-                  {isListingCatalogReport
-                    ? phase === "synced"
-                      ? "✓ Phases 2–3 complete"
-                      : listingImportSubphase === "canonical_sync"
-                        ? "Phase 3 — Sync canonical catalog"
-                        : "Phase 2 — Parse and store raw rows"
-                    : phaseLabel
-                      ? `${phaseLabel} — staging`
-                      : "Staging — copy rows to amazon_staging"}
+                <span
+                  title={
+                    removalShipmentUi
+                      ? REMOVAL_SHIPMENT_UI_LABELS.phase2Subtitle
+                      : listingImportUi
+                        ? LISTING_IMPORT_UI_LABELS.phase2Subtitle
+                        : undefined
+                  }
+                >
+                  {removalShipmentUi
+                    ? REMOVAL_SHIPMENT_UI_LABELS.phase2Title
+                    : listingImportUi
+                      ? phase === "processing"
+                        ? LISTING_IMPORT_UI_LABELS.phase2Title
+                        : `✓ ${LISTING_IMPORT_UI_LABELS.phase2Title}`
+                      : phaseLabel
+                        ? `${phaseLabel} — staging`
+                        : "Phase 2 — Stage to amazon_staging"}
                 </span>
                 <span className={phase !== "processing" ? "text-emerald-500" : "tabular-nums"}>
-                  {phase === "processing"
-                    ? totalRows > 0
-                      ? `${processedRows.toLocaleString()} / ${totalRows.toLocaleString()} rows (${processPct}%)`
-                      : processPct > 0
-                        ? `${processPct}%`
-                        : "running…"
-                    : processedRows > 0
-                      ? `✓ ${processedRows.toLocaleString()}${totalRows > 0 && totalRows !== processedRows ? ` / ${totalRows.toLocaleString()}` : ""} rows`
-                      : "✓ done"}
+                  {removalShipmentUi && removalProgress
+                    ? phase === "processing"
+                      ? removalProgress.dataRowsTotal > 0 || removalProgress.stagedRowsWritten > 0
+                        ? `${removalProgress.stagedRowsWritten.toLocaleString()} / ${removalProgress.dataRowsTotal.toLocaleString()} (${removalProgress.phase2Pct}%)`
+                        : processPct > 0
+                          ? `${processPct}%`
+                          : "running…"
+                      : `✓ ${removalProgress.stagedRowsWritten.toLocaleString()} / ${removalProgress.dataRowsTotal.toLocaleString()} row(s)`
+                    : listingImportUi && !removalShipmentUi && listingProgress
+                      ? phase === "processing"
+                        ? listingProgress.dataRowsTotal > 0 || listingProgress.stagedRowsWritten > 0
+                          ? `${listingProgress.stagedRowsWritten.toLocaleString()} / ${listingProgress.dataRowsTotal.toLocaleString()} (${listingUi?.phase2Pct ?? listingProgress.phase2Pct}%)`
+                          : totalRows > 0
+                            ? `${processedRows.toLocaleString()} / ${totalRows.toLocaleString()} rows (${processPct}%)`
+                            : processPct > 0
+                              ? `${processPct}%`
+                              : "running…"
+                        : `✓ ${listingProgress.stagedRowsWritten.toLocaleString()} / ${listingProgress.dataRowsTotal.toLocaleString()} row(s)`
+                    : phase === "processing"
+                      ? totalRows > 0
+                        ? `${processedRows.toLocaleString()} / ${totalRows.toLocaleString()} rows (${processPct}%)`
+                        : processPct > 0
+                          ? `${processPct}%`
+                          : "running…"
+                      : processedRows > 0
+                        ? `✓ ${processedRows.toLocaleString()}${totalRows > 0 && totalRows !== processedRows ? ` / ${totalRows.toLocaleString()}` : ""} rows`
+                        : "✓ done"}
                 </span>
               </div>
               <div className="relative h-2 overflow-hidden rounded-full bg-muted">
@@ -1293,31 +1649,70 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                 )}
                 <div
                   className="h-full rounded-full bg-sky-500 transition-all duration-500"
-                  style={{ width: phase === "processing" ? `${Math.max(5, processPct)}%` : "100%" }}
+                  style={{
+                    width: `${
+                      removalShipmentUi && removalProgress
+                        ? phase === "processing"
+                          ? Math.max(5, removalProgress.phase2Pct)
+                          : 100
+                        : listingImportUi && !removalShipmentUi && listingProgress
+                          ? phase === "processing"
+                            ? Math.max(5, listingUi?.phase2Pct ?? listingProgress.phase2Pct)
+                            : 100
+                          : phase === "processing"
+                            ? Math.max(5, processPct)
+                            : 100
+                    }%`,
+                  }}
                 />
               </div>
             </div>
           )}
 
-          {/* ── Phase 3 bar (Sync) — not used for listing catalog imports (raw + catalog run in Process). ── */}
-          {!isListingCatalogReport &&
-            (phase === "syncing" ||
-              phase === "synced" ||
-              phase === "worklisting" ||
-              phase === "worklisted") && (
+          {/* ── Phase 3 bar (raw sync) ───────────────────────────────────────── */}
+          {(phase === "syncing" ||
+            phase === "raw_synced" ||
+            phase === "genericing" ||
+            phase === "synced" ||
+            phase === "worklisting" ||
+            phase === "worklisted") && (
             <div>
               <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span>Phase 3 — Sync to amazon_removals</span>
+                <span
+                  title={
+                    removalShipmentUi
+                      ? REMOVAL_SHIPMENT_UI_LABELS.phase3Subtitle
+                      : listingImportUi
+                        ? LISTING_IMPORT_UI_LABELS.phase3Subtitle
+                        : undefined
+                  }
+                >
+                  {listingImportUi
+                    ? LISTING_IMPORT_UI_LABELS.phase3Title
+                    : removalShipmentUi
+                      ? REMOVAL_SHIPMENT_UI_LABELS.phase3Title
+                      : isRemovalReport && detectedType === "REMOVAL_SHIPMENT"
+                        ? "Phase 3 — Raw sync → amazon_removal_shipments"
+                        : "Phase 3 — Raw sync to destination table"}
+                </span>
                 <span
                   className={
-                    phase === "synced" || phase === "worklisting" || phase === "worklisted"
+                    phase === "raw_synced" ||
+                    phase === "genericing" ||
+                    phase === "synced" ||
+                    phase === "worklisting" ||
+                    phase === "worklisted"
                       ? "text-emerald-500"
                       : "tabular-nums"
                   }
                 >
                   {phase === "syncing"
                     ? `${Math.max(0, Math.min(100, syncPct))}%`
-                    : "✓ complete"}
+                    : removalShipmentUi && removalProgress
+                      ? `✓ archived ${removalProgress.rawRowsWritten.toLocaleString()} shipment line(s), skipped ${removalProgress.rawRowsSkippedExisting.toLocaleString()} already-archived line(s)`
+                      : listingImportUi && !removalShipmentUi && listingProgress
+                        ? `✓ raw ${listingProgress.listingRawArchived.toLocaleString()} archived, skipped existing ${listingProgress.listingRawSkipped.toLocaleString()} (${listingUi?.phase3Pct ?? listingProgress.phase3Pct}%)`
+                      : "✓ complete"}
                 </span>
               </div>
               <div className="relative h-2 overflow-hidden rounded-full bg-muted">
@@ -1327,19 +1722,111 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
                 <div
                   className="h-full rounded-full bg-emerald-500 transition-all duration-500"
                   style={{
-                    width: `${phase === "syncing" ? Math.max(5, Math.min(100, syncPct)) : 100}%`,
+                    width: `${
+                      removalShipmentUi && removalProgress
+                        ? phase === "syncing"
+                          ? Math.max(5, Math.min(100, syncPct))
+                          : Math.min(100, removalProgress.phase3Pct)
+                        : listingImportUi && !removalShipmentUi && listingProgress
+                          ? phase === "syncing"
+                            ? Math.max(5, Math.min(100, syncPct))
+                            : Math.min(100, listingUi?.phase3Pct ?? listingProgress.phase3Pct)
+                          : phase === "syncing"
+                            ? Math.max(5, Math.min(100, syncPct))
+                            : 100
+                    }%`,
                   }}
                 />
               </div>
             </div>
           )}
 
-          {/* ── Phase 4 bar (Generate Worklist — removal types only) ─────────── */}
-          {isRemovalReport &&
+          {/* ── Phase 4 — removal shipment tree OR listing catalog (same phases; labels differ). ── */}
+          {(phase === "raw_synced" ||
+            phase === "genericing" ||
+            phase === "synced" ||
+            phase === "worklisting" ||
+            phase === "worklisted") &&
+            (removalShipmentUi || (listingImportUi && !removalShipmentUi)) && (
+            <div>
+              <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
+                <span
+                  title={
+                    removalShipmentUi
+                      ? REMOVAL_SHIPMENT_UI_LABELS.phase4Subtitle
+                      : LISTING_IMPORT_UI_LABELS.phase4Subtitle
+                  }
+                >
+                  {removalShipmentUi
+                    ? REMOVAL_SHIPMENT_UI_LABELS.phase4Title
+                    : LISTING_IMPORT_UI_LABELS.phase4Title}
+                </span>
+                <span
+                  className={
+                    phase === "genericing"
+                      ? "tabular-nums"
+                      : topUi && !topUi.phase4Complete
+                        ? "text-muted-foreground"
+                        : "text-emerald-500"
+                  }
+                >
+                  {removalShipmentUi && removalProgress
+                    ? phase === "genericing"
+                      ? `${removalProgress.genericRowsWritten.toLocaleString()} / ${removalProgress.genericEligible.toLocaleString()} (${removalProgress.phase4Pct}%)`
+                      : topUi?.phase4Complete
+                        ? `✓ ${removalProgress.genericRowsWritten.toLocaleString()} / ${removalProgress.genericEligible.toLocaleString()} enriched`
+                        : `pending — ${removalProgress.genericRowsWritten.toLocaleString()} / ${removalProgress.genericEligible.toLocaleString()}`
+                    : listingImportUi && !removalShipmentUi && listingProgress
+                      ? phase === "genericing"
+                        ? `${listingProgress.phase4Numerator.toLocaleString()} / ${listingProgress.catalogEligibleRows.toLocaleString()} (${listingUi?.phase4Pct ?? listingProgress.phase4Pct}%)`
+                        : topUi?.phase4Complete
+                          ? `✓ new ${listingProgress.catalogRowsNew.toLocaleString()}, updated ${listingProgress.catalogRowsUpdated.toLocaleString()}, unchanged ${listingProgress.catalogRowsUnchanged.toLocaleString()}`
+                          : `pending — Generic (catalog) — ${listingProgress.phase4Numerator.toLocaleString()} / ${listingProgress.catalogEligibleRows > 0 ? listingProgress.catalogEligibleRows.toLocaleString() : "—"} eligible`
+                    : phase === "genericing"
+                      ? "…"
+                      : topUi?.phase4Complete
+                        ? "✓ complete"
+                        : "pending — run Generic"}
+                </span>
+              </div>
+              <div className="relative h-2 overflow-hidden rounded-full bg-muted">
+                {phase === "genericing" && (
+                  <div className="absolute inset-0 animate-pulse rounded-full bg-violet-400/50" />
+                )}
+                <div
+                  className="h-full rounded-full bg-violet-500 transition-all duration-500"
+                  style={{
+                    width: `${
+                      removalShipmentUi && removalProgress
+                        ? phase === "genericing"
+                          ? Math.max(5, removalProgress.phase4Pct)
+                          : topUi?.phase4Complete
+                            ? 100
+                            : Math.max(10, removalProgress.phase4Pct)
+                        : listingImportUi && !removalShipmentUi && listingProgress
+                          ? phase === "genericing"
+                            ? Math.max(5, listingUi?.phase4Pct ?? listingProgress.phase4Pct)
+                            : topUi?.phase4Complete
+                              ? 100
+                              : Math.max(10, listingUi?.phase4Pct ?? listingProgress.phase4Pct)
+                          : phase === "genericing"
+                            ? 45
+                            : topUi?.phase4Complete
+                              ? 100
+                              : 12
+                    }%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* ── Phase 5 bar (Generate Worklist — removal orders only) ───────── */}
+          {effectiveRt === "REMOVAL_ORDER" &&
             (phase === "synced" || phase === "worklisting" || phase === "worklisted") && (
               <div key={`worklist-bar-${worklistBarEpoch}`}>
                 <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                  <span>Phase 4 — Generate Worklist (expected_packages)</span>
+                  <span>Phase 5 — Generate Worklist (expected_packages)</span>
                   <span
                     className={
                       phase === "worklisted" ? "text-emerald-500" : "tabular-nums"
@@ -1403,17 +1890,28 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         )}
 
         {/* Phase 2: Process Data — appears after Phase 1 succeeds */}
-        {phase === "mapped" && (
+        {showProcessTop && (
           <button
             type="button"
+            disabled={listingImportUi && !removalShipmentUi && listingUi?.busyAction === "process"}
             onClick={() => void runProcess()}
-            className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-sky-700"
+            className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-sky-700 disabled:opacity-70"
           >
-            <Loader2 className="h-4 w-4" aria-hidden />
-            Process Data
+            {listingImportUi && !removalShipmentUi && listingUi?.busyAction === "process" ? (
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            ) : (
+              <Zap className="h-4 w-4" aria-hidden />
+            )}
+            {removalShipmentUi
+              ? rsCta === "retry_process"
+                ? "Retry Process"
+                : "Process"
+              : listingImportUi && !removalShipmentUi && listingUi
+                ? listingUi.topCardButtonLabel
+                : "Process Data"}
           </button>
         )}
-        {isProcessing && (
+        {isProcessing && !(listingImportUi && !removalShipmentUi) && (
           <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
             <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
             Processing…
@@ -1421,25 +1919,66 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         )}
 
         {/* Phase 3: Sync to Final Tables — appears after Phase 2 succeeds */}
-        {phase === "staged" && (
+        {showSyncTop && (
           <button
             type="button"
+            disabled={listingImportUi && !removalShipmentUi && listingUi?.busyAction === "sync"}
             onClick={() => void runSync()}
-            className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-emerald-700"
+            className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-emerald-700 disabled:opacity-70"
           >
-            <CheckCircle2 className="h-4 w-4" aria-hidden />
-            Sync to Final Tables
+            {listingImportUi && !removalShipmentUi && listingUi?.busyAction === "sync" ? (
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            ) : (
+              <CheckCircle2 className="h-4 w-4" aria-hidden />
+            )}
+            {removalShipmentUi
+              ? rsCta === "retry_sync"
+                ? "Retry Sync"
+                : "Sync"
+              : listingImportUi && !removalShipmentUi && listingUi
+                ? listingUi.topCardButtonLabel
+                : "Sync to Final Tables"}
           </button>
         )}
-        {isSyncing && (
+        {isSyncing && !(listingImportUi && !removalShipmentUi) && (
           <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
             <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
             Syncing…
           </button>
         )}
 
-        {/* Phase 4: Generate Worklist — removal imports only, after Phase 3 */}
-        {phase === "synced" && isRemovalReport && (
+        {showGenericTop && (
+          <button
+            type="button"
+            disabled={listingImportUi && !removalShipmentUi && listingUi?.busyAction === "generic"}
+            onClick={() => void runGeneric()}
+            className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-violet-700 disabled:opacity-70"
+          >
+            {listingImportUi && !removalShipmentUi && listingUi?.busyAction === "generic" ? (
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            ) : (
+              <CheckCircle2 className="h-4 w-4" aria-hidden />
+            )}
+            {removalShipmentUi
+              ? rsCta === "generic_retry"
+                ? "Retry Generic (shipments)"
+                : "Generic (shipments)"
+              : listingImportUi && !removalShipmentUi && listingUi
+                ? listingUi.topCardButtonLabel
+                : topUi?.showRetryGeneric
+                  ? "Retry Generic Phase"
+                  : "Run Generic Phase"}
+          </button>
+        )}
+        {isGenericing && !(listingImportUi && !removalShipmentUi) && (
+          <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
+            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            Generic phase…
+          </button>
+        )}
+
+        {/* Generate Worklist — removal orders only (registry); shipment tree generic already enriches expected_packages */}
+        {showWorklistPrimary && phase !== "worklisting" && (
           <button
             type="button"
             onClick={() => void runWorklist()}
@@ -1485,25 +2024,42 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         )}
 
         {/* Completion notes */}
-        {phase === "synced" && !isRemovalReport && !isListingCatalogReport && (
+        {phase === "synced" &&
+          effectiveRt !== "REMOVAL_ORDER" &&
+          !removalShipmentUi &&
+          !listingImportUi && (
           <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">
             All 3 phases complete. Data is in the destination tables.
           </p>
         )}
-        {phase === "synced" && isListingCatalogReport && progressMsg && (
+        {phase === "synced" && listingImportUi && progressMsg && (
           <p className="whitespace-pre-line text-xs font-semibold text-emerald-600 dark:text-emerald-400">
             {progressMsg}
           </p>
         )}
-        {phase === "synced" && isRemovalReport && (
+        {phase === "synced" && effectiveRt === "REMOVAL_ORDER" && (
           <p className="text-xs font-semibold text-amber-700 dark:text-amber-400">
             Phase 3 complete (amazon_removals). Click <strong>Generate Worklist</strong> to sync{" "}
             <code className="rounded bg-muted px-1 text-foreground">expected_packages</code> for the scanner.
           </p>
         )}
-        {phase === "worklisted" && isRemovalReport && (
+        {(phase === "synced" || phase === "raw_synced") &&
+          removalShipmentUi &&
+          topUi &&
+          !topUi.phase4Complete && (
+          <p className="text-xs font-semibold text-amber-700 dark:text-amber-400">
+            Phase 3 archived lines to <strong>amazon_removal_shipments</strong>. Run <strong>Generic</strong> for shipment
+            tree / expected_packages enrich — no separate Generate Worklist step for this report.
+          </p>
+        )}
+        {phase === "synced" && removalShipmentUi && topUi?.phase4Complete && (
           <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">
-            All 4 phases complete. Removal data and warehouse worklist are ready.
+            All phases complete — shipment tree / expected_packages enrich finished for this upload.
+          </p>
+        )}
+        {phase === "worklisted" && effectiveRt === "REMOVAL_ORDER" && (
+          <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">
+            All phases complete. Removal order data and warehouse worklist are ready.
           </p>
         )}
       </div>

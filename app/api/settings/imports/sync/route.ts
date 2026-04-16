@@ -11,7 +11,7 @@
  *   FBA_RETURNS … MONTHLY_STORAGE_FEES → raw landing upsert on
  *   (organization_id, source_file_sha256, source_physical_row_number) — one domain row per physical CSV line.
  *   REMOVAL_ORDER    → amazon_removals         (business line — see `uq_amazon_removals_business_line`)
- *   REMOVAL_SHIPMENT → amazon_removal_shipments (staging-line identity; unchanged)
+ *   REMOVAL_SHIPMENT → amazon_removal_shipments (row_number + cross-upload business skip; Phase 4 only for tree / expected_packages)
  *
  * JSONB Fallback: any CSV column not matched by the typed mapper is stored in
  * the `raw_data` JSONB column — this permanently prevents schema cache crashes.
@@ -67,18 +67,32 @@ import {
   uniqueBusinessKeyCount,
   uniqueKeyCount,
 } from "../../../../../lib/pipeline/amazon-removals-business-key";
-import { CONFLICT_KEY, DOMAIN_TABLE, type AmazonSyncKind } from "../../../../../lib/pipeline/amazon-report-registry";
+import { mapStagingMappedRowToListingRawInsert } from "../../../../../lib/import-listing-physical-lines";
+import {
+  CONFLICT_KEY,
+  DOMAIN_TABLE,
+  isListingAmazonSyncKind,
+  requiresPhase4Generic,
+  resolveAmazonImportSyncKind,
+  type AmazonSyncKind,
+} from "../../../../../lib/pipeline/amazon-report-registry";
+import { removalShipmentArchiveBusinessKey } from "../../../../../lib/pipeline/removal-shipment-archive-key";
 import {
   measureBatchUpsertMetrics,
   type BatchUpsertMetricDelta,
 } from "../../../../../lib/pipeline/amazon-sync-batch-metrics";
 import { removeOlderRemovalImportsWithSameFileContent } from "@/app/(admin)/imports/import-actions";
-import { mergeUploadMetadata } from "../../../../../lib/raw-report-upload-metadata";
+import {
+  mergeUploadMetadata,
+  type ImportRunMetrics,
+} from "../../../../../lib/raw-report-upload-metadata";
+import { syncFinancialReferenceResolverForUpload } from "../../../../../lib/financial-reference-resolver-sync";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 
 export const runtime = "nodejs";
-export const maxDuration = 300;
+/** Large listing files — Phase 3 raw upserts only (catalog is Phase 4 Generic). */
+export const maxDuration = 800;
 
 const BATCH_SIZE = 500;
 /** Max rows per Postgres upsert call — enables granular sync_progress updates. */
@@ -199,6 +213,24 @@ type Body = { upload_id?: string };
 
 type SyncKind = AmazonSyncKind;
 
+/** Typed columns on `amazon_listing_report_rows_raw` (overflow not used — payloads are pre-shaped). */
+const NATIVE_COLUMNS_LISTING_RAW = new Set([
+  "organization_id",
+  "store_id",
+  "source_upload_id",
+  "source_report_type",
+  "row_number",
+  "source_file_sha256",
+  "source_physical_row_number",
+  "seller_sku",
+  "asin",
+  "listing_id",
+  "raw_payload",
+  "source_line_hash",
+  "parse_status",
+  "parse_error",
+]);
+
 /** NATIVE_COLUMNS set for each sync kind — passed to packPayloadForSupabase(). */
 const NATIVE_COLUMNS_MAP: Record<SyncKind, Set<string> | null> = {
   FBA_RETURNS:           NATIVE_COLUMNS_RETURNS,
@@ -218,6 +250,9 @@ const NATIVE_COLUMNS_MAP: Record<SyncKind, Set<string> | null> = {
   RESERVED_INVENTORY:    NATIVE_COLUMNS_RESERVED_INVENTORY,
   FEE_PREVIEW:           NATIVE_COLUMNS_FEE_PREVIEW,
   MONTHLY_STORAGE_FEES:  NATIVE_COLUMNS_MONTHLY_STORAGE_FEES,
+  CATEGORY_LISTINGS:     NATIVE_COLUMNS_LISTING_RAW,
+  ALL_LISTINGS:          NATIVE_COLUMNS_LISTING_RAW,
+  ACTIVE_LISTINGS:       NATIVE_COLUMNS_LISTING_RAW,
   UNKNOWN:               null,
 };
 
@@ -293,7 +328,66 @@ function mergeRemovalOrderRowsPreferNonNull(
  * `uq_amazon_removal_shipments_org_upload_staging` (see 20260521_wave1_removal_store_dual_dedupe
  * and migration dropping business-line uniqueness for raw archive).
  */
-const REMOVAL_SHIPMENT_STAGING_CONFLICT = "organization_id,upload_id,amazon_staging_id";
+/** Idempotent per physical CSV line when staging is recreated (see migration20260619). */
+const REMOVAL_SHIPMENT_ROW_NUMBER_CONFLICT = "organization_id,upload_id,staging_row_number";
+
+async function loadCrossUploadShipmentBusinessKeySet(opts: {
+  orgId: string;
+  storeId: string;
+  excludeUploadId: string;
+  orderIds: string[];
+  trackingNumbers: string[];
+}): Promise<Set<string>> {
+  const keys = new Set<string>();
+  const { orgId, storeId, excludeUploadId } = opts;
+  const orderIds = [...new Set(opts.orderIds.map((s) => pgTextUniqueField(s) ?? "").filter(Boolean))].slice(0, 2000);
+  const trackingNumbers = [
+    ...new Set(opts.trackingNumbers.map((s) => pgTextUniqueField(s) ?? "").filter(Boolean)),
+  ].slice(0, 2000);
+
+  const ingest = (rows: Record<string, unknown>[] | null) => {
+    for (const row of rows ?? []) {
+      const k = removalShipmentArchiveBusinessKey(row);
+      if (k) keys.add(k);
+    }
+  };
+
+  for (let i = 0; i < orderIds.length; i += 80) {
+    const chunk = orderIds.slice(i, i + 80);
+    const { data, error } = await supabaseServer
+      .from("amazon_removal_shipments")
+      .select(
+        "organization_id,store_id,order_id,tracking_number,sku,fnsku,disposition,requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date,order_type,carrier,shipment_date",
+      )
+      .eq("organization_id", orgId)
+      .eq("store_id", storeId)
+      .neq("upload_id", excludeUploadId)
+      .in("order_id", chunk);
+    if (error) {
+      throw new Error(`[REMOVAL_SHIPMENT] cross-upload shipment key prefetch failed: ${error.message}`);
+    }
+    ingest(data as Record<string, unknown>[]);
+  }
+
+  for (let i = 0; i < trackingNumbers.length; i += 80) {
+    const chunk = trackingNumbers.slice(i, i + 80);
+    const { data, error } = await supabaseServer
+      .from("amazon_removal_shipments")
+      .select(
+        "organization_id,store_id,order_id,tracking_number,sku,fnsku,disposition,requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date,order_type,carrier,shipment_date",
+      )
+      .eq("organization_id", orgId)
+      .eq("store_id", storeId)
+      .neq("upload_id", excludeUploadId)
+      .in("tracking_number", chunk);
+    if (error) {
+      throw new Error(`[REMOVAL_SHIPMENT] cross-upload shipment key prefetch failed: ${error.message}`);
+    }
+    ingest(data as Record<string, unknown>[]);
+  }
+
+  return keys;
+}
 
 /**
  * Patch `amazon_removals` from typed `amazon_removal_shipments` — fill missing fields only
@@ -392,313 +486,336 @@ async function releaseRemovalPipelineLock(uploadId: string): Promise<void> {
 }
 
 /**
- * REMOVAL_SHIPMENT: for each staging line, upsert into `amazon_removal_shipments` (raw archive) using
- * staging identity only (`organization_id`, `upload_id`, `amazon_staging_id`). After sync, shipment
- * tree + allocations are rebuilt via DB RPCs (legacy per-batch enrichment of `amazon_removals` is bypassed).
+ * REMOVAL_SHIPMENT Phase 3: land rows in `amazon_removal_shipments` only.
+ * Idempotent per upload via `staging_row_number` (stable when staging is recreated).
+ * Skips inserts when the same logical shipment line already exists from another upload.
+ * Does not call shipment tree / expected_packages RPCs (Phase 4 only).
  */
 async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
   synced: number;
   mapperNullCount: number;
+  rawRowsWritten: number;
+  rawRowsSkippedCrossUpload: number;
 }> {
   const { uploadId, orgId, storeId, totalStagingRows, columnMapping, syncUpserted } = opts;
 
   await acquireRemovalPipelineLock(orgId, storeId, uploadId);
 
   try {
-  let shipmentArchiveRowsAttempted = 0;
-  let shipmentArchiveRowsWritten = 0;
-
-  let archived = 0;
-  let mapperNull = 0;
-  const removalsUpdated = 0;
-  let loggedShipmentRawKeys = false;
-  let loggedShipmentMappedSample = false;
-
-  const REMOVAL_ENRICH_VERIFY_FIELDS = [
-    "tracking_number",
-    "carrier",
-    "shipment_date",
-    "order_date",
-    "order_type",
-  ] as const;
-
-  let verifyAStagingFetched = 0;
-  let verifyAShipmentWritten = 0;
-  let verifyAStagingDeleted = 0;
-  let verifyBEnrichConsidered = 0;
-  let verifyBEnrichMatched = 0;
-  let verifyBEnrichUpdatedOk = 0;
-  const verifyBEnrichFieldInPayload: Record<string, number> = {};
-  for (const k of REMOVAL_ENRICH_VERIFY_FIELDS) verifyBEnrichFieldInPayload[k] = 0;
-
-  let removalShipmentBatchIndex = 0;
-
-  while (true) {
-    removalShipmentBatchIndex++;
-    const { data: stagingRows, error: readErr } = await supabaseServer
-      .from(STAGING_TABLE)
-      .select("id, raw_row")
-      .eq("upload_id", uploadId)
-      .eq("organization_id", orgId)
-      .order("id", { ascending: true })
-      .limit(STAGING_READ_BATCH);
-
-    if (readErr) throw new Error(`Staging read failed: ${readErr.message}`);
-    if (!stagingRows || stagingRows.length === 0) break;
-
-    const ids = stagingRows.map((r) => r.id as string);
-
-    const archiveRows: Record<string, unknown>[] = [];
-    for (const sr of stagingRows) {
-      const rawObj = parseStagingRawRow(sr.raw_row);
-      if (!loggedShipmentRawKeys && Object.keys(rawObj).length > 0) {
-        loggedShipmentRawKeys = true;
-        console.log(
-          JSON.stringify({
-            phase: "REMOVAL_SHIPMENT_raw_row_keys",
-            upload_id: uploadId,
-            keys: Object.keys(rawObj).sort(),
-          }),
-        );
-      }
-      const mappedRow = applyColumnMappingToRow(rawObj, columnMapping);
-      const mappedRemoval = mapRowToAmazonRemovalShipment(mappedRow, orgId, uploadId, storeId) as Record<
-        string,
-        unknown
-      > | null;
-      if (!loggedShipmentMappedSample && mappedRemoval) {
-        loggedShipmentMappedSample = true;
-        console.log(
-          JSON.stringify({
-            phase: "REMOVAL_SHIPMENT_mapped_sample_before_upsert",
-            upload_id: uploadId,
-            store_id: storeId,
-            sample: {
-              order_id: mappedRemoval.order_id,
-              tracking_number: mappedRemoval.tracking_number,
-              carrier: mappedRemoval.carrier,
-              shipment_date: mappedRemoval.shipment_date,
-              order_date: mappedRemoval.order_date,
-              order_type: mappedRemoval.order_type,
-              sku: mappedRemoval.sku,
-              fnsku: mappedRemoval.fnsku,
-              disposition: mappedRemoval.disposition,
-              requested_quantity: mappedRemoval.requested_quantity,
-              shipped_quantity: mappedRemoval.shipped_quantity,
-              disposed_quantity: mappedRemoval.disposed_quantity,
-              cancelled_quantity: mappedRemoval.cancelled_quantity,
-            },
-          }),
-        );
-      }
-      const baseArchive: Record<string, unknown> = {
-        organization_id: orgId,
-        upload_id: uploadId,
-        amazon_staging_id: sr.id,
-        store_id: storeId,
-        raw_row: rawObj,
-      };
-      if (mappedRemoval) {
-        Object.assign(baseArchive, {
-          order_id: mappedRemoval.order_id ?? null,
-          sku: mappedRemoval.sku ?? null,
-          fnsku: mappedRemoval.fnsku ?? null,
-          disposition: mappedRemoval.disposition ?? null,
-          tracking_number: mappedRemoval.tracking_number ?? null,
-          carrier: mappedRemoval.carrier ?? null,
-          shipment_date: mappedRemoval.shipment_date ?? null,
-          order_date: mappedRemoval.order_date ?? null,
-          order_type: mappedRemoval.order_type ?? null,
-          requested_quantity: mappedRemoval.requested_quantity ?? null,
-          shipped_quantity: mappedRemoval.shipped_quantity ?? null,
-          disposed_quantity: mappedRemoval.disposed_quantity ?? null,
-          cancelled_quantity: mappedRemoval.cancelled_quantity ?? null,
-        });
-      }
-      archiveRows.push(baseArchive);
-      if (!mappedRemoval) mapperNull++;
-    }
-
-    shipmentArchiveRowsAttempted += archiveRows.length;
-
-    for (let i = 0; i < archiveRows.length; i += UPSERT_CHUNK_SIZE) {
-      const chunk = archiveRows.slice(i, i + UPSERT_CHUNK_SIZE);
-      if (chunk.length === 0) continue;
-      const { error: upsertErr } = await supabaseServer.from("amazon_removal_shipments").upsert(chunk, {
-        onConflict: REMOVAL_SHIPMENT_STAGING_CONFLICT,
-        ignoreDuplicates: false,
-      });
-      if (upsertErr) {
-        throw new Error(
-          `[REMOVAL_SHIPMENT] upsert (staging-key) into amazon_removal_shipments failed: ${upsertErr.message}`,
-        );
-      }
-    }
-
-    shipmentArchiveRowsWritten += archiveRows.length;
-
-    archived += archiveRows.length;
-    await bumpSyncProgressMetadata(
-      { uploadId, orgId, totalStagingRows, upserted: syncUpserted },
-      archiveRows.length,
+    console.log(
+      `[REMOVAL_SHIPMENT] Phase 3 raw sync — destination=amazon_removal_shipments only; ` +
+        `expected_packages and shipment tree are not mutated here (Phase 4 Generic). upload_id=${uploadId}`,
     );
 
-    // Legacy step bypassed: loading `amazon_removal_shipments` by `.in("amazon_staging_id", ids)` for
-    // per-batch enrichment of `amazon_removals` (PostgREST "Bad Request" on large batches). Tree +
-    // allocations are rebuilt once after full sync via `rebuild_shipment_tree_from_removal_shipments`
-    // and `rebuild_removal_item_allocations`.
+    let shipmentArchiveRowsAttempted = 0;
+    let shipmentArchiveRowsWritten = 0;
 
-    const enrichmentShipmentsConsidered = 0;
-    const enrichmentRemovalsMatched = 0;
-    const enrichmentRemovalsUpdated = 0;
-    const enrichPayloadFieldCounts: Record<string, number> = {};
-    for (const k of REMOVAL_ENRICH_VERIFY_FIELDS) enrichPayloadFieldCounts[k] = 0;
+    let archived = 0;
+    let mapperNull = 0;
+    let rawRowsSkippedCrossUpload = 0;
+    const removalsUpdated = 0;
+    let loggedShipmentRawKeys = false;
+    let loggedShipmentMappedSample = false;
 
-    const removalShipmentsUpsertRowCount = archiveRows.length;
-    await deleteFromStaging(ids, orgId);
+    const REMOVAL_ENRICH_VERIFY_FIELDS = [
+      "tracking_number",
+      "carrier",
+      "shipment_date",
+      "order_date",
+      "order_type",
+    ] as const;
 
-    verifyAStagingFetched += stagingRows.length;
-    verifyAShipmentWritten += removalShipmentsUpsertRowCount;
-    verifyAStagingDeleted += ids.length;
-    verifyBEnrichConsidered += enrichmentShipmentsConsidered;
-    verifyBEnrichMatched += enrichmentRemovalsMatched;
-    verifyBEnrichUpdatedOk += enrichmentRemovalsUpdated;
-    for (const fk of REMOVAL_ENRICH_VERIFY_FIELDS) {
-      verifyBEnrichFieldInPayload[fk] += enrichPayloadFieldCounts[fk];
+    let verifyAStagingFetched = 0;
+    let verifyAShipmentWritten = 0;
+    let verifyAStagingDeleted = 0;
+    let verifyBEnrichConsidered = 0;
+    let verifyBEnrichMatched = 0;
+    let verifyBEnrichUpdatedOk = 0;
+    const verifyBEnrichFieldInPayload: Record<string, number> = {};
+    for (const k of REMOVAL_ENRICH_VERIFY_FIELDS) verifyBEnrichFieldInPayload[k] = 0;
+
+    let removalShipmentBatchIndex = 0;
+
+    while (true) {
+      removalShipmentBatchIndex++;
+      const { data: stagingRows, error: readErr } = await supabaseServer
+        .from(STAGING_TABLE)
+        .select("id, row_number, raw_row")
+        .eq("upload_id", uploadId)
+        .eq("organization_id", orgId)
+        .order("row_number", { ascending: true })
+        .limit(STAGING_READ_BATCH);
+
+      if (readErr) throw new Error(`Staging read failed: ${readErr.message}`);
+      if (!stagingRows || stagingRows.length === 0) break;
+
+      const ids = stagingRows.map((r) => r.id as string);
+
+      type ParsedStagingShipment = {
+        sr: (typeof stagingRows)[number];
+        rawObj: Record<string, string>;
+        mappedRemoval: Record<string, unknown> | null;
+        stagingRowNumber: number;
+      };
+
+      const parsed: ParsedStagingShipment[] = [];
+      const orderScratch: string[] = [];
+      const trackingScratch: string[] = [];
+
+      for (const sr of stagingRows) {
+        const rawObj = parseStagingRawRow(sr.raw_row);
+        if (!loggedShipmentRawKeys && Object.keys(rawObj).length > 0) {
+          loggedShipmentRawKeys = true;
+          console.log(
+            JSON.stringify({
+              phase: "REMOVAL_SHIPMENT_raw_row_keys",
+              upload_id: uploadId,
+              keys: Object.keys(rawObj).sort(),
+            }),
+          );
+        }
+        const mappedRow = applyColumnMappingToRow(rawObj, columnMapping);
+        const mappedRemoval = mapRowToAmazonRemovalShipment(mappedRow, orgId, uploadId, storeId) as Record<
+          string,
+          unknown
+        > | null;
+        if (!loggedShipmentMappedSample && mappedRemoval) {
+          loggedShipmentMappedSample = true;
+          console.log(
+            JSON.stringify({
+              phase: "REMOVAL_SHIPMENT_mapped_sample_before_upsert",
+              upload_id: uploadId,
+              store_id: storeId,
+              sample: {
+                order_id: mappedRemoval.order_id,
+                tracking_number: mappedRemoval.tracking_number,
+                carrier: mappedRemoval.carrier,
+                shipment_date: mappedRemoval.shipment_date,
+                order_date: mappedRemoval.order_date,
+                order_type: mappedRemoval.order_type,
+                sku: mappedRemoval.sku,
+                fnsku: mappedRemoval.fnsku,
+                disposition: mappedRemoval.disposition,
+                requested_quantity: mappedRemoval.requested_quantity,
+                shipped_quantity: mappedRemoval.shipped_quantity,
+                disposed_quantity: mappedRemoval.disposed_quantity,
+                cancelled_quantity: mappedRemoval.cancelled_quantity,
+              },
+            }),
+          );
+        }
+
+        const rowNumRaw = (sr as { row_number?: unknown }).row_number;
+        const stagingRowNumber =
+          typeof rowNumRaw === "number" && Number.isFinite(rowNumRaw)
+            ? rowNumRaw
+            : parseInt(String(rowNumRaw ?? ""), 10);
+        if (!Number.isFinite(stagingRowNumber) || stagingRowNumber < 1) {
+          throw new Error(
+            `[REMOVAL_SHIPMENT] Invalid amazon_staging.row_number for upload_id=${uploadId} staging_id=${sr.id}`,
+          );
+        }
+
+        if (mappedRemoval) {
+          const oid = mappedRemoval.order_id != null ? String(mappedRemoval.order_id).trim() : "";
+          if (oid) orderScratch.push(oid);
+          const tr = mappedRemoval.tracking_number != null ? String(mappedRemoval.tracking_number).trim() : "";
+          if (tr) trackingScratch.push(tr);
+        }
+
+        parsed.push({ sr, rawObj, mappedRemoval, stagingRowNumber });
+      }
+
+      const crossUploadKeys = await loadCrossUploadShipmentBusinessKeySet({
+        orgId,
+        storeId,
+        excludeUploadId: uploadId,
+        orderIds: orderScratch,
+        trackingNumbers: trackingScratch,
+      });
+
+      const archiveRows: Record<string, unknown>[] = [];
+      for (const { sr, rawObj, mappedRemoval, stagingRowNumber } of parsed) {
+        const baseArchive: Record<string, unknown> = {
+          organization_id: orgId,
+          upload_id: uploadId,
+          amazon_staging_id: sr.id,
+          store_id: storeId,
+          staging_row_number: stagingRowNumber,
+          raw_row: rawObj,
+        };
+        if (mappedRemoval) {
+          Object.assign(baseArchive, {
+            order_id: mappedRemoval.order_id ?? null,
+            sku: mappedRemoval.sku ?? null,
+            fnsku: mappedRemoval.fnsku ?? null,
+            disposition: mappedRemoval.disposition ?? null,
+            tracking_number: mappedRemoval.tracking_number ?? null,
+            carrier: mappedRemoval.carrier ?? null,
+            shipment_date: mappedRemoval.shipment_date ?? null,
+            order_date: mappedRemoval.order_date ?? null,
+            order_type: mappedRemoval.order_type ?? null,
+            requested_quantity: mappedRemoval.requested_quantity ?? null,
+            shipped_quantity: mappedRemoval.shipped_quantity ?? null,
+            disposed_quantity: mappedRemoval.disposed_quantity ?? null,
+            cancelled_quantity: mappedRemoval.cancelled_quantity ?? null,
+          });
+        }
+
+        if (mappedRemoval) {
+          const bizKey = removalShipmentArchiveBusinessKey(baseArchive);
+          if (bizKey && crossUploadKeys.has(bizKey)) {
+            rawRowsSkippedCrossUpload++;
+            continue;
+          }
+        } else {
+          mapperNull++;
+        }
+
+        archiveRows.push(baseArchive);
+      }
+
+      shipmentArchiveRowsAttempted += archiveRows.length;
+
+      for (let i = 0; i < archiveRows.length; i += UPSERT_CHUNK_SIZE) {
+        const chunk = archiveRows.slice(i, i + UPSERT_CHUNK_SIZE);
+        if (chunk.length === 0) continue;
+        const { error: upsertErr } = await supabaseServer.from("amazon_removal_shipments").upsert(chunk, {
+          onConflict: REMOVAL_SHIPMENT_ROW_NUMBER_CONFLICT,
+          ignoreDuplicates: false,
+        });
+        if (upsertErr) {
+          throw new Error(
+            `[REMOVAL_SHIPMENT] upsert into amazon_removal_shipments failed: ${upsertErr.message}. ` +
+              `Apply migration 20260619_removal_shipment_staging_row_number.sql if the column or unique index is missing.`,
+          );
+        }
+      }
+
+      shipmentArchiveRowsWritten += archiveRows.length;
+
+      archived += stagingRows.length;
+      await bumpSyncProgressMetadata(
+        { uploadId, orgId, totalStagingRows, upserted: syncUpserted },
+        stagingRows.length,
+        {
+          rawRowsWritten: shipmentArchiveRowsWritten,
+          rawRowsSkippedCrossUpload,
+        },
+      );
+
+      const enrichmentShipmentsConsidered = 0;
+      const enrichmentRemovalsMatched = 0;
+      const enrichmentRemovalsUpdated = 0;
+      const enrichPayloadFieldCounts: Record<string, number> = {};
+      for (const k of REMOVAL_ENRICH_VERIFY_FIELDS) enrichPayloadFieldCounts[k] = 0;
+
+      const removalShipmentsUpsertRowCount = archiveRows.length;
+      await deleteFromStaging(ids, orgId);
+
+      verifyAStagingFetched += stagingRows.length;
+      verifyAShipmentWritten += removalShipmentsUpsertRowCount;
+      verifyAStagingDeleted += ids.length;
+      verifyBEnrichConsidered += enrichmentShipmentsConsidered;
+      verifyBEnrichMatched += enrichmentRemovalsMatched;
+      verifyBEnrichUpdatedOk += enrichmentRemovalsUpdated;
+      for (const fk of REMOVAL_ENRICH_VERIFY_FIELDS) {
+        verifyBEnrichFieldInPayload[fk] += enrichPayloadFieldCounts[fk];
+      }
+
+      console.log(
+        JSON.stringify({
+          checkpoint: "REMOVAL_PIPELINE",
+          stage: "AB_per_batch",
+          upload_id: uploadId,
+          organization_id: orgId,
+          store_id: storeId,
+          batch_index: removalShipmentBatchIndex,
+          A_sync: {
+            staging_rows_fetched: stagingRows.length,
+            shipment_rows_upserted: removalShipmentsUpsertRowCount,
+            shipment_rows_skipped_cross_upload_duplicate: rawRowsSkippedCrossUpload,
+            shipment_archive_rows_attempted: shipmentArchiveRowsAttempted,
+            shipment_archive_rows_written: shipmentArchiveRowsWritten,
+            staging_rows_deleted: ids.length,
+          },
+          B_enrichment: {
+            legacy_bypassed: true,
+            note: "Phase 4 Generic runs rebuild_shipment_tree + expected_packages enrich — not invoked in Phase 3.",
+            shipment_rows_considered: enrichmentShipmentsConsidered,
+            removal_rows_matched: enrichmentRemovalsMatched,
+            removal_rows_updated: enrichmentRemovalsUpdated,
+            removal_updates_including_field: enrichPayloadFieldCounts,
+          },
+        }),
+      );
     }
+
+    const stagingCountReconciles = totalStagingRows <= 0 || archived === totalStagingRows;
+
+    const pStoreIdForRpc = isUuidString(storeId) ? storeId : null;
+    console.log(
+      `[REMOVAL_SHIPMENT] raw archive sync completed organization_id=${orgId} p_store_id=${pStoreIdForRpc ?? "null"} ` +
+        `(shipment tree + expected_packages deferred to Phase 4 Generic)`,
+    );
 
     console.log(
       JSON.stringify({
         checkpoint: "REMOVAL_PIPELINE",
-        stage: "AB_per_batch",
+        stage: "AB_upload_totals",
         upload_id: uploadId,
         organization_id: orgId,
         store_id: storeId,
-        batch_index: removalShipmentBatchIndex,
-        A_sync: {
-          staging_rows_fetched: stagingRows.length,
-          shipment_rows_written: removalShipmentsUpsertRowCount,
+        A_sync_totals: {
+          staging_rows_fetched: verifyAStagingFetched,
+          shipment_rows_upserted: verifyAShipmentWritten,
+          shipment_rows_skipped_cross_upload_duplicate: rawRowsSkippedCrossUpload,
           shipment_archive_rows_attempted: shipmentArchiveRowsAttempted,
           shipment_archive_rows_written: shipmentArchiveRowsWritten,
-          shipment_archive_rows_collapsed_by_raw_archive_logic: 0,
-          staging_rows_deleted: ids.length,
+          staging_rows_deleted: verifyAStagingDeleted,
+          initial_staging_row_count: totalStagingRows,
+          staging_rows_processed: archived,
+          staging_fetch_equals_delete: verifyAStagingFetched === verifyAStagingDeleted,
         },
-        B_enrichment: {
+        B_enrichment_totals: {
           legacy_bypassed: true,
-          shipment_rows_considered: enrichmentShipmentsConsidered,
-          removal_rows_matched: enrichmentRemovalsMatched,
-          removal_rows_updated: enrichmentRemovalsUpdated,
-          removal_updates_including_field: enrichPayloadFieldCounts,
+          shipment_rows_considered: verifyBEnrichConsidered,
+          removal_rows_matched: verifyBEnrichMatched,
+          removal_rows_updated: verifyBEnrichUpdatedOk,
+          removal_updates_including_field: verifyBEnrichFieldInPayload,
+        },
+        integrity: {
+          staging_rows_not_skipped_by_traversal: stagingCountReconciles,
+          mapper_null_rows: mapperNull,
         },
       }),
     );
-  }
 
-  const stagingCountReconciles =
-    totalStagingRows <= 0 || archived === totalStagingRows;
-
-  const pStoreIdForRpc = isUuidString(storeId) ? storeId : null;
-  console.log(
-    `[REMOVAL_SHIPMENT] shipment sync completed organization_id=${orgId} p_store_id=${pStoreIdForRpc ?? "null"}`,
-  );
-
-  const { data: treeCounts, error: treeErr } = await supabaseServer.rpc(
-    "rebuild_shipment_tree_from_removal_shipments",
-    { p_organization_id: orgId, p_store_id: pStoreIdForRpc },
-  );
-  if (treeErr) {
-    throw new Error(
-      `[REMOVAL_SHIPMENT] rebuild_shipment_tree_from_removal_shipments failed: ${treeErr.message}`,
+    console.log(
+      JSON.stringify({
+        phase: "REMOVAL_SHIPMENT_wave1_reconciliation",
+        store_id: storeId,
+        shipment_lines_processed: archived,
+        shipment_lines_upserted: shipmentArchiveRowsWritten,
+        skipped_cross_upload_duplicate: rawRowsSkippedCrossUpload,
+        removals_tracking_updates: removalsUpdated,
+        mapper_null: mapperNull,
+      }),
     );
-  }
-  const treeRow = Array.isArray(treeCounts) ? treeCounts[0] : treeCounts;
-  console.log(`[REMOVAL_SHIPMENT] shipment tree rebuilt`, JSON.stringify(treeRow ?? null));
+    console.log(
+      `[REMOVAL_SHIPMENT] Done: processed=${archived} upserted=${shipmentArchiveRowsWritten} ` +
+        `skipped_cross_upload=${rawRowsSkippedCrossUpload} mapper_null=${mapperNull}`,
+    );
 
-  const { data: allocCount, error: allocErr } = await supabaseServer.rpc("rebuild_removal_item_allocations", {
-    p_organization_id: orgId,
-    p_store_id: pStoreIdForRpc,
-  });
-  if (allocErr) {
-    throw new Error(`[REMOVAL_SHIPMENT] rebuild_removal_item_allocations failed: ${allocErr.message}`);
-  }
-  console.log(`[REMOVAL_SHIPMENT] removal allocations rebuilt count=${String(allocCount ?? "null")}`);
-
-  console.log(
-    JSON.stringify({
-      checkpoint: "REMOVAL_PIPELINE",
-      stage: "AB_upload_totals",
-      upload_id: uploadId,
-      organization_id: orgId,
-      store_id: storeId,
-      A_sync_totals: {
-        staging_rows_fetched: verifyAStagingFetched,
-        shipment_rows_written: verifyAShipmentWritten,
-        shipment_archive_rows_attempted: shipmentArchiveRowsAttempted,
-        shipment_archive_rows_written: shipmentArchiveRowsWritten,
-        shipment_archive_rows_collapsed_by_raw_archive_logic: 0,
-        staging_rows_deleted: verifyAStagingDeleted,
-        initial_staging_row_count: totalStagingRows,
-        staging_rows_processed: archived,
-        staging_fetch_equals_delete: verifyAStagingFetched === verifyAStagingDeleted,
-        shipment_written_vs_staging_processed_note:
-          verifyAShipmentWritten < archived
-            ? "fewer_shipment_upsert_rows_than_staging_lines_unexpected"
-            : "ok",
-      },
-      B_enrichment_totals: {
-        legacy_bypassed: true,
-        shipment_rows_considered: verifyBEnrichConsidered,
-        removal_rows_matched: verifyBEnrichMatched,
-        removal_rows_updated: verifyBEnrichUpdatedOk,
-        removal_updates_including_field: verifyBEnrichFieldInPayload,
-      },
-      integrity: {
-        staging_rows_not_skipped_by_traversal: stagingCountReconciles,
-        mapper_null_rows: mapperNull,
-      },
-    }),
-  );
-
-  console.log(
-    JSON.stringify({
-      phase: "REMOVAL_SHIPMENT_wave1_reconciliation",
-      store_id: storeId,
-      shipment_lines_archived: archived,
-      removals_tracking_updates: removalsUpdated,
-      mapper_null: mapperNull,
-    }),
-  );
-  console.log(
-    `[REMOVAL_SHIPMENT] Done: archived=${archived} removals_tracking_updates=${removalsUpdated} mapper_null=${mapperNull}`,
-  );
-
-  return { synced: archived, mapperNullCount: mapperNull };
+    return {
+      synced: archived,
+      mapperNullCount: mapperNull,
+      rawRowsWritten: shipmentArchiveRowsWritten,
+      rawRowsSkippedCrossUpload,
+    };
   } finally {
     await releaseRemovalPipelineLock(uploadId);
   }
-}
-
-/** Maps raw_report_uploads.report_type → canonical SyncKind. */
-function resolveImportKind(reportType: string | null | undefined): SyncKind {
-  const rt = String(reportType ?? "").trim();
-  if (rt === "FBA_RETURNS" || rt === "fba_customer_returns")   return "FBA_RETURNS";
-  if (rt === "REMOVAL_ORDER")                                   return "REMOVAL_ORDER";
-  if (rt === "REMOVAL_SHIPMENT")                                return "REMOVAL_SHIPMENT";
-  if (rt === "INVENTORY_LEDGER" || rt === "inventory_ledger")  return "INVENTORY_LEDGER";
-  if (rt === "REIMBURSEMENTS" || rt === "reimbursements")      return "REIMBURSEMENTS";
-  if (rt === "SETTLEMENT" || rt === "settlement_repository")   return "SETTLEMENT";
-  if (rt === "SAFET_CLAIMS" || rt === "safe_t_claims")         return "SAFET_CLAIMS";
-  if (rt === "TRANSACTIONS" || rt === "transaction_view")      return "TRANSACTIONS";
-  if (rt === "REPORTS_REPOSITORY")                              return "REPORTS_REPOSITORY";
-  if (rt === "ALL_ORDERS")                                      return "ALL_ORDERS";
-  if (rt === "REPLACEMENTS")                                    return "REPLACEMENTS";
-  if (rt === "FBA_GRADE_AND_RESELL")                            return "FBA_GRADE_AND_RESELL";
-  if (rt === "MANAGE_FBA_INVENTORY")                            return "MANAGE_FBA_INVENTORY";
-  if (rt === "FBA_INVENTORY")                                   return "FBA_INVENTORY";
-  if (rt === "RESERVED_INVENTORY")                              return "RESERVED_INVENTORY";
-  if (rt === "FEE_PREVIEW")                                     return "FEE_PREVIEW";
-  if (rt === "MONTHLY_STORAGE_FEES")                            return "MONTHLY_STORAGE_FEES";
-  return "UNKNOWN";
 }
 
 async function audit(
@@ -800,7 +917,9 @@ export async function POST(req: Request): Promise<Response> {
       );
     }
 
-    const kind = resolveImportKind((row as { report_type?: string }).report_type);
+    const kind = resolveAmazonImportSyncKind((row as { report_type?: string }).report_type);
+    const reportTypeRawEarly = String((row as { report_type?: string }).report_type ?? "").trim();
+
     if (kind === "UNKNOWN") {
       return NextResponse.json(
         {
@@ -874,25 +993,49 @@ export async function POST(req: Request): Promise<Response> {
       domainTable: DOMAIN_TABLE[kind] ?? "none",
     });
 
-    // Same removal-order or removal-shipment file re-uploaded: drop older imports with identical
-    // SHA-256 (storage + domain + history row). Scoped by report_type so order vs shipment files
-    // do not cross-delete.
-    if (kind === "REMOVAL_ORDER" || kind === "REMOVAL_SHIPMENT") {
-      const rep = await removeOlderRemovalImportsWithSameFileContent(
-        orgId,
-        uploadId,
-        meta,
-        kind === "REMOVAL_SHIPMENT" ? "REMOVAL_SHIPMENT" : "REMOVAL_ORDER",
-      );
+    // REMOVAL_ORDER: same bytes re-uploaded → remove prior upload rows that share `metadata.content_sha256`.
+    // REMOVAL_SHIPMENT: append-safe by default — same-file purge only when metadata flag is set (destructive).
+    const replaceRemovalShipmentSameFileSha =
+      meta &&
+      typeof meta === "object" &&
+      !Array.isArray(meta) &&
+      (meta as Record<string, unknown>).removal_shipment_replace_same_file_sha === true;
+
+    if (kind === "REMOVAL_ORDER") {
+      const rep = await removeOlderRemovalImportsWithSameFileContent(orgId, uploadId, meta, "REMOVAL_ORDER");
       if (rep.ok && rep.removedUploadIds.length > 0) {
         console.log(
-          `[sync][${kind}] Replaced ${rep.removedUploadIds.length} prior import(s) with the same file (SHA-256).`,
+          `[sync][REMOVAL_ORDER] Replaced ${rep.removedUploadIds.length} prior import(s) with the same file (SHA-256).`,
         );
         await audit(orgId, "import.removal_same_file_replaced_prior_uploads", uploadId, {
           removed_upload_ids: rep.removedUploadIds,
         });
       } else if (!rep.ok) {
         throw new Error(`Same-file cleanup failed: ${rep.error}`);
+      }
+    } else if (kind === "REMOVAL_SHIPMENT") {
+      if (!replaceRemovalShipmentSameFileSha) {
+        console.log(
+          "[sync][REMOVAL_SHIPMENT] Same-file SHA purge skipped (append-safe default). " +
+            "Set metadata.removal_shipment_replace_same_file_sha=true on the upload to delete prior imports with identical content_sha256.",
+        );
+      } else {
+        const rep = await removeOlderRemovalImportsWithSameFileContent(
+          orgId,
+          uploadId,
+          meta,
+          "REMOVAL_SHIPMENT",
+        );
+        if (rep.ok && rep.removedUploadIds.length > 0) {
+          console.log(
+            `[sync][REMOVAL_SHIPMENT] Replaced ${rep.removedUploadIds.length} prior import(s) with the same file (SHA-256) — explicit replace flag.`,
+          );
+          await audit(orgId, "import.removal_same_file_replaced_prior_uploads", uploadId, {
+            removed_upload_ids: rep.removedUploadIds,
+          });
+        } else if (!rep.ok) {
+          throw new Error(`Same-file cleanup failed: ${rep.error}`);
+        }
       }
     }
 
@@ -921,8 +1064,7 @@ export async function POST(req: Request): Promise<Response> {
     //   confirmed written.  If flushDomainBatch() throws at any point, the
     //   remaining staging rows are left untouched so the user can retry.
     //
-    // REMOVAL_SHIPMENT: dedicated path — full raw rows → amazon_removal_shipments;
-    // then DB RPCs rebuild shipment tree + removal_item_allocations (legacy amazon_removals enrichment bypassed).
+    // REMOVAL_SHIPMENT: dedicated path — full raw rows → amazon_removal_shipments only (Phase 4 Generic: tree + expected_packages).
     //
     // Errors propagate immediately — no swallowing, no silent fallbacks.
     let synced = 0;
@@ -930,20 +1072,32 @@ export async function POST(req: Request): Promise<Response> {
     // field). These are removed from staging in the final cleanup but are never
     // written to the domain table — logged as a warning so data loss is visible.
     let mapperNullCount = 0;
+    let removalShipmentRawWritten = 0;
+    let removalShipmentSkippedCross = 0;
+    let removalShipmentLinesForGeneric = 0;
     /** Staging lines merged in JS because they shared a conflict key in the same Postgres batch. */
     let syncDuplicateInBatchTotal = 0;
 
+    const rawTargetLabel = DOMAIN_TABLE[kind] ?? "domain";
     await supabaseServer.from("file_processing_status").upsert(
       {
         upload_id: uploadId,
         organization_id: orgId,
         status: "syncing",
         current_phase: "sync",
+        current_phase_label: `Phase 3 — Raw sync → ${rawTargetLabel}`,
         sync_pct: 0,
         upload_pct: 100,
         process_pct: 100,
+        phase1_upload_pct: 100,
+        phase2_stage_pct: 100,
+        phase3_raw_sync_pct: 0,
+        phase4_generic_pct: 0,
         total_rows: totalStagingRows,
         processed_rows: 0,
+        staged_rows_written: totalStagingRows,
+        phase3_status: "running",
+        phase3_started_at: new Date().toISOString(),
       },
       { onConflict: "upload_id" },
     );
@@ -959,11 +1113,13 @@ export async function POST(req: Request): Promise<Response> {
       });
       synced = r.synced;
       mapperNullCount = r.mapperNullCount;
+      removalShipmentRawWritten = r.rawRowsWritten;
+      removalShipmentSkippedCross = r.rawRowsSkippedCrossUpload;
     } else while (true) {
       // ── Read next chunk: always from the start — prior rows were deleted from staging. ──
       const { data: stagingRows, error: readErr } = await supabaseServer
         .from(STAGING_TABLE)
-        .select("id, row_number, raw_row")
+        .select("id, row_number, raw_row, source_line_hash")
         .eq("upload_id", uploadId)
         .eq("organization_id", orgId)
         .range(0, STAGING_READ_BATCH - 1);
@@ -978,6 +1134,7 @@ export async function POST(req: Request): Promise<Response> {
         id: string;
         row_number: number;
         raw_row: Record<string, string>;
+        source_line_hash?: string;
       }[]) {
         if (hasDomainTable) {
           const rawRow = (sr.raw_row ?? {}) as Record<string, string>;
@@ -985,7 +1142,17 @@ export async function POST(req: Request): Promise<Response> {
 
           let insertRow: Record<string, unknown> | null = null;
 
-          if (kind === "FBA_RETURNS") {
+          if (isListingAmazonSyncKind(kind)) {
+            insertRow = mapStagingMappedRowToListingRawInsert({
+              mappedRow,
+              organizationId: orgId,
+              storeId: importStoreId,
+              sourceUploadId: uploadId,
+              sourceReportType: reportTypeRawEarly,
+              fileLineNumber: sr.row_number,
+              stagingSourceLineHash: String(sr.source_line_hash ?? ""),
+            });
+          } else if (kind === "FBA_RETURNS") {
             insertRow = mapRowToAmazonReturn(mappedRow, orgId, uploadId) as Record<string, unknown>;
           } else if (kind === "REMOVAL_ORDER") {
             insertRow = mapRowToAmazonRemoval(mappedRow, orgId, uploadId, importStoreId!) as Record<string, unknown> | null;
@@ -1082,8 +1249,8 @@ export async function POST(req: Request): Promise<Response> {
       if (kind === "REMOVAL_SHIPMENT") {
         console.warn(
           `[sync][REMOVAL_SHIPMENT] ${mapperNullCount} staging row(s) could not be mapped ` +
-            `(missing order_id / anchor); raw rows were still archived to amazon_removal_shipments. ` +
-            `Tracking was not applied to amazon_removals for those lines.`,
+            `(missing order_id / anchor); those lines were still archived to amazon_removal_shipments with raw_row only. ` +
+            `Phase 3 does not touch amazon_removals or expected_packages.`,
         );
       } else {
         console.warn(
@@ -1106,11 +1273,28 @@ export async function POST(req: Request): Promise<Response> {
         `[sync][${kind}] Row count summary: staging=${totalStagingRows} ` +
           `written=${synced} mapper_null=${mapperNullCount} deduped_in_batch=${Math.max(0, jsDedupedAway)}`,
       );
+      if (isListingAmazonSyncKind(kind)) {
+        const archived = syncMetricTotals.rows_synced_new + syncMetricTotals.rows_synced_updated;
+        const skippedExisting = syncMetricTotals.rows_duplicate_against_existing;
+        console.log(
+          `[sync][${kind}] Phase 3 listing raw summary: raw archived ${archived}, raw skipped_existing ${skippedExisting}`,
+        );
+      }
     } else {
       console.log(
         `[sync][REMOVAL_SHIPMENT] Row count summary: staging=${totalStagingRows} ` +
-          `shipment_lines_archived=${synced} mapper_null=${mapperNullCount}`,
+          `staging_lines_processed=${synced} raw_upserted=${removalShipmentRawWritten} ` +
+          `skipped_cross_upload_duplicate=${removalShipmentSkippedCross} mapper_null=${mapperNullCount}`,
       );
+    }
+
+    if (kind === "REMOVAL_SHIPMENT") {
+      const { count: shipLineCnt } = await supabaseServer
+        .from("amazon_removal_shipments")
+        .select("*", { count: "exact", head: true })
+        .eq("upload_id", uploadId)
+        .eq("organization_id", orgId);
+      removalShipmentLinesForGeneric = typeof shipLineCnt === "number" ? shipLineCnt : removalShipmentRawWritten;
     }
 
     // ── Final safety cleanup: delete any residual staging rows for this upload ─
@@ -1139,23 +1323,27 @@ export async function POST(req: Request): Promise<Response> {
       .maybeSingle();
 
     const syncCollapsedByDedupe =
-      kind !== "REMOVAL_SHIPMENT"
-        ? Math.max(0, totalStagingRows - synced - mapperNullCount)
-        : 0;
+      kind === "REMOVAL_SHIPMENT"
+        ? removalShipmentSkippedCross
+        : Math.max(0, totalStagingRows - synced - mapperNullCount);
 
-    const importMetrics = {
+    const needsPhase4 = requiresPhase4Generic(kind);
+    const importMetrics: ImportRunMetrics = {
       physical_lines_seen: totalStagingRows,
       data_rows_seen: totalStagingRows,
       rows_staged: totalStagingRows,
-      rows_synced_upserted: synced,
+      rows_synced_upserted: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
       rows_mapper_invalid: mapperNullCount,
       rows_duplicate_in_file: syncDuplicateInBatchTotal,
       rows_net_collapsed_vs_staging: syncCollapsedByDedupe,
       rows_synced_new: syncMetricTotals.rows_synced_new,
       rows_synced_updated: syncMetricTotals.rows_synced_updated,
       rows_synced_unchanged: syncMetricTotals.rows_synced_unchanged,
-      rows_duplicate_against_existing: syncMetricTotals.rows_duplicate_against_existing,
-      current_phase: "complete" as const,
+      rows_duplicate_against_existing:
+        kind === "REMOVAL_SHIPMENT"
+          ? removalShipmentSkippedCross
+          : syncMetricTotals.rows_duplicate_against_existing,
+      current_phase: needsPhase4 ? "raw_synced" : "complete",
     };
 
     const wave1Extra =
@@ -1165,32 +1353,49 @@ export async function POST(req: Request): Promise<Response> {
             wave1_sync_reconciliation: {
               kind,
               staging_row_count: totalStagingRows,
-              domain_rows_written: synced,
+              domain_rows_written: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
               mapper_null: mapperNullCount,
               collapsed_by_business_dedupe: syncCollapsedByDedupe,
+              ...(kind === "REMOVAL_SHIPMENT"
+                ? {
+                    removal_shipment_skipped_cross_upload: removalShipmentSkippedCross,
+                    removal_shipment_lines_for_generic: removalShipmentLinesForGeneric,
+                  }
+                : {}),
             },
           }
         : {};
 
+    const finalStatus = needsPhase4 ? "raw_synced" : "synced";
     const { error: markErr } = await supabaseServer
       .from("raw_report_uploads")
       .update({
-        status: "synced",
-        import_pipeline_completed_at: new Date().toISOString(),
+        status: finalStatus,
+        import_pipeline_completed_at: needsPhase4 ? null : new Date().toISOString(),
         metadata: mergeUploadMetadata(
           (prevRow as { metadata?: unknown } | null)?.metadata,
           {
-            row_count: synced,
+            row_count: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
             staging_row_count: totalStagingRows,
-            sync_row_count: synced,
+            sync_row_count: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
             sync_mapper_null_count: mapperNullCount,
             sync_collapsed_by_dedupe: syncCollapsedByDedupe,
             sync_duplicate_in_batch_rows: syncDuplicateInBatchTotal,
             import_metrics: importMetrics,
             process_progress: 100,
             sync_progress: 100,
-            etl_phase: "sync",
-            error_message: undefined,
+            etl_phase: needsPhase4 ? "raw_synced" : "sync",
+            ...(kind === "REMOVAL_SHIPMENT"
+              ? {
+                  removal_shipment_phase3_raw_written: removalShipmentRawWritten,
+                  removal_shipment_phase3_skipped_cross_upload: removalShipmentSkippedCross,
+                  removal_shipment_lines_for_generic: removalShipmentLinesForGeneric,
+                }
+              : {}),
+            ...(isListingAmazonSyncKind(kind)
+              ? { catalog_listing_import_phase: "raw_archived" as const }
+              : {}),
+            error_message: "",
             ...wave1Extra,
           },
         ),
@@ -1201,30 +1406,74 @@ export async function POST(req: Request): Promise<Response> {
 
     if (markErr) throw new Error(`Sync succeeded but failed to save status: ${markErr.message}`);
 
+    const domainLabel = DOMAIN_TABLE[kind] ?? "none";
     await supabaseServer.from("file_processing_status").upsert(
       {
         upload_id: uploadId,
         organization_id: orgId,
-        status: "complete",
-        current_phase: "complete",
+        status: needsPhase4 ? "processing" : "complete",
+        current_phase: needsPhase4 ? "raw_synced" : "complete",
+        current_phase_label: needsPhase4
+          ? `Phase 3 complete — raw landing → ${domainLabel}`
+          : "Pipeline complete",
         upload_pct: 100,
         process_pct: 100,
         sync_pct: 100,
+        phase1_upload_pct: 100,
+        phase2_stage_pct: 100,
+        phase3_raw_sync_pct: 100,
+        phase4_generic_pct: 0,
+        /** Reset stale Phase 4 from a prior run so UI + gates show Generic again after Sync. */
+        phase4_status: needsPhase4 ? "pending" : "complete",
+        phase4_completed_at: needsPhase4 ? null : new Date().toISOString(),
         processed_rows: totalStagingRows,
         total_rows: totalStagingRows,
+        raw_rows_written: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
+        raw_rows_skipped_existing:
+          kind === "REMOVAL_SHIPMENT"
+            ? removalShipmentSkippedCross
+            : syncMetricTotals.rows_duplicate_against_existing,
+        staged_rows_written: totalStagingRows,
         error_message: null,
         import_metrics: importMetrics,
+        phase3_status: "complete",
+        phase3_completed_at: new Date().toISOString(),
       },
       { onConflict: "upload_id" },
     );
 
     await audit(orgId, "import.sync_completed", uploadId, {
-      rowsSynced: synced,
+      rowsSynced: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
       kind,
       domainTable: DOMAIN_TABLE[kind] ?? "none",
     });
 
-    return NextResponse.json({ ok: true, rowsSynced: synced, kind });
+    try {
+      if (kind === "SETTLEMENT" || kind === "TRANSACTIONS" || kind === "REIMBURSEMENTS") {
+        await syncFinancialReferenceResolverForUpload(supabaseServer, orgId, uploadId, kind);
+      }
+    } catch (e) {
+      console.warn(
+        `[sync][${kind}] financial_reference_resolver refresh failed (import rows are still synced):`,
+        e instanceof Error ? e.message : e,
+      );
+    }
+
+    return NextResponse.json({
+      ok: true,
+      rowsSynced: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
+      rowsSkippedCrossUploadDuplicate:
+        kind === "REMOVAL_SHIPMENT" ? removalShipmentSkippedCross : undefined,
+      kind,
+      ...(isListingAmazonSyncKind(kind)
+        ? {
+            listingPhase3: {
+              rawArchived: syncMetricTotals.rows_synced_new + syncMetricTotals.rows_synced_updated,
+              rawSkippedExisting: syncMetricTotals.rows_duplicate_against_existing,
+            },
+          }
+        : {}),
+    });
 
   } catch (e) {
     const message = e instanceof Error ? e.message : "Sync failed.";
@@ -1267,11 +1516,15 @@ type SyncProgressOpts = {
   uploadId: string;
   orgId: string;
   totalStagingRows: number;
-  /** Cumulative domain rows successfully upserted this sync (for progress bar). */
+  /** Cumulative staging lines finished this sync (for progress bar denominator). */
   upserted: { value: number };
 };
 
-async function bumpSyncProgressMetadata(opts: SyncProgressOpts, chunkRowCount: number): Promise<void> {
+async function bumpSyncProgressMetadata(
+  opts: SyncProgressOpts,
+  chunkRowCount: number,
+  removalShipment?: { rawRowsWritten: number; rawRowsSkippedCrossUpload: number },
+): Promise<void> {
   if (opts.totalStagingRows <= 0 || chunkRowCount <= 0) return;
   opts.upserted.value += chunkRowCount;
   const { data: prevRow } = await supabaseServer
@@ -1290,6 +1543,14 @@ async function bumpSyncProgressMetadata(opts: SyncProgressOpts, chunkRowCount: n
           ...((prevMeta as { import_metrics?: Record<string, unknown> }).import_metrics ?? {}),
         }
       : {};
+  const phase3Numerator = removalShipment
+    ? removalShipment.rawRowsWritten + removalShipment.rawRowsSkippedCrossUpload
+    : opts.upserted.value;
+  const phase3Pct = Math.min(
+    99,
+    Math.round((phase3Numerator / Math.max(1, opts.totalStagingRows)) * 100),
+  );
+
   await supabaseServer
     .from("raw_report_uploads")
     .update({
@@ -1301,6 +1562,12 @@ async function bumpSyncProgressMetadata(opts: SyncProgressOpts, chunkRowCount: n
           current_phase: "sync",
           rows_synced: opts.upserted.value,
           total_staging_rows: opts.totalStagingRows,
+          ...(removalShipment
+            ? {
+                removal_shipment_raw_rows_written: removalShipment.rawRowsWritten,
+                removal_shipment_skipped_cross_upload: removalShipment.rawRowsSkippedCrossUpload,
+              }
+            : {}),
         },
       }),
       updated_at: new Date().toISOString(),
@@ -1316,15 +1583,30 @@ async function bumpSyncProgressMetadata(opts: SyncProgressOpts, chunkRowCount: n
         organization_id: opts.orgId,
         status: "syncing",
         current_phase: "sync",
+        current_phase_label: removalShipment
+          ? "Phase 3 — Raw sync → amazon_removal_shipments"
+          : "Phase 3 — Raw sync to destination table",
         upload_pct: 100,
         process_pct: 100,
-        sync_pct: pct,
+        sync_pct: removalShipment ? phase3Pct : pct,
+        phase1_upload_pct: 100,
+        phase2_stage_pct: 100,
+        phase3_raw_sync_pct: removalShipment ? phase3Pct : pct,
         processed_rows: opts.upserted.value,
         total_rows: opts.totalStagingRows,
+        staged_rows_written: opts.totalStagingRows,
+        raw_rows_written: removalShipment ? removalShipment.rawRowsWritten : opts.upserted.value,
+        raw_rows_skipped_existing: removalShipment ? removalShipment.rawRowsSkippedCrossUpload : 0,
         import_metrics: {
           current_phase: "sync",
           rows_synced: opts.upserted.value,
           total_staging_rows: opts.totalStagingRows,
+          ...(removalShipment
+            ? {
+                removal_shipment_raw_rows_written: removalShipment.rawRowsWritten,
+                removal_shipment_skipped_cross_upload: removalShipment.rawRowsSkippedCrossUpload,
+              }
+            : {}),
         },
       },
       { onConflict: "upload_id" },
@@ -1819,6 +2101,11 @@ function deduplicateByConflictKey(
           row.source_staging_id != null && String(row.source_staging_id).trim() !== ""
             ? `sid|${String(row.organization_id)}|${String(row.upload_id)}|${String(row.source_staging_id)}`
             : removalLogicalLineDedupKey(row);
+        break;
+      case "CATEGORY_LISTINGS":
+      case "ALL_LISTINGS":
+      case "ACTIVE_LISTINGS":
+        key = physicalLineDedupKey(row);
         break;
       default:
         // UNKNOWN — give every row a unique key so nothing is silently dropped

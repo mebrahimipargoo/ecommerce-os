@@ -54,7 +54,7 @@ export async function measureBatchUpsertMetrics(
   kind: SyncKind,
   table: string,
   organizationId: string,
-  uploadId: string,
+  _uploadId: string,
   packedRows: Record<string, unknown>[],
 ): Promise<BatchUpsertMetricDelta> {
   if (packedRows.length === 0) return { ...EMPTY_DELTA };
@@ -75,6 +75,9 @@ export async function measureBatchUpsertMetrics(
     case "MONTHLY_STORAGE_FEES":
     case "SETTLEMENT":
     case "SAFET_CLAIMS":
+    case "CATEGORY_LISTINGS":
+    case "ALL_LISTINGS":
+    case "ACTIVE_LISTINGS":
       return await byPhysicalLine(supabase, table, organizationId, packedRows);
     case "REMOVAL_ORDER":
       return await byRemovalBusinessLine(supabase, table, organizationId, packedRows);

@@ -17,7 +17,11 @@ export function formatImportPhaseLabel(phase: string | null | undefined): string
       return "Staged";
     case "sync":
     case "syncing":
-      return "Syncing";
+      return "Phase 3 — Raw sync";
+    case "raw_synced":
+      return "Phase 3 complete — awaiting generic";
+    case "generic":
+      return "Phase 4 — Generic";
     case "complete":
       return "Complete";
     case "failed":

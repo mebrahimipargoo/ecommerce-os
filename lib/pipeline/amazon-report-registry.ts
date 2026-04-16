@@ -11,8 +11,9 @@ import { AMAZON_REMOVALS_BUSINESS_CONFLICT_COLUMNS } from "./amazon-removals-bus
  *   5) Sync → amazon_* domain table(s)
  *   6) Optional enrichment / generate (removals worklist, removal shipment tree RPCs, etc.)
  *
- * Listing exports use `amazon_listing_report_rows_raw` as the staging landing table
- * (source_upload_id + row_number uniqueness) per product requirement — not `amazon_staging`.
+ * Listing exports: Phase 2 lands in `amazon_staging`; Phase 3 upserts into
+ * `amazon_listing_report_rows_raw` on (organization_id, source_file_sha256, source_physical_row_number).
+ * Phase 4 Generic merges into `catalog_products` (same route as removal shipment tree, different body).
  */
 
 /** Canonical sync routing key (maps from raw_report_uploads.report_type). */
@@ -34,9 +35,12 @@ export type AmazonSyncKind =
   | "RESERVED_INVENTORY"
   | "FEE_PREVIEW"
   | "MONTHLY_STORAGE_FEES"
+  | "CATEGORY_LISTINGS"
+  | "ALL_LISTINGS"
+  | "ACTIVE_LISTINGS"
   | "UNKNOWN";
 
-export type StagingTarget = "amazon_staging" | "amazon_listing_report_rows_raw";
+export type StagingTarget = "amazon_staging";
 
 export type DedupeMode =
   | "source_line_hash"
@@ -73,7 +77,7 @@ export type AmazonReportRegistryEntry = {
  * | TRANSACTIONS | amazon_staging | amazon_transactions | source_line_hash | none | no |
  * | REPORTS_REPOSITORY | amazon_staging | amazon_reports_repository | source_line_hash | none | no |
  * | ALL_ORDERS … MONTHLY_STORAGE_FEES | amazon_staging | amazon_* archive | source_line_hash | none | no |
- * | CATEGORY/ALL/ACTIVE_LISTINGS | listing raw | catalog via process route | row_number | none | no |
+ * | CATEGORY/ALL/ACTIVE_LISTINGS | amazon_staging | amazon_listing_report_rows_raw | physical file row | catalog (generic) | no |
  */
 export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistryEntry> = {
   FBA_RETURNS: {
@@ -212,6 +216,30 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
   },
+  CATEGORY_LISTINGS: {
+    staging: "amazon_staging",
+    domainTable: "amazon_listing_report_rows_raw",
+    dedupeMode: "source_line_hash",
+    conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
+    postSyncEnrichment: "none",
+    generateWorklistAfterSync: false,
+  },
+  ALL_LISTINGS: {
+    staging: "amazon_staging",
+    domainTable: "amazon_listing_report_rows_raw",
+    dedupeMode: "source_line_hash",
+    conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
+    postSyncEnrichment: "none",
+    generateWorklistAfterSync: false,
+  },
+  ACTIVE_LISTINGS: {
+    staging: "amazon_staging",
+    domainTable: "amazon_listing_report_rows_raw",
+    dedupeMode: "source_line_hash",
+    conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
+    postSyncEnrichment: "none",
+    generateWorklistAfterSync: false,
+  },
   UNKNOWN: {
     staging: "amazon_staging",
     domainTable: null,
@@ -234,3 +262,38 @@ export const CONFLICT_KEY: Record<AmazonSyncKind, string | null> = Object.fromEn
     AMAZON_REPORT_REGISTRY[k].conflictColumns,
   ]),
 ) as Record<AmazonSyncKind, string | null>;
+
+export function isListingAmazonSyncKind(kind: AmazonSyncKind): boolean {
+  return kind === "CATEGORY_LISTINGS" || kind === "ALL_LISTINGS" || kind === "ACTIVE_LISTINGS";
+}
+
+/** Listing catalog merge and removal shipment tree run in POST /api/settings/imports/generic after raw_synced. */
+export function requiresPhase4Generic(kind: AmazonSyncKind): boolean {
+  return kind === "REMOVAL_SHIPMENT" || isListingAmazonSyncKind(kind);
+}
+
+/** Maps `raw_report_uploads.report_type` (canonical + legacy slugs) → sync kind. */
+export function resolveAmazonImportSyncKind(reportType: string | null | undefined): AmazonSyncKind {
+  const rt = String(reportType ?? "").trim();
+  if (rt === "FBA_RETURNS" || rt === "fba_customer_returns") return "FBA_RETURNS";
+  if (rt === "REMOVAL_ORDER") return "REMOVAL_ORDER";
+  if (rt === "REMOVAL_SHIPMENT") return "REMOVAL_SHIPMENT";
+  if (rt === "INVENTORY_LEDGER" || rt === "inventory_ledger") return "INVENTORY_LEDGER";
+  if (rt === "REIMBURSEMENTS" || rt === "reimbursements") return "REIMBURSEMENTS";
+  if (rt === "SETTLEMENT" || rt === "settlement_repository") return "SETTLEMENT";
+  if (rt === "SAFET_CLAIMS" || rt === "safe_t_claims") return "SAFET_CLAIMS";
+  if (rt === "TRANSACTIONS" || rt === "transaction_view") return "TRANSACTIONS";
+  if (rt === "REPORTS_REPOSITORY") return "REPORTS_REPOSITORY";
+  if (rt === "ALL_ORDERS") return "ALL_ORDERS";
+  if (rt === "REPLACEMENTS") return "REPLACEMENTS";
+  if (rt === "FBA_GRADE_AND_RESELL") return "FBA_GRADE_AND_RESELL";
+  if (rt === "MANAGE_FBA_INVENTORY") return "MANAGE_FBA_INVENTORY";
+  if (rt === "FBA_INVENTORY") return "FBA_INVENTORY";
+  if (rt === "RESERVED_INVENTORY") return "RESERVED_INVENTORY";
+  if (rt === "FEE_PREVIEW") return "FEE_PREVIEW";
+  if (rt === "MONTHLY_STORAGE_FEES") return "MONTHLY_STORAGE_FEES";
+  if (rt === "CATEGORY_LISTINGS") return "CATEGORY_LISTINGS";
+  if (rt === "ALL_LISTINGS") return "ALL_LISTINGS";
+  if (rt === "ACTIVE_LISTINGS") return "ACTIVE_LISTINGS";
+  return "UNKNOWN";
+}

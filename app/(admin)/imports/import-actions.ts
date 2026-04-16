@@ -10,6 +10,7 @@ import {
   type RawReportUploadMetadata,
 } from "../../../lib/raw-report-upload-metadata";
 import type { RawReportUploadRow } from "../../../lib/raw-report-upload-row";
+import type { ImportFpsSnapshot } from "../../../lib/import-ui-action-state";
 import { resolveOrganizationId } from "../../../lib/organization";
 import { resolveWriteOrganizationId } from "../../../lib/server-tenant";
 import type { RawReportType } from "../../../lib/raw-report-types";
@@ -175,6 +176,34 @@ export async function listRawReportUploads(input?: {
 
     const base = (data ?? []) as Record<string, unknown>[];
 
+    const uploadIds = base
+      .map((raw) => String((raw as { id?: unknown }).id ?? "").trim())
+      .filter((id) => isUuidString(id));
+    const fpsByUpload = new Map<string, ImportFpsSnapshot>();
+    if (uploadIds.length > 0) {
+      const { data: fpsRows, error: fpsErr } = await supabaseServer
+        .from("file_processing_status")
+        .select(
+          "upload_id, phase2_status, phase3_status, phase4_status, current_phase, current_phase_label, current_target_table, status",
+        )
+        .in("upload_id", uploadIds);
+      if (!fpsErr && fpsRows) {
+        for (const fr of fpsRows as Record<string, unknown>[]) {
+          const uid = String(fr.upload_id ?? "").trim();
+          if (!isUuidString(uid)) continue;
+          fpsByUpload.set(uid, {
+            phase2_status: fr.phase2_status != null ? String(fr.phase2_status) : null,
+            phase3_status: fr.phase3_status != null ? String(fr.phase3_status) : null,
+            phase4_status: fr.phase4_status != null ? String(fr.phase4_status) : null,
+            current_phase: fr.current_phase != null ? String(fr.current_phase) : null,
+            current_phase_label: fr.current_phase_label != null ? String(fr.current_phase_label) : null,
+            current_target_table: fr.current_target_table != null ? String(fr.current_target_table) : null,
+            row_status: fr.status != null ? String(fr.status) : null,
+          });
+        }
+      }
+    }
+
     const rows: RawReportUploadRow[] = base.map((raw) => {
       const r = raw as Record<string, unknown>;
       const meta = parseRawReportMetadata(r.metadata);
@@ -182,8 +211,9 @@ export async function listRawReportUploads(input?: {
         r.metadata && typeof r.metadata === "object" && !Array.isArray(r.metadata)
           ? (r.metadata as Record<string, unknown>)
           : null;
+      const id = String(r.id);
       return {
-        id: String(r.id),
+        id,
         organization_id: String(r.organization_id ?? ""),
         file_name: String(r.file_name ?? ""),
         report_type: String(r.report_type ?? ""),
@@ -204,6 +234,7 @@ export async function listRawReportUploads(input?: {
         created_at: String(r.created_at ?? ""),
         updated_at: String(r.updated_at ?? ""),
         created_by_name: null,
+        file_processing_status: fpsByUpload.get(id) ?? null,
       };
     });
 

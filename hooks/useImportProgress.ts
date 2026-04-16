@@ -38,6 +38,7 @@ export type ImportProgressStatus =
   | "processing"
   | "syncing"
   | "staged"
+  | "raw_synced"
   | "synced"
   | "complete"
   | "failed";
@@ -78,7 +79,7 @@ function rowToState(row: Record<string, unknown>): ImportProgressState {
   const parsed = parseRawReportMetadata(row.metadata);
   const rawStatus = String(row.status ?? "pending").toLowerCase();
   const status = [
-    "idle", "pending", "uploading", "processing", "staged", "synced", "complete", "failed",
+    "idle", "pending", "uploading", "processing", "staged", "raw_synced", "synced", "complete", "failed",
   ].includes(rawStatus)
     ? (rawStatus as ImportProgressStatus)
     : "pending";
@@ -143,7 +144,7 @@ export function useImportProgress(uploadId: string | null): ImportProgressState 
 
   const fetchOnce = useCallback(async (id: string) => {
     const [rpu, fps] = await Promise.all([
-      supabase.from("raw_report_uploads").select("status, metadata").eq("id", id).maybeSingle(),
+      supabase.from("raw_report_uploads").select("status, metadata, report_type").eq("id", id).maybeSingle(),
       supabase.from("file_processing_status").select("*").eq("upload_id", id).maybeSingle(),
     ]);
     if (rpu.error || !rpu.data) return;
@@ -155,10 +156,34 @@ export function useImportProgress(uploadId: string | null): ImportProgressState 
     const rStatus = String((rpu.data as { status?: string }).status ?? "").toLowerCase();
     if (rStatus === "staged") {
       next = { ...next, status: "staged", processPct: Math.max(next.processPct, 100) };
+    } else if (rStatus === "raw_synced") {
+      next = { ...next, status: "raw_synced", processPct: Math.max(next.processPct, 100), syncPct: Math.max(next.syncPct, 100) };
     } else if (rStatus === "synced" || rStatus === "complete") {
       next = { ...next, status: rStatus as ImportProgressStatus, syncPct: 100 };
     } else if (rStatus === "failed") {
-      next = { ...next, status: "failed" };
+      const fpsData = !fps.error && fps.data ? (fps.data as Record<string, unknown>) : null;
+      const p3 = String(fpsData?.phase3_status ?? "").toLowerCase();
+      const p4 = String(fpsData?.phase4_status ?? "").toLowerCase();
+      const metaRaw = (rpu.data as { metadata?: unknown }).metadata;
+      const rt = String((rpu.data as { report_type?: unknown }).report_type ?? "").trim();
+      const m =
+        metaRaw && typeof metaRaw === "object" && !Array.isArray(metaRaw)
+          ? (metaRaw as Record<string, unknown>)
+          : null;
+      const etl = String(m?.etl_phase ?? "").toLowerCase();
+      const catalogDone = String(m?.catalog_listing_import_phase ?? "").toLowerCase() === "done";
+      const shipmentPipelineDone =
+        rt === "REMOVAL_SHIPMENT" && p3 === "complete" && p4 === "complete" && etl === "complete";
+      if (p4 === "complete" || etl === "complete" || catalogDone || shipmentPipelineDone) {
+        next = {
+          ...next,
+          status: "complete",
+          syncPct: 100,
+          processPct: Math.max(next.processPct, 100),
+        };
+      } else {
+        next = { ...next, status: "failed" };
+      }
     } else if (rStatus === "processing" && next.currentPhase === "staged") {
       next = { ...next, status: "staged" };
     }

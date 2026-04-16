@@ -8,6 +8,7 @@ import type { Readable } from "node:stream";
 
 import {
   applyColumnMappingToRow,
+  computeSourceLineHash,
   extractListingIdentifiersForRawRow,
   listingMappedRowToRawPayload,
   normalizeAmazonReportRowKeys,
@@ -80,6 +81,51 @@ export type BuildRawRowsParams = {
  * For each physical data line (lines[1..]), produce one insert payload for amazon_listing_report_rows_raw.
  * Header is lines[0]. Empty lines: no row (caller increments skipped_empty).
  */
+/**
+ * Staging must keep one row per physical file line; `amazon_staging` also has
+ * `(upload_id, source_line_hash)` uniqueness — fold upload + file line into the hash.
+ */
+export function computeListingPhysicalStagingLineHash(
+  uploadId: string,
+  fileLineNumber: number,
+  orgId: string,
+  mappedRow: Record<string, string>,
+): string {
+  const base = computeSourceLineHash(orgId, mappedRow);
+  return createHash("sha256")
+    .update(`${uploadId}\0${fileLineNumber}\0${base}`, "utf8")
+    .digest("hex");
+}
+
+/** Phase 3: staging `raw_row` (mapped cells) → `amazon_listing_report_rows_raw` row. */
+export function mapStagingMappedRowToListingRawInsert(opts: {
+  mappedRow: Record<string, string>;
+  organizationId: string;
+  storeId: string | null;
+  sourceUploadId: string;
+  sourceReportType: string;
+  /** Same as physical file line index used for `amazon_listing_report_rows_raw.row_number`. */
+  fileLineNumber: number;
+  /** Fingerprint stored on `amazon_staging.source_line_hash` for this line. */
+  stagingSourceLineHash: string;
+}): Record<string, unknown> {
+  const ids = extractListingIdentifiersForRawRow(opts.mappedRow);
+  return {
+    organization_id: opts.organizationId,
+    store_id: opts.storeId,
+    source_upload_id: opts.sourceUploadId,
+    source_report_type: opts.sourceReportType,
+    row_number: opts.fileLineNumber,
+    seller_sku: ids.seller_sku?.trim() || null,
+    asin: ids.asin?.trim() || null,
+    listing_id: ids.listing_id?.trim() || null,
+    raw_payload: listingMappedRowToRawPayload(opts.mappedRow),
+    source_line_hash: opts.stagingSourceLineHash,
+    parse_status: "parsed",
+    parse_error: null,
+  };
+}
+
 export function buildRawRowInsertForPhysicalLine(
   params: BuildRawRowsParams & {
     lineIdx: number;

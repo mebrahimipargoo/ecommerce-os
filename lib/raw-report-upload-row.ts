@@ -1,3 +1,5 @@
+import type { ImportFpsSnapshot } from "./import-ui-action-state";
+
 /**
  * Shape of `raw_report_uploads` rows for admin import UI (not exported from `"use server"` files).
  */
@@ -31,4 +33,6 @@ export type RawReportUploadRow = {
   updated_at: string;
   /** Optional client-only label — not resolved from DB joins. */
   created_by_name?: string | null;
+  /** Joined from `file_processing_status` (phase columns) when listing uploads. */
+  file_processing_status?: ImportFpsSnapshot | null;
 };

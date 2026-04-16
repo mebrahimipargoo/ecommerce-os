@@ -26,7 +26,16 @@ export type ImportRunMetrics = {
   rows_invalid?: number;
   rows_skipped_empty?: number;
   rows_skipped_malformed?: number;
-  current_phase?: "upload" | "staging" | "process" | "staged" | "sync" | "complete" | "failed";
+  current_phase?:
+    | "upload"
+    | "staging"
+    | "process"
+    | "staged"
+    | "sync"
+    | "raw_synced"
+    | "generic"
+    | "complete"
+    | "failed";
   failure_reason?: string;
 };
 
@@ -50,7 +59,14 @@ export type RawReportUploadMetadata = {
   /** Set when POST /etl/generate-worklist (or Next proxy) finishes successfully. */
   worklist_completed?: boolean;
   /** Which ETL phase last wrote progress (upload | staging | sync | worklist). */
-  etl_phase?: "upload" | "staging" | "sync" | "worklist";
+  etl_phase?:
+    | "upload"
+    | "staging"
+    | "sync"
+    | "raw_synced"
+    | "generic"
+    | "complete"
+    | "worklist";
   row_count?: number;
   /** Rows in amazon_staging before Phase 3 (for UI: staged vs synced). */
   staging_row_count?: number;
@@ -85,7 +101,7 @@ export type RawReportUploadMetadata = {
    * "sync"    = Phase 3 (Sync) failed.
    * Used by the History table to show the correct "Retry" button.
    */
-  failed_phase?: "process" | "sync";
+  failed_phase?: "process" | "sync" | "generic";
   /** Amazon Inventory Ledger: single object path under `raw-reports` bucket */
   ledger_storage_path?: string;
   /** Target `stores.id` for ledger uploads (tenant scope remains `organization_id` on the row) */
@@ -102,7 +118,12 @@ export type RawReportUploadMetadata = {
    */
   total_rows?: number;
   /** Listing import: raw_archive → canonical_sync → done (POST /imports/process). */
-  catalog_listing_import_phase?: "raw_archive" | "canonical_sync" | "done";
+  catalog_listing_import_phase?:
+    | "staged"
+    | "raw_archive"
+    | "raw_archived"
+    | "canonical_sync"
+    | "done";
   /** Physical data lines after header (pass 1). */
   catalog_listing_file_rows_seen?: number;
   /** Non-empty data lines after header (physical lines minus empty lines). User-facing row count. */
@@ -121,6 +142,8 @@ export type RawReportUploadMetadata = {
   catalog_listing_canonical_rows_unchanged_or_merged?: number;
   /** @deprecated Use catalog_listing_file_rows_seen */
   catalog_listing_total_rows_seen?: number;
+  /** Non-fatal Phase 4 note when `product_identifier_map` sync failed after `catalog_products` upsert. */
+  catalog_listing_identifier_map_sync_error?: string | null;
   /**
    * Rows that passed the date filter and were actually inserted into staging during Phase 2.
    * May be less than total_rows when a date range is applied.
@@ -143,6 +166,14 @@ export type RawReportUploadMetadata = {
    * Example: `{orgId}/{timestamp}-{random}/original.csv`
    */
   raw_file_path?: string;
+  /** REMOVAL_SHIPMENT Phase 3: rows upserted into amazon_removal_shipments. */
+  removal_shipment_phase3_raw_written?: number;
+  /** REMOVAL_SHIPMENT Phase 3: logical lines skipped (already archived from another upload). */
+  removal_shipment_phase3_skipped_cross_upload?: number;
+  /** REMOVAL_SHIPMENT: archive rows for this upload after Phase 3 (Phase 4 denominator). */
+  removal_shipment_lines_for_generic?: number;
+  /** REMOVAL_SHIPMENT Phase 4: shipment lines used as generic progress denominator. */
+  removal_shipment_phase4_generic_rows_written?: number;
 };
 
 function num(v: unknown, fallback = 0): number {

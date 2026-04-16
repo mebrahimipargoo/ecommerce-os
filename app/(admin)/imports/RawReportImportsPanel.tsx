@@ -11,6 +11,14 @@ import type { RawReportType } from "../../../lib/raw-report-types";
 import { REPORT_TYPE_SPECS } from "../../../lib/csv-import-mapping";
 import { isListingReportType, RAW_REPORT_TYPE_ORDER } from "../../../lib/raw-report-types";
 import { formatImportPhaseLabel } from "../../../lib/pipeline/import-phase-labels";
+import type { ImportUiActionInput } from "../../../lib/import-ui-action-state";
+import { resolveImportUiActionState } from "../../../lib/import-ui-action-state";
+import {
+  buildImportUiActionInputForRemovalShipment,
+  resolveRemovalShipmentPhaseBadgeLabel,
+  resolveRemovalShipmentPrimaryCta,
+} from "../../../lib/import-removal-shipment-ui";
+import { resolveListingImportUiState } from "../../../lib/listing-import-ui";
 import { useDebugMode } from "../../../components/DebugModeContext";
 import { DatabaseTag } from "../../../components/DatabaseTag";
 
@@ -27,6 +35,8 @@ function statusLabel(status: string, uploadProgress?: number, opts?: { listing?:
       return listing ? "Ready — Process Data" : "Phase 2: Process";
     case "staged":
       return "Phase 3: Sync";
+    case "raw_synced":
+      return "Phase 4: Generic";
     case "ready":
       return "Ready";
     case "uploaded":
@@ -39,9 +49,9 @@ function statusLabel(status: string, uploadProgress?: number, opts?: { listing?:
     case "processing":
       return "Processing…";
     case "synced":
-      return listing ? "Complete (listing)" : "Synced";
+      return listing ? "Complete (listing)" : "Complete";
     case "complete":
-      return "Complete";
+      return listing ? "Complete (listing)" : "Complete";
     case "failed":
       return "Failed";
     case "cancelled":
@@ -56,7 +66,7 @@ function statusLabel(status: string, uploadProgress?: number, opts?: { listing?:
 function statusColorClass(status: string): string {
   if (status === "synced" || status === "complete")
     return "bg-emerald-500/15 text-emerald-800 dark:text-emerald-300";
-  if (status === "staged")
+  if (status === "staged" || status === "raw_synced")
     return "bg-violet-500/15 text-violet-800 dark:text-violet-300";
   if (status === "mapped" || status === "ready" || status === "uploaded")
     return "bg-sky-500/15 text-sky-800 dark:text-sky-300";
@@ -98,6 +108,8 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
   // Per-row operation state
   const [processingIds, setProcessingIds] = useState<Set<string>>(() => new Set());
   const [syncingIds, setSyncingIds] = useState<Set<string>>(() => new Set());
+  const [genericIds, setGenericIds] = useState<Set<string>>(() => new Set());
+  const [worklistingIds, setWorklistingIds] = useState<Set<string>>(() => new Set());
   const [deletingIds, setDeletingIds] = useState<Set<string>>(() => new Set());
   const [resettingIds, setResettingIds] = useState<Set<string>>(() => new Set());
 
@@ -147,12 +159,12 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
 
   /** Faster refresh while Process or Sync is running so progress metadata updates visibly. */
   useEffect(() => {
-    if (processingIds.size === 0 && syncingIds.size === 0) return;
+    if (processingIds.size === 0 && syncingIds.size === 0 && genericIds.size === 0 && worklistingIds.size === 0) return;
     const t = setInterval(() => {
       void refresh();
     }, 700);
     return () => clearInterval(t);
-  }, [processingIds.size, syncingIds.size, refresh]);
+  }, [processingIds.size, syncingIds.size, genericIds.size, worklistingIds.size, refresh]);
 
   // ── Single row delete ────────────────────────────────────────────────────
   const runDeleteUpload = async (r: RawReportUploadRow) => {
@@ -219,6 +231,55 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
     }
   };
 
+  // ── Phase 4: Generic (catalog, removal shipment tree, etc.) ───────────────
+  const runGeneric = async (r: RawReportUploadRow) => {
+    setGenericIds((prev) => new Set([...prev, r.id]));
+    setLoadErr(null);
+    try {
+      const res = await fetch("/api/settings/imports/generic", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_id: r.id }),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok || !json.ok) {
+        setLoadErr(json.error ?? "Generic phase failed.");
+        await refresh();
+        return;
+      }
+      await refresh();
+    } catch (e) {
+      setLoadErr(e instanceof Error ? e.message : "Generic phase failed.");
+      await refresh();
+    } finally {
+      setGenericIds((prev) => { const n = new Set(prev); n.delete(r.id); return n; });
+    }
+  };
+
+  const runWorklist = async (r: RawReportUploadRow) => {
+    setWorklistingIds((prev) => new Set([...prev, r.id]));
+    setLoadErr(null);
+    try {
+      const res = await fetch("/api/settings/imports/generate-worklist", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_id: r.id }),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok || !json.ok) {
+        setLoadErr(json.error ?? "Generate Worklist failed.");
+        await refresh();
+        return;
+      }
+      await refresh();
+    } catch (e) {
+      setLoadErr(e instanceof Error ? e.message : "Generate Worklist failed.");
+      await refresh();
+    } finally {
+      setWorklistingIds((prev) => { const n = new Set(prev); n.delete(r.id); return n; });
+    }
+  };
+
   // ── Phase 3: Sync (amazon_staging -> domain tables) ─────────────────────
   const runSync = async (r: RawReportUploadRow) => {
     setSyncingIds((prev) => new Set([...prev, r.id]));
@@ -276,7 +337,12 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
     setSelectedIds(allSelected ? new Set() : new Set(rows.map((r) => r.id)));
 
   const anyBusy = (id: string) =>
-    processingIds.has(id) || syncingIds.has(id) || deletingIds.has(id) || resettingIds.has(id);
+    processingIds.has(id) ||
+    syncingIds.has(id) ||
+    genericIds.has(id) ||
+    worklistingIds.has(id) ||
+    deletingIds.has(id) ||
+    resettingIds.has(id);
 
   return (
     <>
@@ -338,14 +404,16 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
         {/* Sub-description */}
         <div className="space-y-2 px-5 pt-2 pb-3 text-xs text-muted-foreground">
           <p>
-            <strong className="text-foreground">Amazon listing exports:</strong> Phase 1 upload, then{" "}
-            <strong>Process Data</strong> (parse raw rows + sync catalog). There is no separate Sync step and no
-            Generate step.
+            <strong className="text-foreground">Amazon listing exports:</strong> Phase 1 upload →{" "}
+            <strong>Process</strong> (stage to <code className="text-xs">amazon_staging</code>) →{" "}
+            <strong>Sync</strong> (raw rows to <code className="text-xs">amazon_listing_report_rows_raw</code>) →{" "}
+            <strong>Generic (catalog)</strong> (<code className="text-xs">catalog_products</code>).
           </p>
           <p>
             <strong className="text-foreground">Other report types:</strong> after upload,{" "}
-            <strong>Process</strong> stages rows, then <strong>Sync</strong> writes domain tables (removal flows may
-            add Generate Worklist).
+            <strong>Process</strong> stages rows, then <strong>Sync</strong> writes raw/domain tables. Removal shipment
+            imports then run <strong>Generic</strong> (shipment tree). Removal orders use <strong>Generate Worklist</strong>{" "}
+            when needed.
           </p>
           <p>
             Delete performs full cleanup across Storage, staging, and domain tables.
@@ -414,22 +482,71 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                 const isLedgerSession = metaObj?.source === AMAZON_LEDGER_UPLOAD_SOURCE;
                 const busy = anyBusy(r.id);
 
-                // Determine what failed_phase metadata says so we show the right Retry button
-                const failedPhase =
-                  r.status === "failed"
-                    ? ((metaObj?.failed_phase as "process" | "sync" | undefined) ?? "process")
-                    : undefined;
+                const baseInput: ImportUiActionInput = {
+                  reportType: String(r.report_type ?? ""),
+                  status: r.status,
+                  metadata: metaObj,
+                  fps: r.file_processing_status,
+                  isLedgerSession,
+                };
+                const uiInput = buildImportUiActionInputForRemovalShipment(
+                  baseInput,
+                  rt === "REMOVAL_SHIPMENT" ? "REMOVAL_SHIPMENT" : undefined,
+                );
+                const actionState = resolveImportUiActionState(uiInput);
+                const badgeStatus = actionState.badgeStatus;
+                const isRsRow = uiInput.reportType === "REMOVAL_SHIPMENT";
+                const rsRowCta =
+                  !isLedgerSession && isRsRow
+                    ? resolveRemovalShipmentPrimaryCta(actionState, r.status, isLedgerSession)
+                    : null;
+                const rsBadge =
+                  isRsRow && !isLedgerSession
+                    ? resolveRemovalShipmentPhaseBadgeLabel(actionState, r.status, isLedgerSession)
+                    : null;
+
+                const listingUi =
+                  !isLedgerSession && isListing && !isRsRow
+                    ? resolveListingImportUiState({
+                        ...uiInput,
+                        client: {
+                          isProcessing: processingIds.has(r.id),
+                          isSyncing: syncingIds.has(r.id),
+                          isGenericing: genericIds.has(r.id),
+                        },
+                      })
+                    : null;
 
                 const showMapColumns = r.status === "needs_mapping";
                 const showProcess =
                   !isLedgerSession &&
-                  (r.status === "mapped" || r.status === "ready" || r.status === "uploaded");
-                const showSync = r.status === "staged";
-                // Retry buttons — shown when a row is in "failed" state
-                const showRetryProcess =
-                  r.status === "failed" && !isLedgerSession && failedPhase === "process";
-                const showRetrySync =
-                  r.status === "failed" && failedPhase === "sync";
+                  (isRsRow
+                    ? rsRowCta === "process" || rsRowCta === "retry_process"
+                    : isListing && listingUi
+                      ? listingUi.showProcessCta
+                      : r.status === "mapped" || r.status === "ready" || r.status === "uploaded");
+                const showSync =
+                  isRsRow && rsRowCta != null
+                    ? rsRowCta === "sync" || rsRowCta === "retry_sync"
+                    : isListing && listingUi
+                      ? listingUi.showSyncCta
+                      : actionState.showSync;
+                const showGeneric =
+                  isRsRow && rsRowCta != null
+                    ? rsRowCta === "generic" || rsRowCta === "generic_retry"
+                    : isListing && listingUi
+                      ? listingUi.showGenericCta
+                      : actionState.showGeneric;
+                const showWorklist = actionState.showWorklist;
+                const showRetryProcess = !isRsRow && !isListing && actionState.showRetryProcess;
+                const showRetrySync = !isRsRow && !isListing && actionState.showRetrySync;
+                const showRetryGeneric = !isRsRow && !isListing && actionState.showRetryGeneric;
+                const showFailedError =
+                  Boolean(r.errorMessage) &&
+                  (String(badgeStatus).toLowerCase() === "failed" ||
+                    ((isListing || isRsRow) &&
+                      String(r.status).toLowerCase() === "failed" &&
+                      !actionState.phase4Complete));
 
                 return (
                   <tr
@@ -528,7 +645,10 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                           const done = num(metaObj?.row_count,         0);
                           const rawTot  = num(metaObj?.total_rows,        0);
                           const im = metaObj?.import_metrics as { current_phase?: string } | undefined;
-                          const phaseLbl = formatImportPhaseLabel(im?.current_phase ?? "staging");
+                          const phaseLbl =
+                            im?.current_phase === "staging"
+                              ? "Phase 2 — Stage to amazon_staging"
+                              : formatImportPhaseLabel(im?.current_phase ?? "staging");
                           const tot =
                             rawTot > 0 && done > 0 && rawTot > done * 1.18
                               ? done
@@ -558,6 +678,28 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                             </div>
                           );
                         })()
+                      ) : genericIds.has(r.id) ? (
+                        (() => {
+                          const gp = num(metaObj?.process_progress, 0);
+                          return (
+                            <div className="min-w-[120px]">
+                              <div className="mb-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
+                                <span className="flex items-center gap-1">
+                                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                                  Phase 4 — Generic
+                                </span>
+                                <span className="tabular-nums text-muted-foreground">{gp > 0 ? `${gp}%` : "…"}</span>
+                              </div>
+                              <div className="relative h-1.5 overflow-hidden rounded-full bg-muted">
+                                <div className="absolute inset-0 animate-pulse rounded-full bg-emerald-400/40" />
+                                <div
+                                  className="h-full rounded-full bg-emerald-500 transition-all duration-500"
+                                  style={{ width: `${Math.max(5, Math.min(100, gp))}%` }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })()
                       ) : syncingIds.has(r.id) ? (
                         (() => {
                           const syncPct = num(metaObj?.sync_progress, 0);
@@ -566,7 +708,10 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                             rows_synced?: number;
                             total_staging_rows?: number;
                           } | undefined;
-                          const phaseLbl = formatImportPhaseLabel(im?.current_phase ?? "sync");
+                          const phaseLbl =
+                            im?.current_phase === "sync"
+                              ? "Phase 3 — Raw sync"
+                              : formatImportPhaseLabel(im?.current_phase ?? "sync");
                           const rs = num(im?.rows_synced, -1);
                           const ts = num(im?.total_staging_rows, -1);
                           const rowHint =
@@ -597,10 +742,14 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                           <span
                             className={[
                               "inline-flex flex-wrap items-center gap-x-1.5 rounded-full px-2 py-0.5 text-xs font-medium",
-                              statusColorClass(r.status),
+                              statusColorClass(badgeStatus),
                             ].join(" ")}
                           >
-                            <span>{statusLabel(r.status, r.upload_progress, { listing: isListing })}</span>
+                            <span>
+                              {rsBadge ??
+                                listingUi?.phaseBadgeText ??
+                                statusLabel(badgeStatus, r.upload_progress, { listing: isListing })}
+                            </span>
                             {(r.status === "uploading" || r.status === "processing") &&
                               r.upload_progress > 0 && r.upload_progress < 100 && (
                                 <span className="font-normal tabular-nums text-muted-foreground">
@@ -608,8 +757,8 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                                 </span>
                               )}
                           </span>
-                          {r.status === "failed" && r.errorMessage && (
-                            <span className="max-w-[180px] truncate text-[10px] text-destructive" title={r.errorMessage}>
+                          {showFailedError && (
+                            <span className="max-w-[180px] truncate text-[10px] text-destructive" title={r.errorMessage!}>
                               {r.errorMessage}
                             </span>
                           )}
@@ -620,33 +769,14 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                     {/* Row count — Phase 3+: sync/stage when present; else row_count / CSV total */}
                     <td className="px-4 py-3 text-right tabular-nums text-xs text-muted-foreground">
                       {(() => {
-                        const listingRaw = num(metaObj?.catalog_listing_raw_rows_stored, -1);
-                        const listingData = num(metaObj?.catalog_listing_data_rows_seen, -1);
-                        const listingNew = num(
-                          metaObj?.catalog_listing_canonical_rows_new ?? metaObj?.catalog_listing_canonical_rows_inserted,
-                          -1,
-                        );
-                        const listingUnchanged = num(
-                          metaObj?.catalog_listing_canonical_rows_unchanged ??
-                            metaObj?.catalog_listing_canonical_rows_unchanged_or_merged,
-                          -1,
-                        );
-                        if (
-                          isListing &&
-                          listingRaw >= 0 &&
-                          listingData >= 0 &&
-                          (r.status === "synced" || r.status === "processing" || r.status === "complete")
-                        ) {
-                          const syncNote =
-                            r.status === "synced" && listingNew >= 0 && listingUnchanged >= 0
-                              ? ` · new ${listingNew.toLocaleString()} · unchanged ${listingUnchanged.toLocaleString()}`
-                              : "";
+                        if (isListing) {
+                          if (!listingUi) return "—";
                           return (
                             <span
-                              title="Listing import: raw rows stored vs non-empty data lines; canonical counts after Process Data."
-                              className="cursor-help"
+                              title="Listing metrics (shared resolver with top card)."
+                              className="block max-w-[min(100%,20rem)] cursor-help text-right text-[11px] leading-snug text-muted-foreground"
                             >
-                              {`${listingRaw.toLocaleString()} raw / ${listingData.toLocaleString()} data${syncNote}`}
+                              {listingUi.rowMetricsLine}
                             </span>
                           );
                         }
@@ -666,6 +796,49 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                         const processed = num(metaObj?.row_count, -1);
                         const total = num(metaObj?.total_rows, 0);
                         if (stagedCount >= 0 && syncCount >= 0) {
+                          if (isRsRow) {
+                            const im = metaObj?.import_metrics as
+                              | { rows_duplicate_against_existing?: number }
+                              | undefined;
+                            const skippedDup =
+                              num(im?.rows_duplicate_against_existing, -1) >= 0
+                                ? num(im?.rows_duplicate_against_existing, 0)
+                                : num(metaObj?.sync_collapsed_by_dedupe, 0);
+                            const genMeta = num(metaObj?.removal_shipment_phase4_generic_rows_written, -1);
+                            const fpsRow = r.file_processing_status;
+                            const fpsObj =
+                              fpsRow && typeof fpsRow === "object"
+                                ? (fpsRow as {
+                                    generic_rows_written?: unknown;
+                                    raw_rows_written?: unknown;
+                                    raw_rows_skipped_existing?: unknown;
+                                  })
+                                : null;
+                            const rawNewF = fpsObj ? num(fpsObj.raw_rows_written, -1) : -1;
+                            const rawSkipF = fpsObj ? num(fpsObj.raw_rows_skipped_existing, -1) : -1;
+                            const genFps = fpsObj ? num(fpsObj.generic_rows_written, -1) : -1;
+                            const genericDone = genMeta >= 0 ? genMeta : genFps;
+                            const sub: string[] = [];
+                            if (genericDone >= 0) sub.push(`generic ${genericDone.toLocaleString()}`);
+                            if (skippedDup > 0) sub.push(`duplicates skipped ${skippedDup.toLocaleString()}`);
+                            const main =
+                              rawNewF >= 0 || rawSkipF >= 0
+                                ? `staged ${stagedCount.toLocaleString()} · raw new ${(rawNewF >= 0 ? rawNewF : syncCount).toLocaleString()} · raw skipped ${(rawSkipF >= 0 ? rawSkipF : 0).toLocaleString()}`
+                                : `raw ${syncCount.toLocaleString()} / staged ${stagedCount.toLocaleString()}`;
+                            return (
+                              <span
+                                title="Removal shipment: FPS raw_rows_written / raw_rows_skipped_existing; staged = staging rows; duplicates skipped = lines already archived; generic = Phase 4 rows."
+                                className="flex max-w-[min(100%,22rem)] cursor-help flex-wrap justify-end gap-x-1 gap-y-0.5 text-right leading-snug"
+                              >
+                                <span className="tabular-nums">{main}</span>
+                                {sub.length > 0 && (
+                                  <span className="block w-full text-[10px] text-muted-foreground">
+                                    {sub.join(" · ")}
+                                  </span>
+                                )}
+                              </span>
+                            );
+                          }
                           const dupInFile = num(metaObj?.sync_duplicate_in_batch_rows, -1);
                           const im = metaObj?.import_metrics as
                             | {
@@ -760,8 +933,10 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                                 <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
                                 Processing…
                               </>
-                            ) : isListing ? (
-                              "Process Data"
+                            ) : isRsRow && rsRowCta === "retry_process" ? (
+                              "Retry Process"
+                            ) : isListing && listingUi ? (
+                              listingUi.rowActionLabel
                             ) : (
                               "Process"
                             )}
@@ -782,14 +957,58 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                                 <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
                                 Syncing…
                               </>
+                            ) : isRsRow && rsRowCta === "retry_sync" ? (
+                              "Retry Sync"
                             ) : (
                               "Sync"
                             )}
                           </button>
                         )}
 
+                        {showGeneric && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void runGeneric(r)}
+                            aria-label={`Run generic phase for ${r.file_name}`}
+                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-emerald-400/60 bg-emerald-50 px-3 text-xs font-semibold text-emerald-900 shadow-sm transition hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-600/40 dark:bg-emerald-950/30 dark:text-emerald-200"
+                          >
+                            {genericIds.has(r.id) ? (
+                              <>
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                                Generic…
+                              </>
+                            ) : isRsRow ? (
+                              rsRowCta === "generic_retry" ? "Retry Generic (shipments)" : "Generic (shipments)"
+                            ) : isListing && listingUi ? (
+                              listingUi.rowActionLabel
+                            ) : (
+                              "Generic (shipments)"
+                            )}
+                          </button>
+                        )}
+
+                        {showWorklist && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void runWorklist(r)}
+                            aria-label={`Generate worklist for ${r.file_name}`}
+                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-amber-400/60 bg-amber-50 px-3 text-xs font-semibold text-amber-900 shadow-sm transition hover:bg-amber-100 disabled:opacity-50 dark:border-amber-600/40 dark:bg-amber-950/30 dark:text-amber-200"
+                          >
+                            {worklistingIds.has(r.id) ? (
+                              <>
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                                Worklist…
+                              </>
+                            ) : (
+                              "Generate Worklist"
+                            )}
+                          </button>
+                        )}
+
                         {/* In-progress server-side indicator */}
-                        {r.status === "processing" && !processingIds.has(r.id) && !syncingIds.has(r.id) && (
+                        {r.status === "processing" && !processingIds.has(r.id) && !syncingIds.has(r.id) && !genericIds.has(r.id) && (
                           <div className="flex flex-col items-end gap-1">
                             {r.errorMessage ? (
                               <span className="max-w-[200px] truncate text-[10px] font-medium text-destructive" title={r.errorMessage}>
@@ -859,6 +1078,28 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
                               <>
                                 <RotateCcw className="h-3.5 w-3.5" aria-hidden />
                                 Retry Sync
+                              </>
+                            )}
+                          </button>
+                        )}
+
+                        {showRetryGeneric && (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void runGeneric(r)}
+                            aria-label={`Retry generic phase for ${r.file_name}`}
+                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-emerald-400/60 bg-emerald-50 px-3 text-xs font-semibold text-emerald-900 shadow-sm transition hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-600/40 dark:bg-emerald-950/30 dark:text-emerald-200"
+                          >
+                            {genericIds.has(r.id) ? (
+                              <>
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                                Retrying…
+                              </>
+                            ) : (
+                              <>
+                                <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+                                {isListing ? "Retry Generic (catalog)" : "Retry Generic"}
                               </>
                             )}
                           </button>
