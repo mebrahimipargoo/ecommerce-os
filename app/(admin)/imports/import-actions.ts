@@ -186,6 +186,7 @@ export async function listRawReportUploads(input?: {
         .select(
           [
             "upload_id",
+            "phase1_status",
             "phase2_status",
             "phase3_status",
             "phase4_status",
@@ -208,6 +209,13 @@ export async function listRawReportUploads(input?: {
             "processed_rows",
             "file_rows_total",
             "data_rows_total",
+            "rows_eligible_for_generic",
+            "duplicate_rows_skipped",
+            "canonical_rows_new",
+            "canonical_rows_updated",
+            "canonical_rows_unchanged",
+            "upload_bytes_written",
+            "upload_bytes_total",
           ].join(", "),
         )
         .in("upload_id", uploadIds);
@@ -218,6 +226,7 @@ export async function listRawReportUploads(input?: {
           const uid = String(fr.upload_id ?? "").trim();
           if (!isUuidString(uid)) continue;
           fpsByUpload.set(uid, {
+            phase1_status: fr.phase1_status != null ? String(fr.phase1_status) : null,
             phase2_status: fr.phase2_status != null ? String(fr.phase2_status) : null,
             phase3_status: fr.phase3_status != null ? String(fr.phase3_status) : null,
             phase4_status: fr.phase4_status != null ? String(fr.phase4_status) : null,
@@ -240,6 +249,13 @@ export async function listRawReportUploads(input?: {
             processed_rows: numOrNull(fr.processed_rows),
             file_rows_total: numOrNull(fr.file_rows_total),
             data_rows_total: numOrNull(fr.data_rows_total),
+            rows_eligible_for_generic: numOrNull(fr.rows_eligible_for_generic),
+            duplicate_rows_skipped: numOrNull(fr.duplicate_rows_skipped),
+            canonical_rows_new: numOrNull(fr.canonical_rows_new),
+            canonical_rows_updated: numOrNull(fr.canonical_rows_updated),
+            canonical_rows_unchanged: numOrNull(fr.canonical_rows_unchanged),
+            upload_bytes_written: numOrNull(fr.upload_bytes_written),
+            upload_bytes_total: numOrNull(fr.upload_bytes_total),
           });
         }
       }

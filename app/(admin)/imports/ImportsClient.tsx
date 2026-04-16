@@ -89,8 +89,7 @@ export function ImportsClient() {
           Imports
         </h1>
         <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-          Upload FBA Returns, Removal Orders, Inventory Ledger, and other Amazon report files.
-          Phase 1 uploads &amp; maps headers; Phase 2 stages data; Phase 3 syncs to destination tables.
+          Upload Amazon report files. Each file goes through an automated pipeline to process, sync, and enrich data.
         </p>
       </div>
 

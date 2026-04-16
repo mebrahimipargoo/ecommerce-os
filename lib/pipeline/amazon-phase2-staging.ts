@@ -1,6 +1,6 @@
 /**
- * Phase 2 — Process raw file → `amazon_staging` (unified for all Amazon report types).
- * Listing exports: after staging, chains raw archive + catalog merge in-process (no Sync/Generic).
+ * Phase 2 — Process raw file → `amazon_staging` only (unified for all Amazon report types).
+ * Listing exports: same as other reports — Sync lands `amazon_listing_report_rows_raw`, Generic merges `catalog_products`.
  *
  * Shared by:
  *   POST /api/settings/imports/stage  (thin wrapper; rejects listing kinds)
@@ -23,7 +23,14 @@ import { mergeUploadMetadata, parseRawReportMetadata } from "../raw-report-uploa
 import { supabaseServer } from "../supabase-server";
 import { isUuidString } from "../uuid";
 import { isListingReportType } from "../raw-report-types";
-import { completeListingImportFromStaging } from "./listing-import-complete-from-staging";
+import {
+  FPS_KEY_FAILED,
+  FPS_KEY_PROCESS,
+  FPS_LABEL_PROCESS,
+  FPS_NEXT_ACTION_LABEL_SYNC,
+} from "./file-processing-status-contract";
+import { logImportPhase } from "./amazon-import-engine-log";
+import { resolveAmazonImportEngineConfig, resolveAmazonImportSyncKind } from "./amazon-report-registry";
 
 const STAGING_TABLE = "amazon_staging";
 const BATCH_SIZE = 500;
@@ -197,6 +204,8 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       );
     }
 
+    const engine = resolveAmazonImportEngineConfig(resolveAmazonImportSyncKind(reportTypeRaw));
+
     const meta = (row as { metadata?: unknown }).metadata;
     const parsed = parseRawReportMetadata(meta);
     if (parsed.uploadProgress < 100) {
@@ -281,6 +290,14 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         organization_id: orgId,
         status: "processing",
         current_phase: "staging",
+        phase_key: FPS_KEY_PROCESS,
+        phase_label: FPS_LABEL_PROCESS,
+        stage_target_table: engine.stage_target_table,
+        sync_target_table: engine.sync_target_table,
+        generic_target_table: engine.generic_target_table,
+        next_action_key: "sync",
+        next_action_label: FPS_NEXT_ACTION_LABEL_SYNC,
+        current_phase_label: FPS_LABEL_PROCESS,
         upload_pct: 100,
         process_pct: 0,
         sync_pct: 0,
@@ -387,7 +404,14 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
             organization_id: orgId,
             status: "processing",
             current_phase: "staging",
-            current_phase_label: "Phase 2 — Stage to amazon_staging",
+            phase_key: FPS_KEY_PROCESS,
+            phase_label: FPS_LABEL_PROCESS,
+            stage_target_table: engine.stage_target_table,
+            sync_target_table: engine.sync_target_table,
+            generic_target_table: engine.generic_target_table,
+            next_action_key: "sync",
+            next_action_label: FPS_NEXT_ACTION_LABEL_SYNC,
+            current_phase_label: FPS_LABEL_PROCESS,
             upload_pct: 100,
             process_pct: pct,
             phase1_upload_pct: 100,
@@ -482,18 +506,91 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         .eq("organization_id", orgId);
       const rowsInDb = typeof stagingCount === "number" ? stagingCount : approxStaged;
 
-      await completeListingImportFromStaging({
-        uploadId,
-        orgId,
-        phase2: {
-          fileRowsTotal,
-          dataRowsPassed: dataLinesPassed,
-          rowsStaged: rowsInDb,
-          skippedEmpty,
+      const { data: prevRowListing } = await supabaseServer
+        .from("raw_report_uploads")
+        .select("metadata")
+        .eq("id", uploadId)
+        .maybeSingle();
+
+      await supabaseServer
+        .from("raw_report_uploads")
+        .update({
+          status: "staged",
+          import_pipeline_completed_at: null,
+          metadata: mergeUploadMetadata((prevRowListing as { metadata?: unknown } | null)?.metadata, {
+            row_count: dataLinesPassed,
+            total_rows: dataLinesPassed,
+            processed_rows: rowsInDb,
+            process_progress: 100,
+            physical_lines_seen: fileRowsTotal,
+            data_rows_seen: dataLinesPassed,
+            staging_row_count: rowsInDb,
+            catalog_listing_file_rows_seen: fileRowsTotal,
+            catalog_listing_data_rows_seen: dataLinesPassed,
+            import_metrics: {
+              current_phase: "staged",
+              physical_lines_seen: fileRowsTotal,
+              data_rows_seen: dataLinesPassed,
+              rows_staged: rowsInDb,
+              rows_skipped_empty: skippedEmpty,
+              rows_skipped_malformed: 0,
+            },
+          }),
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", uploadId)
+        .eq("organization_id", orgId);
+
+      await supabaseServer.from("file_processing_status").upsert(
+        {
+          upload_id: uploadId,
+          organization_id: orgId,
+          status: "processing",
+          current_phase: "staged",
+          phase_key: FPS_KEY_PROCESS,
+          phase_label: FPS_LABEL_PROCESS,
+          current_phase_label: FPS_LABEL_PROCESS,
+          stage_target_table: engine.stage_target_table,
+          sync_target_table: engine.sync_target_table,
+          generic_target_table: engine.generic_target_table,
+          next_action_key: "sync",
+          next_action_label: FPS_NEXT_ACTION_LABEL_SYNC,
+          upload_pct: 100,
+          process_pct: 100,
+          sync_pct: 0,
+          phase1_upload_pct: 100,
+          phase2_stage_pct: 100,
+          phase3_raw_sync_pct: 0,
+          phase4_generic_pct: 0,
+          processed_rows: rowsInDb,
+          total_rows: Math.max(rowsInDb, dataLinesPassed, 1),
+          staged_rows_written: rowsInDb,
+          file_rows_total: fileRowsTotal,
+          data_rows_total: dataRowsTotal,
+          phase2_status: "complete",
+          phase2_completed_at: new Date().toISOString(),
+          error_message: null,
+          import_metrics: {
+            current_phase: "staged",
+            physical_lines_seen: fileRowsTotal,
+            data_rows_seen: dataLinesPassed,
+            rows_staged: rowsInDb,
+          },
         },
+        { onConflict: "upload_id" },
+      );
+
+      logImportPhase({
+        report_type: reportTypeRaw,
+        upload_id: uploadId,
+        phase: FPS_KEY_PROCESS,
+        phase_key: FPS_KEY_PROCESS,
+        target_table: engine.stage_target_table,
+        rows_written: rowsInDb,
+        rows_processed: rowsInDb,
       });
 
-      await audit(orgId, "import.listing_pipeline_completed", uploadId, {
+      await audit(orgId, "import.listing_stage_completed", uploadId, {
         rowsStaged: rowsInDb,
         totalSeen: fileRowsTotal,
         listing: true,
@@ -504,7 +601,7 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         ok: true,
         rowsStaged: rowsInDb,
         totalRows: fileRowsTotal,
-        pipeline: "listing_import_complete",
+        pipeline: "phase2_staging_listing",
       });
     }
 
@@ -574,11 +671,25 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           organization_id: orgId,
           status: "processing",
           current_phase: "staging",
+          phase_key: FPS_KEY_PROCESS,
+          phase_label: FPS_LABEL_PROCESS,
+          stage_target_table: engine.stage_target_table,
+          sync_target_table: engine.sync_target_table,
+          generic_target_table: engine.generic_target_table,
+          next_action_key: "sync",
+          next_action_label: FPS_NEXT_ACTION_LABEL_SYNC,
+          current_phase_label: FPS_LABEL_PROCESS,
           upload_pct: 100,
           process_pct: pct,
+          phase1_upload_pct: 100,
+          phase2_stage_pct: pct,
+          phase3_raw_sync_pct: 0,
+          phase4_generic_pct: 0,
           sync_pct: 0,
           processed_rows: dataLinesPassed,
           total_rows: denom,
+          staged_rows_written: approxStaged,
+          data_rows_total: dataLinesPassed,
           import_metrics: {
             physical_lines_seen: totalSeen,
             data_rows_seen: dataLinesPassed,
@@ -711,11 +822,28 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
                 organization_id: orgId,
                 status: "processing",
                 current_phase: "staged",
+                phase_key: FPS_KEY_PROCESS,
+                phase_label: FPS_LABEL_PROCESS,
+                current_phase_label: FPS_LABEL_PROCESS,
+                stage_target_table: engine.stage_target_table,
+                sync_target_table: engine.sync_target_table,
+                generic_target_table: engine.generic_target_table,
+                next_action_key: "sync",
+                next_action_label: FPS_NEXT_ACTION_LABEL_SYNC,
                 upload_pct: 100,
                 process_pct: 100,
                 sync_pct: 0,
+                phase1_upload_pct: 100,
+                phase2_stage_pct: 100,
+                phase3_raw_sync_pct: 0,
+                phase4_generic_pct: 0,
                 processed_rows: rowsInDb,
                 total_rows: Math.max(rowsInDb, dataLinesPassed, 1),
+                staged_rows_written: rowsInDb,
+                file_rows_total: totalSeen,
+                data_rows_total: dataLinesPassed,
+                phase2_status: "complete",
+                phase2_completed_at: new Date().toISOString(),
                 error_message: null,
                 import_metrics: {
                   physical_lines_seen: totalSeen,
@@ -726,6 +854,16 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
               },
               { onConflict: "upload_id" },
             );
+
+            logImportPhase({
+              report_type: reportTypeRaw,
+              upload_id: uploadId,
+              phase: FPS_KEY_PROCESS,
+              phase_key: FPS_KEY_PROCESS,
+              target_table: engine.stage_target_table,
+              rows_written: rowsInDb,
+              rows_processed: rowsInDb,
+            });
 
             stagedRowCountForResponse = rowsInDb;
 
@@ -778,6 +916,10 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           upload_id: uploadIdForFail,
           organization_id: orgId,
           status: "failed",
+          phase_key: FPS_KEY_FAILED,
+          phase_label: message.slice(0, 200),
+          next_action_key: null,
+          next_action_label: null,
           upload_pct: 100,
           process_pct: 0,
           error_message: message,

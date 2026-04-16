@@ -1,16 +1,22 @@
 /**
  * POST /api/settings/imports/generic
  *
- * Phase 4 — post-raw actions (per report type). Listing imports use Process only; this route rejects listing kinds.
+ * Phase 4 — registry-driven post-sync actions only (never raw landing).
  */
 
 import { NextResponse } from "next/server";
 
+import { syncFinancialReferenceResolverForUpload } from "../../../../../lib/financial-reference-resolver-sync";
+import { enrichIdentifierMapFromInventoryLedgerUpload } from "../../../../../lib/inventory-ledger-identifier-enrich";
+import { logAmazonImportEngineEvent } from "../../../../../lib/pipeline/amazon-import-engine-log";
+import { FPS_KEY_GENERIC, fpsLabelGeneric } from "../../../../../lib/pipeline/file-processing-status-contract";
 import {
+  DOMAIN_TABLE,
   isListingAmazonSyncKind,
+  resolveAmazonImportEngineConfig,
   resolveAmazonImportSyncKind,
-  type AmazonSyncKind,
 } from "../../../../../lib/pipeline/amazon-report-registry";
+import { runListingCatalogGenericPhase } from "../../../../../lib/pipeline/listing-import-complete-from-staging";
 import { mergeUploadMetadata } from "../../../../../lib/raw-report-upload-metadata";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
@@ -141,15 +147,15 @@ export async function POST(req: Request): Promise<Response> {
 
     const rt = String((row as { report_type?: string }).report_type ?? "").trim();
     const kind = resolveAmazonImportSyncKind(rt);
+    const engine = resolveAmazonImportEngineConfig(kind);
 
-    if (isListingAmazonSyncKind(kind)) {
+    if (!engine.supports_generic) {
       return NextResponse.json(
         {
           ok: false,
-          error:
-            "Listing exports finish in a single Process step (raw archive + catalog). Generic is not used for listing imports.",
+          error: `Report type "${rt || "UNKNOWN"}" has no Generic phase (registry supports_generic=false).`,
         },
-        { status: 409 },
+        { status: 422 },
       );
     }
 
@@ -169,24 +175,29 @@ export async function POST(req: Request): Promise<Response> {
     const phase3Done = phase3CompleteDb(fpsGate?.phase3_status);
     const phase4Done = phase4CompleteDb(fpsGate?.phase4_status);
 
-    if (kind === "REMOVAL_SHIPMENT") {
-      if (!phase3Done) {
-        return NextResponse.json(
-          {
-            ok: false,
-            error: `Removal shipment Phase 4 requires Phase 3 complete (file_processing_status.phase3_status). Current: "${String(fpsGate?.phase3_status ?? "missing")}". Finish Sync first.`,
-          },
-          { status: 409 },
-        );
-      }
-      if (phase4Done) {
-        return NextResponse.json({ ok: true, kind: "REMOVAL_SHIPMENT", skipped: true });
-      }
-    } else if (status !== "raw_synced") {
+    const canRetryGeneric = status === "failed" && failedPhaseRaw === "generic";
+    const stuckProcessing = status === "processing" && phase3Done;
+    const entryOk = status === "raw_synced" || canRetryGeneric || stuckProcessing;
+
+    if (phase4Done) {
+      return NextResponse.json({ ok: true, kind, skipped: true });
+    }
+
+    if (!entryOk) {
       return NextResponse.json(
         {
           ok: false,
-          error: `Phase 4 requires status "raw_synced" (finish Phase 3 first). Current: "${status}".`,
+          error: `Generic phase requires status "raw_synced" (after Sync) or "failed" after a Generic error. Current: "${status}".`,
+        },
+        { status: 409 },
+      );
+    }
+
+    if (!phase3Done) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Generic requires Phase 3 complete (file_processing_status.phase3_status). Current: "${String(fpsGate?.phase3_status ?? "missing")}". Finish Sync first.`,
         },
         { status: 409 },
       );
@@ -210,47 +221,23 @@ export async function POST(req: Request): Promise<Response> {
     let locked: { id?: string }[] | null = null;
     let lockErr: { message: string } | null = null;
 
-    if (kind === "REMOVAL_SHIPMENT") {
-      const shipmentLockable =
-        status === "raw_synced" || (status === "failed" && failedPhaseRaw === "generic");
-      if (!shipmentLockable) {
-        return NextResponse.json(
-          {
-            ok: false,
-            error: `Removal shipment Phase 4 cannot start from status "${status}". Expected raw_synced after Sync, or failed after a Generic attempt.`,
-          },
-          { status: 409 },
-        );
-      }
-      if (status === "raw_synced") {
-        const r = await supabaseServer
-          .from("raw_report_uploads")
-          .update(lockUpdate)
-          .eq("id", uploadId)
-          .eq("organization_id", orgId)
-          .eq("status", "raw_synced")
-          .select("id");
-        locked = r.data as { id?: string }[] | null;
-        if (r.error) lockErr = r.error;
-      }
-      if ((!locked || locked.length === 0) && status === "failed" && failedPhaseRaw === "generic") {
-        const r = await supabaseServer
-          .from("raw_report_uploads")
-          .update(lockUpdate)
-          .eq("id", uploadId)
-          .eq("organization_id", orgId)
-          .eq("status", "failed")
-          .select("id");
-        locked = r.data as { id?: string }[] | null;
-        if (r.error) lockErr = r.error;
-      }
-    } else {
+    if (status === "raw_synced") {
       const r = await supabaseServer
         .from("raw_report_uploads")
         .update(lockUpdate)
         .eq("id", uploadId)
         .eq("organization_id", orgId)
         .eq("status", "raw_synced")
+        .select("id");
+      locked = r.data as { id?: string }[] | null;
+      if (r.error) lockErr = r.error;
+    } else if (canRetryGeneric) {
+      const r = await supabaseServer
+        .from("raw_report_uploads")
+        .update(lockUpdate)
+        .eq("id", uploadId)
+        .eq("organization_id", orgId)
+        .eq("status", "failed")
         .select("id");
       locked = r.data as { id?: string }[] | null;
       if (r.error) lockErr = r.error;
@@ -266,13 +253,18 @@ export async function POST(req: Request): Promise<Response> {
       );
     }
 
+    const genericLabel = fpsLabelGeneric(engine.generic_target_table);
     await supabaseServer.from("file_processing_status").upsert(
       {
         upload_id: uploadId,
         organization_id: orgId,
         status: "processing",
         current_phase: "generic",
-        current_phase_label: "Phase 4 — Generic sync / generate",
+        phase_key: FPS_KEY_GENERIC,
+        phase_label: genericLabel,
+        current_phase_label: genericLabel,
+        current_target_table: engine.generic_target_table,
+        generic_target_table: engine.generic_target_table,
         phase4_status: "running",
         phase4_started_at: new Date().toISOString(),
         phase4_generic_pct: 0,
@@ -308,7 +300,9 @@ export async function POST(req: Request): Promise<Response> {
             organization_id: orgId,
             status: "processing",
             current_phase: "generic",
-            current_phase_label: "Phase 4 — Shipment tree / expected_packages enrich",
+            phase_key: FPS_KEY_GENERIC,
+            phase_label: genericLabel,
+            current_phase_label: genericLabel,
             phase4_generic_pct: 15,
             generic_rows_written: 0,
           },
@@ -370,8 +364,13 @@ export async function POST(req: Request): Promise<Response> {
             organization_id: orgId,
             status: "complete",
             current_phase: "complete",
-            current_phase_label: "Phase 4 complete — shipment tree / expected_packages enrich",
-            current_target_table: "shipment_tree",
+            phase_key: "complete",
+            phase_label: "Complete",
+            next_action_key: null,
+            next_action_label: null,
+            current_phase_label: genericLabel,
+            current_target_table: engine.generic_target_table,
+            generic_target_table: engine.generic_target_table,
             upload_pct: 100,
             process_pct: 100,
             sync_pct: 100,
@@ -387,15 +386,180 @@ export async function POST(req: Request): Promise<Response> {
           { onConflict: "upload_id" },
         );
 
+        logAmazonImportEngineEvent({
+          report_type: rt,
+          upload_id: uploadId,
+          phase: "complete",
+          target_table: engine.generic_target_table,
+          generic_rows_written: genericEligibleRows,
+        });
+
         return NextResponse.json({ ok: true, kind: "REMOVAL_SHIPMENT" });
       } finally {
         await releaseRemovalPipelineLock(uploadId);
       }
     }
 
+    if (isListingAmazonSyncKind(kind)) {
+      await runListingCatalogGenericPhase({ uploadId, orgId });
+      logAmazonImportEngineEvent({
+        report_type: rt,
+        upload_id: uploadId,
+        phase: "complete",
+        target_table: "catalog_products",
+      });
+      return NextResponse.json({ ok: true, kind });
+    }
+
+    if (kind === "INVENTORY_LEDGER") {
+      const enriched = await enrichIdentifierMapFromInventoryLedgerUpload({
+        supabase: supabaseServer,
+        organizationId: orgId,
+        uploadId,
+        storeId: importStoreId,
+      });
+
+      const { data: prevInv } = await supabaseServer
+        .from("raw_report_uploads")
+        .select("metadata")
+        .eq("id", uploadId)
+        .maybeSingle();
+
+      const mergedInv = mergeUploadMetadata((prevInv as { metadata?: unknown } | null)?.metadata, {
+        import_metrics: { current_phase: "complete" },
+        etl_phase: "complete",
+        error_message: "",
+      }) as Record<string, unknown>;
+      mergedInv.inventory_ledger_generic_map_upserts = enriched.map_upserts;
+      delete mergedInv.failed_phase;
+
+      await supabaseServer
+        .from("raw_report_uploads")
+        .update({
+          status: "synced",
+          import_pipeline_completed_at: new Date().toISOString(),
+          metadata: mergedInv,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", uploadId)
+        .eq("organization_id", orgId);
+
+      await supabaseServer.from("file_processing_status").upsert(
+        {
+          upload_id: uploadId,
+          organization_id: orgId,
+          status: "complete",
+          current_phase: "complete",
+          phase_key: "complete",
+          phase_label: "Complete",
+          current_phase_label: "Phase 4 complete — product_identifier_map enrich",
+          current_target_table: "product_identifier_map",
+          generic_target_table: engine.generic_target_table,
+          upload_pct: 100,
+          process_pct: 100,
+          sync_pct: 100,
+          phase1_upload_pct: 100,
+          phase2_stage_pct: 100,
+          phase3_raw_sync_pct: 100,
+          phase4_generic_pct: 100,
+          phase4_status: "complete",
+          phase4_completed_at: new Date().toISOString(),
+          generic_rows_written: enriched.map_upserts,
+          error_message: null,
+        },
+        { onConflict: "upload_id" },
+      );
+
+      logAmazonImportEngineEvent({
+        report_type: rt,
+        upload_id: uploadId,
+        phase: "complete",
+        target_table: "product_identifier_map",
+        rows_processed: enriched.ledger_rows_scanned,
+        generic_rows_written: enriched.map_upserts,
+      });
+
+      return NextResponse.json({ ok: true, kind: "INVENTORY_LEDGER", enriched });
+    }
+
+    if (kind === "SETTLEMENT" || kind === "TRANSACTIONS" || kind === "REIMBURSEMENTS") {
+      await syncFinancialReferenceResolverForUpload(supabaseServer, orgId, uploadId, kind);
+
+      const domainTable = DOMAIN_TABLE[kind];
+      let domainRowCount = 0;
+      if (domainTable) {
+        const { count } = await supabaseServer
+          .from(domainTable)
+          .select("*", { count: "exact", head: true })
+          .eq("organization_id", orgId)
+          .eq("upload_id", uploadId);
+        domainRowCount = typeof count === "number" ? count : 0;
+      }
+
+      const { data: prevFin } = await supabaseServer
+        .from("raw_report_uploads")
+        .select("metadata")
+        .eq("id", uploadId)
+        .maybeSingle();
+
+      const mergedFin = mergeUploadMetadata((prevFin as { metadata?: unknown } | null)?.metadata, {
+        import_metrics: { current_phase: "complete" },
+        etl_phase: "complete",
+        error_message: "",
+      }) as Record<string, unknown>;
+      delete mergedFin.failed_phase;
+
+      await supabaseServer
+        .from("raw_report_uploads")
+        .update({
+          status: "synced",
+          import_pipeline_completed_at: new Date().toISOString(),
+          metadata: mergedFin,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", uploadId)
+        .eq("organization_id", orgId);
+
+      await supabaseServer.from("file_processing_status").upsert(
+        {
+          upload_id: uploadId,
+          organization_id: orgId,
+          status: "complete",
+          current_phase: "complete",
+          phase_key: "complete",
+          phase_label: "Complete",
+          current_phase_label: "Phase 4 complete — financial_reference_resolver",
+          current_target_table: "financial_reference_resolver",
+          generic_target_table: engine.generic_target_table,
+          upload_pct: 100,
+          process_pct: 100,
+          sync_pct: 100,
+          phase1_upload_pct: 100,
+          phase2_stage_pct: 100,
+          phase3_raw_sync_pct: 100,
+          phase4_generic_pct: 100,
+          phase4_status: "complete",
+          phase4_completed_at: new Date().toISOString(),
+          generic_rows_written: domainRowCount,
+          error_message: null,
+        },
+        { onConflict: "upload_id" },
+      );
+
+      logAmazonImportEngineEvent({
+        report_type: rt,
+        upload_id: uploadId,
+        phase: "complete",
+        target_table: "financial_reference_resolver",
+        rows_processed: domainRowCount,
+      });
+
+      return NextResponse.json({ ok: true, kind });
+    }
+
     return NextResponse.json(
-      { ok: false, error: `No Phase 4 action is defined for report type "${rt || "UNKNOWN"}".` },
-      { status: 422 },
+      { ok: false, error: `No Phase 4 handler for report type "${rt || "UNKNOWN"}" (registry mismatch).` },
+      { status: 500 },
     );
   } catch (e) {
     const message = e instanceof Error ? e.message : "Generic phase failed.";

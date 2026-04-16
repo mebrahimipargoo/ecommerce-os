@@ -1,5 +1,11 @@
 import "server-only";
 
+import {
+  FPS_KEY_UPLOAD,
+  FPS_LABEL_UPLOAD,
+  FPS_NEXT_ACTION_LABEL_PROCESS,
+  fpsNextAfterUpload,
+} from "./pipeline/file-processing-status-contract";
 import { mergeUploadMetadata } from "./raw-report-upload-metadata";
 import { supabaseServer } from "./supabase-server";
 import { isUuidString } from "./uuid";
@@ -115,7 +121,11 @@ export async function updateUploadAfterChunk(input: {
         organization_id: orgId,
         status: "uploading",
         current_phase: "upload",
-        current_phase_label: "Phase 1 — Upload to storage",
+        phase_key: FPS_KEY_UPLOAD,
+        phase_label: FPS_LABEL_UPLOAD,
+        next_action_key: fpsNextAfterUpload(),
+        next_action_label: FPS_NEXT_ACTION_LABEL_PROCESS,
+        current_phase_label: FPS_LABEL_UPLOAD,
         upload_pct: pct,
         phase1_upload_pct: pct,
         process_pct: 0,
@@ -123,6 +133,8 @@ export async function updateUploadAfterChunk(input: {
         processed_rows: 0,
         file_size_bytes: totalBytes,
         uploaded_bytes: uploadedBytes,
+        upload_bytes_written: uploadedBytes,
+        upload_bytes_total: totalBytes,
       },
       { onConflict: "upload_id" },
     );
@@ -134,6 +146,8 @@ export async function updateUploadAfterChunk(input: {
         phase1_upload_pct: pct,
         uploaded_bytes: uploadedBytes,
         file_size_bytes: totalBytes,
+        upload_bytes_written: uploadedBytes,
+        upload_bytes_total: totalBytes,
       })
       .eq("upload_id", input.uploadId)
       .eq("organization_id", orgId);
@@ -207,7 +221,11 @@ export async function setUploadByteProgress(input: {
         organization_id: orgId,
         status: "uploading",
         current_phase: "upload",
-        current_phase_label: "Phase 1 — Upload to storage",
+        phase_key: FPS_KEY_UPLOAD,
+        phase_label: FPS_LABEL_UPLOAD,
+        next_action_key: fpsNextAfterUpload(),
+        next_action_label: FPS_NEXT_ACTION_LABEL_PROCESS,
+        current_phase_label: FPS_LABEL_UPLOAD,
         upload_pct: pct,
         phase1_upload_pct: pct,
         process_pct: 0,
@@ -215,6 +233,8 @@ export async function setUploadByteProgress(input: {
         processed_rows: 0,
         file_size_bytes: totalBytes,
         uploaded_bytes: uploadedBytes,
+        upload_bytes_written: uploadedBytes,
+        upload_bytes_total: totalBytes,
       },
       { onConflict: "upload_id" },
     );
@@ -226,6 +246,8 @@ export async function setUploadByteProgress(input: {
         phase1_upload_pct: pct,
         uploaded_bytes: uploadedBytes,
         file_size_bytes: totalBytes,
+        upload_bytes_written: uploadedBytes,
+        upload_bytes_total: totalBytes,
       })
       .eq("upload_id", input.uploadId)
       .eq("organization_id", orgId);

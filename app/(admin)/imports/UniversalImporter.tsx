@@ -18,7 +18,12 @@
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { CheckCircle2, FileText, Loader2, Lock, MapPin, RefreshCw, SquareX, Trash2, UploadCloud, X, Zap } from "lucide-react";
+import { CheckCircle2, FileText, Loader2, MapPin, RefreshCw, SquareX, Trash2, UploadCloud, X, Zap } from "lucide-react";
+import {
+  buildUnifiedPipeline,
+  stepBarColor,
+  stepBadgeColor,
+} from "../../../lib/pipeline/unified-import-pipeline";
 import { isAdminRole, useUserRole } from "../../../components/UserRoleContext";
 import { isUuidString } from "../../../lib/uuid";
 import {
@@ -80,7 +85,7 @@ type ReportTypeChoice =
   | "ACTIVE_LISTINGS";
 
 const REPORT_TYPE_OPTIONS: { value: ReportTypeChoice; label: string }[] = [
-  { value: "AUTO",           label: "✨ Auto-Detect (Recommended)" },
+  { value: "AUTO",           label: "Auto-Detect (Recommended)" },
   { value: "FBA_RETURNS",    label: "FBA Returns" },
   { value: "REMOVAL_ORDER",  label: "Removal Orders" },
   { value: "INVENTORY_LEDGER", label: "Inventory Ledger" },
@@ -202,7 +207,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
 
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
-  const [importFullFile, setImportFullFile] = useState(false);
+  const [importFullFile, setImportFullFile] = useState(true);
   const [dedup, setDedup] = useState(true);
   const [retentionEnabled, setRetentionEnabled] = useState(true);
   const [retentionDays, setRetentionDays] = useState(60);
@@ -344,25 +349,60 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       const { data: fps } = await supabase
         .from("file_processing_status")
         .select(
-          "phase2_status, phase3_status, phase4_status, current_phase, current_phase_label, current_target_table, status, upload_pct, process_pct, sync_pct, phase1_upload_pct, phase2_stage_pct, phase3_raw_sync_pct, phase4_generic_pct, staged_rows_written, raw_rows_written, raw_rows_skipped_existing, generic_rows_written, total_rows, processed_rows, file_rows_total, data_rows_total",
+          [
+            "phase1_status",
+            "phase2_status",
+            "phase3_status",
+            "phase4_status",
+            "current_phase",
+            "current_phase_label",
+            "current_target_table",
+            "status",
+            "upload_pct",
+            "process_pct",
+            "sync_pct",
+            "phase1_upload_pct",
+            "phase2_stage_pct",
+            "phase3_raw_sync_pct",
+            "phase4_generic_pct",
+            "staged_rows_written",
+            "raw_rows_written",
+            "raw_rows_skipped_existing",
+            "generic_rows_written",
+            "total_rows",
+            "processed_rows",
+            "file_rows_total",
+            "data_rows_total",
+            "rows_eligible_for_generic",
+            "duplicate_rows_skipped",
+            "canonical_rows_new",
+            "canonical_rows_updated",
+            "canonical_rows_unchanged",
+            "upload_bytes_written",
+            "upload_bytes_total",
+          ].join(", "),
         )
         .eq("upload_id", sessionUploadId)
         .maybeSingle();
       if (cancelled) return;
-      setSessionFpsRow(fps && typeof fps === "object" ? (fps as Record<string, unknown>) : null);
+      const fpsRow =
+        fps && typeof fps === "object" && !Array.isArray(fps)
+          ? (fps as Record<string, unknown>)
+          : null;
+      setSessionFpsRow(fpsRow);
       const meta =
         rpu.metadata && typeof rpu.metadata === "object" && !Array.isArray(rpu.metadata)
           ? (rpu.metadata as Record<string, unknown>)
           : null;
-      const fpsSnap = fps
+      const fpsSnap = fpsRow
         ? {
-            phase2_status: fps.phase2_status != null ? String(fps.phase2_status) : null,
-            phase3_status: fps.phase3_status != null ? String(fps.phase3_status) : null,
-            phase4_status: fps.phase4_status != null ? String(fps.phase4_status) : null,
-            current_phase: fps.current_phase != null ? String(fps.current_phase) : null,
-            current_phase_label: fps.current_phase_label != null ? String(fps.current_phase_label) : null,
-            current_target_table: fps.current_target_table != null ? String(fps.current_target_table) : null,
-            row_status: fps.status != null ? String(fps.status) : null,
+            phase2_status: fpsRow.phase2_status != null ? String(fpsRow.phase2_status) : null,
+            phase3_status: fpsRow.phase3_status != null ? String(fpsRow.phase3_status) : null,
+            phase4_status: fpsRow.phase4_status != null ? String(fpsRow.phase4_status) : null,
+            current_phase: fpsRow.current_phase != null ? String(fpsRow.current_phase) : null,
+            current_phase_label: fpsRow.current_phase_label != null ? String(fpsRow.current_phase_label) : null,
+            current_target_table: fpsRow.current_target_table != null ? String(fpsRow.current_target_table) : null,
+            row_status: fpsRow.status != null ? String(fpsRow.status) : null,
           }
         : null;
       const input: ImportUiActionInput = {
@@ -379,7 +419,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       const rt = String(rpu.report_type ?? "").trim();
       if (rt && rt !== "UNKNOWN") setDetectedType(rt);
     }
-    const id = setInterval(() => void tick(), 2000);
+    const id = setInterval(() => void tick(), 1500);
     void tick();
     return () => {
       cancelled = true;
@@ -1262,10 +1302,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         </span>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">
-        <strong>Removal Order / Removal Shipment</strong> files use four steps: Upload → Process → Sync to{" "}
-        <code className="rounded bg-muted px-1">amazon_removals</code> →{" "}
-        <strong>Generate Worklist</strong> (<code className="rounded bg-muted px-1">expected_packages</code>).
-        Other report types use three steps. History mirrors every status change below.
+        Upload → Process → Sync → Generic (when applicable). Track progress in real-time below.
       </p>
 
       {/* Error */}
@@ -1482,258 +1519,129 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         />
       </div>
 
-      {/* ── Progress + phase control panel ───────────────────────────────────── */}
-      {phase !== "idle" && (
+      {/* ── Unified pipeline progress ──────────────────────────────────────── */}
+      {phase !== "idle" && (() => {
+        const pipelineStatus = serverImportInput?.status ?? (() => {
+          if (isUploading) return "uploading";
+          if (phase === "needs_mapping") return "needs_mapping";
+          if (phase === "mapped") return "mapped";
+          if (phase === "processing") return "processing";
+          if (phase === "staged") return "staged";
+          if (phase === "syncing") return "syncing";
+          if (phase === "synced" || phase === "worklisted") return "synced";
+          if (phase === "raw_synced") return "raw_synced";
+          if (phase === "genericing") return "processing";
+          if (phase === "worklisting") return "processing";
+          if (phase === "unsupported") return "needs_mapping";
+          return "pending";
+        })();
+        const topPipeline = buildUnifiedPipeline({
+          reportType: effectiveRt || detectedType || "UNKNOWN",
+          status: pipelineStatus,
+          metadata: (serverImportInput?.metadata ?? null) as Record<string, unknown> | null,
+          fps: sessionFpsRow,
+          localUploadPct: isUploading ? uploadPct : undefined,
+          localFileSizeBytes: file?.size,
+          ui:
+            isSyncing || isGenericing || isWorklisting
+              ? { isSyncing, isGenericing, isWorklisting }
+              : undefined,
+        });
+        const visibleSteps = topPipeline.steps.filter((s) => s.tone !== "skipped");
+        const showProcessBtn = !isActive && (topPipeline.nextAction === "process" || topPipeline.nextAction === "map_columns");
+        const showSyncBtn = !isActive && topPipeline.nextAction === "sync";
+        const showGenericBtn = !isActive && topPipeline.nextAction === "generic";
+        const showWorklistBtn = !isActive && topPipeline.nextAction === "worklist";
+
+        return (
         <div className="mt-5 space-y-4 rounded-xl border border-border bg-muted/30 px-4 py-4">
 
-          {/* Status message — REMOVAL_SHIPMENT uses FPS-backed result line when idle */}
-          {(() => {
-            const line = isActive
-              ? progressMsg
-              : removalShipmentUi
-                ? removalResultLine ?? progressMsg
-                : listingImportUi && !removalShipmentUi
-                  ? listingTopLine ?? progressMsg
-                  : progressMsg;
-            if (!line) return null;
-            const isRsResult =
-              !isActive && removalShipmentUi && removalResultLine != null && line === removalResultLine;
-            const isListingResult =
-              !isActive &&
-              listingImportUi &&
-              !removalShipmentUi &&
-              listingTopLine != null &&
-              line === listingTopLine;
-            const listingLines =
-              isListingResult && line.includes("\n") ? line.split("\n").filter(Boolean) : null;
-            return listingLines && listingLines.length > 1 ? (
-              <div className="space-y-1 text-xs font-semibold text-amber-800 dark:text-amber-200">
-                {listingLines.map((l, idx) => (
-                  <p key={idx} className="flex items-center gap-1.5 leading-snug">
-                    {idx === 0 && isActive && (
-                      <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden />
-                    )}
-                    {l}
-                  </p>
-                ))}
-              </div>
-            ) : (
-              <p
-                className={`flex items-center gap-1.5 text-xs ${
-                  isRsResult || isListingResult
-                    ? "font-semibold text-amber-800 dark:text-amber-200"
-                    : "text-muted-foreground"
-                }`}
-              >
-                {isActive && <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden />}
-                {line}
-              </p>
-            );
-          })()}
+          {/* Status message */}
+          {progressMsg && (
+            <p className={`flex items-center gap-1.5 text-xs ${isActive ? "text-muted-foreground" : "font-semibold text-foreground"}`}>
+              {isActive && <Loader2 className="h-3 w-3 shrink-0 animate-spin" aria-hidden />}
+              {progressMsg}
+            </p>
+          )}
 
-          {listingImportUi && !removalShipmentUi && listingPipelineSteps && (
-            <div className="rounded-xl border border-border/80 bg-background/80 px-4 py-3 shadow-sm">
-              <div className="mb-3 flex items-center justify-between gap-2 border-b border-border/60 pb-2">
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Listing pipeline
-                </h3>
-                <span className="text-[10px] text-muted-foreground">
-                  Live progress from storage + row counts
-                </span>
-              </div>
-              <ol className="space-y-3">
-                {listingPipelineSteps.map((step, idx) => {
-                  const barTint =
-                    step.tone === "active"
-                      ? "bg-sky-500"
+          {/* Unified pipeline steps for all file types */}
+          <div className="rounded-xl border border-border/80 bg-background/80 px-4 py-3 shadow-sm">
+            <div className="mb-3 flex items-center justify-between gap-2 border-b border-border/60 pb-2">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Import Pipeline
+              </h3>
+              <span className="text-[10px] text-muted-foreground">
+                {topPipeline.isComplete ? "All phases complete" : topPipeline.currentPhaseLabel}
+              </span>
+            </div>
+            <ol className="space-y-2.5">
+              {visibleSteps.map((step, idx) => {
+                const barColor = stepBarColor(step.tone);
+                const badgeColor = stepBadgeColor(step.tone);
+                const isActiveStep = step.tone === "active";
+                const ring =
+                  step.tone === "active"
+                    ? "ring-2 ring-sky-500/30 bg-sky-500/[0.04]"
+                    : step.tone === "failed"
+                      ? "ring-2 ring-red-500/30 bg-red-500/[0.04]"
                       : step.tone === "done"
-                        ? "bg-emerald-500"
-                        : step.tone === "warning"
-                          ? "bg-amber-500"
-                          : "bg-muted-foreground/40";
-                  const ring =
-                    step.tone === "active"
-                      ? "ring-2 ring-sky-500/35 bg-sky-500/[0.06]"
-                      : step.tone === "warning"
-                        ? "ring-2 ring-amber-500/35 bg-amber-500/[0.06]"
-                        : step.tone === "done"
-                          ? "border border-emerald-500/25 bg-emerald-500/[0.04]"
-                          : "border border-border/70 bg-muted/20";
-                  return (
-                    <li key={step.key} className={`rounded-lg px-3 py-2.5 ${ring}`}>
-                      <div className="mb-1.5 flex items-start gap-3">
-                        <span
-                          className={[
-                            "flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[11px] font-bold",
-                            step.tone === "done"
-                              ? "bg-emerald-600 text-white"
-                              : step.tone === "active"
-                                ? "bg-sky-600 text-white"
-                                : step.tone === "warning"
-                                  ? "bg-amber-600 text-white"
-                                  : "bg-muted text-muted-foreground",
-                          ].join(" ")}
-                        >
-                          {idx + 1}
-                        </span>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5">
-                            <div>
-                              <p className="text-sm font-semibold text-foreground">{step.title}</p>
-                              <p className="text-[11px] text-muted-foreground">{step.subtitle}</p>
-                            </div>
-                            <p className="text-right text-[11px] font-medium tabular-nums text-foreground">
-                              {step.rightLabel}
-                            </p>
+                        ? "border border-emerald-500/20 bg-emerald-500/[0.03]"
+                        : "border border-border/60 bg-muted/15";
+                return (
+                  <li key={step.key} className={`rounded-lg px-3 py-2 ${ring}`}>
+                    <div className="mb-1.5 flex items-start gap-3">
+                      <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ${badgeColor}`}>
+                        {idx + 1}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5">
+                          <div>
+                            <p className="text-sm font-semibold text-foreground">{step.label}</p>
+                            <p className="text-[11px] text-muted-foreground">{step.subtitle}</p>
                           </div>
-                          {step.subLabel ? (
-                            <p className="mt-0.5 text-[10px] font-medium text-violet-700 dark:text-violet-300">
-                              {step.subLabel}
-                            </p>
-                          ) : null}
+                          <p className="text-right text-[11px] font-medium tabular-nums text-foreground">
+                            {step.rightLabel}
+                          </p>
                         </div>
+                        {step.subLabel && (
+                          <p className="mt-0.5 text-[10px] font-medium text-violet-700 dark:text-violet-300">
+                            {step.subLabel}
+                          </p>
+                        )}
                       </div>
-                      <div className="h-2 w-full min-w-0 overflow-hidden rounded-full bg-muted/90 pl-9">
-                        <div
-                          className={`h-full rounded-full transition-[width] duration-500 ease-out ${barTint}`}
-                          style={{ width: `${Math.min(100, Math.max(0, step.pct))}%` }}
-                        />
-                      </div>
-                    </li>
-                  );
-                })}
-              </ol>
-            </div>
-          )}
-
-          {/* ── Phase 1 bars ───────────────────────────────────────────────── */}
-          {!(listingImportUi && !removalShipmentUi) && (
-          <div className="space-y-2">
-            {/* Upload progress */}
-            <div>
-              <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span
-                  title={removalShipmentUi ? REMOVAL_SHIPMENT_UI_LABELS.phase1Subtitle : undefined}
-                >
-                  {removalShipmentUi
-                    ? REMOVAL_SHIPMENT_UI_LABELS.phase1Title
-                    : listingImportUi
-                      ? LISTING_IMPORT_UI_LABELS.phase1Title
-                      : "Phase 1 — Upload"}
-                </span>
-                <span
-                  className={
-                    removalShipmentUi && removalProgress && removalProgress.totalBytes > 0
-                      ? removalProgress.uploadPct >= 100
-                        ? "text-emerald-500"
-                        : "tabular-nums"
-                      : listingImportUi && !removalShipmentUi && listingProgress && listingProgress.totalBytes > 0
-                        ? listingProgress.uploadPct >= 100
-                          ? "text-emerald-500"
-                          : "tabular-nums"
-                        : uploadPct === 100
-                          ? "text-emerald-500"
-                          : ""
-                  }
-                >
-                  {removalShipmentUi && removalProgress && removalProgress.totalBytes > 0
-                    ? `${formatBytes(removalProgress.uploadedBytes)} / ${formatBytes(removalProgress.totalBytes)} (${removalProgress.uploadPct}%)`
-                    : listingImportUi && !removalShipmentUi && listingProgress && listingProgress.totalBytes > 0
-                      ? `${formatBytes(listingProgress.uploadedBytes)} / ${formatBytes(listingProgress.totalBytes)} (${listingProgress.uploadPct}%)`
-                      : `${uploadPct}%`}
-                </span>
-              </div>
-              <div className="relative h-2 overflow-hidden rounded-full bg-muted">
-                {isUploading && uploadPct < 100 && (
-                  <div className="absolute inset-0 animate-pulse rounded-full bg-sky-400/50" />
-                )}
-                <div
-                  className="h-full rounded-full bg-sky-500 transition-all duration-500"
-                  style={{
-                    width: `${
-                      removalShipmentUi && removalProgress && removalProgress.totalBytes > 0
-                        ? removalProgress.uploadPct
-                        : listingImportUi && !removalShipmentUi && listingUi
-                          ? listingUi.phase1Pct
-                          : uploadPct
-                    }%`,
-                  }}
-                />
-              </div>
-            </div>
-
-            {/* AI classification */}
-            <div>
-              <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span>Phase 1 — AI Classification</span>
-                <span>
-                  {phase === "mapped" ? "✓ mapped"
-                   : phase === "needs_mapping" ? "⚠ needs review"
-                   : phase === "unsupported" ? "🚫 not supported"
-                   : (isUploading && uploadPct === 100) ? "running…"
-                   : isUploading ? "pending…"
-                   : "✓ done"}
-                </span>
-              </div>
-              <div className="relative h-2 overflow-hidden rounded-full bg-muted">
-                {isUploading && uploadPct === 100 && (
-                  <div className="absolute inset-0 animate-pulse rounded-full bg-violet-400/50" />
-                )}
-                <div
-                  className={`h-full rounded-full transition-all duration-500 ${
-                    phase === "needs_mapping" ? "bg-amber-500"
-                    : phase === "unsupported" ? "bg-rose-500"
-                    : "bg-violet-500"
-                  }`}
-                  style={{
-                                       width: [
-                      "mapped",
-                      "needs_mapping",
-                      "unsupported",
-                      "processing",
-                      "staged",
-                      "syncing",
-                      "synced",
-                      "raw_synced",
-                      "genericing",
-                      "worklisting",
-                      "worklisted",
-                    ].includes(phase)
-                      ? "100%"
-                      : isUploading && uploadPct === 100 ? "55%" : "0%",
-                  }}
-                />
-              </div>
-            </div>
+                    </div>
+                    <div className="relative h-2 overflow-hidden rounded-full bg-muted/90 ml-9" style={{ width: "calc(100% - 2.25rem)" }}>
+                      {isActiveStep && (
+                        <div className="absolute inset-0 animate-pulse rounded-full bg-sky-400/25" />
+                      )}
+                      <div
+                        className={`h-full rounded-full transition-[width] duration-500 ease-out ${barColor}`}
+                        style={{ width: `${Math.min(100, Math.max(0, step.pct))}%` }}
+                      />
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
           </div>
-          )}
 
-          {/* ── AI detected label ─────────────────────────────────────────────── */}
-          {detectedType &&
-            (phase === "mapped" ||
-              phase === "processing" ||
-              phase === "staged" ||
-              phase === "syncing" ||
-              phase === "synced" ||
-              phase === "raw_synced" ||
-              phase === "genericing" ||
-              phase === "worklisting" ||
-              phase === "worklisted") && (
+          {/* AI detected label */}
+          {detectedType && !["idle", "uploading", "error", "needs_mapping", "unsupported"].includes(phase) && (
             <div className="flex items-center gap-2 rounded-lg border border-emerald-400/40 bg-emerald-500/10 px-3 py-2">
               <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" aria-hidden />
               <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-300">
-                ✨ AI Detected File Type: <span className="font-bold">{detectedType}</span>
+                AI Detected File Type: <span className="font-bold">{detectedType}</span>
               </span>
             </div>
           )}
           {phase === "needs_mapping" && (
             <div className="rounded-lg border border-amber-400/40 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-700 dark:text-amber-300">
-              ⚠ AI could not fully map columns. Use <strong>Map Columns</strong> in the History table below, then Process.
+              AI could not fully map columns. Use <strong>Map Columns</strong> in the History table below, then Process.
             </div>
           )}
           {phase === "unsupported" && (
             <div className="rounded-xl border border-rose-400/50 bg-rose-500/10 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">
-              <p className="font-bold mb-1">🚫 File type not supported</p>
+              <p className="font-bold mb-1">File type not supported</p>
               <p className="text-xs leading-relaxed">{progressMsg}</p>
               <p className="mt-2 text-xs text-muted-foreground">
                 To add support, a new database table and ETL mapping must be configured by an admin.
@@ -1741,298 +1649,71 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
             </div>
           )}
 
-          {!(listingImportUi && !removalShipmentUi) && (
-          <>
-          {/* ── Phase 2 bar (Process) ─────────────────────────────────────────── */}
-          {(phase === "processing" ||
-            phase === "staged" ||
-            phase === "syncing" ||
-            phase === "raw_synced" ||
-            phase === "genericing" ||
-            phase === "synced" ||
-            phase === "worklisting" ||
-            phase === "worklisted") && (
-            <div>
-              <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span
-                  title={
-                    removalShipmentUi
-                      ? REMOVAL_SHIPMENT_UI_LABELS.phase2Subtitle
-                      : listingImportUi
-                        ? LISTING_IMPORT_UI_LABELS.phase2Subtitle
-                        : undefined
-                  }
-                >
-                  {removalShipmentUi
-                    ? REMOVAL_SHIPMENT_UI_LABELS.phase2Title
-                    : listingImportUi
-                      ? phase === "processing"
-                        ? LISTING_IMPORT_UI_LABELS.phase2Title
-                        : `✓ ${LISTING_IMPORT_UI_LABELS.phase2Title}`
-                      : phaseLabel
-                        ? `${phaseLabel} — staging`
-                        : "Phase 2 — Stage to amazon_staging"}
-                </span>
-                <span className={phase !== "processing" ? "text-emerald-500" : "tabular-nums"}>
-                  {removalShipmentUi && removalProgress
-                    ? phase === "processing"
-                      ? removalProgress.dataRowsTotal > 0 || removalProgress.stagedRowsWritten > 0
-                        ? `${removalProgress.stagedRowsWritten.toLocaleString()} / ${removalProgress.dataRowsTotal.toLocaleString()} (${removalProgress.phase2Pct}%)`
-                        : processPct > 0
-                          ? `${processPct}%`
-                          : "running…"
-                      : `✓ ${removalProgress.stagedRowsWritten.toLocaleString()} / ${removalProgress.dataRowsTotal.toLocaleString()} row(s)`
-                    : listingImportUi && !removalShipmentUi && listingProgress
-                      ? phase === "processing"
-                        ? listingProgress.dataRowsTotal > 0 || listingProgress.stagedRowsWritten > 0
-                          ? `${listingProgress.stagedRowsWritten.toLocaleString()} / ${listingProgress.dataRowsTotal.toLocaleString()} (${listingUi?.phase2Pct ?? listingProgress.phase2Pct}%)`
-                          : totalRows > 0
-                            ? `${processedRows.toLocaleString()} / ${totalRows.toLocaleString()} rows (${processPct}%)`
-                            : processPct > 0
-                              ? `${processPct}%`
-                              : "running…"
-                        : `✓ ${listingProgress.stagedRowsWritten.toLocaleString()} / ${listingProgress.dataRowsTotal.toLocaleString()} row(s)`
-                    : phase === "processing"
-                      ? totalRows > 0
-                        ? `${processedRows.toLocaleString()} / ${totalRows.toLocaleString()} rows (${processPct}%)`
-                        : processPct > 0
-                          ? `${processPct}%`
-                          : "running…"
-                      : processedRows > 0
-                        ? `✓ ${processedRows.toLocaleString()}${totalRows > 0 && totalRows !== processedRows ? ` / ${totalRows.toLocaleString()}` : ""} rows`
-                        : "✓ done"}
-                </span>
-              </div>
-              <div className="relative h-2 overflow-hidden rounded-full bg-muted">
-                {phase === "processing" && (
-                  <div className="absolute inset-0 animate-pulse rounded-full bg-sky-400/50" />
-                )}
-                <div
-                  className="h-full rounded-full bg-sky-500 transition-all duration-500"
-                  style={{
-                    width: `${
-                      removalShipmentUi && removalProgress
-                        ? phase === "processing"
-                          ? Math.max(5, removalProgress.phase2Pct)
-                          : 100
-                        : listingImportUi && !removalShipmentUi && listingProgress
-                          ? phase === "processing"
-                            ? Math.max(5, listingUi?.phase2Pct ?? listingProgress.phase2Pct)
-                            : 100
-                          : phase === "processing"
-                            ? Math.max(5, processPct)
-                            : 100
-                    }%`,
-                  }}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* ── Phase 3 bar (raw sync) ───────────────────────────────────────── */}
-          {(phase === "syncing" ||
-            phase === "raw_synced" ||
-            phase === "genericing" ||
-            phase === "synced" ||
-            phase === "worklisting" ||
-            phase === "worklisted") &&
-            !(listingImportUi && !removalShipmentUi) && (
-            <div>
-              <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span
-                  title={
-                    removalShipmentUi
-                      ? REMOVAL_SHIPMENT_UI_LABELS.phase3Subtitle
-                      : listingImportUi
-                        ? LISTING_IMPORT_UI_LABELS.phase3Subtitle
-                        : undefined
-                  }
-                >
-                  {listingImportUi
-                    ? LISTING_IMPORT_UI_LABELS.phase3Title
-                    : removalShipmentUi
-                      ? REMOVAL_SHIPMENT_UI_LABELS.phase3Title
-                      : isRemovalReport && detectedType === "REMOVAL_SHIPMENT"
-                        ? "Phase 3 — Raw sync → amazon_removal_shipments"
-                        : "Phase 3 — Raw sync to destination table"}
-                </span>
-                <span
-                  className={
-                    phase === "raw_synced" ||
-                    phase === "genericing" ||
-                    phase === "synced" ||
-                    phase === "worklisting" ||
-                    phase === "worklisted"
-                      ? "text-emerald-500"
-                      : "tabular-nums"
-                  }
-                >
-                  {phase === "syncing"
-                    ? `${Math.max(0, Math.min(100, syncPct))}%`
-                    : removalShipmentUi && removalProgress
-                      ? `✓ archived ${removalProgress.rawRowsWritten.toLocaleString()} shipment line(s), skipped ${removalProgress.rawRowsSkippedExisting.toLocaleString()} already-archived line(s)`
-                      : listingImportUi && !removalShipmentUi && listingProgress
-                        ? `✓ raw ${listingProgress.listingRawArchived.toLocaleString()} archived, skipped existing ${listingProgress.listingRawSkipped.toLocaleString()} (${listingUi?.phase3Pct ?? listingProgress.phase3Pct}%)`
-                      : "✓ complete"}
-                </span>
-              </div>
-              <div className="relative h-2 overflow-hidden rounded-full bg-muted">
-                {phase === "syncing" && (
-                  <div className="absolute inset-0 animate-pulse rounded-full bg-emerald-400/50" />
-                )}
-                <div
-                  className="h-full rounded-full bg-emerald-500 transition-all duration-500"
-                  style={{
-                    width: `${
-                      removalShipmentUi && removalProgress
-                        ? phase === "syncing"
-                          ? Math.max(5, Math.min(100, syncPct))
-                          : Math.min(100, removalProgress.phase3Pct)
-                        : listingImportUi && !removalShipmentUi && listingProgress
-                          ? phase === "syncing"
-                            ? Math.max(5, Math.min(100, syncPct))
-                            : Math.min(100, listingUi?.phase3Pct ?? listingProgress.phase3Pct)
-                          : phase === "syncing"
-                            ? Math.max(5, Math.min(100, syncPct))
-                            : 100
-                    }%`,
-                  }}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* ── Phase 4 — removal shipment tree OR listing catalog (same phases; labels differ). ── */}
-          {(phase === "raw_synced" ||
-            phase === "genericing" ||
-            phase === "synced" ||
-            phase === "worklisting" ||
-            phase === "worklisted") &&
-            removalShipmentUi && (
-            <div>
-              <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                <span
-                  title={
-                    removalShipmentUi
-                      ? REMOVAL_SHIPMENT_UI_LABELS.phase4Subtitle
-                      : LISTING_IMPORT_UI_LABELS.phase4Subtitle
-                  }
-                >
-                  {removalShipmentUi
-                    ? REMOVAL_SHIPMENT_UI_LABELS.phase4Title
-                    : LISTING_IMPORT_UI_LABELS.phase4Title}
-                </span>
-                <span
-                  className={
-                    phase === "genericing"
-                      ? "tabular-nums"
-                      : topUi && !topUi.phase4Complete
-                        ? "text-muted-foreground"
-                        : "text-emerald-500"
-                  }
-                >
-                  {removalShipmentUi && removalProgress
-                    ? phase === "genericing"
-                      ? `${removalProgress.genericRowsWritten.toLocaleString()} / ${removalProgress.genericEligible.toLocaleString()} (${removalProgress.phase4Pct}%)`
-                      : topUi?.phase4Complete
-                        ? `✓ ${removalProgress.genericRowsWritten.toLocaleString()} / ${removalProgress.genericEligible.toLocaleString()} enriched`
-                        : `pending — ${removalProgress.genericRowsWritten.toLocaleString()} / ${removalProgress.genericEligible.toLocaleString()}`
-                    : listingImportUi && !removalShipmentUi && listingProgress
-                      ? phase === "genericing"
-                        ? `${listingProgress.phase4Numerator.toLocaleString()} / ${listingProgress.catalogEligibleRows.toLocaleString()} (${listingUi?.phase4Pct ?? listingProgress.phase4Pct}%)`
-                        : topUi?.phase4Complete
-                          ? `✓ new ${listingProgress.catalogRowsNew.toLocaleString()}, updated ${listingProgress.catalogRowsUpdated.toLocaleString()}, unchanged ${listingProgress.catalogRowsUnchanged.toLocaleString()}`
-                          : `pending — Generic (catalog) — ${listingProgress.phase4Numerator.toLocaleString()} / ${listingProgress.catalogEligibleRows > 0 ? listingProgress.catalogEligibleRows.toLocaleString() : "—"} eligible`
-                    : phase === "genericing"
-                      ? "…"
-                      : topUi?.phase4Complete
-                        ? "✓ complete"
-                        : "pending — run Generic"}
-                </span>
-              </div>
-              <div className="relative h-2 overflow-hidden rounded-full bg-muted">
-                {phase === "genericing" && (
-                  <div className="absolute inset-0 animate-pulse rounded-full bg-violet-400/50" />
-                )}
-                <div
-                  className="h-full rounded-full bg-violet-500 transition-all duration-500"
-                  style={{
-                    width: `${
-                      removalShipmentUi && removalProgress
-                        ? phase === "genericing"
-                          ? Math.max(5, removalProgress.phase4Pct)
-                          : topUi?.phase4Complete
-                            ? 100
-                            : Math.max(10, removalProgress.phase4Pct)
-                        : listingImportUi && !removalShipmentUi && listingProgress
-                          ? phase === "genericing"
-                            ? Math.max(5, listingUi?.phase4Pct ?? listingProgress.phase4Pct)
-                            : topUi?.phase4Complete
-                              ? 100
-                              : Math.max(10, listingUi?.phase4Pct ?? listingProgress.phase4Pct)
-                          : phase === "genericing"
-                            ? 45
-                            : topUi?.phase4Complete
-                              ? 100
-                              : 12
-                    }%`,
-                  }}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* ── Phase 5 bar (Generate Worklist — removal orders only) ───────── */}
-          {effectiveRt === "REMOVAL_ORDER" &&
-            (phase === "synced" || phase === "worklisting" || phase === "worklisted") && (
-              <div key={`worklist-bar-${worklistBarEpoch}`}>
-                <div className="mb-1 flex justify-between text-[11px] font-medium text-muted-foreground">
-                  <span>Phase 5 — Generate Worklist (expected_packages)</span>
-                  <span
-                    className={
-                      phase === "worklisted" ? "text-emerald-500" : "tabular-nums"
-                    }
-                  >
-                    {phase === "worklisting"
-                      ? worklistPct <= 0
-                        ? "starting…"
-                        : `${Math.max(0, Math.min(100, worklistPct))}%`
-                      : phase === "worklisted"
-                        ? "✓ complete"
-                        : "pending"}
-                  </span>
-                </div>
-                <div className="relative h-2 overflow-hidden rounded-full bg-muted">
-                  {phase === "worklisting" && (
-                    <div className="absolute inset-0 animate-pulse rounded-full bg-amber-400/50" />
-                  )}
-                  <div
-                    className="h-full rounded-full bg-amber-500 transition-all duration-500"
-                    style={{
-                      width: `${
-                        phase === "worklisting"
-                          ? worklistPct <= 0
-                            ? 0
-                            : Math.max(3, Math.min(100, worklistPct))
-                          : phase === "worklisted"
-                            ? 100
-                            : 0
-                      }%`,
-                    }}
-                  />
-                </div>
-              </div>
+          {/* Action buttons inside progress panel */}
+          <div className="flex flex-wrap items-center gap-3 pt-2 border-t border-border/60">
+            {showProcessBtn && topPipeline.nextAction === "process" && (
+              <button type="button" onClick={() => void runProcess()} className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-sky-700">
+                <Zap className="h-4 w-4" aria-hidden />
+                {topPipeline.isFailed ? "Retry Process" : "Process Data"}
+              </button>
             )}
-          </>
-          )}
+            {showProcessBtn && topPipeline.nextAction === "map_columns" && (
+              <button type="button" onClick={() => scrollToSessionInHistory()} className="inline-flex items-center gap-2 rounded-xl border border-amber-400/70 bg-amber-500/10 px-5 py-2.5 text-sm font-semibold text-amber-900 shadow-sm transition hover:bg-amber-500/15 dark:border-amber-600/50 dark:text-amber-100">
+                <MapPin className="h-4 w-4 shrink-0" aria-hidden />
+                Map Columns
+              </button>
+            )}
+            {isProcessing && (
+              <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                Processing...
+              </button>
+            )}
+            {showSyncBtn && (
+              <button type="button" onClick={() => void runSync()} className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-emerald-700">
+                <CheckCircle2 className="h-4 w-4" aria-hidden />
+                {topPipeline.isFailed ? "Retry Sync" : "Sync"}
+              </button>
+            )}
+            {isSyncing && (
+              <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                Syncing...
+              </button>
+            )}
+            {showGenericBtn && (
+              <button type="button" onClick={() => void runGeneric()} className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-violet-700">
+                <CheckCircle2 className="h-4 w-4" aria-hidden />
+                {topPipeline.isFailed ? "Retry Generic" : "Generic"}
+              </button>
+            )}
+            {isGenericing && (
+              <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                Generic...
+              </button>
+            )}
+            {showWorklistBtn && (
+              <button type="button" onClick={() => void runWorklist()} className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-amber-700">
+                <CheckCircle2 className="h-4 w-4" aria-hidden />
+                Generate Worklist
+              </button>
+            )}
+            {isWorklisting && (
+              <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                Generating...
+              </button>
+            )}
+          </div>
         </div>
-      )}
+        );
+      })()}
 
-      {/* ── Action buttons ────────────────────────────────────────────────────── */}
       <div className="mt-6 space-y-2">
         <div className="flex flex-wrap items-center gap-3">
 
-        {/* Phase 1: Upload & AI Map — visible only when idle */}
+        {/* Upload button — visible only when idle */}
         {phase === "idle" && (
           <button
             type="button"
@@ -2053,160 +1734,6 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           </button>
         )}
 
-        {/* Phase 2: Process Data — appears after Phase 1 succeeds */}
-        {showProcessTop && (
-          <button
-            type="button"
-            disabled={listingImportUi && !removalShipmentUi && listingUi?.busyAction === "process"}
-            onClick={() => void runProcess()}
-            className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-sky-700 disabled:opacity-70"
-          >
-            {listingImportUi && !removalShipmentUi && listingUi?.busyAction === "process" ? (
-              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-            ) : (
-              <Zap className="h-4 w-4" aria-hidden />
-            )}
-            {removalShipmentUi
-              ? rsCta === "retry_process"
-                ? "Retry Process"
-                : "Process"
-              : listingImportUi && !removalShipmentUi && listingUi
-                ? listingUi.topCardButtonLabel
-                : "Process Data"}
-          </button>
-        )}
-        {isProcessing && !(listingImportUi && !removalShipmentUi) && (
-          <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
-            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-            Processing…
-          </button>
-        )}
-
-        {showMapListingTop && (
-          <button
-            type="button"
-            onClick={() => scrollToSessionInHistory()}
-            title="Scrolls to Import History. Use Map Columns on this file’s row to fix column mapping."
-            className="inline-flex items-center gap-2 rounded-xl border border-amber-400/70 bg-amber-500/10 px-5 py-2.5 text-sm font-semibold text-amber-900 shadow-sm transition hover:bg-amber-500/15 dark:border-amber-600/50 dark:text-amber-100"
-          >
-            <MapPin className="h-4 w-4 shrink-0" aria-hidden />
-            Map Columns
-          </button>
-        )}
-
-        {/* Phase 3: Sync to Final Tables — appears after Phase 2 succeeds */}
-        {showSyncTop && (
-          <button
-            type="button"
-            disabled={
-              (listingImportUi && !removalShipmentUi) ||
-              (!(listingImportUi && !removalShipmentUi) && isSyncing)
-            }
-            onClick={() => {
-              if (listingImportUi && !removalShipmentUi) return;
-              void runSync();
-            }}
-            title={
-              listingImportUi && !removalShipmentUi
-                ? "Listing imports run raw archive (amazon_listing_report_rows_raw) inside Process — no separate Sync."
-                : undefined
-            }
-            className={[
-              "inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-semibold shadow transition",
-              listingImportUi && !removalShipmentUi
-                ? "cursor-not-allowed border border-emerald-500/35 bg-emerald-500/10 text-emerald-900 opacity-80 dark:text-emerald-100"
-                : "bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-70",
-            ].join(" ")}
-          >
-            {listingImportUi && !removalShipmentUi ? (
-              <Lock className="h-4 w-4 shrink-0 opacity-80" aria-hidden />
-            ) : isSyncing ? (
-              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-            ) : (
-              <CheckCircle2 className="h-4 w-4" aria-hidden />
-            )}
-            {removalShipmentUi
-              ? rsCta === "retry_sync"
-                ? "Retry Sync"
-                : "Sync"
-              : listingImportUi && !removalShipmentUi
-                ? "Sync — raw archive (in Process)"
-                : "Sync to Final Tables"}
-          </button>
-        )}
-        {isSyncing && !(listingImportUi && !removalShipmentUi) && (
-          <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
-            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-            Syncing…
-          </button>
-        )}
-
-        {showGenericTop && (
-          <button
-            type="button"
-            disabled={
-              (listingImportUi && !removalShipmentUi) ||
-              (!(listingImportUi && !removalShipmentUi) && isGenericing)
-            }
-            onClick={() => {
-              if (listingImportUi && !removalShipmentUi) return;
-              void runGeneric();
-            }}
-            title={
-              listingImportUi && !removalShipmentUi
-                ? "Listing catalog merge (e.g. catalog_products) runs inside Process — no separate Generic."
-                : undefined
-            }
-            className={[
-              "inline-flex items-center gap-2 rounded-xl px-5 py-2.5 text-sm font-semibold shadow transition",
-              listingImportUi && !removalShipmentUi
-                ? "cursor-not-allowed border border-violet-500/35 bg-violet-500/10 text-violet-950 opacity-85 dark:text-violet-100"
-                : "bg-violet-600 text-white hover:bg-violet-700 disabled:opacity-70",
-            ].join(" ")}
-          >
-            {listingImportUi && !removalShipmentUi ? (
-              <Lock className="h-4 w-4 shrink-0 opacity-80" aria-hidden />
-            ) : isGenericing ? (
-              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-            ) : (
-              <CheckCircle2 className="h-4 w-4" aria-hidden />
-            )}
-            {removalShipmentUi
-              ? rsCta === "generic_retry"
-                ? "Retry Generic (shipments)"
-                : "Generic (shipments)"
-              : listingImportUi && !removalShipmentUi
-                ? "Generic — catalog (in Process)"
-                : topUi?.showRetryGeneric
-                  ? "Retry Generic Phase"
-                  : "Run Generic Phase"}
-          </button>
-        )}
-        {isGenericing && !(listingImportUi && !removalShipmentUi) && (
-          <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-violet-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
-            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-            Generic phase…
-          </button>
-        )}
-
-        {/* Generate Worklist — removal orders only (registry); shipment tree generic already enriches expected_packages */}
-        {showWorklistPrimary && phase !== "worklisting" && (
-          <button
-            type="button"
-            onClick={() => void runWorklist()}
-            className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-5 py-2.5 text-sm font-semibold text-white shadow transition hover:bg-amber-700"
-          >
-            <CheckCircle2 className="h-4 w-4" aria-hidden />
-            Generate Worklist
-          </button>
-        )}
-        {phase === "worklisting" && (
-          <button type="button" disabled className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-5 py-2.5 text-sm font-semibold text-white opacity-70">
-            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-            Generating worklist…
-          </button>
-        )}
-
         {/* Divider when an upload is active */}
         {phase !== "idle" && <span className="mx-1 text-muted-foreground/40">|</span>}
 
@@ -2224,17 +1751,6 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         )}
         </div>
 
-        {listingImportUi && !removalShipmentUi && showListingPhaseActionRow && (
-          <p className="max-w-3xl text-[11px] leading-relaxed text-muted-foreground">
-            <span className="font-medium text-foreground">Listing files:</span> Sync and Generic stay locked because the
-            server runs <strong className="font-semibold text-foreground">raw archive</strong> and{" "}
-            <strong className="font-semibold text-foreground">catalog merge</strong> inside the same{" "}
-            <strong className="font-semibold text-foreground">Process</strong> request (separate /sync and /generic calls
-            are not used). Live row counts and percentages for those steps are in the pipeline card above.
-          </p>
-        )}
-
-        {/* Delete Import — deletes DB row + Storage */}
         {sessionUploadId && !isActive && (
           <button
             type="button"
@@ -2246,43 +1762,14 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           </button>
         )}
 
-        {/* Completion notes */}
-        {phase === "synced" &&
-          effectiveRt !== "REMOVAL_ORDER" &&
-          !removalShipmentUi &&
-          !listingImportUi && (
+        {(phase === "synced" || phase === "worklisted") && (
           <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">
-            All 3 phases complete. Data is in the destination tables.
+            All phases complete. Data is in the destination tables.
           </p>
         )}
-        {phase === "synced" && listingImportUi && progressMsg && (
-          <p className="whitespace-pre-line text-xs font-semibold text-emerald-600 dark:text-emerald-400">
-            {progressMsg}
-          </p>
-        )}
-        {phase === "synced" && effectiveRt === "REMOVAL_ORDER" && (
+        {phase === "raw_synced" && (
           <p className="text-xs font-semibold text-amber-700 dark:text-amber-400">
-            Phase 3 complete (amazon_removals). Click <strong>Generate Worklist</strong> to sync{" "}
-            <code className="rounded bg-muted px-1 text-foreground">expected_packages</code> for the scanner.
-          </p>
-        )}
-        {(phase === "synced" || phase === "raw_synced") &&
-          removalShipmentUi &&
-          topUi &&
-          !topUi.phase4Complete && (
-          <p className="text-xs font-semibold text-amber-700 dark:text-amber-400">
-            Phase 3 archived lines to <strong>amazon_removal_shipments</strong>. Run <strong>Generic</strong> for shipment
-            tree / expected_packages enrich — no separate Generate Worklist step for this report.
-          </p>
-        )}
-        {phase === "synced" && removalShipmentUi && topUi?.phase4Complete && (
-          <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">
-            All phases complete — shipment tree / expected_packages enrich finished for this upload.
-          </p>
-        )}
-        {phase === "worklisted" && effectiveRt === "REMOVAL_ORDER" && (
-          <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400">
-            All phases complete. Removal order data and warehouse worklist are ready.
+            Sync complete. Run <strong>Generic</strong> to finish processing.
           </p>
         )}
       </div>

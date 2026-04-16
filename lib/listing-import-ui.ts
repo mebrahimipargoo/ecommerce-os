@@ -1,6 +1,6 @@
 /**
- * LISTING-only: shared phase labels, progress model, primary CTA, and status copy.
- * Top card and Import History must use the same resolvers (single source of truth).
+ * LISTING: progress model + pipeline steps (registry-aligned: Process → Sync → Generic).
+ * Action gating uses `resolveImportUiActionState` via `resolveListingImportUiState`.
  */
 
 import { isListingAmazonSyncKind, type AmazonSyncKind } from "./pipeline/amazon-report-registry";
@@ -27,8 +27,8 @@ function num(v: unknown, fallback = 0): number {
 export const LISTING_IMPORT_UI_LABELS = {
   phase1Title: "Phase 1 — Upload raw file",
   phase1Subtitle: "bytes uploaded / file size",
-  phase2Title: "Phase 2 — Process listing import",
-  phase2Subtitle: "raw archive + canonical catalog",
+  phase2Title: "Phase 2 — Process",
+  phase2Subtitle: "Stage to amazon_staging",
   phase3Title: "",
   phase3Subtitle: "",
   phase4Title: "",
@@ -527,7 +527,7 @@ function deriveListingNextAction(st: ImportUiActionState, statusRaw: string): Li
   const status = norm(statusRaw);
   if (st.phase4Complete && (status === "synced" || status === "complete")) return "complete";
   if (st.showRetryProcess) return "retry_process";
-  if (["mapped", "ready", "uploaded", "needs_mapping", "staged"].includes(status)) return "process";
+  if (["mapped", "ready", "uploaded", "needs_mapping"].includes(status)) return "process";
   return null;
 }
 
@@ -545,7 +545,6 @@ function applyLocalPhaseFallback(
   ) {
     return "process";
   }
-  if (lp === "staged" && status === "staged") return "process";
   if (lp === "synced" && (status === "synced" || status === "complete")) return "complete";
   return next;
 }
@@ -619,12 +618,12 @@ export function resolveListingImportUiState(input: ListingImportUiInput): Listin
     next === "process" ||
     next === "retry_process" ||
     busyAction === "process";
-  const showSyncCta = false;
-  const showGenericCta = false;
+  const showSyncCta = st.showSync;
+  const showGenericCta = st.showGeneric;
 
   let topCardButtonLabel = "";
   if (busyAction === "process") topCardButtonLabel = "Processing…";
-  else if (next === "process") topCardButtonLabel = "Process listing import";
+  else if (next === "process") topCardButtonLabel = "Process";
   else if (next === "retry_process") topCardButtonLabel = "Retry Process";
   else if (next === "complete") topCardButtonLabel = "Complete";
 
@@ -634,8 +633,12 @@ export function resolveListingImportUiState(input: ListingImportUiInput): Listin
   if (isComplete) phaseBadgeText = "Complete";
   else if (isFailed) {
     phaseBadgeText = st.showRetryProcess ? "Failed — retry Process" : "Failed";
+  } else if (st.showSync) {
+    phaseBadgeText = "Phase 3: Sync";
+  } else if (st.showGeneric) {
+    phaseBadgeText = "Phase 4: Generic";
   } else if (busyAction === "process" || next === "process" || next === "retry_process") {
-    phaseBadgeText = next === "retry_process" ? "Phase 2: Retry Process" : "Phase 2: Process listing import";
+    phaseBadgeText = next === "retry_process" ? "Phase 2: Retry Process" : "Phase 2: Process";
   } else if (["pending", "uploading"].includes(status)) phaseBadgeText = "Phase 1: Upload";
 
   const completeLine = `Complete — raw archive + catalog snapshot (new ${pm.catalogRowsNew.toLocaleString()}, updated ${pm.catalogRowsUpdated.toLocaleString()}, unchanged ${pm.catalogRowsUnchanged.toLocaleString()}).`;
@@ -644,10 +647,13 @@ export function resolveListingImportUiState(input: ListingImportUiInput): Listin
   if (isComplete) phaseSummaryText = completeLine;
   else if (isFailed) phaseSummaryText = phaseBadgeText;
   else if (busyAction === "process") {
-    phaseSummaryText = "Processing — raw rows to amazon_listing_report_rows_raw, then catalog_products.";
+    phaseSummaryText = "Processing — writing to amazon_staging.";
   } else if (next === "process" || next === "retry_process") {
-    phaseSummaryText =
-      "Run Process once: rows are archived to the listing raw table and merged into catalog_products.";
+    phaseSummaryText = "Run Process to parse the file and stage rows in amazon_staging, then Sync and Generic.";
+  } else if (st.showSync) {
+    phaseSummaryText = "Run Sync to write raw rows to amazon_listing_report_rows_raw.";
+  } else if (st.showGeneric) {
+    phaseSummaryText = "Run Generic to merge into catalog_products.";
   }
 
   const rowMetricsLine = buildListingRowMetricsLine(pm, st, meta);

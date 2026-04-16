@@ -68,12 +68,25 @@ import {
   uniqueKeyCount,
 } from "../../../../../lib/pipeline/amazon-removals-business-key";
 import { mapStagingMappedRowToListingRawInsert } from "../../../../../lib/import-listing-physical-lines";
+import { logImportPhase } from "../../../../../lib/pipeline/amazon-import-engine-log";
+import {
+  FPS_KEY_COMPLETE,
+  FPS_KEY_FAILED,
+  FPS_KEY_SYNC,
+  FPS_LABEL_COMPLETE,
+  FPS_NEXT_ACTION_LABEL_GENERIC,
+  fpsLabelSync,
+  fpsNextAfterSync,
+  fpsPctPhase3,
+} from "../../../../../lib/pipeline/file-processing-status-contract";
 import {
   CONFLICT_KEY,
   DOMAIN_TABLE,
   isListingAmazonSyncKind,
   requiresPhase4Generic,
+  resolveAmazonImportEngineConfig,
   resolveAmazonImportSyncKind,
+  type AmazonImportEngineConfig,
   type AmazonSyncKind,
 } from "../../../../../lib/pipeline/amazon-report-registry";
 import { removalShipmentArchiveBusinessKey } from "../../../../../lib/pipeline/removal-shipment-archive-key";
@@ -86,13 +99,12 @@ import {
   mergeUploadMetadata,
   type ImportRunMetrics,
 } from "../../../../../lib/raw-report-upload-metadata";
-import { syncFinancialReferenceResolverForUpload } from "../../../../../lib/financial-reference-resolver-sync";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 
 export const runtime = "nodejs";
 /** Large listing files — Phase 3 raw upserts only (catalog is Phase 4 Generic). */
-export const maxDuration = 800;
+export const maxDuration = 60;
 
 const BATCH_SIZE = 500;
 /** Max rows per Postgres upsert call — enables granular sync_progress updates. */
@@ -454,6 +466,9 @@ type RemovalShipmentSyncOpts = {
   totalStagingRows: number;
   columnMapping: Record<string, string> | null;
   syncUpserted: { value: number };
+  engine: AmazonImportEngineConfig;
+  reportType: string;
+  duplicateInBatchTotal: { value: number };
 };
 
 /** One active REMOVAL_SHIPMENT sync per (org, store) — avoids shipment tree rebuild races. */
@@ -497,7 +512,8 @@ async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
   rawRowsWritten: number;
   rawRowsSkippedCrossUpload: number;
 }> {
-  const { uploadId, orgId, storeId, totalStagingRows, columnMapping, syncUpserted } = opts;
+  const { uploadId, orgId, storeId, totalStagingRows, columnMapping, syncUpserted, engine, reportType, duplicateInBatchTotal } =
+    opts;
 
   await acquireRemovalPipelineLock(orgId, storeId, uploadId);
 
@@ -696,7 +712,15 @@ async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
 
       archived += stagingRows.length;
       await bumpSyncProgressMetadata(
-        { uploadId, orgId, totalStagingRows, upserted: syncUpserted },
+        {
+          uploadId,
+          orgId,
+          totalStagingRows,
+          upserted: syncUpserted,
+          engine,
+          reportType,
+          duplicateInBatchTotal,
+        },
         stagingRows.length,
         {
           rawRowsWritten: shipmentArchiveRowsWritten,
@@ -861,6 +885,10 @@ async function markFailed(uploadId: string, orgId: string, message: string): Pro
         organization_id: orgId,
         status: "failed",
         current_phase: "failed",
+        phase_key: FPS_KEY_FAILED,
+        phase_label: message.slice(0, 200),
+        next_action_key: null,
+        next_action_label: null,
         error_message: message,
       },
       { onConflict: "upload_id" },
@@ -901,16 +929,18 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     const status = String((row as { status?: unknown }).status ?? "");
-    if (status !== "staged" && status !== "failed") {
+    if (status !== "staged" && status !== "failed" && status !== "processing") {
       return NextResponse.json(
         {
           ok: false,
-          error: `Phase 3 (Sync) requires status "staged" (or "failed" for retry). Current status is "${status}".${
+          error: `Phase 3 (Sync) requires status "staged" (or "failed"/"processing" for retry). Current status is "${status}".${
             status === "mapped" || status === "ready"
               ? " Run Phase 2 (Process) first."
               : status === "needs_mapping"
                 ? ' Use "Map Columns" first, then Process, then Sync.'
-                : ""
+                : status === "raw_synced" || status === "synced" || status === "complete"
+                  ? " Sync has already completed for this upload."
+                  : ""
           }`,
         },
         { status: 409 },
@@ -932,17 +962,7 @@ export async function POST(req: Request): Promise<Response> {
       );
     }
 
-    if (isListingAmazonSyncKind(kind)) {
-      return NextResponse.json(
-        {
-          ok: false,
-          error:
-            "Listing exports finish in a single Process step (raw archive + catalog). Sync is not used for listing imports.",
-        },
-        { status: 409 },
-      );
-    }
-
+    const engine = resolveAmazonImportEngineConfig(kind);
     const hasDomainTable = DOMAIN_TABLE[kind] !== null;
 
     const columnMapping =
@@ -1066,6 +1086,18 @@ export async function POST(req: Request): Promise<Response> {
       rows_duplicate_against_existing: 0,
     };
 
+    const duplicateInBatchRef = { value: 0 };
+    const syncProgressBase: SyncProgressOpts = {
+      uploadId,
+      orgId,
+      totalStagingRows,
+      upserted: syncUpserted,
+      metricTotals: syncMetricTotals,
+      duplicateInBatchTotal: duplicateInBatchRef,
+      engine,
+      reportType: reportTypeRawEarly,
+    };
+
     console.log(`[sync][${kind}] Starting sync — staging rows: ${totalStagingRows}, domain table: ${DOMAIN_TABLE[kind] ?? "none"}`);
 
     // ── Phase 3 core: read → map → upsert → delete (strictly sequenced) ───────
@@ -1087,16 +1119,24 @@ export async function POST(req: Request): Promise<Response> {
     let removalShipmentSkippedCross = 0;
     let removalShipmentLinesForGeneric = 0;
     /** Staging lines merged in JS because they shared a conflict key in the same Postgres batch. */
-    let syncDuplicateInBatchTotal = 0;
 
-    const rawTargetLabel = DOMAIN_TABLE[kind] ?? "domain";
+    const rawTargetLabel = engine.sync_target_table ?? DOMAIN_TABLE[kind] ?? "domain";
+    const syncLabelStart = fpsLabelSync(engine.sync_target_table);
     await supabaseServer.from("file_processing_status").upsert(
       {
         upload_id: uploadId,
         organization_id: orgId,
         status: "syncing",
         current_phase: "sync",
-        current_phase_label: `Phase 3 — Raw sync → ${rawTargetLabel}`,
+        phase_key: FPS_KEY_SYNC,
+        phase_label: syncLabelStart,
+        current_phase_label: syncLabelStart,
+        next_action_key: null,
+        next_action_label: null,
+        stage_target_table: engine.stage_target_table,
+        sync_target_table: engine.sync_target_table,
+        generic_target_table: engine.generic_target_table,
+        current_target_table: rawTargetLabel,
         sync_pct: 0,
         upload_pct: 100,
         process_pct: 100,
@@ -1113,6 +1153,16 @@ export async function POST(req: Request): Promise<Response> {
       { onConflict: "upload_id" },
     );
 
+    logImportPhase({
+      report_type: reportTypeRawEarly,
+      upload_id: uploadId,
+      phase: FPS_KEY_SYNC,
+      phase_key: FPS_KEY_SYNC,
+      rows_processed: 0,
+      rows_written: 0,
+      target_table: rawTargetLabel,
+    });
+
     if (kind === "REMOVAL_SHIPMENT") {
       const r = await runRemovalShipmentSync({
         uploadId,
@@ -1121,6 +1171,9 @@ export async function POST(req: Request): Promise<Response> {
         totalStagingRows,
         columnMapping,
         syncUpserted,
+        engine,
+        reportType: reportTypeRawEarly,
+        duplicateInBatchTotal: duplicateInBatchRef,
       });
       synced = r.synced;
       mapperNullCount = r.mapperNullCount;
@@ -1215,14 +1268,9 @@ export async function POST(req: Request): Promise<Response> {
           if (domainBatch.length >= BATCH_SIZE) {
             const inputBatch = domainBatch.splice(0, BATCH_SIZE);
             const stagingIdsForBatch = batchStagingIds.splice(0, inputBatch.length);
-            const flushResult = await flushDomainBatch(kind, inputBatch, {
-              uploadId,
-              orgId,
-              totalStagingRows,
-              upserted: syncUpserted,
-            }, syncMetricTotals);
+            const flushResult = await flushDomainBatch(kind, inputBatch, syncProgressBase, syncMetricTotals);
             synced += flushResult.flushed;
-            syncDuplicateInBatchTotal += flushResult.collapsedInBatch;
+            duplicateInBatchRef.value += flushResult.collapsedInBatch;
             await deleteFromStaging(stagingIdsForBatch, orgId);
           }
         } else {
@@ -1236,14 +1284,9 @@ export async function POST(req: Request): Promise<Response> {
       if (domainBatch.length > 0) {
         const inputBatch = domainBatch.splice(0);
         const stagingIdsForBatch = batchStagingIds.splice(0, inputBatch.length);
-        const flushResult = await flushDomainBatch(kind, inputBatch, {
-          uploadId,
-          orgId,
-          totalStagingRows,
-          upserted: syncUpserted,
-        }, syncMetricTotals);
+        const flushResult = await flushDomainBatch(kind, inputBatch, syncProgressBase, syncMetricTotals);
         synced += flushResult.flushed;
-        syncDuplicateInBatchTotal += flushResult.collapsedInBatch;
+        duplicateInBatchRef.value += flushResult.collapsedInBatch;
         await deleteFromStaging(stagingIdsForBatch, orgId);
       }
 
@@ -1339,13 +1382,24 @@ export async function POST(req: Request): Promise<Response> {
         : Math.max(0, totalStagingRows - synced - mapperNullCount);
 
     const needsPhase4 = requiresPhase4Generic(kind);
+    const finalRawW =
+      kind === "REMOVAL_SHIPMENT"
+        ? removalShipmentRawWritten
+        : syncMetricTotals.rows_synced_new +
+          syncMetricTotals.rows_synced_updated +
+          syncMetricTotals.rows_synced_unchanged;
+    const finalRawSkip =
+      kind === "REMOVAL_SHIPMENT"
+        ? removalShipmentSkippedCross
+        : syncMetricTotals.rows_duplicate_against_existing;
+    const finalPhase3Pct = fpsPctPhase3(finalRawW, finalRawSkip, totalStagingRows);
     const importMetrics: ImportRunMetrics = {
       physical_lines_seen: totalStagingRows,
       data_rows_seen: totalStagingRows,
       rows_staged: totalStagingRows,
       rows_synced_upserted: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
       rows_mapper_invalid: mapperNullCount,
-      rows_duplicate_in_file: syncDuplicateInBatchTotal,
+      rows_duplicate_in_file: duplicateInBatchRef.value,
       rows_net_collapsed_vs_staging: syncCollapsedByDedupe,
       rows_synced_new: syncMetricTotals.rows_synced_new,
       rows_synced_updated: syncMetricTotals.rows_synced_updated,
@@ -1391,7 +1445,7 @@ export async function POST(req: Request): Promise<Response> {
             sync_row_count: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
             sync_mapper_null_count: mapperNullCount,
             sync_collapsed_by_dedupe: syncCollapsedByDedupe,
-            sync_duplicate_in_batch_rows: syncDuplicateInBatchTotal,
+            sync_duplicate_in_batch_rows: duplicateInBatchRef.value,
             import_metrics: importMetrics,
             process_progress: 100,
             sync_progress: 100,
@@ -1418,32 +1472,72 @@ export async function POST(req: Request): Promise<Response> {
     if (markErr) throw new Error(`Sync succeeded but failed to save status: ${markErr.message}`);
 
     const domainLabel = DOMAIN_TABLE[kind] ?? "none";
+
+    let rowsEligibleGeneric = 0;
+    if (isListingAmazonSyncKind(kind)) {
+      const { count } = await supabaseServer
+        .from("amazon_listing_report_rows_raw")
+        .select("*", { count: "exact", head: true })
+        .eq("organization_id", orgId)
+        .eq("source_upload_id", uploadId);
+      rowsEligibleGeneric = typeof count === "number" ? count : 0;
+    } else if (kind === "INVENTORY_LEDGER") {
+      const { count } = await supabaseServer
+        .from("amazon_inventory_ledger")
+        .select("*", { count: "exact", head: true })
+        .eq("organization_id", orgId)
+        .eq("upload_id", uploadId);
+      rowsEligibleGeneric = typeof count === "number" ? count : 0;
+    } else if (kind === "SETTLEMENT" || kind === "TRANSACTIONS" || kind === "REIMBURSEMENTS") {
+      const t = DOMAIN_TABLE[kind];
+      if (t) {
+        const { count } = await supabaseServer
+          .from(t)
+          .select("*", { count: "exact", head: true })
+          .eq("organization_id", orgId)
+          .eq("upload_id", uploadId);
+        rowsEligibleGeneric = typeof count === "number" ? count : 0;
+      }
+    } else if (kind === "REMOVAL_SHIPMENT") {
+      rowsEligibleGeneric = removalShipmentLinesForGeneric;
+    }
+
+    const syncLabelDone = fpsLabelSync(engine.sync_target_table);
+    const nextGeneric = fpsNextAfterSync(engine.supports_generic);
     await supabaseServer.from("file_processing_status").upsert(
       {
         upload_id: uploadId,
         organization_id: orgId,
         status: needsPhase4 ? "processing" : "complete",
         current_phase: needsPhase4 ? "raw_synced" : "complete",
-        current_phase_label: needsPhase4
-          ? `Phase 3 complete — raw landing → ${domainLabel}`
-          : "Pipeline complete",
+        phase_key: needsPhase4 ? FPS_KEY_SYNC : FPS_KEY_COMPLETE,
+        phase_label: needsPhase4 ? syncLabelDone : FPS_LABEL_COMPLETE,
+        next_action_key: nextGeneric,
+        next_action_label: needsPhase4 ? FPS_NEXT_ACTION_LABEL_GENERIC : null,
+        current_phase_label: needsPhase4 ? syncLabelDone : FPS_LABEL_COMPLETE,
+        stage_target_table: engine.stage_target_table,
+        sync_target_table: engine.sync_target_table,
+        generic_target_table: engine.generic_target_table,
+        current_target_table: domainLabel,
         upload_pct: 100,
         process_pct: 100,
         sync_pct: 100,
         phase1_upload_pct: 100,
         phase2_stage_pct: 100,
-        phase3_raw_sync_pct: 100,
+        phase3_raw_sync_pct: finalPhase3Pct,
         phase4_generic_pct: 0,
         /** Reset stale Phase 4 from a prior run so UI + gates show Generic again after Sync. */
         phase4_status: needsPhase4 ? "pending" : "complete",
         phase4_completed_at: needsPhase4 ? null : new Date().toISOString(),
         processed_rows: totalStagingRows,
         total_rows: totalStagingRows,
-        raw_rows_written: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
+        raw_rows_written: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : finalRawW,
         raw_rows_skipped_existing:
           kind === "REMOVAL_SHIPMENT"
             ? removalShipmentSkippedCross
             : syncMetricTotals.rows_duplicate_against_existing,
+        duplicate_rows_skipped: duplicateInBatchRef.value,
+        rows_eligible_for_generic: rowsEligibleGeneric,
         staged_rows_written: totalStagingRows,
         error_message: null,
         import_metrics: importMetrics,
@@ -1459,16 +1553,17 @@ export async function POST(req: Request): Promise<Response> {
       domainTable: DOMAIN_TABLE[kind] ?? "none",
     });
 
-    try {
-      if (kind === "SETTLEMENT" || kind === "TRANSACTIONS" || kind === "REIMBURSEMENTS") {
-        await syncFinancialReferenceResolverForUpload(supabaseServer, orgId, uploadId, kind);
-      }
-    } catch (e) {
-      console.warn(
-        `[sync][${kind}] financial_reference_resolver refresh failed (import rows are still synced):`,
-        e instanceof Error ? e.message : e,
-      );
-    }
+    logImportPhase({
+      report_type: reportTypeRawEarly,
+      upload_id: uploadId,
+      phase: needsPhase4 ? FPS_KEY_SYNC : FPS_KEY_COMPLETE,
+      phase_key: needsPhase4 ? FPS_KEY_SYNC : FPS_KEY_COMPLETE,
+      target_table: engine.sync_target_table ?? domainLabel,
+      rows_written: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : finalRawW,
+      rows_skipped_existing: finalRawSkip,
+      duplicates_skipped: duplicateInBatchRef.value,
+      rows_processed: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
+    });
 
     return NextResponse.json({
       ok: true,
@@ -1529,6 +1624,10 @@ type SyncProgressOpts = {
   totalStagingRows: number;
   /** Cumulative staging lines finished this sync (for progress bar denominator). */
   upserted: { value: number };
+  metricTotals?: BatchUpsertMetricDelta;
+  duplicateInBatchTotal?: { value: number };
+  engine?: AmazonImportEngineConfig;
+  reportType?: string;
 };
 
 async function bumpSyncProgressMetadata(
@@ -1554,13 +1653,26 @@ async function bumpSyncProgressMetadata(
           ...((prevMeta as { import_metrics?: Record<string, unknown> }).import_metrics ?? {}),
         }
       : {};
-  const phase3Numerator = removalShipment
-    ? removalShipment.rawRowsWritten + removalShipment.rawRowsSkippedCrossUpload
-    : opts.upserted.value;
-  const phase3Pct = Math.min(
-    99,
-    Math.round((phase3Numerator / Math.max(1, opts.totalStagingRows)) * 100),
-  );
+
+  const engine = opts.engine;
+  const syncTarget = engine?.sync_target_table ?? null;
+  const label = fpsLabelSync(syncTarget);
+
+  let rawW: number;
+  let rawSkip: number;
+  if (removalShipment) {
+    rawW = removalShipment.rawRowsWritten;
+    rawSkip = removalShipment.rawRowsSkippedCrossUpload;
+  } else if (opts.metricTotals) {
+    const m = opts.metricTotals;
+    rawW = m.rows_synced_new + m.rows_synced_updated + m.rows_synced_unchanged;
+    rawSkip = m.rows_duplicate_against_existing;
+  } else {
+    rawW = opts.upserted.value;
+    rawSkip = 0;
+  }
+  const dupBatch = opts.duplicateInBatchTotal?.value ?? 0;
+  const phase3Pct = fpsPctPhase3(rawW, rawSkip, opts.totalStagingRows);
 
   await supabaseServer
     .from("raw_report_uploads")
@@ -1594,20 +1706,27 @@ async function bumpSyncProgressMetadata(
         organization_id: opts.orgId,
         status: "syncing",
         current_phase: "sync",
-        current_phase_label: removalShipment
-          ? "Phase 3 — Raw sync → amazon_removal_shipments"
-          : "Phase 3 — Raw sync to destination table",
+        phase_key: FPS_KEY_SYNC,
+        phase_label: label,
+        current_phase_label: label,
+        next_action_key: null,
+        next_action_label: null,
+        stage_target_table: engine?.stage_target_table,
+        sync_target_table: engine?.sync_target_table,
+        generic_target_table: engine?.generic_target_table,
+        current_target_table: syncTarget,
         upload_pct: 100,
         process_pct: 100,
-        sync_pct: removalShipment ? phase3Pct : pct,
+        sync_pct: phase3Pct,
         phase1_upload_pct: 100,
         phase2_stage_pct: 100,
-        phase3_raw_sync_pct: removalShipment ? phase3Pct : pct,
+        phase3_raw_sync_pct: phase3Pct,
         processed_rows: opts.upserted.value,
         total_rows: opts.totalStagingRows,
         staged_rows_written: opts.totalStagingRows,
-        raw_rows_written: removalShipment ? removalShipment.rawRowsWritten : opts.upserted.value,
-        raw_rows_skipped_existing: removalShipment ? removalShipment.rawRowsSkippedCrossUpload : 0,
+        raw_rows_written: rawW,
+        raw_rows_skipped_existing: rawSkip,
+        duplicate_rows_skipped: dupBatch,
         import_metrics: {
           current_phase: "sync",
           rows_synced: opts.upserted.value,

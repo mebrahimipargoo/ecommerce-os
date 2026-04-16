@@ -1,7 +1,6 @@
 /**
- * Pass-2 listing import: replay raw_payload rows into catalog_products (canonical layer).
- * Raw preservation is amazon_listing_report_rows_raw (Phase 3). Canonical upsert is catalog_products
- * (organization_id, store_id, seller_sku, asin — NULLS NOT DISTINCT), invoked from Phase 4 Generic only.
+ * Listing Phase 4: replay raw_payload rows into catalog_products (canonical layer).
+ * Raw preservation is amazon_listing_report_rows_raw (Phase 3 Sync). Canonical upsert runs from Phase 4 Generic only.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";

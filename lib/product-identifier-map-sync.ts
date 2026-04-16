@@ -6,8 +6,6 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import type { CatalogListingSource } from "./import-sync-mappers";
-
 export type CatalogRowForIdentifierMap = {
   id: string;
   organization_id: string;
@@ -38,7 +36,8 @@ export async function upsertProductIdentifierMapFromCatalogRows(
   supabase: SupabaseClient,
   rows: CatalogRowForIdentifierMap[],
   sourceUploadId: string,
-  sourceReportType: CatalogListingSource,
+  /** Provenance slug (listing report or operational enricher, e.g. INVENTORY_LEDGER). */
+  sourceReportType: string,
 ): Promise<void> {
   if (rows.length === 0) return;
 

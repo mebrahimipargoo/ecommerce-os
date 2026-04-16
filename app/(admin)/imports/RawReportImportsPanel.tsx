@@ -1,142 +1,41 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Check, CheckCircle2, CheckSquare, FileSpreadsheet, Loader2, Lock, MapPin, RefreshCw, RotateCcw, Search, Square, Trash2 } from "lucide-react";
+import {
+  Check,
+  CheckSquare,
+  FileSpreadsheet,
+  Loader2,
+  MapPin,
+  RotateCcw,
+  Search,
+  Square,
+  Trash2,
+} from "lucide-react";
 import { AMAZON_LEDGER_UPLOAD_SOURCE } from "../../../lib/raw-report-upload-metadata";
 import type { RawReportUploadRow } from "../../../lib/raw-report-upload-row";
-import { deleteRawReportUpload, listRawReportUploads, resetStuckUpload, updateRawReportType } from "./import-actions";
+import {
+  deleteRawReportUpload,
+  listRawReportUploads,
+  resetStuckUpload,
+  updateRawReportType,
+} from "./import-actions";
 import { ColumnMappingModal } from "./ColumnMappingModal";
 import { useUserRole } from "../../../components/UserRoleContext";
 import type { RawReportType } from "../../../lib/raw-report-types";
 import { REPORT_TYPE_SPECS } from "../../../lib/csv-import-mapping";
-import { isListingReportType, RAW_REPORT_TYPE_ORDER } from "../../../lib/raw-report-types";
-import { formatImportPhaseLabel } from "../../../lib/pipeline/import-phase-labels";
-import type { ImportUiActionInput } from "../../../lib/import-ui-action-state";
-import { resolveImportUiActionState } from "../../../lib/import-ui-action-state";
-import {
-  buildImportUiActionInputForRemovalShipment,
-  resolveRemovalShipmentPhaseBadgeLabel,
-  resolveRemovalShipmentPrimaryCta,
-} from "../../../lib/import-removal-shipment-ui";
-import { buildListingPipelineSteps, resolveListingImportUiState } from "../../../lib/listing-import-ui";
-import { useDebugMode } from "../../../components/DebugModeContext";
+import { RAW_REPORT_TYPE_ORDER } from "../../../lib/raw-report-types";
 import { DatabaseTag } from "../../../components/DatabaseTag";
+import {
+  buildUnifiedPipeline,
+  pipelineBadgeColor,
+  stepBarColor,
+  stepBadgeColor,
+  type PipelineStep,
+  type UnifiedPipelineModel,
+} from "../../../lib/pipeline/unified-import-pipeline";
 
-function num(v: unknown, fallback = 0): number {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  return fallback;
-}
-
-/** Listing-only: same step model as the top importer card, compact for the history table. */
-function ListingPipelineHistoryCell({
-  status,
-  metadata,
-  fps,
-}: {
-  status: string;
-  metadata: Record<string, unknown> | null;
-  fps: RawReportUploadRow["file_processing_status"];
-}) {
-  const steps = buildListingPipelineSteps({
-    status,
-    metadata,
-    fps: fps && typeof fps === "object" ? (fps as Record<string, unknown>) : null,
-  });
-  return (
-    <div className="w-full min-w-0 max-w-[280px] space-y-1">
-      <ol className="w-full min-w-0 space-y-1" aria-label="Listing pipeline steps">
-        {steps.map((s) => {
-          const barTint =
-            s.tone === "active"
-              ? "bg-sky-500"
-              : s.tone === "done"
-                ? "bg-emerald-500"
-                : s.tone === "warning"
-                  ? "bg-amber-500"
-                  : "bg-muted-foreground/35";
-          const fill = Math.min(100, Math.max(0, s.pct));
-          return (
-            <li key={s.key} className="w-full min-w-0 space-y-0.5 text-[10px] leading-tight">
-              <div className="flex items-baseline justify-between gap-1">
-                <span className="min-w-0 break-words font-medium text-foreground" title={`${s.title} — ${s.subtitle}`}>
-                  {s.title}
-                </span>
-                <span className="shrink-0 tabular-nums text-muted-foreground">{Math.round(s.pct)}%</span>
-              </div>
-              <div className="h-1.5 w-full min-w-0 overflow-hidden rounded-full bg-muted/90">
-                <div
-                  className={`h-full rounded-full transition-[width] duration-500 ease-out ${barTint}`}
-                  style={{ width: `${fill}%` }}
-                />
-              </div>
-              <span
-                className="line-clamp-2 text-[9px] text-muted-foreground"
-                title={[s.rightLabel, s.subLabel].filter(Boolean).join(" · ")}
-              >
-                {s.rightLabel}
-                {s.subLabel ? (
-                  <span className="text-violet-700 dark:text-violet-300"> · {s.subLabel}</span>
-                ) : null}
-              </span>
-            </li>
-          );
-        })}
-      </ol>
-    </div>
-  );
-}
-
-// Status badge label
-function statusLabel(status: string, uploadProgress?: number, opts?: { listing?: boolean }): string {
-  const listing = opts?.listing ?? false;
-  switch (status) {
-    case "mapped":
-      return listing ? "Ready — Process Data" : "Phase 2: Process";
-    case "staged":
-      return listing ? "Ready — Process listing import" : "Phase 3: Sync";
-    case "raw_synced":
-      return "Phase 4: Generic";
-    case "ready":
-      return "Ready";
-    case "uploaded":
-      return "Uploaded";
-    case "pending":
-      if (uploadProgress != null && uploadProgress >= 100) return "Ready";
-      return "Pending";
-    case "uploading":
-      return "Uploading…";
-    case "processing":
-      return "Processing…";
-    case "synced":
-      return listing ? "Complete (listing)" : "Complete";
-    case "complete":
-      return listing ? "Complete (listing)" : "Complete";
-    case "failed":
-      return "Failed";
-    case "cancelled":
-      return "Cancelled";
-    case "needs_mapping":
-      return "Needs Mapping";
-    default:
-      return status;
-  }
-}
-
-function statusColorClass(status: string): string {
-  if (status === "synced" || status === "complete")
-    return "bg-emerald-500/15 text-emerald-800 dark:text-emerald-300";
-  if (status === "staged" || status === "raw_synced")
-    return "bg-violet-500/15 text-violet-800 dark:text-violet-300";
-  if (status === "mapped" || status === "ready" || status === "uploaded")
-    return "bg-sky-500/15 text-sky-800 dark:text-sky-300";
-  if (status === "failed" || status === "cancelled")
-    return "bg-destructive/15 text-destructive";
-  if (status === "uploading" || status === "processing")
-    return "bg-sky-500/15 text-sky-800 dark:text-sky-300";
-  if (status === "needs_mapping")
-    return "bg-amber-500/15 text-amber-800 dark:text-amber-300";
-  return "bg-muted text-muted-foreground";
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 const LEGACY_REPORT_TYPE: Record<string, RawReportType> = {
   returns: "fba_customer_returns",
@@ -150,29 +49,79 @@ function coerceReportType(v: string): RawReportType {
   return LEGACY_REPORT_TYPE[v] ?? "UNKNOWN";
 }
 
+// ── Compact pipeline cell ─────────────────────────────────────────────────────
+
+function PipelineCell({ pipeline }: { pipeline: UnifiedPipelineModel }) {
+  const visibleSteps = pipeline.steps.filter((s) => s.tone !== "skipped");
+  return (
+    <div className="w-full min-w-0 max-w-[280px] space-y-1 overflow-hidden">
+      <ol className="w-full min-w-0 space-y-1" aria-label="Import pipeline">
+        {visibleSteps.map((s) => (
+          <PipelineStepRow key={s.key} step={s} />
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function PipelineStepRow({ step }: { step: PipelineStep }) {
+  const bar = stepBarColor(step.tone);
+  const fill = Math.min(100, Math.max(0, step.pct));
+  const isActive = step.tone === "active";
+  return (
+    <li className="w-full min-w-0 space-y-0.5 text-[10px] leading-tight overflow-hidden">
+      <div className="flex items-baseline justify-between gap-1 min-w-0">
+        <span className="min-w-0 truncate font-medium text-foreground">
+          {step.label}
+        </span>
+        <span className="shrink-0 tabular-nums text-muted-foreground">
+          {step.tone === "done"
+            ? "\u2713"
+            : step.tone === "failed"
+              ? "\u2715"
+              : step.pct > 0
+                ? `${Math.round(step.pct)}%`
+                : ""}
+        </span>
+      </div>
+      <div className="relative h-1.5 w-full min-w-0 overflow-hidden rounded-full bg-muted/90">
+        {isActive && (
+          <div className="absolute inset-0 animate-pulse rounded-full bg-sky-400/30" />
+        )}
+        <div
+          className={`h-full rounded-full transition-[width] duration-500 ease-out ${bar}`}
+          style={{ width: `${fill}%` }}
+        />
+      </div>
+      {step.rightLabel && step.rightLabel !== "\u2014" && step.rightLabel !== "N/A" && (
+        <span className="block truncate text-[9px] text-muted-foreground">
+          {step.rightLabel}
+        </span>
+      )}
+    </li>
+  );
+}
+
+// ── Main panel ────────────────────────────────────────────────────────────────
+
 type RawReportImportsPanelProps = {
   organizationId: string | null;
-  /** Parent increments after upload / org change to trigger an immediate refetch (panel stays mounted). */
   refreshSignal?: number;
 };
 
-export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: RawReportImportsPanelProps) {
-  const { debugMode } = useDebugMode();
+export function RawReportImportsPanel({
+  organizationId,
+  refreshSignal = 0,
+}: RawReportImportsPanelProps) {
   const { actorUserId } = useUserRole();
   const [rows, setRows] = useState<RawReportUploadRow[]>([]);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [tableSearch, setTableSearch] = useState("");
   const [reportTypeSaveFlash, setReportTypeSaveFlash] = useState<Record<string, boolean>>({});
 
-  // Per-row operation state
-  const [processingIds, setProcessingIds] = useState<Set<string>>(() => new Set());
-  const [syncingIds, setSyncingIds] = useState<Set<string>>(() => new Set());
-  const [genericIds, setGenericIds] = useState<Set<string>>(() => new Set());
-  const [worklistingIds, setWorklistingIds] = useState<Set<string>>(() => new Set());
+  const [busyIds, setBusyIds] = useState<Record<string, string>>({});
   const [deletingIds, setDeletingIds] = useState<Set<string>>(() => new Set());
-  const [resettingIds, setResettingIds] = useState<Set<string>>(() => new Set());
 
-  // Batch select state
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [batchDeleting, setBatchDeleting] = useState(false);
 
@@ -180,8 +129,18 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const reportTypeOverrideRef = useRef<Map<string, string>>(new Map());
-  /** Ignore stale list responses when org changes or overlapping polls complete out of order. */
   const listFetchGenerationRef = useRef(0);
+
+  const markBusy = (id: string, phase: string) =>
+    setBusyIds((prev) => ({ ...prev, [id]: phase }));
+  const clearBusy = (id: string) =>
+    setBusyIds((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+
+  // ── Data fetching ─────────────────────────────────────────────────────────
 
   const refresh = useCallback(async () => {
     const gen = ++listFetchGenerationRef.current;
@@ -208,63 +167,84 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
   }, [refresh, refreshSignal]);
 
   useEffect(() => {
-    pollRef.current = setInterval(() => {
-      void refresh();
-    }, 3500);
+    pollRef.current = setInterval(() => void refresh(), 5000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
   }, [refresh]);
 
-  /** Faster refresh while Process or Sync is running so progress metadata updates visibly. */
   useEffect(() => {
-    if (processingIds.size === 0 && syncingIds.size === 0 && genericIds.size === 0 && worklistingIds.size === 0) return;
-    const t = setInterval(() => {
-      void refresh();
-    }, 700);
+    const hasBusy = Object.keys(busyIds).length > 0;
+    if (!hasBusy) return;
+    const t = setInterval(() => void refresh(), 1200);
     return () => clearInterval(t);
-  }, [processingIds.size, syncingIds.size, genericIds.size, worklistingIds.size, refresh]);
+  }, [busyIds, refresh]);
 
-  // ── Single row delete ────────────────────────────────────────────────────
+  // ── Operations ──────────────────────────────────────────────────────────────
+
   const runDeleteUpload = async (r: RawReportUploadRow) => {
-    if (!window.confirm(`Delete "${r.file_name}" and all associated data? This cannot be undone.`)) return;
+    if (
+      !window.confirm(
+        `Delete "${r.file_name}" and all associated data? This cannot be undone.`,
+      )
+    )
+      return;
     setDeletingIds((prev) => new Set([...prev, r.id]));
+    setRows((prev) => prev.map((row) => (row.id === r.id ? { ...row, status: "deleting" } : row)));
     setLoadErr(null);
     try {
       const res = await deleteRawReportUpload(r.id);
-      if (!res.ok) { setLoadErr(res.error ?? "Delete failed."); return; }
-      setSelectedIds((prev) => { const n = new Set(prev); n.delete(r.id); return n; });
-      await refresh();
+      if (!res.ok) {
+        setLoadErr(res.error ?? "Delete failed.");
+        return;
+      }
+      setRows((prev) => prev.filter((row) => row.id !== r.id));
+      setSelectedIds((prev) => {
+        const n = new Set(prev);
+        n.delete(r.id);
+        return n;
+      });
     } catch (e) {
       setLoadErr(e instanceof Error ? e.message : "Delete failed.");
+      await refresh();
     } finally {
-      setDeletingIds((prev) => { const n = new Set(prev); n.delete(r.id); return n; });
+      setDeletingIds((prev) => {
+        const n = new Set(prev);
+        n.delete(r.id);
+        return n;
+      });
     }
   };
 
-  // ── Batch delete ─────────────────────────────────────────────────────────
   const runBatchDelete = async () => {
     if (selectedIds.size === 0) return;
-    if (!window.confirm(`Delete ${selectedIds.size} selected import(s) and all associated data? This cannot be undone.`)) return;
+    if (
+      !window.confirm(
+        `Delete ${selectedIds.size} selected import(s) and all associated data? This cannot be undone.`,
+      )
+    )
+      return;
     setBatchDeleting(true);
     setLoadErr(null);
     const ids = [...selectedIds];
     try {
       for (const id of ids) {
+        setRows((prev) => prev.filter((row) => row.id !== id));
         await deleteRawReportUpload(id);
       }
       setSelectedIds(new Set());
-      await refresh();
     } catch (e) {
-      setLoadErr(e instanceof Error ? e.message : "Batch delete partially failed.");
+      setLoadErr(
+        e instanceof Error ? e.message : "Batch delete partially failed.",
+      );
     } finally {
       setBatchDeleting(false);
+      await refresh();
     }
   };
 
-  // ── Phase 2: Process — unified route (staging for Amazon reports; listing branch for catalog exports) ──
   const runProcess = async (r: RawReportUploadRow) => {
-    setProcessingIds((prev) => new Set([...prev, r.id]));
+    markBusy(r.id, "processing");
     setLoadErr(null);
     try {
       const res = await fetch("/api/settings/imports/process", {
@@ -272,27 +252,41 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ upload_id: r.id }),
       });
-      const json = (await res.json()) as {
-        ok?: boolean;
-        error?: string;
-        rowsStaged?: number;
-        rowsProcessed?: number;
-      };
+      const json = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok || !json.ok) {
         setLoadErr(json.error ?? "Processing failed.");
-        return;
       }
       await refresh();
     } catch (e) {
       setLoadErr(e instanceof Error ? e.message : "Processing failed.");
     } finally {
-      setProcessingIds((prev) => { const n = new Set(prev); n.delete(r.id); return n; });
+      clearBusy(r.id);
     }
   };
 
-  // ── Phase 4: Generic (catalog, removal shipment tree, etc.) ───────────────
+  const runSync = async (r: RawReportUploadRow) => {
+    markBusy(r.id, "syncing");
+    setLoadErr(null);
+    try {
+      const res = await fetch("/api/settings/imports/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ upload_id: r.id }),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok || !json.ok) {
+        setLoadErr(json.error ?? "Sync failed.");
+      }
+      await refresh();
+    } catch (e) {
+      setLoadErr(e instanceof Error ? e.message : "Sync failed.");
+    } finally {
+      clearBusy(r.id);
+    }
+  };
+
   const runGeneric = async (r: RawReportUploadRow) => {
-    setGenericIds((prev) => new Set([...prev, r.id]));
+    markBusy(r.id, "generic");
     setLoadErr(null);
     try {
       const res = await fetch("/api/settings/imports/generic", {
@@ -303,20 +297,17 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
       const json = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok || !json.ok) {
         setLoadErr(json.error ?? "Generic phase failed.");
-        await refresh();
-        return;
       }
       await refresh();
     } catch (e) {
       setLoadErr(e instanceof Error ? e.message : "Generic phase failed.");
-      await refresh();
     } finally {
-      setGenericIds((prev) => { const n = new Set(prev); n.delete(r.id); return n; });
+      clearBusy(r.id);
     }
   };
 
   const runWorklist = async (r: RawReportUploadRow) => {
-    setWorklistingIds((prev) => new Set([...prev, r.id]));
+    markBusy(r.id, "worklist");
     setLoadErr(null);
     try {
       const res = await fetch("/api/settings/imports/generate-worklist", {
@@ -327,62 +318,33 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
       const json = (await res.json()) as { ok?: boolean; error?: string };
       if (!res.ok || !json.ok) {
         setLoadErr(json.error ?? "Generate Worklist failed.");
-        await refresh();
-        return;
       }
       await refresh();
     } catch (e) {
-      setLoadErr(e instanceof Error ? e.message : "Generate Worklist failed.");
-      await refresh();
+      setLoadErr(
+        e instanceof Error ? e.message : "Generate Worklist failed.",
+      );
     } finally {
-      setWorklistingIds((prev) => { const n = new Set(prev); n.delete(r.id); return n; });
+      clearBusy(r.id);
     }
   };
 
-  // ── Phase 3: Sync (amazon_staging -> domain tables) ─────────────────────
-  const runSync = async (r: RawReportUploadRow) => {
-    setSyncingIds((prev) => new Set([...prev, r.id]));
-    setLoadErr(null);
-    try {
-      const res = await fetch("/api/settings/imports/sync", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ upload_id: r.id }),
-      });
-      const json = (await res.json()) as { ok?: boolean; error?: string; rowsSynced?: number; kind?: string };
-      if (!res.ok || !json.ok) {
-        setLoadErr(json.error ?? "Sync failed.");
-        await refresh(); // refresh so the row shows "failed" status from the server
-        return;
-      }
-      await refresh();
-    } catch (e) {
-      setLoadErr(e instanceof Error ? e.message : "Sync failed.");
-      await refresh(); // show any server-written "failed" status immediately
-    } finally {
-      setSyncingIds((prev) => { const n = new Set(prev); n.delete(r.id); return n; });
-    }
-  };
-
-  // ── Reset stuck "processing" row ─────────────────────────────────────────
   const runResetStuck = async (r: RawReportUploadRow) => {
-    setResettingIds((prev) => new Set([...prev, r.id]));
+    markBusy(r.id, "resetting");
     setLoadErr(null);
     try {
       const res = await resetStuckUpload({ uploadId: r.id, actorUserId });
-      if (!res.ok) {
-        setLoadErr(res.error ?? "Reset failed.");
-        return;
-      }
+      if (!res.ok) setLoadErr(res.error ?? "Reset failed.");
       await refresh();
     } catch (e) {
       setLoadErr(e instanceof Error ? e.message : "Reset failed.");
     } finally {
-      setResettingIds((prev) => { const n = new Set(prev); n.delete(r.id); return n; });
+      clearBusy(r.id);
     }
   };
 
-  // ── Checkbox helpers ─────────────────────────────────────────────────────
+  // ── Selection helpers ───────────────────────────────────────────────────────
+
   const toggleRow = (id: string) =>
     setSelectedIds((prev) => {
       const n = new Set(prev);
@@ -391,17 +353,21 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
       return n;
     });
 
-  const allSelected = rows.length > 0 && rows.every((r) => selectedIds.has(r.id));
+  const allSelected =
+    rows.length > 0 && rows.every((r) => selectedIds.has(r.id));
   const toggleAll = () =>
     setSelectedIds(allSelected ? new Set() : new Set(rows.map((r) => r.id)));
 
-  const anyBusy = (id: string) =>
-    processingIds.has(id) ||
-    syncingIds.has(id) ||
-    genericIds.has(id) ||
-    worklistingIds.has(id) ||
-    deletingIds.has(id) ||
-    resettingIds.has(id);
+  // ── Filter rows ─────────────────────────────────────────────────────────────
+
+  const q = tableSearch.trim().toLowerCase();
+  const filteredRows = q
+    ? rows.filter(
+        (r) =>
+          r.file_name.toLowerCase().includes(q) ||
+          (r.report_type ?? "").toLowerCase().includes(q),
+      )
+    : rows;
 
   return (
     <>
@@ -409,7 +375,10 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
         <ColumnMappingModal
           row={mappingRow}
           onClose={() => setMappingRow(null)}
-          onSaved={() => { setMappingRow(null); void refresh(); }}
+          onSaved={() => {
+            setMappingRow(null);
+            void refresh();
+          }}
         />
       )}
 
@@ -419,19 +388,27 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
         </div>
       )}
 
-      <div id="data-import-history" className="rounded-2xl border border-border bg-card shadow-sm scroll-mt-20">
-        {/* ── History panel header ─────────────────────────────────────────────── */}
+      <div
+        id="data-import-history"
+        className="rounded-2xl border border-border bg-card shadow-sm scroll-mt-20"
+      >
+        {/* Header */}
         <div className="flex items-center justify-between gap-3 border-b border-border px-5 py-4">
-          {/* Left: title + search */}
           <div className="flex min-w-0 flex-1 items-center gap-3">
             <div className="flex shrink-0 items-center gap-2">
-              <FileSpreadsheet className="h-4 w-4 text-muted-foreground" aria-hidden />
-              <h2 className="text-sm font-semibold text-foreground">Import History</h2>
+              <FileSpreadsheet
+                className="h-4 w-4 text-muted-foreground"
+                aria-hidden
+              />
+              <h2 className="text-sm font-semibold text-foreground">
+                Import History
+              </h2>
             </div>
-
-            {/* Search input */}
             <div className="relative w-full max-w-xs">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
+              <Search
+                className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground"
+                aria-hidden
+              />
               <input
                 type="search"
                 placeholder="Search files…"
@@ -442,7 +419,6 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
             </div>
           </div>
 
-          {/* Right: Delete selected */}
           {selectedIds.size > 0 && (
             <button
               type="button"
@@ -451,7 +427,10 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
               className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-1.5 text-xs font-semibold text-destructive transition hover:bg-destructive/20 disabled:opacity-50"
             >
               {batchDeleting ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                <Loader2
+                  className="h-3.5 w-3.5 animate-spin"
+                  aria-hidden
+                />
               ) : (
                 <Trash2 className="h-3.5 w-3.5" aria-hidden />
               )}
@@ -460,58 +439,44 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
           )}
         </div>
 
-        {/* Sub-description */}
-        <div className="space-y-2 px-5 pt-2 pb-3 text-xs text-muted-foreground">
+        {/* Info text */}
+        <div className="px-5 pt-2 pb-3 text-[11px] text-muted-foreground">
           <p>
-            <strong className="text-foreground">Amazon listing exports:</strong> Phase 1 upload → one{" "}
-            <strong>Process listing import</strong> step (raw rows to{" "}
-            <code className="text-xs">amazon_listing_report_rows_raw</code>, then canonical{" "}
-            <code className="text-xs">catalog_products</code>).
-          </p>
-          <p>
-            <strong className="text-foreground">Other report types:</strong> after upload,{" "}
-            <strong>Process</strong> stages rows, then <strong>Sync</strong> writes raw/domain tables. Removal shipment
-            imports then run <strong>Generic</strong> (shipment tree). Removal orders use <strong>Generate Worklist</strong>{" "}
-            when needed.
-          </p>
-          <p>
-            Delete performs full cleanup across Storage, staging, and domain tables.
-            {debugMode && (
-              <span className="ml-2 font-mono text-[10px] text-muted-foreground/70">
-                [<code>raw_report_uploads</code>]
-              </span>
-            )}
+            Every file follows: <strong className="text-foreground">Upload</strong> → <strong className="text-foreground">Process</strong> → <strong className="text-foreground">Sync</strong> → <strong className="text-foreground">Generic</strong> (when applicable).
           </p>
         </div>
 
-        {/* ── Scrollable table ─────────────────────────────────────────────────── */}
-        <div className="relative max-h-[400px] overflow-x-auto overflow-y-auto rounded-b-2xl">
+        {/* Table */}
+        <div className="relative max-h-[500px] overflow-x-auto overflow-y-auto rounded-b-2xl">
           <DatabaseTag table="raw_report_uploads" />
           <table className="w-full min-w-0 table-fixed border-collapse text-left text-sm">
             <colgroup>
               <col className="w-10" />
               <col className="w-[13%]" />
-              <col className="w-[15%]" />
               <col className="w-[12%]" />
-              <col className="w-[10%]" />
-              <col className="w-[11%]" />
               <col className="w-[9%]" />
-              <col className="w-[18%]" />
-              <col className="w-[12%]" />
+              <col className="w-[9%]" />
+              <col className="w-[9%]" />
+              <col className="w-[7%]" />
+              <col className="w-[26%]" />
+              <col className="w-[15%]" />
             </colgroup>
             <thead>
               <tr className="border-b border-border bg-muted/40 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
                 <th className="px-2 py-2.5">
-                  {/* Select-all checkbox */}
                   <button
                     type="button"
                     onClick={toggleAll}
-                    aria-label={allSelected ? "Deselect all" : "Select all"}
+                    aria-label={
+                      allSelected ? "Deselect all" : "Select all"
+                    }
                     className="text-muted-foreground hover:text-foreground"
                   >
-                    {allSelected
-                      ? <CheckSquare className="h-4 w-4" aria-hidden />
-                      : <Square className="h-4 w-4" aria-hidden />}
+                    {allSelected ? (
+                      <CheckSquare className="h-4 w-4" aria-hidden />
+                    ) : (
+                      <Square className="h-4 w-4" aria-hidden />
+                    )}
                   </button>
                 </th>
                 <th className="px-2 py-2.5">Import</th>
@@ -525,731 +490,463 @@ export function RawReportImportsPanel({ organizationId, refreshSignal = 0 }: Raw
               </tr>
             </thead>
             <tbody>
-              {(() => {
-                const q = tableSearch.trim().toLowerCase();
-                const filteredRows = q
-                  ? rows.filter(
-                      (r) =>
-                        r.file_name.toLowerCase().includes(q) ||
-                        (r.report_type ?? "").toLowerCase().includes(q),
-                    )
-                  : rows;
-                if (filteredRows.length === 0) {
-                  return (
-                    <tr>
-                      <td colSpan={9} className="px-4 py-8 text-center text-muted-foreground">
-                        {rows.length === 0 ? "No imports yet." : `No results for "${tableSearch}".`}
-                      </td>
-                    </tr>
-                  );
-                }
-                return filteredRows.map((r) => {
-                const rt = coerceReportType(r.report_type);
-                const isListing = isListingReportType(rt);
-                const metaObj =
-                  r.metadata && typeof r.metadata === "object" && !Array.isArray(r.metadata)
-                    ? (r.metadata as Record<string, unknown>)
-                    : null;
-                const isLedgerSession = metaObj?.source === AMAZON_LEDGER_UPLOAD_SOURCE;
-                const busy = anyBusy(r.id);
-
-                const baseInput: ImportUiActionInput = {
-                  reportType: String(r.report_type ?? ""),
-                  status: r.status,
-                  metadata: metaObj,
-                  fps: r.file_processing_status,
-                  isLedgerSession,
-                };
-                const uiInput = buildImportUiActionInputForRemovalShipment(
-                  baseInput,
-                  rt === "REMOVAL_SHIPMENT" ? "REMOVAL_SHIPMENT" : undefined,
-                );
-                const actionState = resolveImportUiActionState(uiInput);
-                const badgeStatus = actionState.badgeStatus;
-                const isRsRow = uiInput.reportType === "REMOVAL_SHIPMENT";
-                const rsRowCta =
-                  !isLedgerSession && isRsRow
-                    ? resolveRemovalShipmentPrimaryCta(actionState, r.status, isLedgerSession)
-                    : null;
-                const rsBadge =
-                  isRsRow && !isLedgerSession
-                    ? resolveRemovalShipmentPhaseBadgeLabel(actionState, r.status, isLedgerSession)
-                    : null;
-
-                const listingUi =
-                  !isLedgerSession && isListing && !isRsRow
-                    ? resolveListingImportUiState({
-                        ...uiInput,
-                        client: {
-                          isProcessing: processingIds.has(r.id),
-                          isSyncing: syncingIds.has(r.id),
-                          isGenericing: genericIds.has(r.id),
-                        },
-                      })
-                    : null;
-
-                const showMapColumns = r.status === "needs_mapping";
-                const listingSyncGenericPlaceholders =
-                  isListing &&
-                  listingUi &&
-                  !isLedgerSession &&
-                  !["pending", "uploading"].includes(r.status);
-                const showProcess =
-                  !isLedgerSession &&
-                  (isRsRow
-                    ? rsRowCta === "process" || rsRowCta === "retry_process"
-                    : isListing && listingUi
-                      ? listingUi.showProcessCta
-                      : r.status === "mapped" || r.status === "ready" || r.status === "uploaded");
-                const showSync =
-                  isRsRow && rsRowCta != null
-                    ? rsRowCta === "sync" || rsRowCta === "retry_sync"
-                    : isListing && listingUi
-                      ? listingSyncGenericPlaceholders
-                      : actionState.showSync;
-                const showGeneric =
-                  isRsRow && rsRowCta != null
-                    ? rsRowCta === "generic" || rsRowCta === "generic_retry"
-                    : isListing && listingUi
-                      ? listingSyncGenericPlaceholders
-                      : actionState.showGeneric;
-                const showWorklist = actionState.showWorklist;
-                const showRetryProcess = !isRsRow && !isListing && actionState.showRetryProcess;
-                const showRetrySync = !isRsRow && !isListing && actionState.showRetrySync;
-                const showRetryGeneric = !isRsRow && !isListing && actionState.showRetryGeneric;
-                const showFailedError =
-                  Boolean(r.errorMessage) &&
-                  (String(badgeStatus).toLowerCase() === "failed" ||
-                    ((isListing || isRsRow) &&
-                      String(r.status).toLowerCase() === "failed" &&
-                      !actionState.phase4Complete));
-
-                return (
-                  <tr
-                    key={r.id}
-                    data-upload-id={r.id}
-                    className={[
-                      "border-b border-border last:border-0",
-                      selectedIds.has(r.id) ? "bg-muted/30" : "",
-                    ].join(" ")}
+              {filteredRows.length === 0 ? (
+                <tr>
+                  <td
+                    colSpan={9}
+                    className="px-4 py-8 text-center text-muted-foreground"
                   >
-                    {/* Checkbox */}
-                    <td className="px-2 py-2.5 align-top">
-                      <button
-                        type="button"
-                        onClick={() => toggleRow(r.id)}
-                        aria-label={selectedIds.has(r.id) ? "Deselect row" : "Select row"}
-                        disabled={busy}
-                        className="text-muted-foreground hover:text-foreground disabled:opacity-40"
-                      >
-                        {selectedIds.has(r.id)
-                          ? <CheckSquare className="h-4 w-4 text-primary" aria-hidden />
-                          : <Square className="h-4 w-4" aria-hidden />}
-                      </button>
-                    </td>
-
-                    {/* File name / ID */}
-                    <td className="px-2 py-2.5 align-top">
-                      <div className="flex min-w-0 flex-col gap-0.5 break-words" title={`${r.id}\n${r.file_name}`}>
-                        <span className="text-[11px] font-medium leading-snug text-foreground">{r.file_name}</span>
-                        <span className="font-mono text-[9px] text-muted-foreground">{r.id.slice(0, 8)}…</span>
-                      </div>
-                    </td>
-
-                    {/* Report type dropdown */}
-                    <td className="px-2 py-2.5 align-top">
-                      <div className="flex min-w-0 items-start gap-1">
-                        <select
-                          value={rt}
-                          onChange={async (e) => {
-                            const v = e.target.value as RawReportType;
-                            const prevType = r.report_type;
-                            reportTypeOverrideRef.current.set(r.id, v);
-                            setRows((prev) =>
-                              prev.map((row) => row.id === r.id ? { ...row, report_type: v } : row),
-                            );
-                            const res = await updateRawReportType({ uploadId: r.id, reportType: v, actorUserId });
-                            if (res.ok) {
-                              setReportTypeSaveFlash((m) => ({ ...m, [r.id]: true }));
-                              window.setTimeout(() => {
-                                setReportTypeSaveFlash((m) => { const n = { ...m }; delete n[r.id]; return n; });
-                              }, 2200);
-                            } else {
-                              reportTypeOverrideRef.current.delete(r.id);
-                              setRows((prev) =>
-                                prev.map((row) => row.id === r.id ? { ...row, report_type: prevType } : row),
-                              );
-                              setLoadErr(res.error ?? "Update failed");
-                            }
-                          }}
-                          className="h-auto min-h-8 w-full min-w-0 max-w-full rounded-lg border border-border bg-background py-1 pl-1.5 pr-1 text-[10px] leading-tight text-foreground"
-                        >
-                          {RAW_REPORT_TYPE_ORDER.map((v) => {
-                            const s = REPORT_TYPE_SPECS[v];
-                            const label =
-                              s != null
-                                ? `${s.shortLabel} (${s.description})`
-                                : String(v);
-                            return (
-                              <option key={v} value={v}>
-                                {label}
-                              </option>
-                            );
-                          })}
-                        </select>
-                        {reportTypeSaveFlash[r.id] && (
-                          <Check className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" aria-label="Saved" />
-                        )}
-                      </div>
-                    </td>
-
-                    {/* Uploader */}
-                    <td className="px-2 py-2.5 align-top font-mono text-[10px] leading-snug text-muted-foreground">
-                      <span className="break-all">{r.created_by_name ?? r.created_by ?? "—"}</span>
-                    </td>
-
-                    {/* Date */}
-                    <td className="px-2 py-2.5 align-top text-[10px] leading-snug text-muted-foreground">
-                      <span className="break-words">{new Date(r.created_at).toLocaleString()}</span>
-                    </td>
-
-                    {/* Status badge / live progress */}
-                    <td className="px-2 py-2.5 align-top">
-                      {processingIds.has(r.id) ? (
-                        // Live Phase 2 progress — shows X / Y rows (FPS + metadata; guard stale Phase-1 totals)
-                        (() => {
-                          const pct  = num(metaObj?.process_progress, 0);
-                          const done = num(metaObj?.row_count,         0);
-                          const rawTot  = num(metaObj?.total_rows,        0);
-                          const im = metaObj?.import_metrics as { current_phase?: string } | undefined;
-                          const phaseLbl =
-                            im?.current_phase === "staging"
-                              ? "Phase 2 — Stage to amazon_staging"
-                              : formatImportPhaseLabel(im?.current_phase ?? "staging");
-                          const tot =
-                            rawTot > 0 && done > 0 && rawTot > done * 1.18
-                              ? done
-                              : rawTot;
-                          return (
-                            <div className="min-w-[120px]">
-                              <div className="mb-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[10px] font-medium text-sky-600">
-                                <span className="flex items-center gap-1">
-                                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                                  {phaseLbl}
-                                </span>
-                                <span className="tabular-nums text-muted-foreground">
-                                  {done > 0 || tot > 0
-                                    ? `rows ${done.toLocaleString()} / ${tot > 0 ? tot.toLocaleString() : "…"}`
-                                    : pct > 0 ? `${pct}%` : "…"}
-                                </span>
-                              </div>
-                              <div className="relative h-1.5 overflow-hidden rounded-full bg-muted">
-                                <div
-                                  className="absolute inset-0 animate-pulse rounded-full bg-sky-400/40"
-                                />
-                                <div
-                                  className="h-full rounded-full bg-sky-500 transition-all duration-700"
-                                  style={{ width: `${Math.max(5, pct)}%` }}
-                                />
-                              </div>
-                            </div>
-                          );
-                        })()
-                      ) : genericIds.has(r.id) ? (
-                        (() => {
-                          const gp = num(metaObj?.process_progress, 0);
-                          return (
-                            <div className="min-w-[120px]">
-                              <div className="mb-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
-                                <span className="flex items-center gap-1">
-                                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                                  Phase 4 — Generic
-                                </span>
-                                <span className="tabular-nums text-muted-foreground">{gp > 0 ? `${gp}%` : "…"}</span>
-                              </div>
-                              <div className="relative h-1.5 overflow-hidden rounded-full bg-muted">
-                                <div className="absolute inset-0 animate-pulse rounded-full bg-emerald-400/40" />
-                                <div
-                                  className="h-full rounded-full bg-emerald-500 transition-all duration-500"
-                                  style={{ width: `${Math.max(5, Math.min(100, gp))}%` }}
-                                />
-                              </div>
-                            </div>
-                          );
-                        })()
-                      ) : syncingIds.has(r.id) ? (
-                        (() => {
-                          const syncPct = num(metaObj?.sync_progress, 0);
-                          const im = metaObj?.import_metrics as {
-                            current_phase?: string;
-                            rows_synced?: number;
-                            total_staging_rows?: number;
-                          } | undefined;
-                          const phaseLbl =
-                            im?.current_phase === "sync"
-                              ? "Phase 3 — Raw sync"
-                              : formatImportPhaseLabel(im?.current_phase ?? "sync");
-                          const rs = num(im?.rows_synced, -1);
-                          const ts = num(im?.total_staging_rows, -1);
-                          const rowHint =
-                            rs >= 0 && ts >= 0
-                              ? `rows ${rs.toLocaleString()} / ${ts.toLocaleString()}`
-                              : `${syncPct}%`;
-                          return (
-                            <div className="min-w-[120px]">
-                              <div className="mb-1 flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[10px] font-medium text-violet-600">
-                                <span className="flex items-center gap-1">
-                                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                                  {phaseLbl}
-                                </span>
-                                <span className="tabular-nums text-muted-foreground">{rowHint}</span>
-                              </div>
-                              <div className="relative h-1.5 overflow-hidden rounded-full bg-muted">
-                                <div className="absolute inset-0 animate-pulse rounded-full bg-violet-400/40" />
-                                <div
-                                  className="h-full rounded-full bg-violet-500 transition-all duration-500"
-                                  style={{ width: `${Math.max(5, Math.min(100, syncPct))}%` }}
-                                />
-                              </div>
-                            </div>
-                          );
-                        })()
-                      ) : (
-                        <div className="flex min-w-0 flex-col gap-0.5">
-                          <span
-                            className={[
-                              "flex w-full min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 rounded-md px-1.5 py-0.5 text-[10px] font-medium leading-snug",
-                              statusColorClass(badgeStatus),
-                            ].join(" ")}
-                          >
-                            <span className="min-w-0 break-words">
-                              {rsBadge ??
-                                listingUi?.phaseBadgeText ??
-                                statusLabel(badgeStatus, r.upload_progress, { listing: isListing })}
-                            </span>
-                            {(r.status === "uploading" || r.status === "processing") &&
-                              r.upload_progress > 0 && r.upload_progress < 100 && (
-                                <span className="font-normal tabular-nums text-muted-foreground">
-                                  {r.upload_progress}%
-                                </span>
-                              )}
-                          </span>
-                          {showFailedError && (
-                            <span className="max-w-[180px] truncate text-[10px] text-destructive" title={r.errorMessage!}>
-                              {r.errorMessage}
-                            </span>
-                          )}
-                        </div>
-                      )}
-                    </td>
-
-                    {/* Row count — Phase 3+: sync/stage when present; else row_count / CSV total */}
-                    <td className="px-2 py-2.5 text-right align-top tabular-nums text-[10px] leading-snug text-muted-foreground">
-                      {(() => {
-                        if (isListing) {
-                          if (!listingUi) return "—";
-                          return (
-                            <span
-                              title="Listing metrics (shared resolver with top card)."
-                              className="block min-w-0 cursor-help break-words text-right text-[10px] leading-snug text-muted-foreground"
-                            >
-                              {listingUi.rowMetricsLine}
-                            </span>
-                          );
-                        }
-                        const stagedCount = num(
-                          (metaObj as { staging_row_count?: unknown } | undefined)?.staging_row_count,
-                          -1,
+                    {rows.length === 0
+                      ? "No imports yet."
+                      : `No results for "${tableSearch}".`}
+                  </td>
+                </tr>
+              ) : (
+                filteredRows.map((r) => (
+                  <HistoryRow
+                    key={r.id}
+                    row={r}
+                    busy={!!busyIds[r.id]}
+                    busyPhase={busyIds[r.id] ?? null}
+                    isDeleting={deletingIds.has(r.id)}
+                    isSelected={selectedIds.has(r.id)}
+                    batchDeleting={batchDeleting}
+                    onToggle={() => toggleRow(r.id)}
+                    onProcess={() => void runProcess(r)}
+                    onSync={() => void runSync(r)}
+                    onGeneric={() => void runGeneric(r)}
+                    onWorklist={() => void runWorklist(r)}
+                    onDelete={() => void runDeleteUpload(r)}
+                    onResetStuck={() => void runResetStuck(r)}
+                    onMapColumns={() => setMappingRow(r)}
+                    onReportTypeChange={async (v: RawReportType) => {
+                      const prevType = r.report_type;
+                      reportTypeOverrideRef.current.set(r.id, v);
+                      setRows((prev) =>
+                        prev.map((row) =>
+                          row.id === r.id
+                            ? { ...row, report_type: v }
+                            : row,
+                        ),
+                      );
+                      const res = await updateRawReportType({
+                        uploadId: r.id,
+                        reportType: v,
+                        actorUserId,
+                      });
+                      if (res.ok) {
+                        setReportTypeSaveFlash((m) => ({
+                          ...m,
+                          [r.id]: true,
+                        }));
+                        window.setTimeout(() => {
+                          setReportTypeSaveFlash((m) => {
+                            const n = { ...m };
+                            delete n[r.id];
+                            return n;
+                          });
+                        }, 2200);
+                      } else {
+                        reportTypeOverrideRef.current.delete(r.id);
+                        setRows((prev) =>
+                          prev.map((row) =>
+                            row.id === r.id
+                              ? { ...row, report_type: prevType }
+                              : row,
+                          ),
                         );
-                        const syncCount = num(
-                          (metaObj as { sync_row_count?: unknown } | undefined)?.sync_row_count,
-                          -1,
-                        );
-                        const collapsed = num(
-                          (metaObj as { sync_collapsed_by_dedupe?: unknown } | undefined)
-                            ?.sync_collapsed_by_dedupe,
-                          -1,
-                        );
-                        const processed = num(metaObj?.row_count, -1);
-                        const total = num(metaObj?.total_rows, 0);
-                        if (stagedCount >= 0 && syncCount >= 0) {
-                          if (isRsRow) {
-                            const im = metaObj?.import_metrics as
-                              | { rows_duplicate_against_existing?: number }
-                              | undefined;
-                            const skippedDup =
-                              num(im?.rows_duplicate_against_existing, -1) >= 0
-                                ? num(im?.rows_duplicate_against_existing, 0)
-                                : num(metaObj?.sync_collapsed_by_dedupe, 0);
-                            const genMeta = num(metaObj?.removal_shipment_phase4_generic_rows_written, -1);
-                            const fpsRow = r.file_processing_status;
-                            const fpsObj =
-                              fpsRow && typeof fpsRow === "object"
-                                ? (fpsRow as {
-                                    generic_rows_written?: unknown;
-                                    raw_rows_written?: unknown;
-                                    raw_rows_skipped_existing?: unknown;
-                                  })
-                                : null;
-                            const rawNewF = fpsObj ? num(fpsObj.raw_rows_written, -1) : -1;
-                            const rawSkipF = fpsObj ? num(fpsObj.raw_rows_skipped_existing, -1) : -1;
-                            const genFps = fpsObj ? num(fpsObj.generic_rows_written, -1) : -1;
-                            const genericDone = genMeta >= 0 ? genMeta : genFps;
-                            const sub: string[] = [];
-                            if (genericDone >= 0) sub.push(`generic ${genericDone.toLocaleString()}`);
-                            if (skippedDup > 0) sub.push(`duplicates skipped ${skippedDup.toLocaleString()}`);
-                            const main =
-                              rawNewF >= 0 || rawSkipF >= 0
-                                ? `staged ${stagedCount.toLocaleString()} · raw new ${(rawNewF >= 0 ? rawNewF : syncCount).toLocaleString()} · raw skipped ${(rawSkipF >= 0 ? rawSkipF : 0).toLocaleString()}`
-                                : `raw ${syncCount.toLocaleString()} / staged ${stagedCount.toLocaleString()}`;
-                            return (
-                              <span
-                                title="Removal shipment: FPS raw_rows_written / raw_rows_skipped_existing; staged = staging rows; duplicates skipped = lines already archived; generic = Phase 4 rows."
-                                className="flex max-w-[min(100%,22rem)] cursor-help flex-wrap justify-end gap-x-1 gap-y-0.5 text-right leading-snug"
-                              >
-                                <span className="tabular-nums">{main}</span>
-                                {sub.length > 0 && (
-                                  <span className="block w-full text-[10px] text-muted-foreground">
-                                    {sub.join(" · ")}
-                                  </span>
-                                )}
-                              </span>
-                            );
-                          }
-                          const dupInFile = num(metaObj?.sync_duplicate_in_batch_rows, -1);
-                          const im = metaObj?.import_metrics as
-                            | {
-                                rows_synced_new?: number;
-                                rows_synced_updated?: number;
-                                rows_synced_unchanged?: number;
-                                rows_duplicate_against_existing?: number;
-                              }
-                            | undefined;
-                          const nNew = num(im?.rows_synced_new, -1);
-                          const nUpd = num(im?.rows_synced_updated, -1);
-                          const nUn = num(im?.rows_synced_unchanged, -1);
-                          const nDupDb = num(im?.rows_duplicate_against_existing, -1);
-                          const extra =
-                            collapsed > 0
-                              ? ` — ${collapsed.toLocaleString()} net merged vs staging (key collision)`
-                              : "";
-                          const dupNote =
-                            dupInFile > 0 ? ` · ${dupInFile.toLocaleString()} dup key in batch` : "";
-                          const metricNote =
-                            nNew >= 0 && nUpd >= 0 && nUn >= 0 && nDupDb >= 0
-                              ? ` · new ${nNew.toLocaleString()} · upd ${nUpd.toLocaleString()} · same ${nUn.toLocaleString()} · dup DB ${nDupDb.toLocaleString()}`
-                              : "";
-                          return (
-                            <span
-                              title={
-                                "Phase 3: domain rows upserted / staging rows. " +
-                                (collapsed > 0
-                                  ? `Net ${collapsed} lines did not add a distinct row (duplicate key vs staging). `
-                                  : "") +
-                                (dupInFile > 0
-                                  ? `${dupInFile} duplicate conflict key(s) collapsed inside a single upsert batch.`
-                                  : "") +
-                                (metricNote ? " Metrics: new / updated / unchanged / duplicate vs DB." : "")
-                              }
-                              className="flex max-w-[min(100%,22rem)] cursor-help flex-wrap justify-end gap-x-1 gap-y-0.5 text-right leading-snug"
-                            >
-                              <span className="tabular-nums">
-                                rows {syncCount.toLocaleString()} / {stagedCount.toLocaleString()}
-                              </span>
-                              {(extra || dupNote || metricNote) && (
-                                <span className="block w-full text-[10px] text-muted-foreground">
-                                  {extra}
-                                  {dupNote}
-                                  {metricNote}
-                                </span>
-                              )}
-                            </span>
-                          );
-                        }
-                        if (processed < 0 && total > 0) return `— / ${total.toLocaleString()}`;
-                        if (processed < 0) return "—";
-                        if (total > 0)
-                          return `${processed.toLocaleString()} / ${total.toLocaleString()}`;
-                        return processed.toLocaleString();
-                      })()}
-                    </td>
-
-                    {/* Listing pipeline — same resolver as top card */}
-                    <td className="px-2 py-2.5 align-top">
-                      {isListing && listingUi ? (
-                        <ListingPipelineHistoryCell status={r.status} metadata={metaObj} fps={r.file_processing_status} />
-                      ) : (
-                        <span className="text-[10px] text-muted-foreground">—</span>
-                      )}
-                    </td>
-
-                    {/* Actions */}
-                    <td className="px-2 py-2.5 text-right align-top">
-                      <div className="inline-flex flex-wrap items-center justify-end gap-2">
-
-                        {/* Map Columns — Phase 1 gap fill */}
-                        {showMapColumns && (
-                          <button
-                            type="button"
-                            onClick={() => setMappingRow(r)}
-                            disabled={busy}
-                            aria-label={`Map columns for ${r.file_name}`}
-                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-amber-400/60 bg-amber-50 px-3 text-xs font-semibold text-amber-800 shadow-sm transition hover:bg-amber-100 disabled:opacity-50 dark:border-amber-600/40 dark:bg-amber-950/30 dark:text-amber-300"
-                          >
-                            <MapPin className="h-3.5 w-3.5" aria-hidden />
-                            Map Columns
-                          </button>
-                        )}
-
-                        {/* Process — Phase 2 */}
-                        {showProcess && (
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void runProcess(r)}
-                            aria-label={
-                              isListing
-                                ? `Process Data for ${r.file_name} (listing catalog)`
-                                : `Process ${r.file_name} to staging`
-                            }
-                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-sky-400/60 bg-sky-50 px-3 text-xs font-semibold text-sky-800 shadow-sm transition hover:bg-sky-100 disabled:opacity-50 dark:border-sky-600/40 dark:bg-sky-950/30 dark:text-sky-300"
-                          >
-                            {processingIds.has(r.id) ? (
-                              <>
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                                Processing…
-                              </>
-                            ) : isRsRow && rsRowCta === "retry_process" ? (
-                              "Retry Process"
-                            ) : isListing && listingUi ? (
-                              listingUi.rowActionLabel
-                            ) : (
-                              "Process"
-                            )}
-                          </button>
-                        )}
-
-                        {/* Sync — Phase 3 */}
-                        {showSync && (
-                          <button
-                            type="button"
-                            disabled={busy || Boolean(isListing && listingUi)}
-                            title={
-                              isListing && listingUi
-                                ? "Raw archive runs inside Process for listing imports."
-                                : undefined
-                            }
-                            onClick={() => {
-                              if (isListing && listingUi) return;
-                              void runSync(r);
-                            }}
-                            aria-label={`Sync ${r.file_name} to domain tables`}
-                            className={[
-                              "inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-semibold shadow-sm transition disabled:opacity-50",
-                              isListing && listingUi
-                                ? "cursor-not-allowed border-emerald-500/40 bg-emerald-500/10 text-emerald-900 dark:text-emerald-100"
-                                : "border-violet-400/60 bg-violet-50 text-violet-800 hover:bg-violet-100 dark:border-violet-600/40 dark:bg-violet-950/30 dark:text-violet-300",
-                            ].join(" ")}
-                          >
-                            {isListing && listingUi ? (
-                              <Lock className="h-3.5 w-3.5 shrink-0 opacity-80" aria-hidden />
-                            ) : syncingIds.has(r.id) ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                            ) : (
-                              <CheckCircle2 className="h-3.5 w-3.5 shrink-0 opacity-90" aria-hidden />
-                            )}
-                            {syncingIds.has(r.id) && !(isListing && listingUi) ? (
-                              <>Syncing…</>
-                            ) : isRsRow && rsRowCta === "retry_sync" ? (
-                              "Retry Sync"
-                            ) : isListing && listingUi ? (
-                              "Sync (in Process)"
-                            ) : (
-                              "Sync"
-                            )}
-                          </button>
-                        )}
-
-                        {showGeneric && (
-                          <button
-                            type="button"
-                            disabled={busy || Boolean(isListing && listingUi)}
-                            title={
-                              isListing && listingUi
-                                ? "Catalog merge runs inside Process for listing imports."
-                                : undefined
-                            }
-                            onClick={() => {
-                              if (isListing && listingUi) return;
-                              void runGeneric(r);
-                            }}
-                            aria-label={`Run generic phase for ${r.file_name}`}
-                            className={[
-                              "inline-flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-semibold shadow-sm transition disabled:opacity-50",
-                              isListing && listingUi
-                                ? "cursor-not-allowed border-violet-500/40 bg-violet-500/10 text-violet-950 dark:text-violet-100"
-                                : "border-emerald-400/60 bg-emerald-50 text-emerald-900 hover:bg-emerald-100 dark:border-emerald-600/40 dark:bg-emerald-950/30 dark:text-emerald-200",
-                            ].join(" ")}
-                          >
-                            {isListing && listingUi ? (
-                              <Lock className="h-3.5 w-3.5 shrink-0 opacity-80" aria-hidden />
-                            ) : genericIds.has(r.id) ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                            ) : null}
-                            {genericIds.has(r.id) && !(isListing && listingUi) ? (
-                              <>Generic…</>
-                            ) : isRsRow ? (
-                              rsRowCta === "generic_retry" ? "Retry Generic (shipments)" : "Generic (shipments)"
-                            ) : isListing && listingUi ? (
-                              "Generic (in Process)"
-                            ) : (
-                              "Generic (shipments)"
-                            )}
-                          </button>
-                        )}
-
-                        {showWorklist && (
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void runWorklist(r)}
-                            aria-label={`Generate worklist for ${r.file_name}`}
-                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-amber-400/60 bg-amber-50 px-3 text-xs font-semibold text-amber-900 shadow-sm transition hover:bg-amber-100 disabled:opacity-50 dark:border-amber-600/40 dark:bg-amber-950/30 dark:text-amber-200"
-                          >
-                            {worklistingIds.has(r.id) ? (
-                              <>
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                                Worklist…
-                              </>
-                            ) : (
-                              "Generate Worklist"
-                            )}
-                          </button>
-                        )}
-
-                        {/* In-progress server-side indicator */}
-                        {r.status === "processing" && !processingIds.has(r.id) && !syncingIds.has(r.id) && !genericIds.has(r.id) && (
-                          <div className="flex flex-col items-end gap-1">
-                            {r.errorMessage ? (
-                              <span className="max-w-[200px] truncate text-[10px] font-medium text-destructive" title={r.errorMessage}>
-                                ✕ {r.errorMessage}
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                                Working…
-                              </span>
-                            )}
-                            <button
-                              type="button"
-                              disabled={busy}
-                              onClick={() => void runResetStuck(r)}
-                              aria-label={`Reset stuck import ${r.file_name}`}
-                              className="inline-flex h-7 items-center gap-1 rounded-lg border border-amber-400/60 bg-amber-50 px-2 text-[11px] font-semibold text-amber-800 shadow-sm transition hover:bg-amber-100 disabled:opacity-50 dark:border-amber-600/40 dark:bg-amber-950/30 dark:text-amber-300"
-                            >
-                              {resettingIds.has(r.id) ? (
-                                <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                              ) : (
-                                <RefreshCw className="h-3 w-3" aria-hidden />
-                              )}
-                              Reset Stuck
-                            </button>
-                          </div>
-                        )}
-
-                        {/* Retry Process — Phase 2 failed */}
-                        {showRetryProcess && (
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void runProcess(r)}
-                            aria-label={`Retry processing ${r.file_name}`}
-                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-amber-400/60 bg-amber-50 px-3 text-xs font-semibold text-amber-800 shadow-sm transition hover:bg-amber-100 disabled:opacity-50 dark:border-amber-600/40 dark:bg-amber-950/30 dark:text-amber-300"
-                          >
-                            {processingIds.has(r.id) ? (
-                              <>
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                                Retrying…
-                              </>
-                            ) : (
-                              <>
-                                <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-                                Retry Process
-                              </>
-                            )}
-                          </button>
-                        )}
-
-                        {/* Retry Sync — Phase 3 failed */}
-                        {showRetrySync && (
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void runSync(r)}
-                            aria-label={`Retry syncing ${r.file_name}`}
-                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-violet-400/60 bg-violet-50 px-3 text-xs font-semibold text-violet-800 shadow-sm transition hover:bg-violet-100 disabled:opacity-50 dark:border-violet-600/40 dark:bg-violet-950/30 dark:text-violet-300"
-                          >
-                            {syncingIds.has(r.id) ? (
-                              <>
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                                Retrying…
-                              </>
-                            ) : (
-                              <>
-                                <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-                                Retry Sync
-                              </>
-                            )}
-                          </button>
-                        )}
-
-                        {showRetryGeneric && (
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void runGeneric(r)}
-                            aria-label={`Retry generic phase for ${r.file_name}`}
-                            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-emerald-400/60 bg-emerald-50 px-3 text-xs font-semibold text-emerald-900 shadow-sm transition hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-600/40 dark:bg-emerald-950/30 dark:text-emerald-200"
-                          >
-                            {genericIds.has(r.id) ? (
-                              <>
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                                Retrying…
-                              </>
-                            ) : (
-                              <>
-                                <RotateCcw className="h-3.5 w-3.5" aria-hidden />
-                                {isListing ? "Retry Generic (catalog)" : "Retry Generic"}
-                              </>
-                            )}
-                          </button>
-                        )}
-
-                        {/* Delete — always visible */}
-                        <button
-                          type="button"
-                          disabled={busy || batchDeleting}
-                          onClick={() => void runDeleteUpload(r)}
-                          aria-label={`Delete ${r.file_name}`}
-                          className="inline-flex h-8 items-center gap-1 rounded-lg border border-destructive/40 bg-background px-2.5 text-xs font-medium text-destructive shadow-sm transition hover:bg-destructive/10 disabled:opacity-50"
-                        >
-                          {deletingIds.has(r.id) ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-                          ) : (
-                            <Trash2 className="h-3.5 w-3.5" aria-hidden />
-                          )}
-                          Delete
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              });
-              })()}
+                        setLoadErr(res.error ?? "Update failed");
+                      }
+                    }}
+                    reportTypeSaved={!!reportTypeSaveFlash[r.id]}
+                  />
+                ))
+              )}
             </tbody>
           </table>
         </div>
       </div>
     </>
+  );
+}
+
+// ── Individual row component (memoized for perf) ──────────────────────────────
+
+type HistoryRowProps = {
+  row: RawReportUploadRow;
+  busy: boolean;
+  busyPhase: string | null;
+  isDeleting: boolean;
+  isSelected: boolean;
+  batchDeleting: boolean;
+  onToggle: () => void;
+  onProcess: () => void;
+  onSync: () => void;
+  onGeneric: () => void;
+  onWorklist: () => void;
+  onDelete: () => void;
+  onResetStuck: () => void;
+  onMapColumns: () => void;
+  onReportTypeChange: (v: RawReportType) => void;
+  reportTypeSaved: boolean;
+};
+
+const HistoryRow = React.memo(function HistoryRow({
+  row: r,
+  busy,
+  busyPhase,
+  isDeleting,
+  isSelected,
+  batchDeleting,
+  onToggle,
+  onProcess,
+  onSync,
+  onGeneric,
+  onWorklist,
+  onDelete,
+  onResetStuck,
+  onMapColumns,
+  onReportTypeChange,
+  reportTypeSaved
+}: HistoryRowProps) {
+  const rt = coerceReportType(r.report_type);
+  const metaObj =
+    r.metadata && typeof r.metadata === "object" && !Array.isArray(r.metadata)
+      ? (r.metadata as Record<string, unknown>)
+      : null;
+  const isLedgerSession = metaObj?.source === AMAZON_LEDGER_UPLOAD_SOURCE;
+
+  const pipeline = buildUnifiedPipeline({
+    reportType: String(r.report_type ?? ""),
+    status: r.status,
+    metadata: metaObj,
+    fps: r.file_processing_status as Record<string, unknown> | null,
+    ui:
+      busyPhase === "syncing"
+        ? { isSyncing: true }
+        : busyPhase === "generic"
+          ? { isGenericing: true }
+          : busyPhase === "worklist"
+            ? { isWorklisting: true }
+            : undefined,
+  });
+
+  const anyBusy = busy || isDeleting;
+
+  const showMapColumns = r.status === "needs_mapping";
+  const showProcess =
+    !isLedgerSession &&
+    pipeline.nextAction === "process" &&
+    !busy;
+  const showSync =
+    !isLedgerSession &&
+    pipeline.nextAction === "sync" &&
+    !busy;
+  const showGeneric =
+    !isLedgerSession &&
+    pipeline.nextAction === "generic" &&
+    !busy;
+  const showWorklist =
+    !isLedgerSession &&
+    pipeline.nextAction === "worklist" &&
+    !busy;
+  const showResetStuck =
+    r.status === "processing" && !busy;
+
+  return (
+    <tr
+      data-upload-id={r.id}
+      className={[
+        "border-b border-border last:border-0 transition-opacity",
+        isSelected ? "bg-muted/30" : "",
+        isDeleting ? "opacity-40" : "",
+      ].join(" ")}
+    >
+      {/* Checkbox */}
+      <td className="px-2 py-2.5 align-top">
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-label={isSelected ? "Deselect row" : "Select row"}
+          disabled={anyBusy}
+          className="text-muted-foreground hover:text-foreground disabled:opacity-40"
+        >
+          {isSelected ? (
+            <CheckSquare
+              className="h-4 w-4 text-primary"
+              aria-hidden
+            />
+          ) : (
+            <Square className="h-4 w-4" aria-hidden />
+          )}
+        </button>
+      </td>
+
+      {/* File name */}
+      <td className="px-2 py-2.5 align-top">
+        <div
+          className="flex min-w-0 flex-col gap-0.5 break-words"
+          title={`${r.id}\n${r.file_name}`}
+        >
+          <span className="text-[11px] font-medium leading-snug text-foreground">
+            {r.file_name}
+          </span>
+          <span className="font-mono text-[9px] text-muted-foreground">
+            {r.id.slice(0, 8)}…
+          </span>
+        </div>
+      </td>
+
+      {/* Report type */}
+      <td className="px-2 py-2.5 align-top">
+        <div className="flex min-w-0 items-start gap-1">
+          <select
+            value={rt}
+            onChange={(e) =>
+              onReportTypeChange(e.target.value as RawReportType)
+            }
+            className="h-auto min-h-8 w-full min-w-0 max-w-full rounded-lg border border-border bg-background py-1 pl-1.5 pr-1 text-[10px] leading-tight text-foreground"
+          >
+            {RAW_REPORT_TYPE_ORDER.map((v) => {
+              const s = REPORT_TYPE_SPECS[v];
+              const label =
+                s != null
+                  ? `${s.shortLabel} (${s.description})`
+                  : String(v);
+              return (
+                <option key={v} value={v}>
+                  {label}
+                </option>
+              );
+            })}
+          </select>
+          {reportTypeSaved && (
+            <Check
+              className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400"
+              aria-label="Saved"
+            />
+          )}
+        </div>
+      </td>
+
+      {/* Uploader */}
+      <td className="px-2 py-2.5 align-top font-mono text-[10px] leading-snug text-muted-foreground">
+        <span className="break-all">
+          {r.created_by_name ?? r.created_by ?? "—"}
+        </span>
+      </td>
+
+      {/* Date */}
+      <td className="px-2 py-2.5 align-top text-[10px] leading-snug text-muted-foreground">
+        <span className="break-words">
+          {new Date(r.created_at).toLocaleString()}
+        </span>
+      </td>
+
+      {/* Status badge */}
+      <td className="px-2 py-2.5 align-top">
+        <div className="flex min-w-0 flex-col gap-0.5">
+          {busyPhase ? (
+            <span className="flex items-center gap-1 rounded-md bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 dark:text-sky-300">
+              <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+              {busyPhase === "processing"
+                ? "Processing…"
+                : busyPhase === "syncing"
+                  ? "Syncing…"
+                  : busyPhase === "generic"
+                    ? "Generic…"
+                    : busyPhase === "worklist"
+                      ? "Worklist…"
+                      : "Working…"}
+            </span>
+          ) : (
+            <span
+              className={[
+                "inline-flex min-w-0 items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium leading-snug",
+                pipelineBadgeColor(pipeline.badgeStatus),
+              ].join(" ")}
+            >
+              <span className="min-w-0 break-words">
+                {pipeline.badgeLabel}
+              </span>
+            </span>
+          )}
+          {pipeline.isFailed && r.errorMessage && !busyPhase && (
+            <span
+              className="max-w-[180px] truncate text-[10px] text-destructive"
+              title={r.errorMessage}
+            >
+              {r.errorMessage}
+            </span>
+          )}
+        </div>
+      </td>
+
+      {/* Row count */}
+      <td className="px-2 py-2.5 text-right align-top tabular-nums text-[10px] leading-snug text-muted-foreground">
+        <span
+          title={pipeline.rowMetricsLine}
+          className="block min-w-0 cursor-help break-words text-right"
+        >
+          {pipeline.rowMetricsLine}
+        </span>
+      </td>
+
+      {/* Pipeline */}
+      <td className="px-2 py-2.5 align-top">
+        <PipelineCell pipeline={pipeline} />
+      </td>
+
+      {/* Actions */}
+      <td className="px-2 py-2.5 text-right align-top">
+        <div className="inline-flex flex-wrap items-center justify-end gap-1.5">
+          {showMapColumns && (
+            <ActionButton
+              onClick={onMapColumns}
+              disabled={anyBusy}
+              color="amber"
+              icon={<MapPin className="h-3.5 w-3.5" aria-hidden />}
+            >
+              Map Columns
+            </ActionButton>
+          )}
+
+          {showProcess && (
+            <ActionButton
+              onClick={onProcess}
+              disabled={anyBusy}
+              color="sky"
+            >
+              {pipeline.isFailed ? "Retry Process" : "Process"}
+            </ActionButton>
+          )}
+
+          {busyPhase === "processing" && (
+            <ActionButton disabled color="sky" icon={<Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />}>
+              Processing…
+            </ActionButton>
+          )}
+
+          {showSync && (
+            <ActionButton
+              onClick={onSync}
+              disabled={anyBusy}
+              color="violet"
+            >
+              {pipeline.isFailed ? "Retry Sync" : "Sync"}
+            </ActionButton>
+          )}
+
+          {busyPhase === "syncing" && (
+            <ActionButton disabled color="violet" icon={<Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />}>
+              Syncing…
+            </ActionButton>
+          )}
+
+          {showGeneric && (
+            <ActionButton
+              onClick={onGeneric}
+              disabled={anyBusy}
+              color="emerald"
+            >
+              {pipeline.isFailed ? "Retry Generic" : "Generic"}
+            </ActionButton>
+          )}
+
+          {busyPhase === "generic" && (
+            <ActionButton disabled color="emerald" icon={<Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />}>
+              Generic…
+            </ActionButton>
+          )}
+
+          {showWorklist && (
+            <ActionButton
+              onClick={onWorklist}
+              disabled={anyBusy}
+              color="amber"
+            >
+              Worklist
+            </ActionButton>
+          )}
+
+          {busyPhase === "worklist" && (
+            <ActionButton disabled color="amber" icon={<Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />}>
+              Worklist…
+            </ActionButton>
+          )}
+
+          {showResetStuck && (
+            <ActionButton
+              onClick={onResetStuck}
+              disabled={anyBusy}
+              color="amber"
+              icon={<RotateCcw className="h-3 w-3" aria-hidden />}
+              small
+            >
+              Reset
+            </ActionButton>
+          )}
+
+          <button
+            type="button"
+            disabled={anyBusy || batchDeleting}
+            onClick={onDelete}
+            aria-label={`Delete ${r.file_name}`}
+            className="inline-flex h-7 items-center gap-1 rounded-lg border border-destructive/40 bg-background px-2 text-[11px] font-medium text-destructive shadow-sm transition hover:bg-destructive/10 disabled:opacity-50"
+          >
+            {isDeleting ? (
+              <Loader2
+                className="h-3.5 w-3.5 animate-spin"
+                aria-hidden
+              />
+            ) : (
+              <Trash2 className="h-3.5 w-3.5" aria-hidden />
+            )}
+            Delete
+          </button>
+        </div>
+      </td>
+    </tr>
+  );
+});
+
+// ── Shared action button ──────────────────────────────────────────────────────
+
+const COLOR_MAP: Record<string, string> = {
+  sky: "border-sky-400/60 bg-sky-50 text-sky-800 hover:bg-sky-100 dark:border-sky-600/40 dark:bg-sky-950/30 dark:text-sky-300",
+  violet: "border-violet-400/60 bg-violet-50 text-violet-800 hover:bg-violet-100 dark:border-violet-600/40 dark:bg-violet-950/30 dark:text-violet-300",
+  emerald: "border-emerald-400/60 bg-emerald-50 text-emerald-900 hover:bg-emerald-100 dark:border-emerald-600/40 dark:bg-emerald-950/30 dark:text-emerald-200",
+  amber: "border-amber-400/60 bg-amber-50 text-amber-800 hover:bg-amber-100 dark:border-amber-600/40 dark:bg-amber-950/30 dark:text-amber-300",
+};
+
+function ActionButton({
+  children,
+  onClick,
+  disabled,
+  color,
+  icon,
+  small,
+}: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+  color: string;
+  icon?: React.ReactNode;
+  small?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className={[
+        "inline-flex items-center gap-1 rounded-lg border font-semibold shadow-sm transition disabled:opacity-50",
+        small ? "h-6 px-2 text-[10px]" : "h-7 px-2.5 text-[11px]",
+        COLOR_MAP[color] ?? COLOR_MAP.sky,
+      ].join(" ")}
+    >
+      {icon}
+      {children}
+    </button>
   );
 }

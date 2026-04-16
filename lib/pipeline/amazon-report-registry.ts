@@ -1,19 +1,8 @@
 import { AMAZON_REMOVALS_BUSINESS_CONFLICT_COLUMNS } from "./amazon-removals-business-key";
 
 /**
- * Central routing for Amazon raw-report imports.
- *
- * Pipeline (all non-ledger file uploads):
- *   1) Upload raw file → raw_report_uploads + Storage
- *   2) Stage rows → amazon_staging (or listing raw table for catalog exports)
- *   3) Parse/map from staging (combined with step 2 for CSV reports)
- *   4) Duplicate detection (staging hash; sync upsert against domain unique indexes)
- *   5) Sync → amazon_* domain table(s)
- *   6) Optional enrichment / generate (removals worklist, removal shipment tree RPCs, etc.)
- *
- * Listing exports: Phase 2 lands in `amazon_staging`; Phase 3 upserts into
- * `amazon_listing_report_rows_raw` on (organization_id, source_file_sha256, source_physical_row_number).
- * Phase 4 Generic merges into `catalog_products` (same route as removal shipment tree, different body).
+ * Single source of truth for Amazon raw-report import engine behavior.
+ * Phases: upload → process → sync → generic (optional) → complete | failed
  */
 
 /** Canonical sync routing key (maps from raw_report_uploads.report_type). */
@@ -50,35 +39,42 @@ export type DedupeMode =
   | "settlement_line"
   | "removal_shipment_staging";
 
+export type AmazonReportFamily =
+  | "returns"
+  | "removal"
+  | "ledger"
+  | "financial"
+  | "listing"
+  | "safet"
+  | "repository"
+  | "archive"
+  | "unknown";
+
+export type AmazonImportPhaseModel = "unified_v1";
+
 export type AmazonReportRegistryEntry = {
   staging: StagingTarget;
+  /** @deprecated use sync_target_table — kept for callers using DOMAIN_TABLE */
   domainTable: string | null;
   dedupeMode: DedupeMode;
-  /** PostgREST upsert arbiter — must match a UNIQUE index (see migrations). */
   conflictColumns: string | null;
-  /** Down-only RPC enrichment after sync (if any). */
   postSyncEnrichment: "removal_shipment_tree" | "none";
-  /** Whether removals worklist generate is applicable after sync. */
   generateWorklistAfterSync: boolean;
+  report_family: AmazonReportFamily;
+  phase_model: AmazonImportPhaseModel;
+  stage_target_table: StagingTarget;
+  sync_target_table: string | null;
+  /** Phase-4 destination label (table or logical subsystem). */
+  generic_target_table: string | null;
+  supports_generic: boolean;
+  supports_worklist: boolean;
+  progress_strategy: "batch_csv_stream" | "batch_listing_physical_lines";
+  physical_identity_strategy: string;
+  business_identity_strategy: string;
 };
 
-/**
- * Routing matrix (report_type → behavior).
- *
- * | report_type | staging | target table(s) | dedupe | post-step | generate |
- * |-------------|---------|-----------------|--------|-----------|----------|
- * | FBA_RETURNS | amazon_staging | amazon_returns | physical file row | none | no |
- * | REMOVAL_ORDER | amazon_staging | amazon_removals | business_line | none | yes |
- * | REMOVAL_SHIPMENT | amazon_staging | amazon_removal_shipments + RPC | removal_shipment_staging | removal_shipment_tree | no |
- * | INVENTORY_LEDGER | amazon_staging | amazon_inventory_ledger | source_line_hash | none | no |
- * | REIMBURSEMENTS | amazon_staging | amazon_reimbursements | source_line_hash | none | no |
- * | SETTLEMENT | amazon_staging | amazon_settlements | settlement_line | none | no |
- * | SAFET_CLAIMS | amazon_staging | amazon_safet_claims | safet_claim_id | none | no |
- * | TRANSACTIONS | amazon_staging | amazon_transactions | source_line_hash | none | no |
- * | REPORTS_REPOSITORY | amazon_staging | amazon_reports_repository | source_line_hash | none | no |
- * | ALL_ORDERS … MONTHLY_STORAGE_FEES | amazon_staging | amazon_* archive | source_line_hash | none | no |
- * | CATEGORY/ALL/ACTIVE_LISTINGS | amazon_staging | amazon_listing_report_rows_raw | physical file row | catalog (generic) | no |
- */
+export type AmazonImportEngineConfig = AmazonReportRegistryEntry & { kind: AmazonSyncKind };
+
 export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistryEntry> = {
   FBA_RETURNS: {
     staging: "amazon_staging",
@@ -87,6 +83,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "returns",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_returns",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "file_sha256_plus_physical_row_number",
+    business_identity_strategy: "physical_line",
   },
   REMOVAL_ORDER: {
     staging: "amazon_staging",
@@ -95,6 +101,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: AMAZON_REMOVALS_BUSINESS_CONFLICT_COLUMNS,
     postSyncEnrichment: "none",
     generateWorklistAfterSync: true,
+    report_family: "removal",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_removals",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: true,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "staging_row_lineage",
+    business_identity_strategy: "removal_order_composite",
   },
   REMOVAL_SHIPMENT: {
     staging: "amazon_staging",
@@ -103,6 +119,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,upload_id,amazon_staging_id",
     postSyncEnrichment: "removal_shipment_tree",
     generateWorklistAfterSync: false,
+    report_family: "removal",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_removal_shipments",
+    generic_target_table: "expected_packages",
+    supports_generic: true,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "upload_plus_staging_id",
+    business_identity_strategy: "removal_shipment_staging_line",
   },
   INVENTORY_LEDGER: {
     staging: "amazon_staging",
@@ -111,6 +137,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "ledger",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_inventory_ledger",
+    generic_target_table: "product_identifier_map",
+    supports_generic: true,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   REIMBURSEMENTS: {
     staging: "amazon_staging",
@@ -119,6 +155,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "financial",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_reimbursements",
+    generic_target_table: "financial_reference_resolver",
+    supports_generic: true,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   SETTLEMENT: {
     staging: "amazon_staging",
@@ -127,6 +173,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "financial",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_settlements",
+    generic_target_table: "financial_reference_resolver",
+    supports_generic: true,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "file_sha256_plus_physical_row_number",
+    business_identity_strategy: "settlement_line",
   },
   SAFET_CLAIMS: {
     staging: "amazon_staging",
@@ -135,6 +191,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "safet",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_safet_claims",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "safet_claim_anchor",
   },
   TRANSACTIONS: {
     staging: "amazon_staging",
@@ -143,6 +209,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "financial",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_transactions",
+    generic_target_table: "financial_reference_resolver",
+    supports_generic: true,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   REPORTS_REPOSITORY: {
     staging: "amazon_staging",
@@ -151,6 +227,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "repository",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_reports_repository",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   ALL_ORDERS: {
     staging: "amazon_staging",
@@ -159,6 +245,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "archive",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_all_orders",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   REPLACEMENTS: {
     staging: "amazon_staging",
@@ -167,6 +263,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "archive",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_replacements",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   FBA_GRADE_AND_RESELL: {
     staging: "amazon_staging",
@@ -175,6 +281,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "archive",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_fba_grade_and_resell",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   MANAGE_FBA_INVENTORY: {
     staging: "amazon_staging",
@@ -183,6 +299,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "archive",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_manage_fba_inventory",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   FBA_INVENTORY: {
     staging: "amazon_staging",
@@ -191,6 +317,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "archive",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_fba_inventory",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   RESERVED_INVENTORY: {
     staging: "amazon_staging",
@@ -199,6 +335,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "archive",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_reserved_inventory",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   FEE_PREVIEW: {
     staging: "amazon_staging",
@@ -207,6 +353,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "archive",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_fee_preview",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   MONTHLY_STORAGE_FEES: {
     staging: "amazon_staging",
@@ -215,6 +371,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "archive",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_monthly_storage_fees",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
   },
   CATEGORY_LISTINGS: {
     staging: "amazon_staging",
@@ -223,6 +389,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "listing",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_listing_report_rows_raw",
+    generic_target_table: "catalog_products",
+    supports_generic: true,
+    supports_worklist: false,
+    progress_strategy: "batch_listing_physical_lines",
+    physical_identity_strategy: "file_sha256_plus_physical_row_number",
+    business_identity_strategy: "listing_raw_line",
   },
   ALL_LISTINGS: {
     staging: "amazon_staging",
@@ -231,6 +407,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "listing",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_listing_report_rows_raw",
+    generic_target_table: "catalog_products",
+    supports_generic: true,
+    supports_worklist: false,
+    progress_strategy: "batch_listing_physical_lines",
+    physical_identity_strategy: "file_sha256_plus_physical_row_number",
+    business_identity_strategy: "listing_raw_line",
   },
   ACTIVE_LISTINGS: {
     staging: "amazon_staging",
@@ -239,6 +425,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "listing",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_listing_report_rows_raw",
+    generic_target_table: "catalog_products",
+    supports_generic: true,
+    supports_worklist: false,
+    progress_strategy: "batch_listing_physical_lines",
+    physical_identity_strategy: "file_sha256_plus_physical_row_number",
+    business_identity_strategy: "listing_raw_line",
   },
   UNKNOWN: {
     staging: "amazon_staging",
@@ -247,6 +443,16 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     conflictColumns: null,
     postSyncEnrichment: "none",
     generateWorklistAfterSync: false,
+    report_family: "unknown",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: null,
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "none",
+    business_identity_strategy: "none",
   },
 };
 
@@ -263,13 +469,17 @@ export const CONFLICT_KEY: Record<AmazonSyncKind, string | null> = Object.fromEn
   ]),
 ) as Record<AmazonSyncKind, string | null>;
 
+export function resolveAmazonImportEngineConfig(kind: AmazonSyncKind): AmazonImportEngineConfig {
+  return { kind, ...AMAZON_REPORT_REGISTRY[kind] };
+}
+
 export function isListingAmazonSyncKind(kind: AmazonSyncKind): boolean {
   return kind === "CATEGORY_LISTINGS" || kind === "ALL_LISTINGS" || kind === "ACTIVE_LISTINGS";
 }
 
-/** Removal shipment tree runs in POST /api/settings/imports/generic after raw_synced. Listing uses one Process step instead. */
+/** Phase 4 required when registry declares generic support. */
 export function requiresPhase4Generic(kind: AmazonSyncKind): boolean {
-  return kind === "REMOVAL_SHIPMENT";
+  return AMAZON_REPORT_REGISTRY[kind].supports_generic;
 }
 
 /** Maps `raw_report_uploads.report_type` (canonical + legacy slugs) → sync kind. */

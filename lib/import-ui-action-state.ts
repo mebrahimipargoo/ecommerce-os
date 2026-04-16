@@ -13,6 +13,8 @@ import {
 import { isListingReportType } from "./raw-report-types";
 
 export type ImportFpsSnapshot = {
+  phase_key?: string | null;
+  phase1_status?: string | null;
   phase2_status?: string | null;
   phase3_status?: string | null;
   phase4_status?: string | null;
@@ -37,6 +39,13 @@ export type ImportFpsSnapshot = {
   processed_rows?: number | null;
   file_rows_total?: number | null;
   data_rows_total?: number | null;
+  rows_eligible_for_generic?: number | null;
+  duplicate_rows_skipped?: number | null;
+  canonical_rows_new?: number | null;
+  canonical_rows_updated?: number | null;
+  canonical_rows_unchanged?: number | null;
+  upload_bytes_written?: number | null;
+  upload_bytes_total?: number | null;
 };
 
 export type ImportUiActionInput = {
@@ -117,47 +126,30 @@ export function resolveImportUiActionState(input: ImportUiActionInput): ImportUi
 
   const needsP4 = requiresPhase4Generic(kind);
 
-  /**
-   * Listing “Phase 4” is catalog merge inside the single Process step — done when FPS/metadata/row status agree.
-   */
-  const listingPhase4Done =
-    isListingReportType(input.reportType) &&
-    (p4 ||
-      (catalogDone && (etlPhase === "complete" || status === "synced" || status === "complete")));
-
-  /** Avoid treating legacy status alone as Phase 4 done (was hiding Generic while the bar showed "complete"). */
-  const shipmentPhase4Done =
-    kind === "REMOVAL_SHIPMENT" &&
-    (p4 || (etlPhase === "complete" && (status === "synced" || status === "complete")));
-
-  const phase4Complete = !needsP4 ? (listing ? listingPhase4Done : true) : shipmentPhase4Done;
+  /** Generic phase complete: FPS row, listing catalog flag, or terminal metadata after Phase 4 routes. */
+  const phase4Complete =
+    !needsP4 ||
+    p4 ||
+    (listing && catalogDone) ||
+    (!listing && needsP4 && norm(etlPhase) === "complete");
 
   const registry = AMAZON_REPORT_REGISTRY[kind];
   const wantsWorklist = registry.generateWorklistAfterSync === true;
 
   const genericInFlight = status === "processing" && etlPhase === "generic";
 
-  /**
-   * Listing imports: derive Sync / Generic from phase columns (file_processing_status),
-   * not legacy raw_report_uploads.status alone — avoids hiding Generic after a Phase 4
-   * retry left status `failed` while phase3_status is still complete.
-   */
-  const removalShipment = kind === "REMOVAL_SHIPMENT";
-
-  /** Listing finishes in Process only; removal shipment still uses Sync after staging. */
   const showSync =
     !isLedger &&
-    (removalShipment
-      ? !phase3Complete &&
-        (status === "staged" || (status === "failed" && failedPhaseRaw === "sync"))
-      : status === "staged" || (status === "failed" && failedPhaseRaw === "sync"));
+    !phase3Complete &&
+    (status === "staged" || (status === "failed" && failedPhaseRaw === "sync"));
 
   const showGeneric =
     !isLedger &&
     needsP4 &&
     !phase4Complete &&
     !genericInFlight &&
-    (removalShipment ? phase3Complete : status === "raw_synced");
+    phase3Complete &&
+    (status === "raw_synced" || (status === "failed" && failedPhaseRaw === "generic"));
 
   const showWorklist =
     !isLedger &&
@@ -167,13 +159,9 @@ export function resolveImportUiActionState(input: ImportUiActionInput): ImportUi
     phase3Complete &&
     !worklistCompleted;
 
-  const showRetryProcess =
-    status === "failed" &&
-    !isLedger &&
-    (failedPhaseRaw === "process" ||
-      (listing && (failedPhaseRaw === "sync" || failedPhaseRaw === "generic")));
+  const showRetryProcess = status === "failed" && !isLedger && failedPhaseRaw === "process";
 
-  const showRetrySync = status === "failed" && failedPhaseRaw === "sync" && !phase3Complete && !listing;
+  const showRetrySync = status === "failed" && failedPhaseRaw === "sync" && !phase3Complete;
 
   /** Phase 4 Generic retry after a failed generic attempt (listing + removal shipment). */
   const showRetryGeneric =
@@ -186,7 +174,6 @@ export function resolveImportUiActionState(input: ImportUiActionInput): ImportUi
   if (status === "failed" && needsP4 && phase4Complete) {
     badgeStatus = "synced";
   } else if (
-    (listing || removalShipment) &&
     needsP4 &&
     status === "failed" &&
     failedPhaseRaw === "generic" &&
@@ -246,11 +233,11 @@ export function inferUniversalImporterPhase(input: ImportUiActionInput): Univers
   const etlPhase = norm(meta?.etl_phase);
   const fps = input.fps ?? null;
   const cp = norm(fps?.current_phase);
+  const pk = norm(fps?.phase_key);
   const fpsRowStatus = norm(fps?.row_status);
   const kind = resolveAmazonImportSyncKind(input.reportType);
   const wl = meta?.worklist_completed === true;
   const wantsWorklist = AMAZON_REPORT_REGISTRY[kind].generateWorklistAfterSync === true;
-  const listing = isListingReportType(input.reportType);
   const failedPhaseRaw = meta?.failed_phase != null ? String(meta.failed_phase).trim().toLowerCase() : "";
 
   if (status === "pending" || status === "uploading") return null;
@@ -260,10 +247,9 @@ export function inferUniversalImporterPhase(input: ImportUiActionInput): Univers
   if (status === "raw_synced") return "raw_synced";
 
   if (status === "processing") {
-    if (listing) return "processing";
-    if (etlPhase === "generic") return "genericing";
+    if (etlPhase === "generic" || pk === "generic") return "genericing";
     if (etlPhase === "worklist") return "worklisting";
-    if (cp === "sync" || fpsRowStatus === "syncing") return "syncing";
+    if (pk === "sync" || cp === "sync" || fpsRowStatus === "syncing") return "syncing";
     return "processing";
   }
 
