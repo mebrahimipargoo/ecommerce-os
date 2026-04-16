@@ -10,14 +10,16 @@
 
 import React from "react";
 import {
-  Bell, Briefcase, ChevronDown, Menu, Search,
+  Bell, Briefcase, ChevronDown, LogOut, Menu, Search,
   Server, ShieldCheck, Sparkles, User,
 } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { ThemeToggle } from "./ThemeToggle";
 import { useGlobalSearch } from "./GlobalSearchContext";
 import { useUserRole, type UserRole } from "./UserRoleContext";
 import { useRbacPermissions } from "../hooks/useRbacPermissions";
 import { DevRoleSwitcher } from "./DevRoleSwitcher";
+import { supabase } from "@/src/lib/supabase";
 
 // ─── Role badge metadata (production read-only display) ───────────────────────
 
@@ -54,6 +56,7 @@ const ROLE_META: Record<UserRole, RoleMeta> = {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
+  const router = useRouter();
   const { query, setQuery } = useGlobalSearch();
   const {
     role, actorName,
@@ -62,9 +65,21 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
     organizationId,
   } = useUserRole();
   const { canSwitchOrganization } = useRbacPermissions();
+  const [isSigningOut, setIsSigningOut] = React.useState(false);
 
   const { label: roleLabel, Icon: RoleIcon, badgeCls } = ROLE_META[role];
   const profileInitial = actorName.trim().charAt(0).toUpperCase() || "U";
+
+  async function handleSignOut() {
+    setIsSigningOut(true);
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      setIsSigningOut(false);
+      return;
+    }
+    router.replace("/login");
+    router.refresh();
+  }
 
   return (
     <header
@@ -174,6 +189,17 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
             <span className="text-[10px] text-muted-foreground">{roleLabel}</span>
           </div>
           <ChevronDown className="hidden h-3 w-3 text-muted-foreground sm:block" />
+        </button>
+
+        <button
+          type="button"
+          onClick={() => void handleSignOut()}
+          disabled={isSigningOut}
+          aria-label="Sign out"
+          className="inline-flex h-9 items-center gap-1.5 rounded-full border border-border px-3 text-xs font-medium text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          <LogOut className="h-3.5 w-3.5" />
+          {isSigningOut ? "Signing out..." : "Logout"}
         </button>
       </div>
     </header>
