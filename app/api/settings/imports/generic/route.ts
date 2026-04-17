@@ -22,7 +22,8 @@ import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 
 export const runtime = "nodejs";
-export const maxDuration = 800;
+/** Vercel Hobby: maxDuration must be 1–300s. Upgrade to Pro for higher limits if imports need longer. */
+export const maxDuration = 300;
 
 type Body = { upload_id?: string };
 
