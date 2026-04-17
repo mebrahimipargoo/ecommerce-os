@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import {
-  ArrowLeft, ImageIcon, Loader2, Pencil, Plus, Save, Trash2, UserRound, X,
+  ArrowLeft, ImageIcon, KeyRound, Loader2, Pencil, Plus, Save, Trash2, UserRound, X,
 } from "lucide-react";
 import { isAdminRole, useUserRole, type UserRole } from "../../../components/UserRoleContext";
 import { UserProfileAvatar } from "./UserProfileAvatar";
@@ -28,6 +28,7 @@ const BTN_SECONDARY =
   "inline-flex items-center justify-center gap-2 rounded-md border border-border bg-background px-3 py-2 text-sm font-medium transition hover:bg-accent";
 
 type Toast = { msg: string; ok: boolean } | null;
+const MIN_RESET_PASSWORD_LENGTH = 8;
 
 export default function UsersPage() {
   const { role, actorUserId } = useUserRole();
@@ -45,6 +46,11 @@ export default function UsersPage() {
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [tenantDefaultCompanyId, setTenantDefaultCompanyId] = useState("");
   const [createCompanyId, setCreateCompanyId] = useState("");
+  const [resetTarget, setResetTarget] = useState<ProfileRow | null>(null);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [resettingPassword, setResettingPassword] = useState(false);
 
   const showToast = useCallback((msg: string, ok: boolean) => {
     setToast({ msg, ok });
@@ -111,6 +117,21 @@ export default function UsersPage() {
   function closeModal() {
     setModalOpen(false);
     setEditing(null);
+  }
+
+  function openResetPassword(row: ProfileRow) {
+    setResetTarget(row);
+    setNewPassword("");
+    setConfirmPassword("");
+    setResetOpen(true);
+  }
+
+  function closeResetPassword() {
+    setResetOpen(false);
+    setResetTarget(null);
+    setNewPassword("");
+    setConfirmPassword("");
+    setResettingPassword(false);
   }
 
   async function handlePhotoChange(e: React.ChangeEvent<HTMLInputElement>, profileId: string) {
@@ -185,6 +206,42 @@ export default function UsersPage() {
     }
     showToast("User removed.", true);
     await load();
+  }
+
+  async function handleResetPasswordSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!resetTarget) return;
+
+    if (newPassword !== confirmPassword) {
+      showToast("New password and confirm password must match.", false);
+      return;
+    }
+    if (newPassword.length < MIN_RESET_PASSWORD_LENGTH) {
+      showToast(`Password must be at least ${MIN_RESET_PASSWORD_LENGTH} characters.`, false);
+      return;
+    }
+
+    setResettingPassword(true);
+    try {
+      const response = await fetch("/api/admin/reset-password", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: resetTarget.id,
+          newPassword,
+        }),
+      });
+      const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+      if (!response.ok) {
+        throw new Error(payload?.error || "Password reset failed.");
+      }
+      showToast(`Password reset for ${resetTarget.email || "user"}.`, true);
+      closeResetPassword();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Password reset failed.", false);
+    } finally {
+      setResettingPassword(false);
+    }
   }
 
   if (!isAdminRole(role)) {
@@ -293,6 +350,14 @@ export default function UsersPage() {
                           <span className="sr-only">Change photo</span>
                           <ImageIcon className="h-4 w-4" />
                         </label>
+                        <button
+                          type="button"
+                          className="rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"
+                          onClick={() => openResetPassword(row)}
+                          aria-label="Reset password"
+                        >
+                          <KeyRound className="h-4 w-4" />
+                        </button>
                         <button
                           type="button"
                           className="rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -447,6 +512,74 @@ export default function UsersPage() {
                 <button type="submit" className={BTN_PRIMARY} disabled={saving}>
                   {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                   {editing ? "Save changes" : "Create user"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {resetOpen && resetTarget && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-foreground/40 p-4 backdrop-blur-sm">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reset-password-modal-title"
+            className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-xl"
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <h2 id="reset-password-modal-title" className="text-lg font-bold">
+                Reset password
+              </h2>
+              <button
+                type="button"
+                onClick={closeResetPassword}
+                className="rounded-md p-1 hover:bg-accent"
+                aria-label="Close"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <p className="mb-4 text-sm text-muted-foreground">
+              Set a new password for <span className="font-medium text-foreground">{resetTarget.email || resetTarget.id}</span>.
+            </p>
+            <form onSubmit={(e) => void handleResetPasswordSubmit(e)} className="space-y-4">
+              <div>
+                <label className={LABEL} htmlFor="newPassword">New password</label>
+                <input
+                  id="newPassword"
+                  type="password"
+                  className={INPUT}
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  minLength={MIN_RESET_PASSWORD_LENGTH}
+                  required
+                  autoComplete="new-password"
+                />
+              </div>
+              <div>
+                <label className={LABEL} htmlFor="confirmPassword">Confirm password</label>
+                <input
+                  id="confirmPassword"
+                  type="password"
+                  className={INPUT}
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  minLength={MIN_RESET_PASSWORD_LENGTH}
+                  required
+                  autoComplete="new-password"
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Minimum length: {MIN_RESET_PASSWORD_LENGTH} characters.
+              </p>
+              <div className="flex justify-end gap-2 pt-2">
+                <button type="button" className={BTN_SECONDARY} onClick={closeResetPassword}>
+                  Cancel
+                </button>
+                <button type="submit" className={BTN_PRIMARY} disabled={resettingPassword}>
+                  {resettingPassword ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+                  Reset password
                 </button>
               </div>
             </form>
