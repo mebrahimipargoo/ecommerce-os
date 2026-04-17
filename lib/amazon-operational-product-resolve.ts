@@ -5,6 +5,15 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 
+import {
+  fetchProductIdentifierMapCandidates,
+  pickBestProductIdentifierMatch,
+  type ProductIdentifierMapRow,
+  type ProductIdentifierMatchResult,
+} from "./product-identifier-match";
+
+export type { ProductIdentifierMapRow, ProductIdentifierMatchResult } from "./product-identifier-match";
+
 export type CatalogListingSnapshot = {
   id: string;
   seller_sku: string | null;
@@ -14,18 +23,6 @@ export type CatalogListingSnapshot = {
   listing_status: string | null;
   source_report_type: string | null;
   canonical_scope: string | null;
-};
-
-export type ProductIdentifierMapRow = {
-  id: string;
-  organization_id: string;
-  product_id: string | null;
-  catalog_product_id: string | null;
-  store_id: string | null;
-  seller_sku: string | null;
-  asin: string | null;
-  fnsku: string | null;
-  external_listing_id: string | null;
 };
 
 export type OperationalProductBridge = {
@@ -59,7 +56,7 @@ export async function fetchProductIdentifierBridge(
   let q = supabase
     .from("product_identifier_map")
     .select(
-      "id, organization_id, product_id, catalog_product_id, store_id, seller_sku, asin, fnsku, external_listing_id",
+      "id, organization_id, product_id, catalog_product_id, store_id, seller_sku, asin, fnsku, msku, title, disposition, external_listing_id, confidence_score, match_source, inventory_source, last_seen_at, linked_from_report_family, linked_from_target_table",
     )
     .eq("organization_id", organizationId);
 
@@ -97,7 +94,98 @@ export async function fetchProductIdentifierBridge(
   };
 }
 
-/** Convenience wrapper for `amazon_returns`-style rows (org + sku + asin [+ store if known]). */
+/**
+ * Priority-based single match for operational rows (fetch candidates, then rank in memory).
+ */
+export async function resolveProductIdentifierMapMatch(
+  supabase: SupabaseClient,
+  hints: {
+    organizationId: string;
+    storeId?: unknown;
+    fnsku?: unknown;
+    msku?: unknown;
+    sku?: unknown;
+    asin?: unknown;
+  },
+): Promise<ProductIdentifierMatchResult> {
+  const organizationId = hints.organizationId;
+  const storeId = n(hints.storeId);
+  const fnsku = n(hints.fnsku);
+  const msku = n(hints.msku) ?? n(hints.sku);
+  const asin = n(hints.asin);
+
+  const candidates = await fetchProductIdentifierMapCandidates(supabase, organizationId, {
+    organizationId,
+    storeId,
+    fnsku,
+    msku,
+    asin,
+  });
+  return pickBestProductIdentifierMatch(candidates, {
+    organizationId,
+    storeId,
+    fnsku,
+    msku,
+    asin,
+  });
+}
+
+/** `amazon_inventory_ledger`-style row (FNSKU column + optional MSKU/ASIN in payload or future columns). */
+export function resolveIdentifierMapForInventoryLedgerRow(
+  supabase: SupabaseClient,
+  organizationId: string,
+  storeId: string | null,
+  row: { fnsku?: unknown; msku?: unknown; sku?: unknown; asin?: unknown; raw_data?: unknown },
+): Promise<ProductIdentifierMatchResult> {
+  return resolveProductIdentifierMapMatch(supabase, {
+    organizationId,
+    storeId,
+    fnsku: row.fnsku,
+    msku: row.msku ?? row.sku,
+    asin: row.asin,
+  });
+}
+
+/** `amazon_returns`-style rows (org + sku + asin [+ store if known]). */
+export function resolveIdentifierMapForAmazonReturnRow(
+  supabase: SupabaseClient,
+  organizationId: string,
+  row: { sku?: unknown; asin?: unknown; fnsku?: unknown; store_id?: unknown },
+): Promise<ProductIdentifierMatchResult> {
+  return resolveProductIdentifierMapMatch(supabase, {
+    organizationId,
+    storeId: row.store_id,
+    msku: row.sku,
+    asin: row.asin,
+    fnsku: row.fnsku,
+  });
+}
+
+/** `amazon_removals`-style lines with store + sku + asin + optional fnsku. */
+export function resolveIdentifierMapForAmazonRemovalLine(
+  supabase: SupabaseClient,
+  organizationId: string,
+  row: { store_id?: unknown; sku?: unknown; asin?: unknown; fnsku?: unknown },
+): Promise<ProductIdentifierMatchResult> {
+  return resolveProductIdentifierMapMatch(supabase, {
+    organizationId,
+    storeId: row.store_id,
+    msku: row.sku,
+    asin: row.asin,
+    fnsku: row.fnsku,
+  });
+}
+
+/** `amazon_removal_shipments`-style lines (same identifier shape as removals). */
+export function resolveIdentifierMapForAmazonRemovalShipmentLine(
+  supabase: SupabaseClient,
+  organizationId: string,
+  row: { store_id?: unknown; sku?: unknown; asin?: unknown; fnsku?: unknown },
+): Promise<ProductIdentifierMatchResult> {
+  return resolveIdentifierMapForAmazonRemovalLine(supabase, organizationId, row);
+}
+
+/** @deprecated Prefer `resolveProductIdentifierMapMatch` + priority ranking. */
 export function resolveBridgeForAmazonReturnRow(
   supabase: SupabaseClient,
   organizationId: string,
@@ -110,7 +198,7 @@ export function resolveBridgeForAmazonReturnRow(
   });
 }
 
-/** Convenience wrapper for removal / shipment lines that include `store_id`. */
+/** @deprecated Prefer `resolveProductIdentifierMapMatch`. */
 export function resolveBridgeForRemovalLine(
   supabase: SupabaseClient,
   organizationId: string,
@@ -124,7 +212,7 @@ export function resolveBridgeForRemovalLine(
   });
 }
 
-/** Ledger / reimbursement / settlement / transaction lines — usually no `store_id` on row. */
+/** @deprecated Prefer `resolveProductIdentifierMapMatch`. */
 export function resolveBridgeForSkuAsin(
   supabase: SupabaseClient,
   organizationId: string,

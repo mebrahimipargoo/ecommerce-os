@@ -7,7 +7,7 @@
 import { NextResponse } from "next/server";
 
 import { syncFinancialReferenceResolverForUpload } from "../../../../../lib/financial-reference-resolver-sync";
-import { enrichIdentifierMapFromInventoryLedgerUpload } from "../../../../../lib/inventory-ledger-identifier-enrich";
+import { completeInventoryLedgerProductIdentifierMapPhase } from "../../../../../lib/inventory-ledger-generic-completion";
 import { logAmazonImportEngineEvent } from "../../../../../lib/pipeline/amazon-import-engine-log";
 import { FPS_KEY_GENERIC, fpsLabelGeneric } from "../../../../../lib/pipeline/file-processing-status-contract";
 import {
@@ -412,74 +412,24 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     if (kind === "INVENTORY_LEDGER") {
-      const enriched = await enrichIdentifierMapFromInventoryLedgerUpload({
+      const { enriched, mapUpserts } = await completeInventoryLedgerProductIdentifierMapPhase({
         supabase: supabaseServer,
         organizationId: orgId,
         uploadId,
         storeId: importStoreId,
+        reportTypeRaw: rt,
+        engine,
       });
 
-      const { data: prevInv } = await supabaseServer
-        .from("raw_report_uploads")
-        .select("metadata")
-        .eq("id", uploadId)
-        .maybeSingle();
-
-      const mergedInv = mergeUploadMetadata((prevInv as { metadata?: unknown } | null)?.metadata, {
-        import_metrics: { current_phase: "complete" },
-        etl_phase: "complete",
-        error_message: "",
-      }) as Record<string, unknown>;
-      mergedInv.inventory_ledger_generic_map_upserts = enriched.map_upserts;
-      delete mergedInv.failed_phase;
-
-      await supabaseServer
-        .from("raw_report_uploads")
-        .update({
-          status: "synced",
-          import_pipeline_completed_at: new Date().toISOString(),
-          metadata: mergedInv,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", uploadId)
-        .eq("organization_id", orgId);
-
-      await supabaseServer.from("file_processing_status").upsert(
-        {
-          upload_id: uploadId,
-          organization_id: orgId,
-          status: "complete",
-          current_phase: "complete",
-          phase_key: "complete",
-          phase_label: "Complete",
-          current_phase_label: "Phase 4 complete — product_identifier_map enrich",
-          current_target_table: "product_identifier_map",
-          generic_target_table: engine.generic_target_table,
-          upload_pct: 100,
-          process_pct: 100,
-          sync_pct: 100,
-          phase1_upload_pct: 100,
-          phase2_stage_pct: 100,
-          phase3_raw_sync_pct: 100,
-          phase4_generic_pct: 100,
-          phase4_status: "complete",
-          phase4_completed_at: new Date().toISOString(),
-          generic_rows_written: enriched.map_upserts,
-          error_message: null,
+      return NextResponse.json({
+        ok: true,
+        kind: "INVENTORY_LEDGER",
+        enriched: {
+          ...enriched,
+          map_upserts: mapUpserts,
+          catalog_hits: enriched.ledger_bridge_rows_enriched,
         },
-        { onConflict: "upload_id" },
-      );
-
-      logAmazonImportEngineEvent({
-        report_type: rt,
-        upload_id: uploadId,
-        phase: "complete",
-        target_table: "product_identifier_map",
-        rows_processed: enriched.ledger_rows_scanned,
-        generic_rows_written: enriched.map_upserts,
       });
-
-      return NextResponse.json({ ok: true, kind: "INVENTORY_LEDGER", enriched });
     }
 
     if (kind === "SETTLEMENT" || kind === "TRANSACTIONS" || kind === "REIMBURSEMENTS") {

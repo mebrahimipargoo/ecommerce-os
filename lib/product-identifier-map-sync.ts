@@ -1,7 +1,7 @@
 /**
  * Bridge rows between `catalog_products` (listing snapshot) and future `products`
- * (internal master). Populated only from listing canonical sync — never from
- * operational/financial imports.
+ * (internal master). Listing path seeds seller_sku + asin (+ optional listing id);
+ * FNSKU stays null when not present on the listing. Ledger enrichment fills FNSKU separately.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -14,6 +14,11 @@ export type CatalogRowForIdentifierMap = {
   asin: string | null;
   fnsku: string | null;
   listing_id: string | null;
+};
+
+export type ListingIdentifierMapUpsertMetrics = {
+  rows_inserted: number;
+  rows_updated: number;
 };
 
 /** Matches `uq_product_identifier_map_org_store_ids` COALESCE semantics. */
@@ -31,21 +36,23 @@ function identifierTupleKey(p: {
 /**
  * Upserts `product_identifier_map` rows for listing-derived catalog rows.
  * Non-destructive: updates `last_seen_at` / provenance on refresh; never deletes.
+ * Does not null out `fnsku` on refresh when the listing has no FNSKU (preserves ledger fills).
  */
 export async function upsertProductIdentifierMapFromCatalogRows(
   supabase: SupabaseClient,
   rows: CatalogRowForIdentifierMap[],
   sourceUploadId: string,
-  /** Provenance slug (listing report or operational enricher, e.g. INVENTORY_LEDGER). */
+  /** Provenance slug (listing report type, e.g. category_listings). */
   sourceReportType: string,
-): Promise<void> {
-  if (rows.length === 0) return;
+): Promise<ListingIdentifierMapUpsertMetrics> {
+  const empty: ListingIdentifierMapUpsertMetrics = { rows_inserted: 0, rows_updated: 0 };
+  if (rows.length === 0) return empty;
 
   const orgId = String(rows[0]?.organization_id ?? "").trim();
-  if (!orgId) return;
+  if (!orgId) return empty;
 
   const catalogIds = [...new Set(rows.map((r) => r.id).filter(Boolean))];
-  if (catalogIds.length === 0) return;
+  if (catalogIds.length === 0) return empty;
 
   const now = new Date().toISOString();
   const reportSlug = sourceReportType;
@@ -81,7 +88,7 @@ export async function upsertProductIdentifierMapFromCatalogRows(
   }
 
   const toInsert: Record<string, unknown>[] = [];
-  const toUpdate: { id: string }[] = [];
+  const toUpdate: { id: string; patch: Record<string, unknown> }[] = [];
 
   for (const r of rows) {
     const seller_sku = r.seller_sku != null ? String(r.seller_sku).trim() : null;
@@ -103,7 +110,23 @@ export async function upsertProductIdentifierMapFromCatalogRows(
     const existingId = existingByTuple.get(mapKey);
 
     if (existingId) {
-      toUpdate.push({ id: existingId });
+      const patch: Record<string, unknown> = {
+        last_seen_at: now,
+        source_upload_id: sourceUploadId,
+        source_report_type: reportSlug,
+        is_primary: true,
+        seller_sku,
+        asin,
+        external_listing_id,
+        msku: seller_sku,
+        match_source: "listing_catalog",
+        inventory_source: null,
+        confidence_score: 1.0,
+        linked_from_report_family: "listing",
+        linked_from_target_table: "catalog_products",
+      };
+      if (fnsku != null) patch.fnsku = fnsku;
+      toUpdate.push({ id: existingId, patch });
     } else {
       toInsert.push({
         organization_id: orgId,
@@ -112,9 +135,16 @@ export async function upsertProductIdentifierMapFromCatalogRows(
         seller_sku,
         asin,
         fnsku,
+        msku: seller_sku,
         external_listing_id,
         source_upload_id: sourceUploadId,
         source_report_type: reportSlug,
+        match_source: "listing_catalog",
+        inventory_source: null,
+        confidence_score: 1.0,
+        linked_from_report_family: "listing",
+        linked_from_target_table: "catalog_products",
+        first_seen_at: now,
         is_primary: true,
         last_seen_at: now,
       });
@@ -129,19 +159,27 @@ export async function upsertProductIdentifierMapFromCatalogRows(
     if (error) throw new Error(`product_identifier_map insert failed: ${error.message}`);
   }
 
-  const updateIds = [...new Set(toUpdate.map((u) => u.id))];
+  const updateById = new Map<string, Record<string, unknown>>();
+  for (const u of toUpdate) {
+    updateById.set(u.id, { ...(updateById.get(u.id) ?? {}), ...u.patch });
+  }
+  const updateIds = [...updateById.keys()];
   const UPDATE_CHUNK = 75;
   for (let i = 0; i < updateIds.length; i += UPDATE_CHUNK) {
     const chunk = updateIds.slice(i, i + UPDATE_CHUNK);
-    const { error } = await supabase
-      .from("product_identifier_map")
-      .update({
-        last_seen_at: now,
-        source_upload_id: sourceUploadId,
-        source_report_type: reportSlug,
-        is_primary: true,
-      })
-      .in("id", chunk);
-    if (error) throw new Error(`product_identifier_map update failed: ${error.message}`);
+    for (const id of chunk) {
+      const patch = updateById.get(id);
+      if (!patch) continue;
+      const { error } = await supabase.from("product_identifier_map").update(patch).eq("id", id);
+      if (error) throw new Error(`product_identifier_map update failed: ${error.message}`);
+    }
   }
+
+  const metrics = { rows_inserted: toInsert.length, rows_updated: updateIds.length };
+  console.log(
+    `[product_identifier_map listing] org=${orgId} source=${reportSlug} ` +
+      `listing_bridge_rows_normalized=${metrics.rows_inserted + metrics.rows_updated} ` +
+      `inserted=${metrics.rows_inserted} updated=${metrics.rows_updated}`,
+  );
+  return metrics;
 }

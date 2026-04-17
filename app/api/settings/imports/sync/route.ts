@@ -89,6 +89,7 @@ import {
   type AmazonImportEngineConfig,
   type AmazonSyncKind,
 } from "../../../../../lib/pipeline/amazon-report-registry";
+import { completeInventoryLedgerProductIdentifierMapPhase } from "../../../../../lib/inventory-ledger-generic-completion";
 import { removalShipmentArchiveBusinessKey } from "../../../../../lib/pipeline/removal-shipment-archive-key";
 import {
   measureBatchUpsertMetrics,
@@ -1547,17 +1548,33 @@ export async function POST(req: Request): Promise<Response> {
       { onConflict: "upload_id" },
     );
 
+    let inventoryLedgerRanInlineGeneric = false;
+    if (kind === "INVENTORY_LEDGER" && needsPhase4) {
+      await completeInventoryLedgerProductIdentifierMapPhase({
+        supabase: supabaseServer,
+        organizationId: orgId,
+        uploadId,
+        storeId: importStoreId ?? null,
+        reportTypeRaw: reportTypeRawEarly,
+        engine,
+      });
+      inventoryLedgerRanInlineGeneric = true;
+    }
+
     await audit(orgId, "import.sync_completed", uploadId, {
       rowsSynced: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
       kind,
       domainTable: DOMAIN_TABLE[kind] ?? "none",
     });
 
+    const syncLogPhaseKey =
+      inventoryLedgerRanInlineGeneric || !needsPhase4 ? FPS_KEY_COMPLETE : FPS_KEY_SYNC;
+
     logImportPhase({
       report_type: reportTypeRawEarly,
       upload_id: uploadId,
-      phase: needsPhase4 ? FPS_KEY_SYNC : FPS_KEY_COMPLETE,
-      phase_key: needsPhase4 ? FPS_KEY_SYNC : FPS_KEY_COMPLETE,
+      phase: syncLogPhaseKey,
+      phase_key: syncLogPhaseKey,
       target_table: engine.sync_target_table ?? domainLabel,
       rows_written: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : finalRawW,
       rows_skipped_existing: finalRawSkip,
