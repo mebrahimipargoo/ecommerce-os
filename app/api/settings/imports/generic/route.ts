@@ -16,7 +16,7 @@ import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 
 export const runtime = "nodejs";
-export const maxDuration = 800;
+export const maxDuration = 300;
 
 type Body = { upload_id?: string };
 

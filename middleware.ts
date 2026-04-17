@@ -6,6 +6,8 @@ export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   const isLoginRoute = pathname.startsWith("/login");
+  /** Password reset tokens live in the URL hash, which is not sent to the server; these routes must stay public. */
+  const isPublicAuthRoute = pathname.startsWith("/auth/");
   if (
     pathname.startsWith("/_next") ||
     pathname === "/favicon.ico"
@@ -43,7 +45,7 @@ export async function middleware(request: NextRequest) {
   } = await supabase.auth.getUser();
 
   if (error || !user) {
-    if (isLoginRoute) {
+    if (isLoginRoute || isPublicAuthRoute) {
       return response;
     }
     const loginUrl = request.nextUrl.clone();
