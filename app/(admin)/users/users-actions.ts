@@ -126,10 +126,10 @@ export async function createUserProfile(input: {
   const cid = input.organization_id.trim();
   if (!isUuidString(cid)) return { ok: false, error: "Select a valid company." };
   const fullName = input.full_name.trim();
-  const VALID_ROLES = ["super_admin", "system_employee", "admin", "employee", "operator"] as const;
+  const VALID_ROLES = ["super_admin", "system_employee", "tenant_admin", "employee"] as const;
   const role = VALID_ROLES.includes(input.role as typeof VALID_ROLES[number])
     ? input.role
-    : "operator";
+    : "employee";
   try {
     const tempPassword = `${randomBytes(24).toString("base64url")}Aa1!`;
     const { data: authCreated, error: authErr } = await supabaseServer.auth.admin.createUser({
@@ -176,8 +176,8 @@ export async function updateUserProfile(
   };
   if (typeof patch.full_name === "string") row.full_name = patch.full_name.trim();
   if (typeof patch.role === "string") {
-    const VALID_ROLES = ["super_admin", "system_employee", "admin", "employee", "operator"];
-    row.role = VALID_ROLES.includes(patch.role) ? patch.role : "operator";
+    const VALID_ROLES = ["super_admin", "system_employee", "tenant_admin", "employee"];
+    row.role = VALID_ROLES.includes(patch.role) ? patch.role : "employee";
   }
   if ("photo_url" in patch) row.photo_url = patch.photo_url;
   try {

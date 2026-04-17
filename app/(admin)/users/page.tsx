@@ -5,7 +5,7 @@ import Link from "next/link";
 import {
   ArrowLeft, ImageIcon, KeyRound, Loader2, Pencil, Plus, Save, Trash2, UserRound, X,
 } from "lucide-react";
-import { isAdminRole, useUserRole, type UserRole } from "../../../components/UserRoleContext";
+import { isAdminRole, useUserRole } from "../../../components/UserRoleContext";
 import { UserProfileAvatar } from "./UserProfileAvatar";
 import {
   createUserProfile,
@@ -29,6 +29,16 @@ const BTN_SECONDARY =
 
 type Toast = { msg: string; ok: boolean } | null;
 const MIN_RESET_PASSWORD_LENGTH = 8;
+type EditableUserRole = "super_admin" | "system_employee" | "tenant_admin" | "employee";
+
+function normalizeEditableRole(role: string | null | undefined): EditableUserRole {
+  const value = (role ?? "").trim().toLowerCase();
+  if (value === "super_admin") return "super_admin";
+  if (value === "system_employee") return "system_employee";
+  if (value === "tenant_admin" || value === "admin") return "tenant_admin";
+  if (value === "employee" || value === "operator") return "employee";
+  return "employee";
+}
 
 export default function UsersPage() {
   const { role, actorUserId } = useUserRole();
@@ -40,7 +50,7 @@ export default function UsersPage() {
   const [saving, setSaving] = useState(false);
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
-  const [userRole, setUserRole] = useState<UserRole>("operator");
+  const [userRole, setUserRole] = useState<EditableUserRole>("employee");
   const [photoUploading, setPhotoUploading] = useState(false);
   const [pendingPhoto, setPendingPhoto] = useState<File | null>(null);
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
@@ -97,7 +107,7 @@ export default function UsersPage() {
     setEditing(null);
     setFullName("");
     setEmail("");
-    setUserRole("operator");
+    setUserRole("employee");
     setPendingPhoto(null);
     const pick =
       companies.some((c) => c.id === tenantDefaultCompanyId) ? tenantDefaultCompanyId : companies[0]?.id ?? "";
@@ -109,8 +119,7 @@ export default function UsersPage() {
     setEditing(row);
     setFullName(row.full_name ?? "");
     setEmail(row.email);
-    const VALID: UserRole[] = ["super_admin", "system_employee", "admin", "employee", "operator"];
-    setUserRole(VALID.includes(row.role as UserRole) ? (row.role as UserRole) : "operator");
+    setUserRole(normalizeEditableRole(row.role));
     setModalOpen(true);
   }
 
@@ -493,11 +502,10 @@ export default function UsersPage() {
                   id="role"
                   className={INPUT}
                   value={userRole}
-                  onChange={(e) => setUserRole(e.target.value as UserRole)}
+                  onChange={(e) => setUserRole(e.target.value as EditableUserRole)}
                 >
-                  <option value="operator">Operator — Warehouse / WMS only</option>
                   <option value="employee">Employee — Office staff (no Settings/Users)</option>
-                  <option value="admin">Admin — Company boss (full org access)</option>
+                  <option value="tenant_admin">Admin — Company boss (full org access)</option>
                   <option value="system_employee">System Employee — SaaS staff (multi-org)</option>
                   <option value="super_admin">Super Admin — God mode (platform owner)</option>
                 </select>
