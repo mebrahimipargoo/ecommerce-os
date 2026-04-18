@@ -7,7 +7,10 @@ import { BRAND_LOGO_IMG_CLASSNAME } from "../lib/brand-logo-classes";
 import { normalizeTenantLogoUrl } from "../lib/tenant-logo-url";
 
 /**
- * Tenant logo from organization / workspace settings, or {@link LogoMark} if missing or broken.
+ * Tenant organization logo from {@link BrandingContext} (DB-backed), or
+ * {@link LogoMark} (platform mark from `platform_settings`) if missing or broken.
+ *
+ * Do not use for AppShell sidebar chrome — use {@link LogoMark} + `PlatformBrandingContext` there.
  */
 export function BrandLogoImage({ className }: { className?: string }) {
   const { logoUrl } = useBranding();

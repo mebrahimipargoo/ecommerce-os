@@ -5,6 +5,7 @@ import React, {
 } from "react";
 import { supabase } from "@/src/lib/supabase";
 import {
+  getOrganizationNames,
   listWorkspaceOrganizationsForAdmin,
   type WorkspaceOrganizationOption,
 } from "../app/session/tenant-actions";
@@ -32,17 +33,44 @@ export const ROLE_HIERARCHY: UserRole[] = [
 
 const LS_WORKSPACE_ORGANIZATION = "workspace_selected_organization_id";
 
+function splitJoined<T>(raw: unknown): T | null {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) return (raw[0] as T | undefined) ?? null;
+  return raw as T;
+}
+
+function titleCaseRoleKey(key: string | null | undefined): string {
+  const k = (key ?? "").trim().toLowerCase();
+  if (!k) return "User";
+  return k
+    .split("_")
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
 // ─── Context Shape ────────────────────────────────────────────────────────────
 
 type UserRoleContextValue = {
+  /**
+   * Effective tier for RBAC / route gates (`normalizeRole` + optional dev override).
+   */
   role: UserRole;
+  /** Canonical `roles.key` (preferred) or legacy `profiles.role` text. */
+  canonicalRoleKey: string | null;
+  /** Catalog `roles.name` when the join resolves; otherwise derived from the key. */
+  canonicalRoleLabel: string;
   actorName: string;
   /** Resolved workspace user profile id (`profiles.id`) for audit trails and tenant bootstrap */
   actorUserId: string | null;
   /** Home organization from profile (`profiles.organization_id`) */
   homeOrganizationId: string | null;
-  /** Tenant scope for logistics data — effective `organization_id` (super_admin may override via workspace picker) */
+  /** `organizations.name` for the profile home org (when readable via RLS). */
+  homeOrganizationName: string | null;
+  /** Tenant scope for logistics data — effective `organization_id` (internal staff may use workspace override). */
   organizationId: string | null;
+  /** Human-readable label for `organizationId` (org name, workspace list fallback, or “No Organization”). */
+  organizationName: string;
   profileLoading: boolean;
   profileError: string | null;
   /** GBAC foundation: group/team slugs from `profiles.team_groups` JSONB */
@@ -74,13 +102,51 @@ function readStoredWorkspaceCompanyId(): string | null {
   return t && isUuidString(t) ? t : null;
 }
 
-function normalizeRole(raw: string | null | undefined): UserRole {
+/** Role keys that use the multi-org workspace picker (internal staff). */
+export const INTERNAL_STAFF_ROLE_KEYS = new Set([
+  "super_admin",
+  "system_admin",
+  "system_employee",
+  "programmer",
+  "customer_service",
+]);
+
+/**
+ * Maps catalog / legacy `roles.key` (or `profiles.role`) to the 5-tier RBAC tier
+ * used for badge colors and `isAtLeast()` comparisons.
+ */
+export function canonicalRoleKeyToTier(raw: string | null | undefined): UserRole {
   const r = (raw ?? "").trim().toLowerCase();
-  if (r === "super_admin")     return "super_admin";
-  if (r === "system_employee") return "system_employee";
-  if (r === "admin")           return "admin";
-  if (r === "employee")        return "employee";
+  if (r === "super_admin") return "super_admin";
+  if (
+    r === "system_employee"
+    || r === "system_admin"
+    || r === "programmer"
+    || r === "customer_service"
+  ) {
+    return "system_employee";
+  }
+  if (r === "tenant_admin") return "admin";
+  if (r === "admin") return "admin";
+  if (r === "employee") return "employee";
+  if (r === "operator") return "operator";
   return "operator";
+}
+
+/** Role keys that may see internal DEV chrome when Technical debug is on. */
+export const INTERNAL_DEV_BADGE_ROLE_KEYS = new Set([
+  "super_admin",
+  "programmer",
+  "system_admin",
+]);
+
+export function canShowInternalDevBadge(canonicalRoleKey: string | null | undefined): boolean {
+  const k = (canonicalRoleKey ?? "").trim().toLowerCase();
+  return INTERNAL_DEV_BADGE_ROLE_KEYS.has(k);
+}
+
+function normalizeRole(raw: string | null | undefined): UserRole {
+  return canonicalRoleKeyToTier(raw);
 }
 
 // ─── Provider ─────────────────────────────────────────────────────────────────
@@ -90,16 +156,20 @@ const UserRoleContext = createContext<UserRoleContextValue | null>(null);
 export function UserRoleProvider({ children }: { children: React.ReactNode }) {
   const { debugMode, setDebugMode } = useDebugMode();
 
-  const [profileRole, setProfileRole]               = useState<UserRole>("operator");
+  const [rbacRole, setRbacRole]                     = useState<UserRole>("operator");
+  const [canonicalRoleKey, setCanonicalRoleKey]   = useState<string | null>(null);
+  const [canonicalRoleLabel, setCanonicalRoleLabel] = useState<string>("User");
   const [debugRole,   setDebugRoleState]            = useState<UserRole | null>(null);
   const [actorUserId, setActorUserId]               = useState<string | null>(null);
   const [homeOrganizationId, setHomeOrganizationId] = useState<string | null>(null);
+  const [homeOrganizationName, setHomeOrganizationName] = useState<string | null>(null);
   const [teamGroups,  setTeamGroups]                = useState<string[]>([]);
   const [superAdminOrganizationOverride, setSuperAdminOrganizationOverride] = useState<string | null>(null);
   const [workspaceOrganizations, setWorkspaceOrganizations] = useState<WorkspaceOrganizationOption[]>([]);
   const [actorName,       setActorName]       = useState("Operator");
   const [profileLoading,  setProfileLoading]  = useState(true);
   const [profileError,    setProfileError]    = useState<string | null>(null);
+  const [orgLabelsById,   setOrgLabelsById]   = useState<Record<string, string>>({});
 
   const loadProfile = useCallback(async () => {
     setProfileLoading(true);
@@ -112,9 +182,12 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
     setActorUserId(authUserId);
 
     if (!authUserId) {
-      setProfileRole("admin");
+      setRbacRole("admin");
+      setCanonicalRoleKey(null);
+      setCanonicalRoleLabel("User");
       setActorName("Operator");
       setTeamGroups([]);
+      setHomeOrganizationName(null);
       const fallback =
         process.env.NEXT_PUBLIC_ORGANIZATION_ID?.trim() ||
         "00000000-0000-0000-0000-000000000001";
@@ -124,35 +197,72 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    const { data: profileRow } = await supabase
+    const { data: profileData, error: profileSelectError } = await supabase
       .from("profiles")
-      .select("id, organization_id, full_name, role, team_groups")
+      .select(
+        [
+          "id, organization_id, full_name, role, team_groups",
+          "roles!profiles_role_id_fkey(key, name, scope)",
+          "organizations!profiles_organization_id_fkey(name)",
+        ].join(", "),
+      )
       .eq("id", authUserId)
       .maybeSingle();
 
-    if (!profileRow) {
+    if (profileSelectError) {
+      setHomeOrganizationName(null);
+      setProfileError(profileSelectError.message);
+      setProfileLoading(false);
+      return;
+    }
+
+    if (!profileData || typeof profileData !== "object") {
+      setHomeOrganizationName(null);
       setProfileError(`Authenticated user is missing a profiles row (id=${authUserId}).`);
       setProfileLoading(false);
       return;
     }
 
-    const nr = normalizeRole(profileRow.role);
-    setProfileRole(nr);
+    const profileRow = profileData as Record<string, unknown>;
+
+    const joined = splitJoined<{ key?: string | null; name?: string | null; scope?: string | null }>(
+      profileRow.roles,
+    );
+    const joinedKey = joined?.key != null ? String(joined.key).trim().toLowerCase() : null;
+    const rawKey = (joinedKey ?? String(profileRow.role ?? "").trim().toLowerCase());
+    const nr = normalizeRole(rawKey || String(profileRow.role ?? ""));
+    setRbacRole(nr);
+
+    const canonKey = (joinedKey ?? String(profileRow.role ?? "").trim().toLowerCase()) || null;
+    setCanonicalRoleKey(canonKey);
+    const catalogName =
+      joined?.name != null && String(joined.name).trim().length > 0
+        ? String(joined.name).trim()
+        : titleCaseRoleKey(canonKey);
+    setCanonicalRoleLabel(catalogName);
+
     setActorName(String(profileRow.full_name ?? "").trim() || "User");
     setTeamGroups(Array.isArray(profileRow.team_groups) ? profileRow.team_groups.map(String) : []);
     const cid = String(profileRow.organization_id ?? "").trim();
-    setHomeOrganizationId(cid && isUuidString(cid) ? cid : null);
+    const homeId = cid && isUuidString(cid) ? cid : null;
+    setHomeOrganizationId(homeId);
 
-    if (nr === "super_admin" || nr === "system_employee") {
+    const orgEmbed = splitJoined<{ name?: string | null }>(profileRow.organizations);
+    const joinedName = orgEmbed != null && typeof orgEmbed.name === "string" ? orgEmbed.name.trim() : "";
+    setHomeOrganizationName(joinedName.length > 0 ? joinedName : null);
+
+    let internalEffectiveId: string | null = null;
+    if (INTERNAL_STAFF_ROLE_KEYS.has(rawKey)) {
       const stored = readStoredWorkspaceCompanyId();
-      const pick   = stored && isUuidString(stored) ? stored : cid;
-      setSuperAdminOrganizationOverride(pick && isUuidString(pick) ? pick : null);
+      const pick   = stored && isUuidString(stored) ? stored : (homeId ?? "");
+      internalEffectiveId = pick && isUuidString(pick) ? pick : null;
+      setSuperAdminOrganizationOverride(internalEffectiveId);
       void listWorkspaceOrganizationsForAdmin().then((orgRes) => {
         if (!orgRes.ok) return;
         const rows = [...orgRes.rows];
         const ids  = new Set(rows.map((r) => r.organization_id));
-        if (cid && isUuidString(cid) && !ids.has(cid)) {
-          rows.push({ organization_id: cid, display_name: "Your workspace" });
+        if (homeId && !ids.has(homeId)) {
+          rows.push({ organization_id: homeId, display_name: "Your workspace" });
         }
         rows.sort((a, b) => a.display_name.localeCompare(b.display_name));
         setWorkspaceOrganizations(rows);
@@ -161,6 +271,25 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
       setSuperAdminOrganizationOverride(null);
       setWorkspaceOrganizations([]);
     }
+
+    const idsToLabel = [
+      ...new Set(
+        [homeId, internalEffectiveId].filter((x): x is string => !!x && isUuidString(x)),
+      ),
+    ];
+    if (idsToLabel.length > 0) {
+      const nm = await getOrganizationNames(idsToLabel);
+      if (nm.ok) {
+        setOrgLabelsById((prev) => {
+          const next = { ...prev };
+          for (const r of nm.rows) {
+            next[r.organization_id] = r.display_name;
+          }
+          return next;
+        });
+      }
+    }
+
     setProfileLoading(false);
   }, []);
 
@@ -181,8 +310,7 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
     if (!debugMode) setDebugRoleState(null);
   }, [debugMode]);
 
-  // Effective role: always use authenticated profile role.
-  const role = useMemo((): UserRole => profileRole, [profileRole]);
+  const role = useMemo((): UserRole => debugRole ?? rbacRole, [debugRole, rbacRole]);
 
   const setWorkspaceOrganizationId = useCallback((id: string) => {
     const t = id.trim();
@@ -200,6 +328,39 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
     return homeOrganizationId;
   }, [role, superAdminOrganizationOverride, homeOrganizationId]);
 
+  /**
+   * Human-readable label for the effective `organizationId` (logistics / tenant scope).
+   * Not app product branding (`BrandingContext`); not necessarily a custom logo asset.
+   *
+   * Resolution order:
+   *   1. `orgLabelsById[id]` — filled by `getOrganizationNames()` in tenant-actions:
+   *      prefers `organization_settings.company_display_name`, else `organizations.name`,
+   *      else the UUID string.
+   *   2. If `id === homeOrganizationId`, the joined `organizations.name` from the profile
+   *      load (`homeOrganizationName`).
+   *   3. `workspaceOrganizations` row for this id (RPC list; may be UUID fallback).
+   *   4. Raw `organizationId` UUID.
+   */
+  const organizationName = useMemo((): string => {
+    const id = organizationId;
+    if (!id) return "No Organization";
+    const cached = (orgLabelsById[id] ?? "").trim();
+    if (cached) return cached;
+    if (id === homeOrganizationId) {
+      const home = (homeOrganizationName ?? "").trim();
+      if (home) return home;
+    }
+    const fromList = workspaceOrganizations.find((o) => o.organization_id === id)?.display_name?.trim();
+    if (fromList) return fromList;
+    return id;
+  }, [
+    organizationId,
+    homeOrganizationId,
+    homeOrganizationName,
+    workspaceOrganizations,
+    orgLabelsById,
+  ]);
+
   /** Dev-mode: directly set any of the 5 tiers (null = revert to real role).
    *  Auto-enables debug mode if it is not already on. */
   const setDebugRole = useCallback((r: UserRole | null) => {
@@ -211,19 +372,23 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
   const toggleRole = useCallback(() => {
     if (!debugMode) setDebugMode(true);
     setDebugRoleState((prev) => {
-      const cur = prev ?? profileRole;
+      const cur = prev ?? rbacRole;
       const idx = ROLE_HIERARCHY.indexOf(cur);
       return ROLE_HIERARCHY[(idx + 1) % ROLE_HIERARCHY.length];
     });
-  }, [debugMode, setDebugMode, profileRole]);
+  }, [debugMode, setDebugMode, rbacRole]);
 
   const value = useMemo(
     () => ({
       role,
+      canonicalRoleKey,
+      canonicalRoleLabel,
       actorName,
       actorUserId,
       homeOrganizationId,
+      homeOrganizationName,
       organizationId,
+      organizationName,
       profileLoading,
       profileError,
       teamGroups,
@@ -234,7 +399,9 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
       refreshProfile: loadProfile,
     }),
     [
-      role, actorName, actorUserId, homeOrganizationId, organizationId,
+      role, canonicalRoleKey, canonicalRoleLabel, actorName, actorUserId,
+      homeOrganizationId, homeOrganizationName,
+      organizationId, organizationName,
       profileLoading, profileError, teamGroups, workspaceOrganizations,
       setWorkspaceOrganizationId, setDebugRole, toggleRole, loadProfile,
     ],
@@ -250,10 +417,14 @@ export function useUserRole(): UserRoleContextValue {
   if (!ctx) {
     return {
       role: "operator",
+      canonicalRoleKey: null,
+      canonicalRoleLabel: "User",
       actorName: "User",
       actorUserId: null,
       homeOrganizationId: null,
+      homeOrganizationName: null,
       organizationId: null,
+      organizationName: "No Organization",
       profileLoading: false,
       profileError: null,
       teamGroups: [],

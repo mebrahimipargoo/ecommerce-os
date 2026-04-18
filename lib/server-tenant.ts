@@ -5,6 +5,12 @@ import { getSessionUserIdFromCookies } from "./supabase-server-auth";
 import { resolveOrganizationId } from "./organization";
 import { isUuidString } from "./uuid";
 
+function splitJoined<T>(raw: unknown): T | null {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) return (raw[0] as T | undefined) ?? null;
+  return raw as T;
+}
+
 /**
  * Workspace user directory (`public.profiles`).
  * Roles (5-tier RBAC): super_admin | system_employee | admin | employee | operator
@@ -14,6 +20,11 @@ export type TenantProfileRow = {
   organization_id: string;
   full_name: string;
   role: string;
+  /**
+   * When `profiles.role_id` joins `roles`, the catalog scope (`system` | `tenant`).
+   * Null if the join did not resolve (legacy rows rely on `role` text only).
+   */
+  role_scope: string | null;
   photo_url: string | null;
   /** Email is stored in auth.users, not profiles — may be absent on legacy rows. */
   email?: string;
@@ -65,7 +76,9 @@ export async function loadTenantProfile(
   if (!id || !isUuidString(id)) return null;
   const { data, error } = await supabaseServer
     .from("profiles")
-    .select("id, organization_id, full_name, name, role, photo_url, team_groups")
+    .select(
+      "id, organization_id, full_name, name, role, photo_url, team_groups, roles!profiles_role_id_fkey(key, name, scope)",
+    )
     .eq("id", id)
     .maybeSingle();
   if (error || !data) return null;
@@ -75,18 +88,52 @@ export async function loadTenantProfile(
   const team_groups: string[] = Array.isArray(rawGroups)
     ? rawGroups.map(String).filter(Boolean)
     : [];
+  const rolesJoined = splitJoined<{ key?: unknown; scope?: unknown }>(row.roles);
+  const scopeRaw = rolesJoined?.scope;
+  const role_scope =
+    scopeRaw != null && String(scopeRaw).trim() ? String(scopeRaw).trim() : null;
   return {
     id: String(row.id),
     organization_id: typeof oid === "string" && oid.trim() ? oid : "",
     full_name: String(row.full_name ?? row.name ?? "").trim(),
-    role: String(row.role ?? "operator"),
+    role: String(rolesJoined?.key ?? row.role ?? "operator").trim(),
+    role_scope,
     photo_url: row.photo_url != null ? String(row.photo_url) : null,
     team_groups,
   };
 }
 
+const TENANT_BRANDING_EDITOR_ROLE_KEYS = new Set([
+  "tenant_admin",
+  /** Legacy tenant admin key — same privilege as `tenant_admin`. */
+  "admin",
+  /** Technical staff: may edit tenant branding for their resolved org (catalog key, not 5-tier tier). */
+  "programmer",
+]);
+
+/**
+ * True when the profile may edit tenant company name / logo on `organization_settings`.
+ * Allowed: `tenant_admin`, legacy `admin`, `programmer`, and `super_admin` (effective org).
+ * Excluded: `employee`, `operator`, and other tenant roles (e.g. `customer_service` as tenant).
+ */
+export function canEditTenantOrganizationBranding(profile: TenantProfileRow | null): boolean {
+  if (!profile) return false;
+  const k = profile.role.trim().toLowerCase();
+  if (isSuperAdminRole(k)) return true;
+  return TENANT_BRANDING_EDITOR_ROLE_KEYS.has(k);
+}
+
+/**
+ * True when the profile may edit `public.platform_settings` (platform product branding).
+ * Restricted to `super_admin` only.
+ */
+export function canManagePlatformSettings(profile: TenantProfileRow | null): boolean {
+  if (!profile) return false;
+  return isSuperAdminRole(profile.role);
+}
+
 export function isSuperAdminRole(role: string | null | undefined): boolean {
-  return (role ?? "").trim() === "super_admin";
+  return (role ?? "").trim().toLowerCase() === "super_admin";
 }
 
 /**

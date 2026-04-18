@@ -1,74 +1,59 @@
 "use client";
 
 /**
- * Global top bar — search, notifications, theme, profile, and (dev-only) role switcher.
- * Branding lives exclusively in the sidebar on all breakpoints.
+ * Global top bar — search, notifications, theme, and profile menu.
  *
- * Dev-mode role switching is handled by <DevRoleSwitcher /> — a standalone
- * component so it can be unit-tested and reused in Storybook without this file.
+ * Role / RBAC label is not shown here (avoid duplication); it lives on `/profile` only.
+ * DEV badge gating unchanged (`debugMode` + internal catalog keys).
+ *
+ * Tenant context: the workspace strip uses `UserRoleContext.organizationName` (effective
+ * org id + name resolution) and a generic `Building2` icon — not tenant logos from
+ * `organization_settings`. Platform product name/logo live only in the sidebar (`LogoMark`
+ * + `platform_settings` via `PlatformBrandingContext`).
+ *
+ * Mock role switching for internal QA lives in the Tech Debug panel, not here.
  */
 
 import React from "react";
 import {
-  Bell, Briefcase, ChevronDown, LogOut, Menu, Search,
-  Server, ShieldCheck, Sparkles, User,
+  Bell, Building2, ChevronDown, LogOut, Menu, Search,
+  UserCircle,
 } from "lucide-react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ThemeToggle } from "./ThemeToggle";
 import { useGlobalSearch } from "./GlobalSearchContext";
-import { useUserRole, type UserRole } from "./UserRoleContext";
-import { useRbacPermissions } from "../hooks/useRbacPermissions";
-import { DevRoleSwitcher } from "./DevRoleSwitcher";
+import { useDebugMode } from "./DebugModeContext";
+import { useUserRole, canShowInternalDevBadge } from "./UserRoleContext";
 import { supabase } from "@/src/lib/supabase";
-
-// ─── Role badge metadata (production read-only display) ───────────────────────
-
-type RoleMeta = { label: string; Icon: React.ElementType; badgeCls: string };
-
-const ROLE_META: Record<UserRole, RoleMeta> = {
-  super_admin: {
-    label:    "Super Admin",
-    Icon:     Sparkles,
-    badgeCls: "border-violet-300 bg-violet-50 text-violet-800 dark:border-violet-700/60 dark:bg-violet-950/40 dark:text-violet-200",
-  },
-  system_employee: {
-    label:    "System Employee",
-    Icon:     Server,
-    badgeCls: "border-fuchsia-300 bg-fuchsia-50 text-fuchsia-700 dark:border-fuchsia-700/60 dark:bg-fuchsia-950/40 dark:text-fuchsia-200",
-  },
-  admin: {
-    label:    "Admin",
-    Icon:     ShieldCheck,
-    badgeCls: "border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700/60 dark:bg-emerald-950/30 dark:text-emerald-300",
-  },
-  employee: {
-    label:    "Employee",
-    Icon:     Briefcase,
-    badgeCls: "border-sky-300 bg-sky-50 text-sky-700 dark:border-sky-700/60 dark:bg-sky-950/40 dark:text-sky-300",
-  },
-  operator: {
-    label:    "Operator",
-    Icon:     User,
-    badgeCls: "border-slate-300 bg-slate-50 text-slate-600 dark:border-slate-600 dark:bg-slate-800/50 dark:text-slate-300",
-  },
-};
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
   const router = useRouter();
   const { query, setQuery } = useGlobalSearch();
+  const { debugMode } = useDebugMode();
   const {
-    role, actorName,
-    workspaceOrganizations,
-    setWorkspaceOrganizationId,
-    organizationId,
+    canonicalRoleKey,
+    actorName,
+    organizationName,
   } = useUserRole();
-  const { canSwitchOrganization } = useRbacPermissions();
   const [isSigningOut, setIsSigningOut] = React.useState(false);
+  const [profileMenuOpen, setProfileMenuOpen] = React.useState(false);
+  const profileMenuRef = React.useRef<HTMLDivElement>(null);
 
-  const { label: roleLabel, Icon: RoleIcon, badgeCls } = ROLE_META[role];
   const profileInitial = actorName.trim().charAt(0).toUpperCase() || "U";
+  const showDevBadge = debugMode && canShowInternalDevBadge(canonicalRoleKey);
+
+  React.useEffect(() => {
+    if (!profileMenuOpen) return;
+    function onDocMouseDown(e: MouseEvent) {
+      const el = profileMenuRef.current;
+      if (el && !el.contains(e.target as Node)) setProfileMenuOpen(false);
+    }
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, [profileMenuOpen]);
 
   async function handleSignOut() {
     setIsSigningOut(true);
@@ -83,7 +68,7 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
 
   return (
     <header
-      className="sticky top-0 z-40 flex h-14 w-full min-w-0 shrink-0 items-center justify-between gap-3 border-b border-border bg-card px-3 md:px-4"
+      className="sticky top-0 z-40 flex h-14 w-full min-w-0 shrink-0 items-center justify-between gap-2 border-b border-border bg-card px-3 sm:gap-3 md:px-4"
       role="banner"
     >
       {/* Hamburger — mobile only */}
@@ -96,9 +81,21 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
         <Menu className="h-5 w-5" />
       </button>
 
-      {/* Search — desktop */}
-      <div className="mx-2 hidden min-w-0 max-w-md flex-1 md:flex">
-        <label className="relative flex w-full items-center">
+      {/* Effective workspace org label (see UserRoleContext `organizationName`); generic icon only. */}
+      <div
+        className="hidden min-w-0 max-w-[14rem] shrink-0 truncate rounded-lg border border-border bg-muted/50 px-2.5 py-1.5 text-left text-xs font-medium text-foreground shadow-sm md:block md:max-w-[20rem]"
+        title={organizationName}
+        aria-label={`Current workspace organization: ${organizationName}`}
+      >
+        <span className="mr-1.5 inline-flex shrink-0 align-middle text-muted-foreground" aria-hidden>
+          <Building2 className="h-3.5 w-3.5" aria-hidden />
+        </span>
+        {organizationName}
+      </div>
+
+      {/* Search — desktop (center band; does not use tenant branding) */}
+      <div className="mx-1 hidden min-w-0 flex-1 md:mx-2 md:flex md:max-w-none md:justify-center">
+        <label className="relative flex w-full max-w-xl items-center md:mx-auto">
           <Search className="pointer-events-none absolute left-3 h-4 w-4 text-muted-foreground" aria-hidden />
           <input
             type="search"
@@ -111,8 +108,20 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
         </label>
       </div>
 
+      {/* Effective workspace org (mobile); same data source as desktop chip. */}
+      <div
+        className="mx-0 max-w-[min(38vw,11rem)] shrink-0 truncate rounded-md border border-border bg-muted/40 px-2 py-1 text-[11px] font-medium text-foreground md:hidden"
+        title={organizationName}
+        aria-label={`Current workspace organization: ${organizationName}`}
+      >
+        <span className="mr-1 inline-flex shrink-0 align-middle text-muted-foreground" aria-hidden>
+          <Building2 className="h-3 w-3" />
+        </span>
+        {organizationName}
+      </div>
+
       {/* Search — mobile */}
-      <div className="mx-1 flex min-w-0 flex-1 md:hidden">
+      <div className="mx-0 flex min-w-0 flex-1 md:hidden">
         <label className="relative flex w-full items-center">
           <Search className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground" aria-hidden />
           <input
@@ -129,41 +138,14 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
       {/* Right-side controls */}
       <div className="ml-auto flex shrink-0 items-center gap-1.5 sm:gap-2">
 
-        {/* ── Dev-mode role switcher (shows when Debug Mode toggle is on) ── */}
-        <DevRoleSwitcher />
-
-        {/* ── Production role badge — read-only, shown when NOT in debug mode ── */}
-        <div
-          className={[
-            "hidden h-9 items-center gap-1.5 rounded-full border px-3 text-xs font-semibold",
-            "sm:flex",
-            badgeCls,
-          ].join(" ")}
-          title={`Signed in as ${roleLabel}`}
-          aria-label={`Role: ${roleLabel}`}
-        >
-          <RoleIcon className="h-3.5 w-3.5" />
-          {roleLabel}
-        </div>
-
-        {/* ── Org Switcher (super_admin / system_employee) ─────────────── */}
-        {canSwitchOrganization && workspaceOrganizations.length > 0 && (
-          <label className="hidden max-w-[min(100%,14rem)] items-center gap-1 sm:flex">
-            <span className="sr-only">Workspace company</span>
-            <select
-              value={organizationId ?? ""}
-              onChange={(e) => setWorkspaceOrganizationId(e.target.value)}
-              className="h-9 max-w-full rounded-lg border border-border bg-background px-2 text-xs font-medium text-foreground shadow-sm outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring"
-              title="Switch company"
-            >
-              {workspaceOrganizations.map((o) => (
-                <option key={o.organization_id} value={o.organization_id}>
-                  {o.display_name}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
+        {showDevBadge ? (
+          <span
+            className="hidden rounded-full border border-orange-300 bg-orange-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-orange-700 dark:border-orange-600/60 dark:bg-orange-950/40 dark:text-orange-300 sm:inline"
+            title="Technical debug mode is on"
+          >
+            DEV
+          </span>
+        ) : null}
 
         <ThemeToggle />
 
@@ -176,31 +158,55 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
           <span className="absolute right-1 top-1 h-2 w-2 rounded-full bg-destructive ring-2 ring-card" />
         </button>
 
-        {/* Profile pill */}
-        <button
-          type="button"
-          className="flex items-center gap-2 rounded-full border border-border bg-card px-2 py-1.5 text-xs shadow-sm transition hover:bg-accent"
-        >
-          <div className="flex h-7 w-7 items-center justify-center rounded-full bg-gradient-to-tr from-primary to-sky-600 text-[11px] font-semibold text-primary-foreground">
-            {profileInitial}
-          </div>
-          <div className="hidden flex-col items-start leading-tight sm:flex">
-            <span className="text-xs font-medium text-foreground">{actorName}</span>
-            <span className="text-[10px] text-muted-foreground">{roleLabel}</span>
-          </div>
-          <ChevronDown className="hidden h-3 w-3 text-muted-foreground sm:block" />
-        </button>
+        {/* Profile menu */}
+        <div className="relative" ref={profileMenuRef}>
+          <button
+            type="button"
+            aria-expanded={profileMenuOpen}
+            aria-haspopup="menu"
+            aria-label={`Account menu for ${actorName}`}
+            onClick={() => setProfileMenuOpen((o) => !o)}
+            className="flex items-center gap-2 rounded-full border border-border bg-card px-2 py-1.5 text-xs shadow-sm transition hover:bg-accent"
+          >
+            <div className="flex h-7 w-7 items-center justify-center rounded-full bg-gradient-to-tr from-primary to-sky-600 text-[11px] font-semibold text-primary-foreground">
+              {profileInitial}
+            </div>
+            <span className="hidden max-w-[14rem] truncate text-xs font-medium text-foreground sm:inline">
+              {actorName}
+            </span>
+            <ChevronDown className="hidden h-3 w-3 shrink-0 text-muted-foreground sm:block" />
+          </button>
 
-        <button
-          type="button"
-          onClick={() => void handleSignOut()}
-          disabled={isSigningOut}
-          aria-label="Sign out"
-          className="inline-flex h-9 items-center gap-1.5 rounded-full border border-border px-3 text-xs font-medium text-muted-foreground transition hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          <LogOut className="h-3.5 w-3.5" />
-          {isSigningOut ? "Signing out..." : "Logout"}
-        </button>
+          {profileMenuOpen ? (
+            <div
+              role="menu"
+              className="absolute right-0 top-full z-50 mt-1 min-w-[11rem] rounded-lg border border-border bg-popover py-1 text-popover-foreground shadow-lg"
+            >
+              <Link
+                href="/profile"
+                role="menuitem"
+                className="flex items-center gap-2 px-3 py-2 text-sm hover:bg-accent"
+                onClick={() => setProfileMenuOpen(false)}
+              >
+                <UserCircle className="h-4 w-4 shrink-0 opacity-70" />
+                Profile &amp; account
+              </Link>
+              <button
+                type="button"
+                role="menuitem"
+                disabled={isSigningOut}
+                className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+                onClick={() => {
+                  setProfileMenuOpen(false);
+                  void handleSignOut();
+                }}
+              >
+                <LogOut className="h-4 w-4 shrink-0 opacity-70" />
+                {isSigningOut ? "Signing out…" : "Sign out"}
+              </button>
+            </div>
+          ) : null}
+        </div>
       </div>
     </header>
   );

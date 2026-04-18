@@ -8,6 +8,10 @@
  *
  * Sidebar visibility is driven entirely by useRbacPermissions (no role comparisons here).
  * Content column: TopHeader (shrink-0) + scrollable main (flex-1 min-h-0 overflow-auto).
+ *
+ * Shell product row: platform name + `LogoMark` from `public.platform_settings` via
+ * `PlatformBrandingContext` — not tenant `organization_settings`. Tenant org label is only
+ * in `TopHeader` via `UserRoleContext`.
  */
 
 import React, {
@@ -19,13 +23,15 @@ import { usePathname } from "next/navigation";
 import {
   Banknote, Building2, ChevronDown,
   ClipboardList, Database, DollarSign, FileText,
-  Package,
+  Package, Palette,
   PanelLeftClose, PanelLeftOpen,
   RotateCcw, ScanLine, Settings, Shield, ShieldAlert, Users, Wrench, X,
 } from "lucide-react";
 import { TopHeader } from "./TopHeader";
-import { BrandingProvider, useBranding } from "./BrandingContext";
-import { BrandLogoImage } from "./BrandLogoImage";
+import { BrandingProvider } from "./BrandingContext";
+import { PlatformBrandingProvider, usePlatformBranding } from "./PlatformBrandingContext";
+import { LogoMark } from "./LogoMark";
+import { PLATFORM_TAGLINE } from "../lib/platform-branding";
 import { GlobalSearchProvider } from "./GlobalSearchContext";
 import { UserRoleProvider } from "./UserRoleContext";
 import { TechDebugPanel } from "./TechDebugPanel";
@@ -103,9 +109,11 @@ const CLS = {
 export function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <UserRoleProvider>
-      <BrandingProvider>
-        <AppShellInner>{children}</AppShellInner>
-      </BrandingProvider>
+      <PlatformBrandingProvider>
+        <BrandingProvider>
+          <AppShellInner>{children}</AppShellInner>
+        </BrandingProvider>
+      </PlatformBrandingProvider>
     </UserRoleProvider>
   );
 }
@@ -113,12 +121,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 // ─── Inner shell (has access to context) ─────────────────────────────────────
 
 function AppShellInner({ children }: { children: React.ReactNode }) {
+  const { platformAppName, loading: platformNameLoading } = usePlatformBranding();
   const [collapsed,     setCollapsed]     = useState(false);
   const [mobileOpen,    setMobileOpen]    = useState(false);
   const [techDebugOpen, setTechDebugOpen] = useState(false);
   const [mounted,       setMounted]       = useState(false);
   const [expanded,      setExpanded]      = useState<Record<string, boolean>>({});
-  const { companyName: brandName } = useBranding();
   const pathname = usePathname();
   const isAuthRoute = pathname === "/login";
 
@@ -378,6 +386,23 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
           )}
         </div>
 
+        {/* ── Tech Debug (internal technical roles; not platform super-admin menu) ── */}
+        {perms.canSeeTechDebug && !perms.canSeePlatformAdmin && (
+          <div className="mt-4">
+            {showSection
+              ? <p className={CLS.section}>Developer</p>
+              : <div className="mb-2 mx-3 h-px bg-border" />
+            }
+            <div className="space-y-0.5">
+              <TechDebugNavButton
+                collapsed={sidebarCollapsed}
+                alwaysFull={alwaysFull}
+                onClick={openTechDebug}
+              />
+            </div>
+          </div>
+        )}
+
         {/* ── System Admin — Imports (admin+) ───────────────────────────── */}
         {perms.canSeeSystemAdmin && perms.canSeeImports && (
           <div className="mt-4">
@@ -394,18 +419,26 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
           </div>
         )}
 
-        {/* ── Platform (super_admin only) ───────────────────────────────── */}
-        {perms.canSeePlatformAdmin && (
+        {/* ── Platform: super_admin (admin + platform branding); internal staff see section for tech debug only ── */}
+        {(perms.canSeePlatformAdmin || perms.isAtLeast("system_employee")) && (
           <div className="mt-4">
             {showSection
               ? <p className={CLS.section}>Platform</p>
               : <div className="mb-2 mx-3 h-px bg-border" />
             }
             <div className="space-y-0.5">
-              <NavLink
-                item={{ label: "Admin Settings", icon: Shield, href: "/admin/settings" }}
-                alwaysFull={alwaysFull}
-              />
+              {perms.canSeePlatformAdmin && (
+                <NavLink
+                  item={{ label: "Admin Settings", icon: Shield, href: "/admin/settings" }}
+                  alwaysFull={alwaysFull}
+                />
+              )}
+              {perms.canSeePlatformAdmin && (
+                <NavLink
+                  item={{ label: "Platform branding", icon: Palette, href: "/platform/settings" }}
+                  alwaysFull={alwaysFull}
+                />
+              )}
               {perms.canSeeTechDebug && (
                 <TechDebugNavButton
                   collapsed={sidebarCollapsed}
@@ -435,12 +468,12 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
       >
         <div className="flex h-14 shrink-0 items-center justify-between border-b border-sidebar-border px-4">
           <div className="flex min-w-0 flex-1 items-center gap-2.5">
-            <BrandLogoImage />
+            <LogoMark />
             <div className="min-w-0">
-              <p className="text-sm font-bold text-sidebar-foreground">
-                {brandName || "E-commerce OS"}
+              <p className="truncate text-sm font-bold text-sidebar-foreground">
+                {platformNameLoading && !platformAppName ? "…" : platformAppName || "·"}
               </p>
-              <p className="text-[10px] text-muted-foreground">Returns ERP</p>
+              <p className="truncate text-[10px] text-muted-foreground">{PLATFORM_TAGLINE}</p>
             </div>
           </div>
           <button
@@ -453,7 +486,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
           </button>
         </div>
 
-        <nav className="flex-1 overflow-y-auto px-2 py-4">
+        <nav className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
           <SidebarBody alwaysFull collapsed={false} />
         </nav>
       </div>
@@ -490,18 +523,18 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
               "flex h-14 shrink-0 items-center border-b border-sidebar-border px-4 min-w-0 overflow-hidden",
               collapsed ? "justify-center" : "gap-2.5",
             ].join(" ")}>
-              <BrandLogoImage />
+              <LogoMark />
               {!collapsed && (
                 <div className="min-w-0">
                   <p className="truncate text-sm font-bold text-sidebar-foreground">
-                    {brandName || "E-commerce OS"}
+                    {platformNameLoading && !platformAppName ? "…" : platformAppName || "·"}
                   </p>
-                  <p className="text-[10px] text-muted-foreground">Returns ERP</p>
+                  <p className="truncate text-[10px] text-muted-foreground">{PLATFORM_TAGLINE}</p>
                 </div>
               )}
             </div>
 
-            <nav className="flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
+            <nav className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
               <SidebarBody collapsed={collapsed} />
             </nav>
 

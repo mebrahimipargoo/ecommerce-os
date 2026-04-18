@@ -10,19 +10,21 @@ export function ThemeToggle() {
 
   useEffect(() => { setMounted(true); }, []);
 
-  if (!mounted) {
-    // Stable placeholder to prevent layout shift during hydration
-    return <div className="h-9 w-9 rounded-full border border-border" />;
-  }
-
-  const isDark = resolvedTheme === "dark";
+  const isDark = mounted && resolvedTheme === "dark";
 
   return (
     <button
       type="button"
+      disabled={!mounted}
       onClick={() => setTheme(isDark ? "light" : "dark")}
-      aria-label={isDark ? "Switch to light mode" : "Switch to dark mode"}
-      className="group relative flex h-9 w-9 items-center justify-center overflow-hidden rounded-full border border-border bg-card text-card-foreground shadow-sm transition hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      aria-label={
+        !mounted
+          ? "Toggle color theme"
+          : isDark
+            ? "Switch to light mode"
+            : "Switch to dark mode"
+      }
+      className="group relative flex h-9 w-9 items-center justify-center overflow-hidden rounded-full border border-border bg-card text-card-foreground shadow-sm transition hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-70"
     >
       {/* Sun — shown in dark mode to switch to light */}
       <Sun

@@ -1,10 +1,14 @@
 "use server";
 
-import { resolveTenantOrganizationId, type TenantWriteContext } from "../../lib/server-tenant";
+import {
+  canEditTenantOrganizationBranding,
+  loadTenantProfile,
+  resolveTenantOrganizationId,
+  type TenantWriteContext,
+} from "../../lib/server-tenant";
 import { supabaseServer } from "../../lib/supabase-server";
 import { upsertOrganizationLogoUrl } from "../../lib/organization-logo";
 import { isUuidString } from "../../lib/uuid";
-import { saveCoreSettings } from "./workspace-settings-actions";
 
 /** Primary bucket (create as public in Supabase → Storage). */
 const PRIMARY_LOGO_BUCKET = "logos";
@@ -32,7 +36,7 @@ const ALLOWED_TYPES = new Set([
 
 /**
  * Uploads a logo via service role (bypasses Storage RLS), stores public URL in
- * organization_settings.logo_url and syncs core_settings.company_logo_url.
+ * `organization_settings.logo_url` only (tenant branding — not `platform_settings` or `core_settings`).
  */
 export async function uploadOrganizationLogoAction(
   formData: FormData,
@@ -55,6 +59,16 @@ export async function uploadOrganizationLogoAction(
     actorProfileId,
     organizationId: companyIdRaw && isUuidString(companyIdRaw) ? companyIdRaw : null,
   };
+
+  if (actorProfileId && isUuidString(actorProfileId)) {
+    const profile = await loadTenantProfile(actorProfileId);
+    if (!canEditTenantOrganizationBranding(profile)) {
+      return { ok: false, error: "You do not have permission to upload a company logo." };
+    }
+  } else {
+    return { ok: false, error: "Missing or invalid session profile." };
+  }
+
   const orgId = await resolveTenantOrganizationId(tenant);
   if (!isUuidString(orgId)) {
     return {
@@ -121,11 +135,6 @@ export async function uploadOrganizationLogoAction(
   const orgRes = await upsertOrganizationLogoUrl(publicUrl, tenant);
   if (!orgRes.ok) {
     return { ok: false, error: orgRes.error ?? "Failed to save logo_url on organization_settings." };
-  }
-
-  const coreRes = await saveCoreSettings({ company_logo_url: publicUrl, logo_url: publicUrl }, tenant);
-  if (!coreRes.ok) {
-    return { ok: false, error: coreRes.error ?? "Failed to sync workspace branding." };
   }
 
   return { ok: true, publicUrl };

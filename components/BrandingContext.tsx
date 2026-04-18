@@ -1,15 +1,25 @@
 "use client";
 
+/**
+ * Tenant / workspace white-label cache (organization + workspace_settings).
+ *
+ * Used when tenant visuals must refresh (e.g. after saving Settings) and for
+ * `BrandLogoImage`. Data is read from `organization_settings` only (not `platform_settings`).
+ * App shell chrome (sidebar product row) must use {@link ./PlatformBrandingContext} +
+ * {@link LogoMark} only — never this context for platform identity.
+ */
+
 import React, {
   createContext, useCallback, useContext, useEffect, useMemo, useState,
 } from "react";
-import { getCoreSettings } from "../app/settings/workspace-settings-actions";
+import { getTenantBrandingForActor } from "../app/settings/tenant-organization-branding-actions";
 import { normalizeTenantLogoUrl } from "../lib/tenant-logo-url";
 import { useUserRole } from "./UserRoleContext";
 
 export type BrandingContextValue = {
+  /** Tenant display name from `organization_settings` / `organizations.name` (not platform name). */
   companyName: string;
-  /** Resolved public URL for tenant logo (organization_settings + core_settings). */
+  /** Resolved public URL for tenant logo (`organization_settings.logo_url`). */
   logoUrl: string;
   loading: boolean;
   refresh: () => Promise<void>;
@@ -18,36 +28,35 @@ export type BrandingContextValue = {
 const BrandingContext = createContext<BrandingContextValue | null>(null);
 
 export function BrandingProvider({ children }: { children: React.ReactNode }) {
-  const { organizationId } = useUserRole();
+  const { organizationId, actorUserId, profileLoading } = useUserRole();
   const [companyName, setCompanyName] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
+    if (!actorUserId?.trim()) {
+      setCompanyName("");
+      setLogoUrl("");
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
-      const cfg = await getCoreSettings(organizationId ?? undefined);
-      const name =
-        (typeof cfg.company_name === "string" && cfg.company_name.trim()) ||
-        (typeof cfg.workspace_name === "string" && String(cfg.workspace_name).trim()) ||
-        "";
-      const raw =
-        (typeof cfg.company_logo_url === "string" && cfg.company_logo_url.trim()) ||
-        (typeof cfg.logo_url === "string" && cfg.logo_url.trim()) ||
-        "";
-      setCompanyName(name);
-      setLogoUrl(normalizeTenantLogoUrl(raw));
+      const b = await getTenantBrandingForActor(actorUserId, organizationId);
+      setCompanyName(b.company_display_name.trim());
+      setLogoUrl(normalizeTenantLogoUrl(b.logo_url));
     } catch {
       setCompanyName("");
       setLogoUrl("");
     } finally {
       setLoading(false);
     }
-  }, [organizationId]);
+  }, [organizationId, actorUserId]);
 
   useEffect(() => {
+    if (profileLoading) return;
     void refresh();
-  }, [refresh]);
+  }, [refresh, profileLoading]);
 
   const value = useMemo(
     () => ({ companyName, logoUrl, loading, refresh }),

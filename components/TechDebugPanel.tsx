@@ -3,8 +3,8 @@
 /**
  * TechDebugPanel — Super-admin granular developer tooling panel.
  *
- * Opened via the "🛠️ Tech Debug" sidebar item (super_admin only, controlled by
- * canSeeTechDebug in useRbacPermissions).
+ * Opened via the "Tech Debug" sidebar item (internal technical roles; see
+ * `canSeeTechDebug` in useRbacPermissions).
  *
  * Manages AdminDebugContext flags through DebugModeContext:
  *   • Master debug mode (gates everything)
@@ -29,6 +29,7 @@ import {
   X,
 } from "lucide-react";
 import { useDebugMode } from "./DebugModeContext";
+import { DevRoleSwitcher } from "./DevRoleSwitcher";
 import { useUserRole } from "./UserRoleContext";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -161,7 +162,7 @@ export function TechDebugPanel({ open, onClose }: TechDebugPanelProps) {
             </div>
             <div className="leading-tight">
               <p className="text-sm font-bold text-foreground">Tech Debug</p>
-              <p className="text-[10px] text-muted-foreground">Super Admin Developer Tools</p>
+              <p className="text-[10px] text-muted-foreground">Internal developer tools</p>
             </div>
           </div>
 
@@ -188,6 +189,16 @@ export function TechDebugPanel({ open, onClose }: TechDebugPanelProps) {
               onChange={setDebugMode}
               icon={Terminal}
             />
+          </div>
+
+          <div>
+            <SectionLabel>Role simulation</SectionLabel>
+            <div className="rounded-xl border border-border bg-muted/30 p-3">
+              <p className="mb-2 text-xs text-muted-foreground leading-relaxed">
+                Pick a mock RBAC tier to exercise navigation and gates. Turning this on enables Debug Mode.
+              </p>
+              <DevRoleSwitcher />
+            </div>
           </div>
 
           {/* Display flags */}

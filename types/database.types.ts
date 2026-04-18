@@ -179,10 +179,32 @@ export type ProfileRow = {
   full_name: string | null;
   /** Roles: super_admin | admin | operator */
   role: string | null;
+  /** Preferred FK → `public.roles.id` (migration 20260621100000). */
+  role_id: string | null;
   /** Public URL of profile photo in the `profiles` storage bucket. */
   photo_url: string | null;
   created_at: string;
   updated_at: string | null;
+};
+
+// ---------------------------------------------------------------------------
+// roles (access foundation)
+// ---------------------------------------------------------------------------
+
+export type RoleScope = "system" | "tenant";
+
+/**
+ * `public.roles` — scoped role catalog (system vs tenant).
+ */
+export type RolesRow = {
+  id: string;
+  key: string;
+  name: string;
+  description: string | null;
+  scope: RoleScope;
+  is_system: boolean;
+  is_assignable: boolean;
+  created_at: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -214,6 +236,18 @@ export type ClaimSubmissionsRow = {
   updated_at: string | null;
   /** URL to the filed claim report / confirmation PDF (set by Python agent). */
   report_url: string | null;
+};
+
+// ---------------------------------------------------------------------------
+// platform_settings (singleton: id = true)
+// ---------------------------------------------------------------------------
+
+export type PlatformSettingsRow = {
+  id: boolean;
+  app_name: string;
+  logo_url: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -255,16 +289,16 @@ export type Database = {
         Insert: Record<string, unknown>;
         Update: Record<string, unknown>;
         /**
-         * FK: profiles.organization_id → organization_settings.organization_id
-         * (UNIQUE constraint on organization_settings.organization_id required — see
-         * migration 20260414_profiles_organization_id_fkey.sql)
+         * FK: profiles.organization_id → public.organizations(id)
+         * (migration 20260622100000_profiles_organization_id_fk_organizations.sql;
+         * supersedes 20260414 target of organization_settings for PostgREST embeds.)
          */
         Relationships: [
           {
             foreignKeyName: "profiles_organization_id_fkey";
             columns: ["organization_id"];
-            referencedRelation: "organization_settings";
-            referencedColumns: ["organization_id"];
+            referencedRelation: "organizations";
+            referencedColumns: ["id"];
           },
         ];
       };
@@ -294,6 +328,12 @@ export type Database = {
       };
       organization_settings: {
         Row: OrganizationSettingsRow;
+        Insert: Record<string, unknown>;
+        Update: Record<string, unknown>;
+        Relationships: [];
+      };
+      platform_settings: {
+        Row: PlatformSettingsRow;
         Insert: Record<string, unknown>;
         Update: Record<string, unknown>;
         Relationships: [];

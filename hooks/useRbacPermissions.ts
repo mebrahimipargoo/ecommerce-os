@@ -11,7 +11,12 @@
  */
 
 import { useMemo } from "react";
-import { useUserRole, ROLE_HIERARCHY, type UserRole } from "../components/UserRoleContext";
+import {
+  useUserRole,
+  ROLE_HIERARCHY,
+  INTERNAL_DEV_BADGE_ROLE_KEYS,
+  type UserRole,
+} from "../components/UserRoleContext";
 
 export type RbacPermissions = {
   // ── Operations (visible to everyone except pure operator) ──
@@ -31,8 +36,12 @@ export type RbacPermissions = {
   // ── Platform (super_admin only) ───────────────────────────
   canSeePlatformAdmin:   boolean;
 
+  /** Tenant company name / logo on `organization_settings` — tenant_admin (tier `admin`), super_admin, and catalog `programmer`. */
+  canEditTenantBranding: boolean;
+
   /**
-   * Tech Debug slide-over panel (granular debug flags). super_admin only.
+   * Tech Debug slide-over panel (granular debug flags + mock role tier).
+   * Internal technical catalog roles; see implementation.
    */
   canSeeTechDebug:       boolean;
 
@@ -60,7 +69,8 @@ export type RbacPermissions = {
 };
 
 export function useRbacPermissions(): RbacPermissions {
-  const { role } = useUserRole();
+  const { role, canonicalRoleKey } = useUserRole();
+  const ck = (canonicalRoleKey ?? "").trim().toLowerCase();
 
   return useMemo((): RbacPermissions => {
     const isAtLeast = (minRole: UserRole): boolean =>
@@ -86,7 +96,16 @@ export function useRbacPermissions(): RbacPermissions {
       // Platform menu: super_admin only
       canSeePlatformAdmin:  role === "super_admin",
 
-      canSeeTechDebug:      role === "super_admin",
+      // Tenant org branding: tenant admins + super admins; `programmer` is system tier but edits tenant branding by policy.
+      canEditTenantBranding:
+        role === "admin"
+        || role === "super_admin"
+        || ck === "programmer",
+
+      // Tech Debug panel: super_admin tier, or internal staff by catalog role key.
+      canSeeTechDebug:
+        role === "super_admin"
+        || INTERNAL_DEV_BADGE_ROLE_KEYS.has(ck),
 
       // WMS: available to all roles; operators see only this section
       canSeeWmsTools:       true,
@@ -97,5 +116,5 @@ export function useRbacPermissions(): RbacPermissions {
 
       isAtLeast,
     };
-  }, [role]);
+  }, [role, ck]);
 }

@@ -1,20 +1,26 @@
 "use client";
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
-  ArrowLeft, ImageIcon, KeyRound, Loader2, Pencil, Plus, Save, Trash2, UserRound, X,
+  ArrowLeft, KeyRound, Loader2, Pencil, Plus, Save, Tag, Trash2, UserRound, X,
 } from "lucide-react";
 import { isAdminRole, useUserRole } from "../../../components/UserRoleContext";
 import { UserProfileAvatar } from "./UserProfileAvatar";
 import {
+  assignUserGroup,
   createUserProfile,
   deleteUserProfile,
   getTenantCompanyIdForUsersPage,
+  listAssignableRolesForUsers,
+  listGroupsForOrganization,
+  listUserGroupAssignmentsForProfiles,
   listUserProfiles,
+  removeUserGroup,
   updateUserProfile,
+  type AssignableRoleRow,
 } from "./users-actions";
-import type { ProfileRow } from "./users-types";
+import type { OrgGroupRow, ProfileRow } from "./users-types";
 import type { CompanyOption } from "../../../lib/imports-types";
 import { listCompaniesForImports } from "../imports/companies-actions";
 import { uploadUserProfilePhotoAction } from "./upload-profile-photo-action";
@@ -29,19 +35,31 @@ const BTN_SECONDARY =
 
 type Toast = { msg: string; ok: boolean } | null;
 const MIN_RESET_PASSWORD_LENGTH = 8;
-type EditableUserRole = "super_admin" | "system_employee" | "tenant_admin" | "employee";
 
-function normalizeEditableRole(role: string | null | undefined): EditableUserRole {
+function humanizeRoleKey(k: string | null | undefined): string {
+  const s = (k ?? "").trim().toLowerCase();
+  if (!s) return "—";
+  return s
+    .split("_")
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+/** Map stored / legacy display keys to an assignable catalog key for the role dropdown. */
+function normalizeRolePickerValue(
+  role: string | null | undefined,
+  assignableKeys: Set<string>,
+): string {
   const value = (role ?? "").trim().toLowerCase();
-  if (value === "super_admin") return "super_admin";
-  if (value === "system_employee") return "system_employee";
-  if (value === "tenant_admin" || value === "admin") return "tenant_admin";
-  if (value === "employee" || value === "operator") return "employee";
-  return "employee";
+  if (value === "admin") return assignableKeys.has("tenant_admin") ? "tenant_admin" : value;
+  if (assignableKeys.has(value)) return value;
+  if (assignableKeys.has("employee")) return "employee";
+  return [...assignableKeys][0] ?? "employee";
 }
 
 export default function UsersPage() {
-  const { role, actorUserId } = useUserRole();
+  const { role, actorUserId, organizationId } = useUserRole();
   const [rows, setRows] = useState<ProfileRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<Toast>(null);
@@ -50,7 +68,16 @@ export default function UsersPage() {
   const [saving, setSaving] = useState(false);
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
-  const [userRole, setUserRole] = useState<EditableUserRole>("employee");
+  const [userRole, setUserRole] = useState<string>("employee");
+  const [assignableRoles, setAssignableRoles] = useState<AssignableRoleRow[]>([]);
+
+  useEffect(() => {
+    if (!modalOpen || assignableRoles.length === 0) return;
+    const keys = new Set(assignableRoles.map((r) => r.key));
+    if (!keys.has(userRole)) {
+      setUserRole(normalizeRolePickerValue(userRole, keys));
+    }
+  }, [modalOpen, assignableRoles, userRole]);
   const [photoUploading, setPhotoUploading] = useState(false);
   const [pendingPhoto, setPendingPhoto] = useState<File | null>(null);
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
@@ -61,37 +88,66 @@ export default function UsersPage() {
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [resettingPassword, setResettingPassword] = useState(false);
+  const [groupsForEdit, setGroupsForEdit] = useState<OrgGroupRow[]>([]);
+  const [groupsEditLoading, setGroupsEditLoading] = useState(false);
+  const [groupPickId, setGroupPickId] = useState("");
+  const [groupBusy, setGroupBusy] = useState(false);
+  const editLoadSeq = useRef(0);
 
   const showToast = useCallback((msg: string, ok: boolean) => {
     setToast({ msg, ok });
     setTimeout(() => setToast(null), 4200);
   }, []);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (): Promise<ProfileRow[] | null> => {
     setLoading(true);
-    const res = await listUserProfiles();
-    setLoading(false);
+    const res = await listUserProfiles({
+      actorProfileId: actorUserId,
+      filterOrganizationId: organizationId,
+    });
     if (!res.ok) {
+      setLoading(false);
       showToast(res.error, false);
-      return;
+      return null;
     }
-    setRows(res.rows);
-  }, [showToast]);
+    const ids = res.rows.map((r) => r.id);
+    const assignRes = await listUserGroupAssignmentsForProfiles(ids, {
+      actorProfileId: actorUserId,
+      filterOrganizationId: organizationId,
+    });
+    let merged: ProfileRow[];
+    if (assignRes.ok) {
+      merged = res.rows.map((r) => ({
+        ...r,
+        assigned_groups: assignRes.byProfileId[r.id] ?? [],
+      }));
+    } else {
+      showToast(assignRes.error, false);
+      merged = res.rows.map((r) => ({ ...r, assigned_groups: [] }));
+    }
+    setRows(merged);
+    setLoading(false);
+    return merged;
+  }, [showToast, actorUserId, organizationId]);
 
   useEffect(() => {
     if (isAdminRole(role)) void load();
-  }, [role, load]);
+  }, [role, organizationId, load]);
 
   useEffect(() => {
     if (!isAdminRole(role)) return;
     let cancelled = false;
     void (async () => {
-      const [tid, coRes] = await Promise.all([
+      const [tid, coRes, rolesRes] = await Promise.all([
         getTenantCompanyIdForUsersPage(),
         listCompaniesForImports(actorUserId),
+        listAssignableRolesForUsers(),
       ]);
       if (cancelled) return;
       setTenantDefaultCompanyId(tid);
+      if (rolesRes.ok) {
+        setAssignableRoles(rolesRes.rows);
+      }
       if (coRes.ok) {
         setCompanies(coRes.rows);
         const pick = coRes.rows.some((c) => c.id === tid) ? tid : coRes.rows[0]?.id ?? "";
@@ -107,7 +163,8 @@ export default function UsersPage() {
     setEditing(null);
     setFullName("");
     setEmail("");
-    setUserRole("employee");
+    const tenantFirst = assignableRoles.find((r) => r.scope === "tenant");
+    setUserRole(tenantFirst?.key ?? assignableRoles[0]?.key ?? "employee");
     setPendingPhoto(null);
     const pick =
       companies.some((c) => c.id === tenantDefaultCompanyId) ? tenantDefaultCompanyId : companies[0]?.id ?? "";
@@ -116,16 +173,41 @@ export default function UsersPage() {
   }
 
   function openEdit(row: ProfileRow) {
+    const seq = ++editLoadSeq.current;
     setEditing(row);
     setFullName(row.full_name ?? "");
     setEmail(row.email);
-    setUserRole(normalizeEditableRole(row.role));
+    const keys = new Set(assignableRoles.map((r) => r.key));
+    setUserRole(normalizeRolePickerValue(row.role, keys));
+    setGroupPickId("");
+    setGroupsForEdit([]);
     setModalOpen(true);
+    if (!row.organization_id) {
+      setGroupsEditLoading(false);
+      return;
+    }
+    setGroupsEditLoading(true);
+    void (async () => {
+      const g = await listGroupsForOrganization(row.organization_id!, {
+        actorProfileId: actorUserId,
+        filterOrganizationId: organizationId,
+      });
+      if (seq !== editLoadSeq.current) return;
+      setGroupsEditLoading(false);
+      if (g.ok) {
+        setGroupsForEdit(g.rows);
+      } else {
+        showToast(g.error, false);
+      }
+    })();
   }
 
   function closeModal() {
     setModalOpen(false);
     setEditing(null);
+    setGroupsForEdit([]);
+    setGroupPickId("");
+    setGroupsEditLoading(false);
   }
 
   function openResetPassword(row: ProfileRow) {
@@ -155,7 +237,13 @@ export default function UsersPage() {
       const res = await uploadUserProfilePhotoAction(fd);
       if (!res.ok) throw new Error(res.error);
       showToast("Profile photo updated.", true);
-      await load();
+      const merged = await load();
+      if (merged) {
+        setEditing((e) => {
+          if (!e || e.id !== profileId) return e;
+          return merged.find((r) => r.id === profileId) ?? e;
+        });
+      }
     } catch (err) {
       showToast(err instanceof Error ? err.message : "Upload failed.", false);
     } finally {
@@ -217,6 +305,57 @@ export default function UsersPage() {
     await load();
   }
 
+  async function handleAddGroup() {
+    if (!editing || !groupPickId) return;
+    const profileId = editing.id;
+    setGroupBusy(true);
+    try {
+      const res = await assignUserGroup(profileId, groupPickId, {
+        actorProfileId: actorUserId,
+        filterOrganizationId: organizationId,
+      });
+      if (!res.ok) throw new Error(res.error);
+      showToast("Group added.", true);
+      const merged = await load();
+      setGroupPickId("");
+      if (merged) {
+        setEditing((e) => {
+          if (!e || e.id !== profileId) return e;
+          return merged.find((r) => r.id === profileId) ?? e;
+        });
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Add failed.", false);
+    } finally {
+      setGroupBusy(false);
+    }
+  }
+
+  async function handleRemoveGroup(groupId: string) {
+    if (!editing) return;
+    const profileId = editing.id;
+    setGroupBusy(true);
+    try {
+      const res = await removeUserGroup(profileId, groupId, {
+        actorProfileId: actorUserId,
+        filterOrganizationId: organizationId,
+      });
+      if (!res.ok) throw new Error(res.error);
+      showToast("Group removed.", true);
+      const merged = await load();
+      if (merged) {
+        setEditing((e) => {
+          if (!e || e.id !== profileId) return e;
+          return merged.find((r) => r.id === profileId) ?? e;
+        });
+      }
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "Remove failed.", false);
+    } finally {
+      setGroupBusy(false);
+    }
+  }
+
   async function handleResetPasswordSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!resetTarget) return;
@@ -259,7 +398,7 @@ export default function UsersPage() {
         <UserRound className="mx-auto mb-4 h-12 w-12 text-muted-foreground" />
         <h1 className="text-lg font-bold">Users</h1>
         <p className="mt-2 text-sm text-muted-foreground">
-          Switch to <strong>Admin</strong> or <strong>Super Admin</strong> in the header to manage users.
+          You need an organization <strong>Admin</strong> role (or internal staff with user management) to open this directory.
         </p>
         <Link href="/" className="mt-6 inline-block text-sm font-medium text-primary underline">
           Back to dashboard
@@ -269,7 +408,7 @@ export default function UsersPage() {
   }
 
   return (
-    <div className="mx-auto max-w-5xl px-4 py-8">
+    <div className="mx-auto w-full min-w-0 max-w-6xl px-4 py-8 sm:px-6">
       <Link
         href="/"
         className="mb-6 inline-flex items-center gap-2 text-sm font-medium text-muted-foreground transition hover:text-foreground"
@@ -300,7 +439,7 @@ export default function UsersPage() {
           <div>
             <h1 className="text-2xl font-bold tracking-tight">Users</h1>
             <p className="text-sm text-muted-foreground">
-              Manage workspace profiles, roles, and photos.
+              Directory: roles, groups, and admin password resets.
             </p>
           </div>
         </div>
@@ -322,64 +461,114 @@ export default function UsersPage() {
           </p>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-sm">
+            <table className="w-full min-w-[640px] table-fixed border-collapse text-sm">
               <thead>
-                <tr className="border-b border-border bg-muted/40 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  <th className="px-4 py-3">User</th>
-                  <th className="px-4 py-3">Email</th>
-                  <th className="px-4 py-3">Company</th>
-                  <th className="px-4 py-3">Role</th>
-                  <th className="px-4 py-3 text-right">Actions</th>
+                <tr className="border-b border-border bg-muted/40 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  <th className="w-[22%] px-2 py-2.5 sm:px-3">User</th>
+                  <th className="w-[26%] px-2 py-2.5 sm:px-3">Email</th>
+                  <th className="w-[14%] px-2 py-2.5 sm:px-3">Company</th>
+                  <th className="w-[18%] px-2 py-2.5 sm:px-3">Role</th>
+                  <th className="w-[12%] px-2 py-2.5 sm:px-3">Groups</th>
+                  <th className="w-[8%] px-2 py-2.5 text-right sm:px-3">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((row) => (
                   <tr key={row.id} className="border-b border-border last:border-0">
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-3">
+                    <td className="px-2 py-2 align-middle sm:px-3">
+                      <div className="flex min-w-0 items-center gap-2">
                         <UserProfileAvatar name={row.full_name || row.email} photoUrl={row.photo_url} />
-                        <span className="font-medium">{row.full_name || "—"}</span>
+                        <span className="min-w-0 truncate font-medium" title={row.full_name || undefined}>
+                          {row.full_name || "—"}
+                        </span>
                       </div>
                     </td>
-                    <td className="px-4 py-3 text-muted-foreground">{row.email || "—"}</td>
-                    <td className="px-4 py-3 text-muted-foreground">
-                      {row.company_name ?? "—"}
+                    <td className="px-2 py-2 align-middle text-muted-foreground sm:px-3">
+                      <span className="block truncate text-xs" title={row.email || undefined}>
+                        {row.email || "—"}
+                      </span>
                     </td>
-                    <td className="px-4 py-3 capitalize">{row.role}</td>
-                    <td className="px-4 py-3 text-right">
-                      <div className="flex justify-end gap-1">
-                        <label className="cursor-pointer rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground">
-                          <input
-                            type="file"
-                            accept="image/*"
-                            className="hidden"
-                            disabled={photoUploading}
-                            onChange={(e) => void handlePhotoChange(e, row.id)}
-                          />
-                          <span className="sr-only">Change photo</span>
-                          <ImageIcon className="h-4 w-4" />
-                        </label>
+                    <td className="px-2 py-2 align-middle text-muted-foreground sm:px-3">
+                      <span className="block truncate text-xs" title={row.company_name ?? undefined}>
+                        {row.company_name ?? "—"}
+                      </span>
+                    </td>
+                    <td
+                      className="px-2 py-2 align-middle sm:px-3"
+                      title={row.role ? `${row.role_display_name?.trim() || humanizeRoleKey(row.role)} (${row.role})` : undefined}
+                    >
+                      <div className="min-w-0">
+                        <span className="block truncate text-xs font-medium text-foreground">
+                          {row.role_display_name?.trim() || humanizeRoleKey(row.role)}
+                        </span>
+                        {row.role_scope ? (
+                          <span
+                            className={[
+                              "mt-0.5 inline-block max-w-full truncate rounded px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
+                              row.role_scope === "system"
+                                ? "bg-amber-100 text-amber-900 dark:bg-amber-950/60 dark:text-amber-100"
+                                : "bg-sky-100 text-sky-900 dark:bg-sky-950/60 dark:text-sky-100",
+                            ].join(" ")}
+                          >
+                            {row.role_scope}
+                          </span>
+                        ) : null}
+                      </div>
+                    </td>
+                    <td className="px-2 py-2 align-middle sm:px-3">
+                      {row.organization_id ? (
+                        <div className="flex min-w-0 flex-wrap gap-0.5">
+                          {(row.assigned_groups ?? []).length === 0 ? (
+                            <span className="text-muted-foreground">—</span>
+                          ) : (
+                            <>
+                              {(row.assigned_groups ?? []).slice(0, 2).map((g) => (
+                                <span
+                                  key={g.user_group_id}
+                                  className="inline-flex max-w-[5.5rem] items-center truncate rounded bg-muted px-1 py-0.5 text-[10px] text-foreground"
+                                  title={`${g.name} (${g.key})`}
+                                >
+                                  {g.name}
+                                </span>
+                              ))}
+                              {(row.assigned_groups ?? []).length > 2 ? (
+                                <span className="text-[10px] text-muted-foreground">
+                                  +{(row.assigned_groups ?? []).length - 2}
+                                </span>
+                              ) : null}
+                            </>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </td>
+                    <td className="px-1 py-2 align-middle text-right sm:px-2">
+                      <div className="flex justify-end gap-0">
                         <button
                           type="button"
-                          className="rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"
+                          className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"
                           onClick={() => openResetPassword(row)}
                           aria-label="Reset password"
+                          title="Reset password"
                         >
                           <KeyRound className="h-4 w-4" />
                         </button>
                         <button
                           type="button"
-                          className="rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"
+                          className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"
                           onClick={() => openEdit(row)}
                           aria-label="Edit"
+                          title="Edit user"
                         >
                           <Pencil className="h-4 w-4" />
                         </button>
                         <button
                           type="button"
-                          className="rounded-md p-2 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30"
+                          className="rounded-md p-1.5 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30"
                           onClick={() => void handleDelete(row.id)}
                           aria-label="Delete"
+                          title="Remove user"
                         >
                           <Trash2 className="h-4 w-4" />
                         </button>
@@ -502,17 +691,116 @@ export default function UsersPage() {
                   id="role"
                   className={INPUT}
                   value={userRole}
-                  onChange={(e) => setUserRole(e.target.value as EditableUserRole)}
+                  onChange={(e) => setUserRole(e.target.value)}
+                  disabled={assignableRoles.length === 0}
                 >
-                  <option value="employee">Employee — Office staff (no Settings/Users)</option>
-                  <option value="tenant_admin">Admin — Company boss (full org access)</option>
-                  <option value="system_employee">System Employee — SaaS staff (multi-org)</option>
-                  <option value="super_admin">Super Admin — God mode (platform owner)</option>
+                  {assignableRoles.length === 0 ? (
+                    <option value="">Loading roles…</option>
+                  ) : (
+                    <>
+                      <optgroup label="Company (tenant)">
+                        {assignableRoles
+                          .filter((r) => r.scope === "tenant")
+                          .map((r) => (
+                            <option key={r.id} value={r.key}>
+                              {r.name} ({r.key})
+                            </option>
+                          ))}
+                      </optgroup>
+                      <optgroup label="Internal (system)">
+                        {assignableRoles
+                          .filter((r) => r.scope === "system")
+                          .map((r) => (
+                            <option key={r.id} value={r.key}>
+                              {r.name} ({r.key})
+                            </option>
+                          ))}
+                      </optgroup>
+                    </>
+                  )}
                 </select>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Role controls which modules and sections this user can access.
+                  Tenant roles apply to customer organizations; system roles are for internal staff.
                 </p>
               </div>
+              {editing && editing.organization_id ? (
+                <div className="rounded-lg border border-border bg-muted/15 p-3">
+                  <div className="mb-2 flex items-center gap-2 text-sm font-medium">
+                    <Tag className="h-3.5 w-3.5 text-muted-foreground" />
+                    Groups
+                  </div>
+                  {groupsEditLoading ? (
+                    <p className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Loading groups…
+                    </p>
+                  ) : (
+                    <>
+                      <div className="mb-2 flex flex-wrap gap-1">
+                        {(editing.assigned_groups ?? []).length === 0 ? (
+                          <span className="text-xs text-muted-foreground">No groups assigned.</span>
+                        ) : (
+                          (editing.assigned_groups ?? []).map((g) => (
+                            <span
+                              key={g.user_group_id}
+                              className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2 py-0.5 text-xs"
+                            >
+                              <span className="max-w-[160px] truncate" title={g.key}>{g.name}</span>
+                              <button
+                                type="button"
+                                className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                                disabled={groupBusy}
+                                aria-label={`Remove ${g.name}`}
+                                onClick={() => void handleRemoveGroup(g.group_id)}
+                              >
+                                <X className="h-3 w-3" />
+                              </button>
+                            </span>
+                          ))
+                        )}
+                      </div>
+                      <div className="flex flex-wrap items-end gap-2">
+                        <div className="min-w-0 flex-1">
+                          <label className={LABEL} htmlFor="addGroup">Add group</label>
+                          <select
+                            id="addGroup"
+                            className={INPUT}
+                            value={groupPickId}
+                            onChange={(e) => setGroupPickId(e.target.value)}
+                            disabled={groupBusy || groupsForEdit.length === 0}
+                          >
+                            <option value="">
+                              {groupsForEdit.length === 0 ? "No groups in this org" : "Select…"}
+                            </option>
+                            {groupsForEdit
+                              .filter((g) => !(editing.assigned_groups ?? []).some((a) => a.group_id === g.id))
+                              .map((g) => (
+                                <option key={g.id} value={g.id}>
+                                  {g.name} ({g.key})
+                                </option>
+                              ))}
+                          </select>
+                        </div>
+                        <button
+                          type="button"
+                          className={[BTN_SECONDARY, "h-10 shrink-0"].join(" ")}
+                          disabled={groupBusy || !groupPickId}
+                          onClick={() => void handleAddGroup()}
+                        >
+                          Add
+                        </button>
+                      </div>
+                      <p className="mt-1 text-[11px] text-muted-foreground">
+                        Groups are scoped to this user&apos;s company organization.
+                      </p>
+                    </>
+                  )}
+                </div>
+              ) : editing ? (
+                <p className="text-xs text-muted-foreground">
+                  Groups require a company on the profile; this user has no organization set.
+                </p>
+              ) : null}
               <div className="flex justify-end gap-2 pt-2">
                 <button type="button" className={BTN_SECONDARY} onClick={closeModal}>
                   Cancel

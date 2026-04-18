@@ -4,6 +4,7 @@ import "./globals.css";
 import { ThemeProvider } from "../components/providers/ThemeProvider";
 import { DebugModeProvider } from "../components/DebugModeContext";
 import { AppShell } from "../components/AppShell";
+import { getPlatformAppNameForMetadata } from "../lib/platform-settings-read";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -16,10 +17,13 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-export const metadata: Metadata = {
-  title: "E-commerce OS",
-  description: "B2B Returns & Recovery Platform",
-};
+export async function generateMetadata(): Promise<Metadata> {
+  const title = await getPlatformAppNameForMetadata();
+  return {
+    title,
+    description: "B2B Returns & Recovery Platform",
+  };
+}
 
 export const viewport = {
   width: "device-width",
