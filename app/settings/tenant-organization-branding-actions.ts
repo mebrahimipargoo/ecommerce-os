@@ -1,13 +1,19 @@
 "use server";
 
 import { supabaseServer } from "../../lib/supabase-server";
+import { getSessionUserIdFromCookies } from "../../lib/supabase-server-auth";
 import {
   canEditTenantOrganizationBranding,
-  loadTenantProfile,
+  loadActorTenantProfile,
   resolveTenantOrganizationId,
   resolveWriteOrganizationId,
+  type TenantProfileRow,
   type TenantWriteContext,
 } from "../../lib/server-tenant";
+import {
+  canPickWorkspaceOrganizationForTenantBranding,
+  normalizeRoleKeyForBranding,
+} from "../../lib/tenant-branding-permissions";
 import { getOrganizationLogoUrlFromDb } from "../../lib/organization-logo";
 import { normalizeTenantLogoUrl } from "../../lib/tenant-logo-url";
 import { isUuidString } from "../../lib/uuid";
@@ -18,6 +24,95 @@ const DEBUG =
   process.env.NEXT_PUBLIC_BRANDING_DEBUG === "1";
 function dlog(...args: unknown[]) {
   if (DEBUG) console.log("[tenant-branding-server]", ...args);
+}
+
+/** Same columns as `loadTenantProfile` — used only for precise error strings when resolution fails. */
+const PROFILE_SELECT_FOR_DIAGNOSTICS =
+  "id, organization_id, full_name, role, role_id, photo_url, team_groups";
+
+/**
+ * Explains why `loadActorTenantProfile` returned null (no session, missing profiles row, DB error, or id mismatch).
+ * Prefix `[branding]` makes these easy to grep while debugging.
+ */
+async function buildBrandingProfileResolutionError(clientAid: string): Promise<string> {
+  let sessionUid: string | null = null;
+  try {
+    sessionUid = await getSessionUserIdFromCookies();
+  } catch {
+    return "[branding] Could not read auth cookies (cookies() failed).";
+  }
+  if (!sessionUid) {
+    return (
+      "[branding] No Supabase session user id in cookies. Sign in again, or ensure auth cookies are sent with server actions."
+    );
+  }
+
+  const s = await supabaseServer
+    .from("profiles")
+    .select(PROFILE_SELECT_FOR_DIAGNOSTICS)
+    .eq("id", sessionUid)
+    .maybeSingle();
+  if (s.error) {
+    return `[branding] profiles query failed for session uid (${sessionUid.slice(0, 8)}…): ${s.error.message}`;
+  }
+  if (!s.data) {
+    return (
+      "[branding] No row in public.profiles for the auth session user id. " +
+      "This app expects profiles.id = auth.users.id. Create/sync the profile row for this user."
+    );
+  }
+
+  const c = await supabaseServer
+    .from("profiles")
+    .select(PROFILE_SELECT_FOR_DIAGNOSTICS)
+    .eq("id", clientAid)
+    .maybeSingle();
+  if (c.error) {
+    return `[branding] profiles query failed for client actor id (${clientAid.slice(0, 8)}…): ${c.error.message}`;
+  }
+  if (!c.data) {
+    return (
+      "[branding] No public.profiles row for the client actor id. " +
+      "Settings must pass profiles.id (same as auth.users.id). Reload the page to refresh actor id."
+    );
+  }
+
+  if (sessionUid !== clientAid) {
+    return (
+      `[branding] Session user id (${sessionUid.slice(0, 8)}…) and client actor id (${clientAid.slice(0, 8)}…) differ. ` +
+      "Both have profiles rows; resolve the mismatch (sign out/in or hard refresh)."
+    );
+  }
+
+  return (
+    "[branding] Unexpected: profiles rows exist but loadActorTenantProfile returned null. " +
+    "Enable BRANDING_DEBUG=1 and check [tenant-branding-server] logs."
+  );
+}
+
+function buildBrandingOrgResolutionError(
+  profile: TenantProfileRow,
+  tenantOrgHint: string | null | undefined,
+): string {
+  const rk = normalizeRoleKeyForBranding(profile.role);
+  const hint = (tenantOrgHint ?? "").trim();
+  if (canPickWorkspaceOrganizationForTenantBranding(rk)) {
+    if (!hint || !isUuidString(hint)) {
+      return (
+        "[branding] No workspace organization selected. Pick a tenant in the org/workspace switcher, then save again."
+      );
+    }
+    return (
+      "[branding] Could not resolve the selected workspace organization. Re-select the organization and try again."
+    );
+  }
+  const home = (profile.organization_id ?? "").trim();
+  if (!home) {
+    return (
+      "[branding] Your profile has no organization_id. Ask an admin to assign you to an organization."
+    );
+  }
+  return "[branding] Resolved organization id is missing or invalid for this save.";
 }
 
 export type TenantOrganizationBranding = {
@@ -84,20 +179,24 @@ export async function getTenantBrandingForActor(
   actorProfileId: string | null | undefined,
   organizationIdHint?: string | null,
 ): Promise<TenantOrganizationBranding> {
-  const aid = String(actorProfileId ?? "").trim();
-  dlog("getTenantBrandingForActor", { actorProfileId: aid || null, organizationIdHint });
-  if (!aid || !isUuidString(aid)) {
+  const clientAid = String(actorProfileId ?? "").trim();
+  dlog("getTenantBrandingForActor", { actorProfileId: clientAid || null, organizationIdHint });
+  if (!clientAid || !isUuidString(clientAid)) {
     dlog("getTenantBrandingForActor → no actor profile id, returning empty");
     return { company_display_name: "", logo_url: "" };
   }
-  const profile = await loadTenantProfile(aid);
+  const profile = await loadActorTenantProfile(clientAid);
   dlog("getTenantBrandingForActor → profile", profile ? {
     id: profile.id,
     role: profile.role,
     role_scope: profile.role_scope,
     organization_id: profile.organization_id,
   } : null);
-  const orgId = await resolveWriteOrganizationId(aid, organizationIdHint ?? null);
+  if (!profile) {
+    dlog("getTenantBrandingForActor → loadActorTenantProfile returned null", { clientAid });
+    return { company_display_name: "", logo_url: "" };
+  }
+  const orgId = await resolveWriteOrganizationId(profile.id, organizationIdHint ?? null);
   dlog("getTenantBrandingForActor → resolved orgId", orgId);
   if (!isUuidString(orgId)) {
     return { company_display_name: "", logo_url: "" };
@@ -113,8 +212,7 @@ export type SaveTenantOrganizationBrandingInput = {
 
 /**
  * Persists tenant company name and logo on `organization_settings` only.
- * Allowed for `tenant_admin`, legacy `admin`, `programmer`, and `super_admin`
- * (see {@link canEditTenantOrganizationBranding}).
+ * Allowed roles: see {@link canEditTenantOrganizationBranding} / `tenant-branding-permissions`.
  *
  * Implemented as a single upsert that preserves unrelated columns when the row
  * already exists, so name + logo always land atomically.
@@ -123,28 +221,47 @@ export async function saveTenantOrganizationBranding(
   input: SaveTenantOrganizationBrandingInput,
   tenant: TenantWriteContext | null | undefined,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
-  const aid = String(tenant?.actorProfileId ?? "").trim();
-  if (!aid || !isUuidString(aid)) {
-    dlog("save → missing/invalid actor profile id", { aid });
+  const clientAid = String(tenant?.actorProfileId ?? "").trim();
+  if (!clientAid || !isUuidString(clientAid)) {
+    dlog("save → missing/invalid actor profile id", { aid: clientAid });
     return { ok: false, error: "Missing or invalid session profile." };
   }
-  const profile = await loadTenantProfile(aid);
+
+  /**
+   * Session-first, then client `actorProfileId` — same chain as `loadActorTenantProfile` in server-tenant.
+   * Avoids only querying by session uid when that id has no profiles row yet the client id does.
+   */
+  const profile = await loadActorTenantProfile(clientAid);
   const allowed = canEditTenantOrganizationBranding(profile);
   dlog("save → permission check", {
-    aid,
-    role: profile?.role ?? null,
+    clientAid,
+    resolved_profile_id: profile?.id ?? null,
+    role_raw: profile?.role ?? null,
+    role_normalized: profile ? normalizeRoleKeyForBranding(profile.role) : null,
     role_scope: profile?.role_scope ?? null,
     profile_organization_id: profile?.organization_id ?? null,
+    profile_loaded: Boolean(profile),
     canEditTenantOrganizationBranding: allowed,
   });
+  if (!profile) {
+    dlog("save → loadActorTenantProfile returned null", { clientAid });
+    return { ok: false, error: await buildBrandingProfileResolutionError(clientAid) };
+  }
   if (!allowed) {
     return { ok: false, error: "You do not have permission to edit company branding." };
   }
 
-  const orgId = await resolveTenantOrganizationId(tenant ?? null);
-  dlog("save → resolved orgId", { tenantHint: tenant?.organizationId ?? null, orgId });
+  const tenantForWrite: TenantWriteContext = {
+    actorProfileId: profile.id,
+    organizationId: tenant?.organizationId,
+  };
+  const orgId = await resolveTenantOrganizationId(tenantForWrite);
+  dlog("save → resolved orgId", {
+    tenantHint: tenant?.organizationId ?? null,
+    orgId,
+  });
   if (!isUuidString(orgId)) {
-    return { ok: false, error: "No organization context for this save." };
+    return { ok: false, error: buildBrandingOrgResolutionError(profile, tenant?.organizationId) };
   }
 
   // Guard: verify organization actually exists (FK constraint on organization_settings).

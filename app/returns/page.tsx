@@ -370,7 +370,8 @@ export default function ReturnsPage() {
     <div className="flex min-h-0 w-full min-w-0 flex-1 flex-col">
       {/* Top Bar */}
       {/* Page title row — global TopHeader (theme/profile) is rendered by AppShell above */}
-      <header className="sticky top-0 z-[100] flex flex-wrap items-center gap-3 border-b border-border bg-card/90 px-4 py-3 backdrop-blur-sm">
+      {/* z below app TopHeader (z-50) so global chrome popovers aren’t covered */}
+      <header className="sticky top-0 z-20 flex flex-wrap items-center gap-3 border-b border-border bg-card/90 px-4 py-3 backdrop-blur-sm">
         <div className="min-w-0 flex-1">
           <h1 className="font-bold text-foreground">Returns & Logistics</h1>
           <p className="text-xs text-slate-400">FBA Reimbursement ERP · tenant-scoped data</p>
@@ -431,7 +432,7 @@ export default function ReturnsPage() {
       </header>
 
       {/* Tab Bar */}
-      <div className="sticky top-[57px] z-[90] border-b border-border bg-card">
+      <div className="sticky top-[57px] z-10 border-b border-border bg-card">
         <nav className="flex gap-0 overflow-x-auto px-4" role="tablist">
           {tabs.map((t) => {
             const Icon = t.icon; const active = activeTab === t.id;

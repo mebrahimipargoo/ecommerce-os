@@ -17,6 +17,7 @@ import {
   INTERNAL_DEV_BADGE_ROLE_KEYS,
   type UserRole,
 } from "../components/UserRoleContext";
+import { canEditTenantOrganizationBrandingByRoleKey } from "../lib/tenant-branding-permissions";
 
 export type RbacPermissions = {
   // ── Operations (visible to everyone except pure operator) ──
@@ -69,8 +70,10 @@ export type RbacPermissions = {
 };
 
 export function useRbacPermissions(): RbacPermissions {
-  const { role, canonicalRoleKey } = useUserRole();
+  const { role, canonicalRoleKey, actorCanonicalRoleKey } = useUserRole();
   const ck = (canonicalRoleKey ?? "").trim().toLowerCase();
+  /** Workspace chrome must follow the signed-in account, not “view as” simulation. */
+  const actorCk = (actorCanonicalRoleKey ?? "").trim().toLowerCase();
 
   return useMemo((): RbacPermissions => {
     const isAtLeast = (minRole: UserRole): boolean =>
@@ -96,11 +99,8 @@ export function useRbacPermissions(): RbacPermissions {
       // Platform menu: super_admin only
       canSeePlatformAdmin:  role === "super_admin",
 
-      // Tenant org branding: tenant admins + super admins; `programmer` is system tier but edits tenant branding by policy.
-      canEditTenantBranding:
-        role === "admin"
-        || role === "super_admin"
-        || ck === "programmer",
+      // Tenant org branding: canonical role keys only (not 5-tier UI labels).
+      canEditTenantBranding: canEditTenantOrganizationBrandingByRoleKey(canonicalRoleKey),
 
       // Tech Debug panel: super_admin tier, or internal staff by catalog role key.
       canSeeTechDebug:
@@ -111,10 +111,11 @@ export function useRbacPermissions(): RbacPermissions {
       canSeeWmsTools:       true,
       isWmsOnly:            isOperator,
 
-      // Multi-org switcher: platform-level staff
-      canSwitchOrganization: role === "super_admin" || role === "system_employee",
+      // Multi-org switcher: platform-level staff (actor only — stays on while viewing as a tenant user)
+      canSwitchOrganization:
+        actorCk === "super_admin" || actorCk === "programmer" || actorCk === "system_admin",
 
       isAtLeast,
     };
-  }, [role, ck]);
+  }, [role, ck, actorCk]);
 }

@@ -1,13 +1,14 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
-import { ImageIcon, Loader2, Save } from "lucide-react";
+import React, { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { ImageIcon, Loader2, Save } from "lucide-react";
 import {
-  getPlatformSettingsAction,
-  savePlatformSettingsAction,
-} from "./platform-settings-actions";
-import { uploadPlatformLogoAction } from "./upload-platform-logo-action";
+  getCompanySettingsAction,
+  saveCompanySettingsAction,
+} from "./company-settings-actions";
+import { uploadOrganizationLogoAction } from "../upload-organization-logo-action";
+import { useUserRole } from "@/components/UserRoleContext";
 import {
   responsiveFormInput,
   responsivePageInner,
@@ -15,46 +16,62 @@ import {
   responsivePageOuter,
 } from "../../../lib/responsive-page-shell";
 
-export default function PlatformSettingsPage() {
+export default function CompanySettingsPage() {
+  const { organizationId: workspaceOrganizationId, profileLoading } = useUserRole();
   const [loading, setLoading] = useState(true);
-  const [accessDenied, setAccessDenied] = useState<"not_authenticated" | "forbidden" | null>(null);
-  const [appName, setAppName] = useState("");
+  const [accessDenied, setAccessDenied] = useState<"not_authenticated" | "forbidden" | null>(
+    null,
+  );
+  const [organizationId, setOrganizationId] = useState<string | null>(null);
+  const [companyDisplayName, setCompanyDisplayName] = useState("");
+  const [fallbackOrganizationName, setFallbackOrganizationName] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
   const [uploadingLogo, setUploadingLogo] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const effectiveDisplayName = useMemo(() => {
+    const explicit = companyDisplayName.trim();
+    if (explicit) return explicit;
+    return fallbackOrganizationName.trim();
+  }, [companyDisplayName, fallbackOrganizationName]);
+
   useEffect(() => {
+    if (profileLoading) return;
     let cancelled = false;
     void (async () => {
-      const res = await getPlatformSettingsAction();
+      setLoading(true);
+      const res = await getCompanySettingsAction(workspaceOrganizationId);
       if (cancelled) return;
-      setAppName(res.app_name);
-      setLogoUrl(res.logo_url);
       setAccessDenied(res.accessDenied);
+      setOrganizationId(res.organizationId);
+      setCompanyDisplayName(res.companyDisplayName);
+      setFallbackOrganizationName(res.fallbackOrganizationName);
+      setLogoUrl(res.logoUrl);
       setLoading(false);
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [workspaceOrganizationId, profileLoading]);
 
   async function onSave(e: React.FormEvent) {
     e.preventDefault();
     setSaving(true);
     setError(null);
     setMessage(null);
-    const res = await savePlatformSettingsAction({
-      app_name: appName.trim(),
+    const res = await saveCompanySettingsAction({
+      company_display_name: companyDisplayName.trim(),
       logo_url: logoUrl.trim() || null,
+      organization_id: workspaceOrganizationId,
     });
     setSaving(false);
     if (!res.ok) {
       setError(res.error);
       return;
     }
-    setMessage("Platform branding saved.");
+    setMessage("Company branding saved.");
   }
 
   async function onLogoFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -67,7 +84,10 @@ export default function PlatformSettingsPage() {
     try {
       const formData = new FormData();
       formData.append("file", file);
-      const res = await uploadPlatformLogoAction(formData);
+      if (workspaceOrganizationId) {
+        formData.append("organization_id", workspaceOrganizationId);
+      }
+      const res = await uploadOrganizationLogoAction(formData);
       if (!res.ok) {
         setError(res.error);
         return;
@@ -85,7 +105,7 @@ export default function PlatformSettingsPage() {
         <div className={`${responsivePageInner} flex min-h-[40vh] items-center justify-center`}>
           <div className="flex items-center gap-3 text-sm text-muted-foreground">
             <Loader2 className="h-5 w-5 shrink-0 animate-spin" />
-            Loading platform settings...
+            Loading company settings...
           </div>
         </div>
       </div>
@@ -96,11 +116,11 @@ export default function PlatformSettingsPage() {
     return (
       <div className={responsivePageOuter}>
         <div className={responsivePageNarrow}>
-          <h1 className="text-lg font-semibold text-foreground">Platform settings</h1>
+          <h1 className="text-lg font-semibold text-foreground">Company settings</h1>
           <p className="mt-2 text-sm text-muted-foreground">
             {accessDenied === "not_authenticated"
               ? "You must be signed in to view this page."
-              : "Only super_admin can edit platform settings."}
+              : "You do not have access to edit company branding."}
           </p>
           <Link
             href="/settings"
@@ -118,14 +138,24 @@ export default function PlatformSettingsPage() {
       <div className={`${responsivePageInner} space-y-6`}>
         <header className="space-y-2">
           <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
-            Platform branding
+            Company branding
           </h1>
           <p className="max-w-3xl text-sm text-muted-foreground">
-            Super-admin-only platform identity. This writes only to{" "}
+            Tenant branding for your effective organization. This reads and writes only{" "}
             <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px]">
-              platform_settings
+              organization_settings.company_display_name
+            </code>{" "}
+            and{" "}
+            <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px]">
+              organization_settings.logo_url
             </code>
             .
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Effective organization:{" "}
+            <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[10px]">
+              {organizationId ?? "unknown"}
+            </code>
           </p>
           <Link
             href="/settings"
@@ -153,25 +183,32 @@ export default function PlatformSettingsPage() {
           <div className="min-w-0 space-y-4">
             <div>
               <label
-                htmlFor="platform-app-name"
+                htmlFor="company-display-name"
                 className="mb-1.5 block text-sm font-medium text-foreground"
               >
-                Platform app name
+                Company display name
               </label>
               <input
-                id="platform-app-name"
+                id="company-display-name"
                 type="text"
-                value={appName}
-                onChange={(ev) => setAppName(ev.target.value)}
+                value={companyDisplayName}
+                onChange={(ev) => setCompanyDisplayName(ev.target.value)}
+                placeholder={fallbackOrganizationName || "Enter a display name"}
                 className={responsiveFormInput}
-                required
-                autoComplete="off"
               />
+              <p className="mt-1 text-xs text-muted-foreground">
+                Fallback when empty: <strong>{fallbackOrganizationName || "none"}</strong>
+              </p>
+            </div>
+
+            <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              Effective displayed company name:{" "}
+              <span className="font-semibold text-foreground">{effectiveDisplayName || "(empty)"}</span>
             </div>
           </div>
 
           <div className="min-w-0 space-y-3">
-            <span className="mb-1.5 block text-sm font-medium text-foreground">Platform logo</span>
+            <span className="mb-1.5 block text-sm font-medium text-foreground">Company logo</span>
             <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm font-medium transition hover:bg-muted">
               {uploadingLogo ? (
                 <>
@@ -193,7 +230,7 @@ export default function PlatformSettingsPage() {
               />
             </label>
             <p className="text-xs text-muted-foreground">
-              Upload updates <code className="rounded bg-muted px-1 font-mono text-[10px]">platform_settings.logo_url</code>{" "}
+              Upload updates <code className="rounded bg-muted px-1 font-mono text-[10px]">organization_settings.logo_url</code>{" "}
               automatically.
             </p>
             {logoUrl ? (
@@ -202,7 +239,7 @@ export default function PlatformSettingsPage() {
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src={logoUrl}
-                    alt="Platform logo preview"
+                    alt="Company logo preview"
                     className="max-h-full w-full max-w-full object-contain p-2"
                   />
                 </div>

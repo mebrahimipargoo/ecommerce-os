@@ -105,7 +105,8 @@ export async function listWorkspaceOrganizationsForAdmin(): Promise<
     }[];
     const out: WorkspaceOrganizationOption[] = rows
       .map((r) => {
-        const id = String(r.organization_id ?? "").trim();
+        const raw = r as { organization_id?: string; company_id?: string };
+        const id = String(raw.organization_id ?? raw.company_id ?? "").trim();
         const dn =
           typeof r.display_name === "string" && r.display_name.trim().length > 0
             ? r.display_name.trim()

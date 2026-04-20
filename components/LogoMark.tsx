@@ -14,7 +14,7 @@ export function LogoMark({ className }: { className?: string }) {
   return (
     <div
       className={[
-        "flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-primary/10 ring-1 ring-primary/40",
+        "flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-sky-500/10 ring-1 ring-sky-500/40 dark:bg-sky-950/50 dark:ring-sky-500/30",
         className ?? "",
       ].filter(Boolean).join(" ")}
     >
@@ -24,11 +24,11 @@ export function LogoMark({ className }: { className?: string }) {
           src={platformLogoUrl}
           alt=""
           aria-hidden
-          className="h-full w-full object-contain p-0.5"
+          className="h-full w-full rounded-md object-contain p-0.5"
           onError={() => setImgBroken(true)}
         />
       ) : (
-        <span className="text-[11px] font-bold leading-none tracking-tight text-primary">
+        <span className="text-[11px] font-bold leading-none tracking-tight text-sky-600 dark:text-sky-400">
           {loading ? "…" : monogram || "·"}
         </span>
       )}

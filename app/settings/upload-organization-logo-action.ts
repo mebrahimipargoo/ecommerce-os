@@ -1,14 +1,19 @@
 "use server";
 
-import {
-  canEditTenantOrganizationBranding,
-  loadTenantProfile,
-  resolveTenantOrganizationId,
-  type TenantWriteContext,
-} from "../../lib/server-tenant";
 import { supabaseServer } from "../../lib/supabase-server";
-import { upsertOrganizationLogoUrl } from "../../lib/organization-logo";
-import { isUuidString } from "../../lib/uuid";
+import {
+  canEditTenantOrganizationBrandingByRoleKey,
+  normalizeRoleKeyForBranding,
+} from "../../lib/tenant-branding-permissions";
+import { resolveEffectiveCompanyOrganizationId } from "../../lib/resolve-effective-company-organization";
+import { getAuthenticatedCompanyActor } from "./company/company-settings-actions";
+
+const BRANDING_DEBUG =
+  process.env.BRANDING_DEBUG === "1" ||
+  process.env.NEXT_PUBLIC_BRANDING_DEBUG === "1";
+function brandingDlog(...args: unknown[]) {
+  if (BRANDING_DEBUG) console.log("[upload-organization-logo]", ...args);
+}
 
 /** Primary bucket (create as public in Supabase → Storage). */
 const PRIMARY_LOGO_BUCKET = "logos";
@@ -53,24 +58,24 @@ export async function uploadOrganizationLogoAction(
     return { ok: false, error: "Unsupported image type. Use PNG, JPEG, WebP, GIF, or SVG." };
   }
 
-  const actorProfileId = String(formData.get("actor_profile_id") ?? "").trim() || null;
-  const companyIdRaw = String(formData.get("organization_id") ?? "").trim() || null;
-  const tenant: TenantWriteContext = {
-    actorProfileId,
-    organizationId: companyIdRaw && isUuidString(companyIdRaw) ? companyIdRaw : null,
-  };
-
-  if (actorProfileId && isUuidString(actorProfileId)) {
-    const profile = await loadTenantProfile(actorProfileId);
-    if (!canEditTenantOrganizationBranding(profile)) {
-      return { ok: false, error: "You do not have permission to upload a company logo." };
-    }
-  } else {
-    return { ok: false, error: "Missing or invalid session profile." };
+  const actor = await getAuthenticatedCompanyActor();
+  if (!actor || !actor.roleKey) {
+    brandingDlog("permission: no actor or roleKey", { hasActor: Boolean(actor) });
+    return { ok: false, error: "You must be signed in." };
+  }
+  if (!canEditTenantOrganizationBrandingByRoleKey(actor.roleKey)) {
+    brandingDlog("permission: role denied branding upload", {
+      role_raw: actor.roleKey,
+      role_normalized: normalizeRoleKeyForBranding(actor.roleKey),
+    });
+    return { ok: false, error: "You do not have permission to upload a company logo." };
   }
 
-  const orgId = await resolveTenantOrganizationId(tenant);
-  if (!isUuidString(orgId)) {
+  const requestedOrgRaw = formData.get("organization_id");
+  const requestedOrg =
+    typeof requestedOrgRaw === "string" ? requestedOrgRaw : null;
+  const orgId = resolveEffectiveCompanyOrganizationId(actor, requestedOrg);
+  if (!orgId) {
     return {
       ok: false,
       error:
@@ -122,6 +127,7 @@ export async function uploadOrganizationLogoAction(
   }
 
   if (upErr) {
+    brandingDlog("storage: upload failed", { bucket, message: upErr.message });
     const hint =
       bucket === PRIMARY_LOGO_BUCKET && isBucketMissingError(upErr.message)
         ? ` Create a public Storage bucket named "${PRIMARY_LOGO_BUCKET}" in Supabase, or ensure the "${FALLBACK_BUCKET}" bucket exists.`
@@ -132,10 +138,39 @@ export async function uploadOrganizationLogoAction(
   const { data: urlData } = supabaseServer.storage.from(bucket).getPublicUrl(objectPath);
   const publicUrl = urlData.publicUrl;
 
-  const orgRes = await upsertOrganizationLogoUrl(publicUrl, tenant);
-  if (!orgRes.ok) {
-    return { ok: false, error: orgRes.error ?? "Failed to save logo_url on organization_settings." };
+  const { data: existing } = await supabaseServer
+    .from("organization_settings")
+    .select(
+      "is_ai_label_ocr_enabled, is_ai_packing_slip_ocr_enabled, default_claim_evidence, company_display_name",
+    )
+    .eq("organization_id", orgId)
+    .maybeSingle();
+
+  const ex = existing as
+    | {
+        is_ai_label_ocr_enabled?: boolean | null;
+        is_ai_packing_slip_ocr_enabled?: boolean | null;
+        default_claim_evidence?: Record<string, unknown> | null;
+        company_display_name?: string | null;
+      }
+    | null;
+
+  const { error: dbErr } = await supabaseServer.from("organization_settings").upsert(
+    {
+      organization_id: orgId,
+      is_ai_label_ocr_enabled: ex?.is_ai_label_ocr_enabled ?? false,
+      is_ai_packing_slip_ocr_enabled: ex?.is_ai_packing_slip_ocr_enabled ?? false,
+      default_claim_evidence: ex?.default_claim_evidence ?? {},
+      company_display_name: ex?.company_display_name ?? null,
+      logo_url: publicUrl,
+    },
+    { onConflict: "organization_id" },
+  );
+  if (dbErr) {
+    brandingDlog("db: organization_settings upsert failed", dbErr.message);
+    return { ok: false, error: dbErr.message };
   }
 
+  brandingDlog("ok", { orgId, publicUrl });
   return { ok: true, publicUrl };
 }

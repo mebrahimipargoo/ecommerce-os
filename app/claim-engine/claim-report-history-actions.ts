@@ -74,12 +74,12 @@ async function loadProfileNames(ids: string[]): Promise<Map<string, string>> {
   if (uuids.length === 0) return new Map();
   const { data, error } = await supabaseServer
     .from("profiles")
-    .select("id, full_name, name")
+    .select("id, full_name")
     .in("id", uuids);
   if (error || !data) return new Map();
   const m = new Map<string, string>();
-  for (const row of data as { id: string; full_name?: string | null; name?: string | null }[]) {
-    const name = (row.full_name ?? row.name ?? "").trim();
+  for (const row of data as { id: string; full_name?: string | null }[]) {
+    const name = (row.full_name ?? "").trim();
     if (row.id && name) m.set(row.id, name);
   }
   return m;

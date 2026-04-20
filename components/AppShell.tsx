@@ -10,8 +10,8 @@
  * Content column: TopHeader (shrink-0) + scrollable main (flex-1 min-h-0 overflow-auto).
  *
  * Shell product row: platform name + `LogoMark` from `public.platform_settings` via
- * `PlatformBrandingContext` — not tenant `organization_settings`. Tenant org label is only
- * in `TopHeader` via `UserRoleContext`.
+ * `PlatformBrandingContext`. Tenant org label + optional tenant logo live in `TopHeader`
+ * (`UserRoleContext` + `BrandingContext`).
  */
 
 import React, {
@@ -19,13 +19,14 @@ import React, {
 } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
+import { DrawerWorkspaceBar } from "./DrawerWorkspaceBar";
 import { usePathname } from "next/navigation";
 import {
   Banknote, Building2, ChevronDown,
   ClipboardList, Database, DollarSign, FileText,
   Package, Palette,
   PanelLeftClose, PanelLeftOpen,
-  RotateCcw, ScanLine, Settings, Shield, ShieldAlert, Users, Wrench, X,
+  RotateCcw, ScanLine, Settings, ShieldAlert, Users, Wrench, X,
 } from "lucide-react";
 import { TopHeader } from "./TopHeader";
 import { BrandingProvider } from "./BrandingContext";
@@ -221,7 +222,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                 {badge}
               </span>
             )}
-            {active && <span className="ml-1 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />}
+            {active && <span className="ml-1 h-1.5 w-1.5 shrink-0 rounded-full bg-sky-500 dark:bg-sky-400" />}
           </>
         )}
 
@@ -429,12 +430,6 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             <div className="space-y-0.5">
               {perms.canSeePlatformAdmin && (
                 <NavLink
-                  item={{ label: "Admin Settings", icon: Shield, href: "/admin/settings" }}
-                  alwaysFull={alwaysFull}
-                />
-              )}
-              {perms.canSeePlatformAdmin && (
-                <NavLink
                   item={{ label: "Platform branding", icon: Palette, href: "/platform/settings" }}
                   alwaysFull={alwaysFull}
                 />
@@ -467,7 +462,12 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         className="fixed left-0 top-0 z-[210] flex h-full w-[280px] max-w-[85vw] flex-col border-r border-sidebar-border bg-sidebar shadow-2xl animate-drawer-slide-in-left"
       >
         <div className="flex h-14 shrink-0 items-center justify-between border-b border-sidebar-border px-4">
-          <div className="flex min-w-0 flex-1 items-center gap-2.5">
+          <Link
+            href="/"
+            onClick={closeMenu}
+            className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg outline-none ring-sidebar-ring transition hover:bg-sidebar-accent/25 focus-visible:ring-2"
+            title="Home / Dashboard"
+          >
             <LogoMark />
             <div className="min-w-0">
               <p className="truncate text-sm font-bold text-sidebar-foreground">
@@ -475,7 +475,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
               </p>
               <p className="truncate text-[10px] text-muted-foreground">{PLATFORM_TAGLINE}</p>
             </div>
-          </div>
+          </Link>
           <button
             type="button"
             onClick={closeMenu}
@@ -485,6 +485,8 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             <X className="h-4 w-4" />
           </button>
         </div>
+
+        <DrawerWorkspaceBar onClose={closeMenu} />
 
         <nav className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
           <SidebarBody alwaysFull collapsed={false} />
@@ -519,10 +521,14 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
               collapsed ? "w-16" : "w-60",
             ].join(" ")}
           >
-            <div className={[
-              "flex h-14 shrink-0 items-center border-b border-sidebar-border px-4 min-w-0 overflow-hidden",
-              collapsed ? "justify-center" : "gap-2.5",
-            ].join(" ")}>
+            <Link
+              href="/"
+              className={[
+                "flex h-14 shrink-0 items-center border-b border-sidebar-border px-4 min-w-0 overflow-hidden outline-none ring-sidebar-ring transition hover:bg-sidebar-accent/25 focus-visible:ring-2",
+                collapsed ? "justify-center" : "gap-2.5",
+              ].join(" ")}
+              title="Home / Dashboard"
+            >
               <LogoMark />
               {!collapsed && (
                 <div className="min-w-0">
@@ -532,7 +538,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                   <p className="truncate text-[10px] text-muted-foreground">{PLATFORM_TAGLINE}</p>
                 </div>
               )}
-            </div>
+            </Link>
 
             <nav className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
               <SidebarBody collapsed={collapsed} />

@@ -1,11 +1,7 @@
 "use server";
 
 import { supabaseServer } from "../../../lib/supabase-server";
-import {
-  canManagePlatformSettings,
-  loadTenantProfile,
-} from "../../../lib/server-tenant";
-import { isUuidString } from "../../../lib/uuid";
+import { getAuthenticatedPlatformRoleKey } from "./platform-settings-actions";
 
 const PRIMARY_LOGO_BUCKET = "logos";
 const FALLBACK_BUCKET = "media";
@@ -35,24 +31,9 @@ const ALLOWED_TYPES = new Set([
 export async function uploadPlatformLogoAction(
   formData: FormData,
 ): Promise<{ ok: true; publicUrl: string } | { ok: false; error: string }> {
-  const actorProfileId = String(formData.get("actor_profile_id") ?? "").trim();
-  if (!actorProfileId || !isUuidString(actorProfileId)) {
-    if (process.env.NEXT_PUBLIC_BRANDING_DEBUG === "1" || process.env.BRANDING_DEBUG === "1") {
-      console.log("[platform-settings-server] upload → missing/invalid actor profile id", { actorProfileId });
-    }
-    return { ok: false, error: "Missing or invalid session profile." };
-  }
-  const profile = await loadTenantProfile(actorProfileId);
-  const allowed = canManagePlatformSettings(profile);
-  if (process.env.NEXT_PUBLIC_BRANDING_DEBUG === "1" || process.env.BRANDING_DEBUG === "1") {
-    console.log("[platform-settings-server] upload → permission check", {
-      actorProfileId,
-      role: profile?.role ?? null,
-      role_scope: profile?.role_scope ?? null,
-      canManagePlatformSettings: allowed,
-    });
-  }
-  if (!allowed) {
+  const roleKey = await getAuthenticatedPlatformRoleKey();
+  if (!roleKey) return { ok: false, error: "You must be signed in." };
+  if (roleKey !== "super_admin") {
     return { ok: false, error: "You do not have permission to upload a platform logo." };
   }
 

@@ -54,6 +54,7 @@ import {
 } from "../../lib/openai-settings";
 import { useBranding } from "../../components/BrandingContext";
 import { isAdminRole, useUserRole } from "../../components/UserRoleContext";
+import { WorkspaceOrganizationPicker } from "../../components/WorkspaceOrganizationPicker";
 import { useRbacPermissions } from "../../hooks/useRbacPermissions";
 import { FALLBACK_ORGANIZATION_ID } from "../../lib/organization";
 import { isUuidString } from "../../lib/uuid";
@@ -359,9 +360,21 @@ function brandingDlog(tag: string, data: Record<string, unknown>) {
 }
 
 export default function SettingsPage() {
-  const { role, organizationId, actorUserId, profileLoading, canonicalRoleKey, homeOrganizationId } = useUserRole();
+  const {
+    role,
+    organizationId,
+    actorUserId,
+    profileLoading,
+    canonicalRoleKey,
+    homeOrganizationId,
+    workspaceOrganizations,
+    setWorkspaceOrganizationId,
+  } = useUserRole();
   const perms = useRbacPermissions();
   const canEditTenantBranding = perms.canEditTenantBranding;
+  const canEditSystemSettings = ["super_admin", "programmer", "system_admin"].includes(
+    (canonicalRoleKey ?? "").trim().toLowerCase(),
+  );
   const { refresh: refreshBranding } = useBranding();
 
   useEffect(() => {
@@ -373,6 +386,7 @@ export default function SettingsPage() {
       homeOrganizationId,
       effectiveOrganizationId: organizationId,
       canEditTenantBranding: perms.canEditTenantBranding,
+      canEditSystemSettings,
       canSeePlatformAdmin: perms.canSeePlatformAdmin,
     });
   }, [
@@ -383,6 +397,7 @@ export default function SettingsPage() {
     homeOrganizationId,
     organizationId,
     perms.canEditTenantBranding,
+    canEditSystemSettings,
     perms.canSeePlatformAdmin,
   ]);
 
@@ -558,7 +573,8 @@ export default function SettingsPage() {
     };
   }, [mounted, tenantCtx]);
 
-  // ── Tenant company branding: resolve org server-side from profile + hint (no race on null org)
+  // ── Tenant company branding: resolve org server-side from profile + hint (home org when scope not yet set)
+  const brandingOrganizationHint = organizationId ?? homeOrganizationId;
   useEffect(() => {
     if (!mounted || profileLoading) return;
     if (!actorUserId?.trim()) {
@@ -573,10 +589,10 @@ export default function SettingsPage() {
       setCoreSettingsLoading(true);
       brandingDlog("load-branding: fetching", {
         actorUserId,
-        organizationIdHint: organizationId,
+        organizationIdHint: brandingOrganizationHint,
       });
       try {
-        const b = await getTenantBrandingForActor(actorUserId, organizationId);
+        const b = await getTenantBrandingForActor(actorUserId, brandingOrganizationHint);
         if (cancelled) return;
         brandingDlog("load-branding: received", b);
         setCompanyName(b.company_display_name ?? "");
@@ -589,7 +605,7 @@ export default function SettingsPage() {
     return () => {
       cancelled = true;
     };
-  }, [mounted, profileLoading, actorUserId, organizationId]);
+  }, [mounted, profileLoading, actorUserId, brandingOrganizationHint]);
 
   // ── Load FEFO settings from DB ─────────────────────────────────────────────
   useEffect(() => {
@@ -732,8 +748,8 @@ export default function SettingsPage() {
     try {
       const fd = new FormData();
       fd.append("file", file);
-      if (actorUserId) fd.append("actor_profile_id", actorUserId);
-      if (organizationId?.trim()) fd.append("organization_id", organizationId.trim());
+      const oid = (organizationId ?? "").trim();
+      if (oid) fd.append("organization_id", oid);
       const res = await uploadOrganizationLogoAction(fd);
       if (!res.ok) throw new Error(res.error ?? "Logo upload failed.");
       setCompanyLogoUrl(res.publicUrl);
@@ -1116,6 +1132,10 @@ export default function SettingsPage() {
   }
 
   function openAddStoreModal() {
+    if (!canEditSystemSettings) {
+      showToast("You do not have permission to edit system settings / stores & adapters.", false);
+      return;
+    }
     setEditingStoreId(null);
     setNewStoreName("");
     setNewStorePlatform("amazon");
@@ -1128,6 +1148,10 @@ export default function SettingsPage() {
   }
 
   async function openEditStoreModal(store: StorePublicRow) {
+    if (!canEditSystemSettings) {
+      showToast("You do not have permission to edit system settings / stores & adapters.", false);
+      return;
+    }
     setEditingStoreId(store.id);
     setNewStoreName(store.name);
     setNewStorePlatform(store.platform);
@@ -1173,6 +1197,10 @@ export default function SettingsPage() {
 
   async function handleAddStore(e: React.FormEvent) {
     e.preventDefault();
+    if (!canEditSystemSettings) {
+      showToast("You do not have permission to edit system settings / stores & adapters.", false);
+      return;
+    }
     if (!newStoreName.trim()) { showToast("Store name is required.", false); return; }
     setAddStoreSaving(true);
 
@@ -1261,6 +1289,10 @@ export default function SettingsPage() {
   }
 
   async function handleDeleteStore(store: StorePublicRow) {
+    if (!canEditSystemSettings) {
+      showToast("You do not have permission to edit system settings / stores & adapters.", false);
+      return;
+    }
     if (!window.confirm(`Delete "${store.name}"? This cannot be undone.`)) return;
     setDeletingStoreId(store.id);
     const res = await deleteStore(store.id, settingsRbac);
@@ -1432,7 +1464,7 @@ export default function SettingsPage() {
                         Your tenant or company identity for this organization — name and logo used on{" "}
                         <span className="font-semibold">reports</span>,{" "}
                         <span className="font-semibold">claim PDFs</span>, and other tenant-facing surfaces.
-                        Loaded automatically for the organization you belong to (or the workspace org you selected as a super admin).
+                        Loaded automatically for the organization you belong to (or the workspace you select below / in the header).
                         Stored in <code className="rounded bg-muted px-1 font-mono text-[11px]">organization_settings</code> only — not platform branding (
                         <code className="rounded bg-muted px-1 font-mono text-[11px]">platform_settings</code> is edited under{" "}
                         <span className="font-semibold">Platform Settings</span>).
@@ -1440,9 +1472,32 @@ export default function SettingsPage() {
                     </div>
                   </div>
 
+                  {perms.canSwitchOrganization && workspaceOrganizations.length > 0 ? (
+                    <div className="space-y-1.5 rounded-lg border border-border bg-muted/30 px-3 py-3">
+                      <label htmlFor="settings-branding-workspace" className="text-xs font-medium text-muted-foreground">
+                        Workspace for branding
+                      </label>
+                      <WorkspaceOrganizationPicker
+                        buttonId="settings-branding-workspace"
+                        options={workspaceOrganizations}
+                        value={organizationId}
+                        onChange={setWorkspaceOrganizationId}
+                        leadingIcon={false}
+                        ariaLabel="Workspace organization for company branding"
+                        triggerClassName={`${SELECT_CLS} flex items-center justify-between gap-2`}
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        Name, logo, and saves apply to this organization (same as the header switcher when shown).
+                      </p>
+                    </div>
+                  ) : null}
+
                   {!canEditTenantBranding ? (
                     <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-100">
-                      Your role can view this organization&apos;s branding but cannot change it. Tenant admins and super admins may edit.
+                      Your role can view this organization&apos;s branding but cannot change it. Editing requires a tenant or platform admin role (
+                      <span className="font-mono">tenant_admin</span>, <span className="font-mono">admin</span>,{" "}
+                      <span className="font-mono">super_admin</span>, <span className="font-mono">programmer</span>,{" "}
+                      <span className="font-mono">system_admin</span>).
                     </p>
                   ) : null}
 
@@ -1642,6 +1697,12 @@ export default function SettingsPage() {
 
               {/* ── Connected Stores card ─────────────────────────────────── */}
               <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-5">
+                {!canEditSystemSettings ? (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-100">
+                    You do not have permission to edit system settings / stores & adapters.
+                    Allowed roles: <strong>super_admin</strong>, <strong>programmer</strong>, <strong>system_admin</strong>.
+                  </div>
+                ) : null}
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-100 dark:bg-sky-950/50">
@@ -1659,7 +1720,7 @@ export default function SettingsPage() {
                   </div>
 
                   {/* Add New Store — paywall gated */}
-                  {canAddStore ? (
+                  {canAddStore && canEditSystemSettings ? (
                     <button
                       type="button"
                       onClick={openAddStoreModal}
@@ -1672,10 +1733,14 @@ export default function SettingsPage() {
                     <button
                       type="button"
                       disabled
-                      title="Upgrade your plan to connect more stores"
+                      title={
+                        !canEditSystemSettings
+                          ? "Insufficient role for system settings / stores & adapters."
+                          : "Upgrade your plan to connect more stores"
+                      }
                       className="inline-flex shrink-0 cursor-not-allowed items-center gap-2 rounded-xl bg-amber-400 px-4 py-2.5 text-sm font-bold text-amber-950 opacity-95"
                     >
-                      👑 Upgrade to Add Stores
+                      {canEditSystemSettings ? "👑 Upgrade to Add Stores" : "Access required"}
                     </button>
                   )}
                 </div>
@@ -1802,7 +1867,8 @@ export default function SettingsPage() {
                             <button
                               type="button"
                               onClick={() => void openEditStoreModal(s)}
-                              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground transition hover:border-sky-300 hover:text-sky-600"
+                              disabled={!canEditSystemSettings}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground transition hover:border-sky-300 hover:text-sky-600 disabled:cursor-not-allowed disabled:opacity-40"
                             >
                               <Pencil className="h-3 w-3" />
                               Edit
@@ -1812,8 +1878,8 @@ export default function SettingsPage() {
                             <button
                               type="button"
                               onClick={() => void handleDeleteStore(s)}
-                              disabled={isDeleting}
-                              className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-100 disabled:opacity-50 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
+                              disabled={isDeleting || !canEditSystemSettings}
+                              className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
                             >
                               {isDeleting
                                 ? <Loader2 className="h-3 w-3 animate-spin" />

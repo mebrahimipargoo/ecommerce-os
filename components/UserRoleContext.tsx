@@ -9,6 +9,12 @@ import {
   listWorkspaceOrganizationsForAdmin,
   type WorkspaceOrganizationOption,
 } from "../app/session/tenant-actions";
+import {
+  getViewAsProfileSnapshot,
+  listViewAsProfilesForOrganization,
+  type ViewAsProfileRow,
+} from "../app/session/view-as-actions";
+import { normalizeRoleKeyForBranding } from "../lib/tenant-branding-permissions";
 import { isUuidString } from "../lib/uuid";
 import { useDebugMode } from "./DebugModeContext";
 
@@ -32,6 +38,7 @@ export const ROLE_HIERARCHY: UserRole[] = [
 ];
 
 const LS_WORKSPACE_ORGANIZATION = "workspace_selected_organization_id";
+const LS_VIEW_AS_PROFILE_ID = "workspace_view_as_profile_id";
 
 function splitJoined<T>(raw: unknown): T | null {
   if (raw == null) return null;
@@ -56,8 +63,10 @@ type UserRoleContextValue = {
    * Effective tier for RBAC / route gates (`normalizeRole` + optional dev override).
    */
   role: UserRole;
-  /** Canonical `roles.key` (preferred) or legacy `profiles.role` text. */
+  /** Canonical `roles.key` (preferred) or legacy `profiles.role` text — effective for UI/RBAC (includes “view as” simulation). */
   canonicalRoleKey: string | null;
+  /** Signed-in user’s catalog role key only (never the simulated “view as” role). */
+  actorCanonicalRoleKey: string | null;
   /** Catalog `roles.name` when the join resolves; otherwise derived from the key. */
   canonicalRoleLabel: string;
   actorName: string;
@@ -79,6 +88,21 @@ type UserRoleContextValue = {
   workspaceOrganizations: WorkspaceOrganizationOption[];
   /** super_admin: persist selected organization (also in localStorage) */
   setWorkspaceOrganizationId: (id: string) => void;
+  /**
+   * True when signed-in user may use org workspace + “view as” (super_admin / programmer / system_admin).
+   * Used for tenant scope — not affected by simulated role.
+   */
+  sessionCanWorkspaceSwitch: boolean;
+  /** Simulated member profile id, or null (your own navigation / RBAC). */
+  viewAsProfileId: string | null;
+  setViewAsProfileId: (profileId: string | null) => void;
+  /** Profiles in the current workspace org for the “View as” control. */
+  viewAsProfileOptions: ViewAsProfileRow[];
+  viewAsProfileOptionsLoading: boolean;
+  /** True when navigation reflects another user’s role (UI simulation only). */
+  isViewingAsAnotherUser: boolean;
+  /** Display name of the simulated user (banner / switcher). */
+  viewAsDisplayName: string | null;
   /** Dev-mode only: directly set a mocked role (null = revert to real profile role) */
   setDebugRole: (role: UserRole | null) => void;
   /** Dev-mode only: cycle through all 5 roles in hierarchy order */
@@ -102,13 +126,40 @@ function readStoredWorkspaceCompanyId(): string | null {
   return t && isUuidString(t) ? t : null;
 }
 
+function readStoredViewAsProfileId(): string | null {
+  if (typeof window === "undefined") return null;
+  const t = window.localStorage.getItem(LS_VIEW_AS_PROFILE_ID)?.trim();
+  return t && isUuidString(t) ? t : null;
+}
+
+/** One row per org id (RPC / merges can repeat the same UUID). Prefer a human label over raw UUID text. */
+function dedupeWorkspaceOrganizations(
+  rows: WorkspaceOrganizationOption[],
+): WorkspaceOrganizationOption[] {
+  const byId = new Map<string, WorkspaceOrganizationOption>();
+  for (const r of rows) {
+    const id = (r.organization_id ?? "").trim();
+    if (!id) continue;
+    const prev = byId.get(id);
+    if (!prev) {
+      byId.set(id, r);
+      continue;
+    }
+    const prevPlain = prev.display_name.trim() === id;
+    const nextPlain = r.display_name.trim() === id;
+    if (prevPlain && !nextPlain) byId.set(id, r);
+    else if (prevPlain === nextPlain && r.display_name.length > prev.display_name.length) {
+      byId.set(id, r);
+    }
+  }
+  return [...byId.values()];
+}
+
 /** Role keys that use the multi-org workspace picker (internal staff). */
 export const INTERNAL_STAFF_ROLE_KEYS = new Set([
   "super_admin",
   "system_admin",
-  "system_employee",
   "programmer",
-  "customer_service",
 ]);
 
 /**
@@ -171,6 +222,18 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
   const [profileError,    setProfileError]    = useState<string | null>(null);
   const [orgLabelsById,   setOrgLabelsById]   = useState<Record<string, string>>({});
 
+  const [sessionCanWorkspaceSwitch, setSessionCanWorkspaceSwitch] = useState(false);
+  const [viewAsProfileId, setViewAsProfileIdState] = useState<string | null>(null);
+  const [viewAsSnapshot, setViewAsSnapshot] = useState<{
+    rbacRole: UserRole;
+    canonicalKey: string;
+    label: string;
+    name: string;
+    teamGroups: string[];
+  } | null>(null);
+  const [viewAsProfileOptions, setViewAsProfileOptions] = useState<ViewAsProfileRow[]>([]);
+  const [viewAsProfileOptionsLoading, setViewAsProfileOptionsLoading] = useState(false);
+
   const loadProfile = useCallback(async () => {
     setProfileLoading(true);
     setProfileError(null);
@@ -188,6 +251,13 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
       setActorName("Operator");
       setTeamGroups([]);
       setHomeOrganizationName(null);
+      setSessionCanWorkspaceSwitch(false);
+      setViewAsProfileIdState(null);
+      setViewAsSnapshot(null);
+      setViewAsProfileOptions([]);
+      if (typeof window !== "undefined") {
+        window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
+      }
       const fallback =
         process.env.NEXT_PUBLIC_ORGANIZATION_ID?.trim() ||
         "00000000-0000-0000-0000-000000000001";
@@ -212,6 +282,7 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
     if (profileSelectError) {
       setHomeOrganizationName(null);
       setProfileError(profileSelectError.message);
+      setSessionCanWorkspaceSwitch(false);
       setProfileLoading(false);
       return;
     }
@@ -219,6 +290,7 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
     if (!profileData || typeof profileData !== "object") {
       setHomeOrganizationName(null);
       setProfileError(`Authenticated user is missing a profiles row (id=${authUserId}).`);
+      setSessionCanWorkspaceSwitch(false);
       setProfileLoading(false);
       return;
     }
@@ -229,12 +301,20 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
       profileRow.roles,
     );
     const joinedKey = joined?.key != null ? String(joined.key).trim().toLowerCase() : null;
-    const rawKey = (joinedKey ?? String(profileRow.role ?? "").trim().toLowerCase());
-    const nr = normalizeRole(rawKey || String(profileRow.role ?? ""));
+    const catalogKeyNorm = normalizeRoleKeyForBranding(
+      joinedKey ?? String(profileRow.role ?? ""),
+    );
+    const nr = normalizeRole(catalogKeyNorm || String(profileRow.role ?? ""));
     setRbacRole(nr);
 
-    const canonKey = (joinedKey ?? String(profileRow.role ?? "").trim().toLowerCase()) || null;
+    const canonKey = catalogKeyNorm.length > 0 ? catalogKeyNorm : null;
     setCanonicalRoleKey(canonKey);
+
+    const canWs =
+      INTERNAL_STAFF_ROLE_KEYS.has(catalogKeyNorm)
+      || nr === "super_admin"
+      || nr === "system_employee";
+    setSessionCanWorkspaceSwitch(canWs);
     const catalogName =
       joined?.name != null && String(joined.name).trim().length > 0
         ? String(joined.name).trim()
@@ -251,21 +331,38 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
     const joinedName = orgEmbed != null && typeof orgEmbed.name === "string" ? orgEmbed.name.trim() : "";
     setHomeOrganizationName(joinedName.length > 0 ? joinedName : null);
 
-    let internalEffectiveId: string | null = null;
-    if (INTERNAL_STAFF_ROLE_KEYS.has(rawKey)) {
+    let workspaceSelectionId: string | null = null;
+    if (canWs) {
       const stored = readStoredWorkspaceCompanyId();
-      const pick   = stored && isUuidString(stored) ? stored : (homeId ?? "");
-      internalEffectiveId = pick && isUuidString(pick) ? pick : null;
-      setSuperAdminOrganizationOverride(internalEffectiveId);
+      if (stored && isUuidString(stored)) {
+        workspaceSelectionId = stored;
+      } else if (homeId) {
+        workspaceSelectionId = homeId;
+      }
+      setSuperAdminOrganizationOverride(workspaceSelectionId);
       void listWorkspaceOrganizationsForAdmin().then((orgRes) => {
-        if (!orgRes.ok) return;
-        const rows = [...orgRes.rows];
-        const ids  = new Set(rows.map((r) => r.organization_id));
+        const rows: WorkspaceOrganizationOption[] = orgRes.ok ? [...orgRes.rows] : [];
+        const ids = new Set(rows.map((r) => r.organization_id));
         if (homeId && !ids.has(homeId)) {
-          rows.push({ organization_id: homeId, display_name: "Your workspace" });
+          rows.push({
+            organization_id: homeId,
+            display_name: joinedName || "Your organization",
+          });
+          ids.add(homeId);
         }
-        rows.sort((a, b) => a.display_name.localeCompare(b.display_name));
-        setWorkspaceOrganizations(rows);
+        if (workspaceSelectionId && !ids.has(workspaceSelectionId)) {
+          rows.push({
+            organization_id: workspaceSelectionId,
+            display_name:
+              workspaceSelectionId === homeId && joinedName
+                ? joinedName
+                : workspaceSelectionId,
+          });
+          ids.add(workspaceSelectionId);
+        }
+        const unique = dedupeWorkspaceOrganizations(rows);
+        unique.sort((a, b) => a.display_name.localeCompare(b.display_name));
+        setWorkspaceOrganizations(unique);
       });
     } else {
       setSuperAdminOrganizationOverride(null);
@@ -274,7 +371,7 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
 
     const idsToLabel = [
       ...new Set(
-        [homeId, internalEffectiveId].filter((x): x is string => !!x && isUuidString(x)),
+        [homeId, workspaceSelectionId].filter((x): x is string => !!x && isUuidString(x)),
       ),
     ];
     if (idsToLabel.length > 0) {
@@ -287,6 +384,26 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
           }
           return next;
         });
+      }
+    }
+
+    if (canWs) {
+      const va = readStoredViewAsProfileId();
+      if (va && va !== authUserId) {
+        setViewAsProfileIdState(va);
+      } else {
+        setViewAsProfileIdState(null);
+        setViewAsSnapshot(null);
+        if (typeof window !== "undefined") {
+          window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
+        }
+      }
+    } else {
+      setViewAsProfileIdState(null);
+      setViewAsSnapshot(null);
+      setViewAsProfileOptions([]);
+      if (typeof window !== "undefined") {
+        window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
       }
     }
 
@@ -310,7 +427,114 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
     if (!debugMode) setDebugRoleState(null);
   }, [debugMode]);
 
-  const role = useMemo((): UserRole => debugRole ?? rbacRole, [debugRole, rbacRole]);
+  const organizationId = useMemo((): string | null => {
+    if (sessionCanWorkspaceSwitch) {
+      return superAdminOrganizationOverride ?? homeOrganizationId;
+    }
+    return homeOrganizationId;
+  }, [sessionCanWorkspaceSwitch, superAdminOrganizationOverride, homeOrganizationId]);
+
+  useEffect(() => {
+    if (!sessionCanWorkspaceSwitch || profileLoading || !organizationId) {
+      setViewAsProfileOptions([]);
+      setViewAsProfileOptionsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setViewAsProfileOptionsLoading(true);
+    void listViewAsProfilesForOrganization(organizationId).then((res) => {
+      if (cancelled) return;
+      setViewAsProfileOptionsLoading(false);
+      if (res.ok) setViewAsProfileOptions(res.rows);
+      else setViewAsProfileOptions([]);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionCanWorkspaceSwitch, profileLoading, organizationId]);
+
+  useEffect(() => {
+    if (!viewAsProfileId) {
+      setViewAsSnapshot(null);
+      return;
+    }
+    if (!organizationId || !sessionCanWorkspaceSwitch || !actorUserId) {
+      return;
+    }
+    if (viewAsProfileId === actorUserId) {
+      setViewAsProfileIdState(null);
+      setViewAsSnapshot(null);
+      if (typeof window !== "undefined") {
+        window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
+      }
+      return;
+    }
+    let cancelled = false;
+    void getViewAsProfileSnapshot(viewAsProfileId, organizationId).then((res) => {
+      if (cancelled) return;
+      if (!res.ok) {
+        setViewAsProfileIdState(null);
+        setViewAsSnapshot(null);
+        if (typeof window !== "undefined") {
+          window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
+        }
+        return;
+      }
+      const s = res.snapshot;
+      setViewAsSnapshot({
+        rbacRole: canonicalRoleKeyToTier(s.canonical_role_key),
+        canonicalKey: s.canonical_role_key,
+        label: s.role_label,
+        name: s.full_name,
+        teamGroups: s.team_groups,
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [viewAsProfileId, organizationId, sessionCanWorkspaceSwitch, actorUserId]);
+
+  const role = useMemo((): UserRole => {
+    if (viewAsSnapshot) return viewAsSnapshot.rbacRole;
+    return debugRole ?? rbacRole;
+  }, [viewAsSnapshot, debugRole, rbacRole]);
+
+  const effectiveCanonicalRoleKey = useMemo(() => {
+    if (viewAsSnapshot) return viewAsSnapshot.canonicalKey;
+    return canonicalRoleKey;
+  }, [viewAsSnapshot, canonicalRoleKey]);
+
+  const effectiveCanonicalRoleLabel = useMemo(() => {
+    if (viewAsSnapshot) return viewAsSnapshot.label;
+    return canonicalRoleLabel;
+  }, [viewAsSnapshot, canonicalRoleLabel]);
+
+  const effectiveTeamGroups = useMemo(() => {
+    if (viewAsSnapshot) return viewAsSnapshot.teamGroups;
+    return teamGroups;
+  }, [viewAsSnapshot, teamGroups]);
+
+  const isViewingAsAnotherUser = Boolean(viewAsSnapshot && viewAsProfileId);
+  const viewAsDisplayName = viewAsSnapshot?.name ?? null;
+
+  const setViewAsProfileId = useCallback(
+    (profileId: string | null) => {
+      const t = (profileId ?? "").trim();
+      if (!t || !isUuidString(t) || t === actorUserId) {
+        setViewAsProfileIdState(null);
+        setViewAsSnapshot(null);
+        if (typeof window !== "undefined") {
+          window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
+        }
+        return;
+      }
+      setViewAsProfileIdState(t);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(LS_VIEW_AS_PROFILE_ID, t);
+      }
+    },
+    [actorUserId],
+  );
 
   const setWorkspaceOrganizationId = useCallback((id: string) => {
     const t = id.trim();
@@ -320,13 +544,6 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
       window.localStorage.setItem(LS_WORKSPACE_ORGANIZATION, t);
     }
   }, []);
-
-  const organizationId = useMemo((): string | null => {
-    if (role === "super_admin" || role === "system_employee") {
-      return superAdminOrganizationOverride ?? homeOrganizationId;
-    }
-    return homeOrganizationId;
-  }, [role, superAdminOrganizationOverride, homeOrganizationId]);
 
   /**
    * Human-readable label for the effective `organizationId` (logistics / tenant scope).
@@ -381,8 +598,9 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
   const value = useMemo(
     () => ({
       role,
-      canonicalRoleKey,
-      canonicalRoleLabel,
+      canonicalRoleKey: effectiveCanonicalRoleKey,
+      actorCanonicalRoleKey: canonicalRoleKey,
+      canonicalRoleLabel: effectiveCanonicalRoleLabel,
       actorName,
       actorUserId,
       homeOrganizationId,
@@ -391,19 +609,46 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
       organizationName,
       profileLoading,
       profileError,
-      teamGroups,
+      teamGroups: effectiveTeamGroups,
       workspaceOrganizations,
       setWorkspaceOrganizationId,
+      sessionCanWorkspaceSwitch,
+      viewAsProfileId,
+      setViewAsProfileId,
+      viewAsProfileOptions,
+      viewAsProfileOptionsLoading,
+      isViewingAsAnotherUser,
+      viewAsDisplayName,
       setDebugRole,
       toggleRole,
       refreshProfile: loadProfile,
     }),
     [
-      role, canonicalRoleKey, canonicalRoleLabel, actorName, actorUserId,
-      homeOrganizationId, homeOrganizationName,
-      organizationId, organizationName,
-      profileLoading, profileError, teamGroups, workspaceOrganizations,
-      setWorkspaceOrganizationId, setDebugRole, toggleRole, loadProfile,
+      role,
+      effectiveCanonicalRoleKey,
+      canonicalRoleKey,
+      effectiveCanonicalRoleLabel,
+      actorName,
+      actorUserId,
+      homeOrganizationId,
+      homeOrganizationName,
+      organizationId,
+      organizationName,
+      profileLoading,
+      profileError,
+      effectiveTeamGroups,
+      workspaceOrganizations,
+      setWorkspaceOrganizationId,
+      sessionCanWorkspaceSwitch,
+      viewAsProfileId,
+      setViewAsProfileId,
+      viewAsProfileOptions,
+      viewAsProfileOptionsLoading,
+      isViewingAsAnotherUser,
+      viewAsDisplayName,
+      setDebugRole,
+      toggleRole,
+      loadProfile,
     ],
   );
 
@@ -418,6 +663,7 @@ export function useUserRole(): UserRoleContextValue {
     return {
       role: "operator",
       canonicalRoleKey: null,
+      actorCanonicalRoleKey: null,
       canonicalRoleLabel: "User",
       actorName: "User",
       actorUserId: null,
@@ -430,6 +676,13 @@ export function useUserRole(): UserRoleContextValue {
       teamGroups: [],
       workspaceOrganizations: [],
       setWorkspaceOrganizationId: () => {},
+      sessionCanWorkspaceSwitch: false,
+      viewAsProfileId: null,
+      setViewAsProfileId: () => {},
+      viewAsProfileOptions: [],
+      viewAsProfileOptionsLoading: false,
+      isViewingAsAnotherUser: false,
+      viewAsDisplayName: null,
       setDebugRole: () => {},
       toggleRole: () => {},
       refreshProfile: async () => {},

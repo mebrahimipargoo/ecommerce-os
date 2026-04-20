@@ -4462,7 +4462,7 @@ export function WizardStep1({ state, setState, openPackages, openPallets, existi
                 type="button"
                 disabled={dis}
                 onClick={() => setState((p) => ({ ...p, condition_keys: toggleConditionKey(p.condition_keys, c.key) }))}
-                className={`inline-flex min-h-[40px] items-center gap-2 rounded-full border-2 px-3 py-2 text-left text-sm font-semibold transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40 ${active ? `${c.border} ${c.bg} ring-2 ring-primary/30` : "border-border bg-card hover:bg-accent/50"}`}
+                className={`inline-flex min-h-[40px] items-center gap-2 rounded-full border-2 px-3 py-2 text-left text-sm font-semibold transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40 ${active ? `${c.border} ${c.bg} ring-2 ring-sky-500/30` : "border-border bg-card hover:bg-accent/50"}`}
               >
                 <Icon className={`h-5 w-5 shrink-0 ${active ? c.iconColor : "text-muted-foreground"}`} />
                 <span className="text-foreground">{c.label}</span>
