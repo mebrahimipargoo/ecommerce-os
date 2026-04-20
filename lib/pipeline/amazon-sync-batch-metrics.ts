@@ -70,6 +70,8 @@ export async function measureBatchUpsertMetrics(
     case "FBA_GRADE_AND_RESELL":
     case "MANAGE_FBA_INVENTORY":
     case "FBA_INVENTORY":
+    case "INBOUND_PERFORMANCE":
+    case "AMAZON_FULFILLED_INVENTORY":
     case "RESERVED_INVENTORY":
     case "FEE_PREVIEW":
     case "MONTHLY_STORAGE_FEES":

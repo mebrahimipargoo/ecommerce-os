@@ -39,6 +39,10 @@ import {
   mapRowToAmazonTransaction,
   mapRowToAmazonReportsRepository,
   mapRowToAmazonRawArchive,
+  mapRowToAmazonManageFbaInventory,
+  mapRowToAmazonFbaInventory,
+  mapRowToAmazonInboundPerformance,
+  mapRowToAmazonAmazonFulfilledInventory,
   packPayloadForSupabase,
   NATIVE_COLUMNS_RETURNS,
   NATIVE_COLUMNS_REMOVALS,
@@ -53,6 +57,8 @@ import {
   NATIVE_COLUMNS_FBA_GRADE_AND_RESELL,
   NATIVE_COLUMNS_MANAGE_FBA_INVENTORY,
   NATIVE_COLUMNS_FBA_INVENTORY,
+  NATIVE_COLUMNS_INBOUND_PERFORMANCE,
+  NATIVE_COLUMNS_AMAZON_FULFILLED_INVENTORY,
   NATIVE_COLUMNS_RESERVED_INVENTORY,
   NATIVE_COLUMNS_FEE_PREVIEW,
   NATIVE_COLUMNS_MONTHLY_STORAGE_FEES,
@@ -260,6 +266,8 @@ const NATIVE_COLUMNS_MAP: Record<SyncKind, Set<string> | null> = {
   FBA_GRADE_AND_RESELL:  NATIVE_COLUMNS_FBA_GRADE_AND_RESELL,
   MANAGE_FBA_INVENTORY:  NATIVE_COLUMNS_MANAGE_FBA_INVENTORY,
   FBA_INVENTORY:         NATIVE_COLUMNS_FBA_INVENTORY,
+  INBOUND_PERFORMANCE:   NATIVE_COLUMNS_INBOUND_PERFORMANCE,
+  AMAZON_FULFILLED_INVENTORY: NATIVE_COLUMNS_AMAZON_FULFILLED_INVENTORY,
   RESERVED_INVENTORY:    NATIVE_COLUMNS_RESERVED_INVENTORY,
   FEE_PREVIEW:           NATIVE_COLUMNS_FEE_PREVIEW,
   MONTHLY_STORAGE_FEES:  NATIVE_COLUMNS_MONTHLY_STORAGE_FEES,
@@ -1237,12 +1245,38 @@ export async function POST(req: Request): Promise<Response> {
               string,
               unknown
             > | null;
+          } else if (kind === "MANAGE_FBA_INVENTORY") {
+            insertRow = mapRowToAmazonManageFbaInventory(
+              mappedRow,
+              orgId,
+              uploadId,
+              importStoreId,
+            ) as Record<string, unknown> | null;
+          } else if (kind === "FBA_INVENTORY") {
+            insertRow = mapRowToAmazonFbaInventory(
+              mappedRow,
+              orgId,
+              uploadId,
+              importStoreId,
+            ) as Record<string, unknown> | null;
+          } else if (kind === "INBOUND_PERFORMANCE") {
+            insertRow = mapRowToAmazonInboundPerformance(
+              mappedRow,
+              orgId,
+              uploadId,
+              importStoreId,
+            ) as Record<string, unknown> | null;
+          } else if (kind === "AMAZON_FULFILLED_INVENTORY") {
+            insertRow = mapRowToAmazonAmazonFulfilledInventory(
+              mappedRow,
+              orgId,
+              uploadId,
+              importStoreId,
+            ) as Record<string, unknown> | null;
           } else if (
             kind === "ALL_ORDERS" ||
             kind === "REPLACEMENTS" ||
             kind === "FBA_GRADE_AND_RESELL" ||
-            kind === "MANAGE_FBA_INVENTORY" ||
-            kind === "FBA_INVENTORY" ||
             kind === "RESERVED_INVENTORY" ||
             kind === "FEE_PREVIEW" ||
             kind === "MONTHLY_STORAGE_FEES"
@@ -1526,8 +1560,13 @@ export async function POST(req: Request): Promise<Response> {
         phase1_upload_pct: 100,
         phase2_stage_pct: 100,
         phase3_raw_sync_pct: finalPhase3Pct,
-        phase4_generic_pct: 0,
-        /** Reset stale Phase 4 from a prior run so UI + gates show Generic again after Sync. */
+        /**
+         * Phase 5 contract:
+         *   • supports_generic=true  → leave Phase 4 at 0% pending until Generic runs.
+         *   • supports_generic=false → Phase 4 is an explicit no-op; mark 100% complete
+         *     so the UI shows the 5-phase pipeline as done (not "pending forever").
+         */
+        phase4_generic_pct: needsPhase4 ? 0 : 100,
         phase4_status: needsPhase4 ? "pending" : "complete",
         phase4_completed_at: needsPhase4 ? null : new Date().toISOString(),
         processed_rows: totalStagingRows,
@@ -2234,6 +2273,8 @@ function deduplicateByConflictKey(
       case "FBA_GRADE_AND_RESELL":
       case "MANAGE_FBA_INVENTORY":
       case "FBA_INVENTORY":
+      case "INBOUND_PERFORMANCE":
+      case "AMAZON_FULFILLED_INVENTORY":
       case "RESERVED_INVENTORY":
       case "FEE_PREVIEW":
       case "MONTHLY_STORAGE_FEES":

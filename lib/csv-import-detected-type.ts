@@ -16,6 +16,8 @@ export const CLASSIFIED_REPORT_TYPES = [
   "FBA_GRADE_AND_RESELL",
   "MANAGE_FBA_INVENTORY",
   "FBA_INVENTORY",
+  "INBOUND_PERFORMANCE",
+  "AMAZON_FULFILLED_INVENTORY",
   "RESERVED_INVENTORY",
   "FEE_PREVIEW",
   "MONTHLY_STORAGE_FEES",
@@ -668,6 +670,93 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
       aliases: ["fnsku", "FNSKU", "fulfillment-network-sku"],
     },
   ],
+  MANAGE_FBA_INVENTORY: [
+    { key: "fnsku", label: "FNSKU", required: true,
+      aliases: ["fnsku", "FNSKU", "fulfillment-network-sku"] },
+    { key: "afn_fulfillable_quantity", label: "AFN Fulfillable Quantity", required: true,
+      aliases: ["afn-fulfillable-quantity", "afn fulfillable quantity"] },
+    { key: "sku", label: "SKU (merchant)", required: false,
+      aliases: ["sku", "SKU", "merchant-sku", "msku"] },
+    { key: "asin", label: "ASIN", required: false, aliases: ["asin", "ASIN"] },
+    { key: "product_name", label: "Product Name", required: false,
+      aliases: ["product-name", "product name", "title"] },
+    { key: "condition", label: "Condition", required: false,
+      aliases: ["condition", "item-condition"] },
+    { key: "your_price", label: "Your Price", required: false,
+      aliases: ["your-price", "your price", "price"] },
+    { key: "afn_warehouse_quantity", label: "AFN Warehouse Quantity", required: false,
+      aliases: ["afn-warehouse-quantity", "afn warehouse quantity"] },
+    { key: "afn_unsellable_quantity", label: "AFN Unsellable Quantity", required: false,
+      aliases: ["afn-unsellable-quantity", "afn unsellable quantity"] },
+    { key: "afn_reserved_quantity", label: "AFN Reserved Quantity", required: false,
+      aliases: ["afn-reserved-quantity", "afn reserved quantity"] },
+    { key: "afn_total_quantity", label: "AFN Total Quantity", required: false,
+      aliases: ["afn-total-quantity", "afn total quantity"] },
+    { key: "afn_inbound_working_quantity", label: "AFN Inbound Working", required: false,
+      aliases: ["afn-inbound-working-quantity", "afn inbound working quantity"] },
+    { key: "afn_inbound_shipped_quantity", label: "AFN Inbound Shipped", required: false,
+      aliases: ["afn-inbound-shipped-quantity", "afn inbound shipped quantity"] },
+    { key: "afn_inbound_receiving_quantity", label: "AFN Inbound Receiving", required: false,
+      aliases: ["afn-inbound-receiving-quantity", "afn inbound receiving quantity"] },
+  ],
+  FBA_INVENTORY: [
+    { key: "fnsku", label: "FNSKU", required: true,
+      aliases: ["fnsku", "FNSKU", "fulfillment-network-sku"] },
+    { key: "available", label: "Available", required: true,
+      aliases: ["available", "afn-fulfillable-quantity"] },
+    { key: "snapshot_date", label: "Snapshot Date", required: false,
+      aliases: ["snapshot-date", "snapshot date", "Snapshot-Date"] },
+    { key: "sku", label: "SKU (merchant)", required: false,
+      aliases: ["sku", "SKU", "merchant-sku", "msku"] },
+    { key: "asin", label: "ASIN", required: false, aliases: ["asin", "ASIN"] },
+    { key: "product_name", label: "Product Name", required: false,
+      aliases: ["product-name", "product name", "title"] },
+    { key: "condition", label: "Condition", required: false,
+      aliases: ["condition", "item-condition"] },
+    { key: "inbound_quantity", label: "Inbound Quantity", required: false,
+      aliases: ["inbound-quantity", "inbound quantity"] },
+    { key: "inbound_working", label: "Inbound Working", required: false,
+      aliases: ["inbound-working", "inbound working"] },
+    { key: "inbound_received", label: "Inbound Received", required: false,
+      aliases: ["inbound-received", "inbound received"] },
+    { key: "inventory_supply_at_fba", label: "Inventory Supply at FBA", required: false,
+      aliases: ["inventory-supply-at-fba", "inventory supply at fba"] },
+    { key: "total_reserved_quantity", label: "Total Reserved Quantity", required: false,
+      aliases: ["total-reserved-quantity", "total reserved quantity"] },
+  ],
+  INBOUND_PERFORMANCE: [
+    { key: "fba_shipment_id", label: "FBA Shipment ID", required: true,
+      aliases: ["fba-shipment-id", "fba shipment id", "shipment-id", "shipment id"] },
+    { key: "problem_type", label: "Problem Type", required: true,
+      aliases: ["problem-type", "problem type"] },
+    { key: "fba_carton_id", label: "FBA Carton ID", required: false,
+      aliases: ["fba-carton-id", "fba carton id", "carton-id"] },
+    { key: "expected_quantity", label: "Expected Quantity", required: false,
+      aliases: ["expected-quantity", "expected quantity"] },
+    { key: "received_quantity", label: "Received Quantity", required: false,
+      aliases: ["received-quantity", "received quantity"] },
+    { key: "problem_quantity", label: "Problem Quantity", required: false,
+      aliases: ["problem-quantity", "problem quantity"] },
+    { key: "sku", label: "SKU", required: false,
+      aliases: ["sku", "SKU", "merchant-sku", "msku"] },
+    { key: "fnsku", label: "FNSKU", required: false,
+      aliases: ["fnsku", "FNSKU", "fulfillment-network-sku"] },
+    { key: "asin", label: "ASIN", required: false, aliases: ["asin", "ASIN"] },
+  ],
+  AMAZON_FULFILLED_INVENTORY: [
+    { key: "seller_sku", label: "Seller SKU", required: true,
+      aliases: ["seller-sku", "seller sku", "sku", "SKU"] },
+    { key: "fulfillment_channel_sku", label: "Fulfillment Channel SKU", required: true,
+      aliases: ["fulfillment-channel-sku", "fulfillment channel sku", "fnsku"] },
+    { key: "asin", label: "ASIN", required: true,
+      aliases: ["asin", "ASIN"] },
+    { key: "quantity_available", label: "Quantity Available", required: true,
+      aliases: ["quantity-available", "quantity available"] },
+    { key: "condition_type", label: "Condition Type", required: false,
+      aliases: ["condition-type", "condition type", "condition"] },
+    { key: "warehouse_condition_code", label: "Warehouse Condition Code", required: false,
+      aliases: ["warehouse-condition-code", "warehouse condition code"] },
+  ],
 };
 
 /**
@@ -842,6 +931,78 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
     return { reportType: "TRANSACTIONS", matchedRule: "transaction type+total product charges" };
   }
 
+  // ── Rule INV-A: Manage FBA Inventory (AFN) ──────────────────────────────
+  // Anchor: fnsku + afn-fulfillable-quantity, plus at least one AFN flow column.
+  // Must run BEFORE listing rules so AFN exports never collapse into ALL/ACTIVE LISTINGS.
+  if (
+    ds.has("fnsku") &&
+    ds.has("afn fulfillable quantity") &&
+    (
+      ds.has("afn warehouse quantity") ||
+      ds.has("afn inbound working quantity") ||
+      ds.has("afn inbound receiving quantity")
+    )
+  ) {
+    return {
+      reportType: "MANAGE_FBA_INVENTORY",
+      matchedRule: "fnsku+afn fulfillable quantity+afn warehouse/inbound flow",
+    };
+  }
+
+  // ── Rule INV-B: FBA Inventory (Health) ──────────────────────────────────
+  // Anchor: snapshot-date + fnsku + available, plus at least one inbound/supply column.
+  if (
+    ds.has("snapshot date") &&
+    ds.has("fnsku") &&
+    ds.has("available") &&
+    (
+      ds.has("inbound quantity") ||
+      ds.has("inbound working") ||
+      ds.has("inbound received") ||
+      ds.has("inventory supply at fba") ||
+      ds.has("total reserved quantity")
+    )
+  ) {
+    return {
+      reportType: "FBA_INVENTORY",
+      matchedRule: "snapshot date+fnsku+available+inbound/supply column",
+    };
+  }
+
+  // ── Rule INV-C: Inbound Performance ─────────────────────────────────────
+  // Anchor: fba-shipment-id + problem-type, plus at least one quantity / carton column.
+  if (
+    ds.has("fba shipment id") &&
+    ds.has("problem type") &&
+    (
+      ds.has("expected quantity") ||
+      ds.has("received quantity") ||
+      ds.has("problem quantity") ||
+      ds.has("fba carton id")
+    )
+  ) {
+    return {
+      reportType: "INBOUND_PERFORMANCE",
+      matchedRule: "fba shipment id+problem type+quantity/carton column",
+    };
+  }
+
+  // ── Rule INV-D: Amazon Fulfilled Inventory ──────────────────────────────
+  // Anchor: seller-sku + fulfillment-channel-sku + asin + quantity available.
+  // MUST run BEFORE listing rules so this never falls into ALL_LISTINGS / ACTIVE_LISTINGS.
+  if (
+    ds.has("seller sku") &&
+    ds.has("fulfillment channel sku") &&
+    ds.has("asin") &&
+    ds.has("quantity available")
+  ) {
+    return {
+      reportType: "AMAZON_FULFILLED_INVENTORY",
+      matchedRule:
+        "seller sku+fulfillment channel sku+asin+quantity available (Amazon Fulfilled Inventory; not a listing export)",
+    };
+  }
+
   // Rule 9: Category Listings Report — browse / category columns plus seller SKU + ASIN
   if (
     ds.has("seller sku") &&
@@ -930,6 +1091,8 @@ export function parseGptReportType(raw: string): RawReportType {
   if (/\bFBA_GRADE_AND_RESELL\b/.test(u)) return "FBA_GRADE_AND_RESELL";
   if (/\bMANAGE_FBA_INVENTORY\b/.test(u)) return "MANAGE_FBA_INVENTORY";
   if (/\bFBA_INVENTORY\b/.test(u)) return "FBA_INVENTORY";
+  if (/\bINBOUND_PERFORMANCE\b/.test(u)) return "INBOUND_PERFORMANCE";
+  if (/\bAMAZON_FULFILLED_INVENTORY\b/.test(u)) return "AMAZON_FULFILLED_INVENTORY";
   if (/\bRESERVED_INVENTORY\b/.test(u)) return "RESERVED_INVENTORY";
   if (/\bFEE_PREVIEW\b/.test(u)) return "FEE_PREVIEW";
   if (/\bMONTHLY_STORAGE_FEES\b/.test(u)) return "MONTHLY_STORAGE_FEES";

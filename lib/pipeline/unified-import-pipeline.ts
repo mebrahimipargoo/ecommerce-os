@@ -21,6 +21,28 @@ import {
   type AmazonSyncKind,
 } from "./amazon-report-registry";
 
+/**
+ * Five-phase inventory family — these report types ALWAYS render a Generic
+ * step in the UI so the top card and history row both expose the same
+ * 5-phase pipeline (Upload · Map & classify · Process · Sync · Generic).
+ *
+ *   • INVENTORY_LEDGER → Generic runs inline at end of Sync (real enrichment).
+ *   • The other four → Generic is an explicit no-op (registry has
+ *     supports_generic = false). The UI renders the step as "done · no-op"
+ *     once Sync finishes so the pipeline never appears "pending forever".
+ *
+ * Other report families with supports_generic=false (FBA_RETURNS, SAFET_CLAIMS,
+ * ALL_ORDERS, …) keep their existing 4-phase display — the listing / removal
+ * / shipment surfaces are intentionally untouched in this pass.
+ */
+export const FIVE_PHASE_INVENTORY_FAMILY: ReadonlySet<AmazonSyncKind> = new Set<AmazonSyncKind>([
+  "INVENTORY_LEDGER",
+  "MANAGE_FBA_INVENTORY",
+  "FBA_INVENTORY",
+  "INBOUND_PERFORMANCE",
+  "AMAZON_FULFILLED_INVENTORY",
+]);
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export type PipelineStepKey =
@@ -386,7 +408,22 @@ export function buildUnifiedPipeline(input: UnifiedPipelineInput): UnifiedPipeli
   const p4pct =
     genericRunning && p4pctRaw === 0 ? 5 : p4pctRaw;
   const genericTarget = reg.generic_target_table ? reg.generic_target_table.replace(/^amazon_/, "").replaceAll("_", " ") : "enrichment";
+
+  /**
+   * Five-phase inventory family with `supports_generic=false` (the four new
+   * inventory reports). Generic is an explicit backend no-op — the UI must
+   * still render the 5th step so the top card and history row look identical.
+   *   • While Sync is in progress     → step shows `pending` + "auto-completes after Sync"
+   *   • Once Sync (Phase 3) completes → step flips to `done` + "no-op"
+   * No spinner, no fake percentages, no "Generic" button (nextAction stays null).
+   */
+  const fivePhaseInventoryFamily = FIVE_PHASE_INVENTORY_FAMILY.has(kind);
+  const noOpGenericForInventory = fivePhaseInventoryFamily && !needsP4;
+
   const genericRight = (() => {
+    if (noOpGenericForInventory) {
+      return phase3Complete ? "no-op" : "auto-completes after Sync";
+    }
     if (!needsP4) return "N/A";
     if (phase4Complete) {
       if (canonSum > 0) return `new ${fmtRows(canonNew)} · upd ${fmtRows(canonUpd)} · same ${fmtRows(canonUnch)}`;
@@ -401,20 +438,35 @@ export function buildUnifiedPipeline(input: UnifiedPipelineInput): UnifiedPipeli
     return "—";
   })();
 
+  const genericSubtitle = noOpGenericForInventory
+    ? "Not required — no enrichment for this report"
+    : `Enrich ${genericTarget}`;
+
+  const genericTone: PipelineStepTone = (() => {
+    if (noOpGenericForInventory) {
+      return phase3Complete ? "done" : "pending";
+    }
+    if (!needsP4) return "skipped";
+    if (st === "failed" && failedPhase === "generic") return "failed";
+    if (genericRunning) return "active";
+    if (phase4Complete) return "done";
+    return "pending";
+  })();
+
+  const genericPct = (() => {
+    if (noOpGenericForInventory) return phase3Complete ? 100 : 0;
+    if (!needsP4) return 0;
+    if (phase4Complete) return 100;
+    if (genericRunning) return Math.max(3, p4pct);
+    return 0;
+  })();
+
   const genericStep: PipelineStep = {
     key: "generic",
     label: "Generic",
-    subtitle: `Enrich ${genericTarget}`,
-    pct: !needsP4 ? 0 : phase4Complete ? 100 : genericRunning ? Math.max(3, p4pct) : 0,
-    tone: !needsP4
-      ? "skipped"
-      : st === "failed" && failedPhase === "generic"
-        ? "failed"
-        : genericRunning
-          ? "active"
-          : phase4Complete
-            ? "done"
-            : "pending",
+    subtitle: genericSubtitle,
+    pct: genericPct,
+    tone: genericTone,
     rightLabel: genericRight,
     subLabel: undefined,
   };
@@ -450,7 +502,10 @@ export function buildUnifiedPipeline(input: UnifiedPipelineInput): UnifiedPipeli
   // ── Assemble steps ──────────────────────────────────────────────────────
 
   const steps: PipelineStep[] = [uploadStep, classifyStep, processStep, syncStep];
-  if (needsP4) steps.push(genericStep);
+  // Always render Generic for the inventory five-phase family, even when the
+  // backend marks it as a no-op (supports_generic=false). For all other report
+  // types the existing behaviour (only push when supports_generic=true) wins.
+  if (needsP4 || fivePhaseInventoryFamily) steps.push(genericStep);
   if (wantsWorklist) steps.push(worklistStep);
 
   // ── Overall status ──────────────────────────────────────────────────────

@@ -21,6 +21,8 @@ export type AmazonSyncKind =
   | "FBA_GRADE_AND_RESELL"
   | "MANAGE_FBA_INVENTORY"
   | "FBA_INVENTORY"
+  | "INBOUND_PERFORMANCE"
+  | "AMAZON_FULFILLED_INVENTORY"
   | "RESERVED_INVENTORY"
   | "FEE_PREVIEW"
   | "MONTHLY_STORAGE_FEES"
@@ -328,6 +330,42 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     physical_identity_strategy: "source_line_hash",
     business_identity_strategy: "line_hash_unique",
   },
+  INBOUND_PERFORMANCE: {
+    staging: "amazon_staging",
+    domainTable: "amazon_inbound_performance",
+    dedupeMode: "source_line_hash",
+    conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
+    postSyncEnrichment: "none",
+    generateWorklistAfterSync: false,
+    report_family: "archive",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_inbound_performance",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
+  },
+  AMAZON_FULFILLED_INVENTORY: {
+    staging: "amazon_staging",
+    domainTable: "amazon_amazon_fulfilled_inventory",
+    dedupeMode: "source_line_hash",
+    conflictColumns: "organization_id,source_file_sha256,source_physical_row_number",
+    postSyncEnrichment: "none",
+    generateWorklistAfterSync: false,
+    report_family: "archive",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "amazon_amazon_fulfilled_inventory",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "source_line_hash",
+    business_identity_strategy: "line_hash_unique",
+  },
   RESERVED_INVENTORY: {
     staging: "amazon_staging",
     domainTable: "amazon_reserved_inventory",
@@ -499,6 +537,8 @@ export function resolveAmazonImportSyncKind(reportType: string | null | undefine
   if (rt === "FBA_GRADE_AND_RESELL") return "FBA_GRADE_AND_RESELL";
   if (rt === "MANAGE_FBA_INVENTORY") return "MANAGE_FBA_INVENTORY";
   if (rt === "FBA_INVENTORY") return "FBA_INVENTORY";
+  if (rt === "INBOUND_PERFORMANCE") return "INBOUND_PERFORMANCE";
+  if (rt === "AMAZON_FULFILLED_INVENTORY") return "AMAZON_FULFILLED_INVENTORY";
   if (rt === "RESERVED_INVENTORY") return "RESERVED_INVENTORY";
   if (rt === "FEE_PREVIEW") return "FEE_PREVIEW";
   if (rt === "MONTHLY_STORAGE_FEES") return "MONTHLY_STORAGE_FEES";

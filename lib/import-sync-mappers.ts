@@ -247,19 +247,82 @@ export const NATIVE_COLUMNS_FBA_GRADE_AND_RESELL = new Set([
   "raw_data", "created_at", "updated_at",
 ]);
 
-/** amazon_manage_fba_inventory — physical DB columns */
+/**
+ * amazon_manage_fba_inventory — physical DB columns.
+ * Wave 4 expansion adds AFN flow + listing context columns; older deployments
+ * have only the original (id/org/store/upload/hash/sku/asin/fnsku/afn_fulfillable_quantity)
+ * subset — packPayloadForSupabase will redirect any column missing in the DB to raw_data,
+ * so this expanded set is forward-compatible with the column-add migration.
+ */
 export const NATIVE_COLUMNS_MANAGE_FBA_INVENTORY = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
   "source_file_sha256", "source_physical_row_number",
-  "asin", "fnsku", "sku", "afn_fulfillable_quantity",
+  "sku", "fnsku", "asin", "product_name", "condition", "your_price",
+  "mfn_listing_exists", "mfn_fulfillable_quantity",
+  "afn_listing_exists",
+  "afn_warehouse_quantity", "afn_fulfillable_quantity", "afn_unsellable_quantity",
+  "afn_reserved_quantity", "afn_total_quantity", "per_unit_volume",
+  "afn_inbound_working_quantity", "afn_inbound_shipped_quantity", "afn_inbound_receiving_quantity",
+  "afn_researching_quantity", "afn_reserved_future_supply", "afn_future_supply_buyable",
+  "store",
   "raw_data", "created_at", "updated_at",
 ]);
 
-/** amazon_fba_inventory — physical DB columns */
+/**
+ * amazon_fba_inventory (Inventory Health) — physical DB columns.
+ * Same forward-compatibility rule applies.
+ */
 export const NATIVE_COLUMNS_FBA_INVENTORY = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
   "source_file_sha256", "source_physical_row_number",
-  "asin", "fnsku", "sku", "quantity",
+  "snapshot_date", "sku", "fnsku", "asin", "product_name", "condition",
+  "available", "pending_removal_quantity",
+  "inv_age_0_to_90_days", "inv_age_91_to_180_days", "inv_age_181_to_270_days",
+  "inv_age_271_to_365_days", "inv_age_366_to_455_days", "inv_age_456_plus_days",
+  "currency",
+  "units_shipped_t7", "units_shipped_t30", "units_shipped_t60", "units_shipped_t90",
+  "alert", "your_price", "sales_price",
+  "recommended_action", "sell_through",
+  "item_volume", "volume_unit_measurement", "storage_type", "storage_volume",
+  "marketplace", "product_group", "sales_rank", "days_of_supply", "estimated_excess_quantity",
+  "weeks_of_cover_t30", "weeks_of_cover_t90",
+  "estimated_storage_cost_next_month",
+  "inbound_quantity", "inbound_working", "inbound_shipped", "inbound_received",
+  "no_sale_last_6_months", "total_reserved_quantity", "unfulfillable_quantity",
+  "historical_days_of_supply", "fba_minimum_inventory_level", "fba_inventory_level_health_status",
+  "recommended_ship_in_quantity", "recommended_ship_in_date",
+  "inventory_age_snapshot_date", "inventory_supply_at_fba",
+  "reserved_fc_transfer", "reserved_fc_processing", "reserved_customer_order",
+  "total_days_of_supply_including_open_shipments",
+  "supplier", "is_seasonal_in_next_3_months", "season_name", "season_start_date", "season_end_date",
+  "quantity",
+  "raw_data", "created_at", "updated_at",
+]);
+
+/**
+ * amazon_inbound_performance — physical DB columns (NEW table; migration 20260622).
+ */
+export const NATIVE_COLUMNS_INBOUND_PERFORMANCE = new Set([
+  "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
+  "issue_reported_date", "shipment_creation_date",
+  "fba_shipment_id", "fba_carton_id", "fulfillment_center_id",
+  "sku", "fnsku", "asin", "product_name",
+  "problem_type", "problem_quantity", "expected_quantity", "received_quantity",
+  "performance_measurement_unit", "coaching_level", "fee_type", "currency", "fee_total",
+  "problem_level", "alert_status",
+  "raw_data", "created_at", "updated_at",
+]);
+
+/**
+ * amazon_amazon_fulfilled_inventory — physical DB columns (NEW table; migration 20260623).
+ * Table name doubled to match the registry domain table convention `amazon_<report-slug>`.
+ */
+export const NATIVE_COLUMNS_AMAZON_FULFILLED_INVENTORY = new Set([
+  "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
+  "source_file_sha256", "source_physical_row_number",
+  "seller_sku", "fulfillment_channel_sku", "asin",
+  "condition_type", "warehouse_condition_code", "quantity_available",
   "raw_data", "created_at", "updated_at",
 ]);
 
@@ -1660,5 +1723,406 @@ export function mapRowToAmazonRawArchive(
     fnsku: pick(row, FNSKU_ALIASES) || null,
     sku: pick(row, SKU_ALIASES) || null,
     raw_data,
+  };
+}
+
+// =============================================================================
+// ── Specialised mappers for the four FBA-inventory report families
+//    (MANAGE_FBA_INVENTORY, FBA_INVENTORY, INBOUND_PERFORMANCE,
+//     AMAZON_FULFILLED_INVENTORY).
+//
+// Strategy:
+//   • Every column listed in the spec is consumed via pickT() so it lands in
+//     a NATIVE column; everything else falls through to raw_data via
+//     buildRawData(). packPayloadForSupabase() in sync/route.ts is the final
+//     safety net that re-buckets unknown columns even after the mapper runs.
+//   • Mappers never throw on a missing optional column. They return null only
+//     for fully blank rows.
+// =============================================================================
+
+const PRODUCT_NAME_ALIASES = ["product-name", "product name", "title", "item-name", "item name"];
+const CONDITION_ALIASES = ["condition", "item-condition", "condition-type"];
+
+/** integer parser that tolerates blanks, "—", commas; returns null if empty/non-numeric. */
+function parseIntSafe(v: string | null | undefined): number | null {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s || s === "—" || s === "-") return null;
+  const n = parseInt(s.replace(/,/g, ""), 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** numeric parser tolerating blanks, currency symbols, "—". */
+function parseNumSafe(v: string | null | undefined): number | null {
+  if (v == null) return null;
+  const s = String(v).trim().replace(/[,$\u00A0]/g, "");
+  if (!s || s === "—" || s === "-") return null;
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** "yes"/"true"/"1"/"y" → true · "no"/"false"/"0"/"n" → false · else null. */
+function parseBoolLoose(v: string | null | undefined): boolean | null {
+  if (v == null) return null;
+  const s = String(v).trim().toLowerCase();
+  if (!s) return null;
+  if (["yes", "y", "true", "t", "1"].includes(s)) return true;
+  if (["no", "n", "false", "f", "0"].includes(s)) return false;
+  return null;
+}
+
+/** Pass through trimmed string or null — Amazon dates appear as "YYYY-MM-DD" in these reports. */
+function passThroughDateText(v: string | null | undefined): string | null {
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s || null;
+}
+
+// ── MANAGE_FBA_INVENTORY ──────────────────────────────────────────────────────
+
+export type AmazonManageFbaInventoryInsert = {
+  organization_id: string;
+  store_id: string | null;
+  source_upload_id: string;
+  source_line_hash: string;
+  sku: string | null;
+  fnsku: string | null;
+  asin: string | null;
+  product_name: string | null;
+  condition: string | null;
+  your_price: number | null;
+  mfn_listing_exists: boolean | null;
+  mfn_fulfillable_quantity: number | null;
+  afn_listing_exists: boolean | null;
+  afn_warehouse_quantity: number | null;
+  afn_fulfillable_quantity: number | null;
+  afn_unsellable_quantity: number | null;
+  afn_reserved_quantity: number | null;
+  afn_total_quantity: number | null;
+  per_unit_volume: number | null;
+  afn_inbound_working_quantity: number | null;
+  afn_inbound_shipped_quantity: number | null;
+  afn_inbound_receiving_quantity: number | null;
+  afn_researching_quantity: number | null;
+  afn_reserved_future_supply: number | null;
+  afn_future_supply_buyable: number | null;
+  store: string | null;
+  raw_data: Record<string, string> | null;
+};
+
+export function mapRowToAmazonManageFbaInventory(
+  row: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+  storeId: string | null,
+): AmazonManageFbaInventoryInsert | null {
+  const hasContent = Object.values(row).some((v) => v != null && String(v).trim() !== "");
+  if (!hasContent) return null;
+
+  const source_line_hash = computeSourceLineHash(orgId, row);
+  const consumed = new Set<string>();
+
+  return {
+    organization_id: orgId,
+    store_id: storeId || null,
+    source_upload_id: uploadId,
+    source_line_hash,
+    sku:                pickT(row, ["sku", "merchant-sku", "msku", "seller-sku", "seller sku"], consumed) || null,
+    fnsku:              pickT(row, FNSKU_ALIASES, consumed) || null,
+    asin:               pickT(row, ASIN_ALIASES, consumed) || null,
+    product_name:       pickT(row, PRODUCT_NAME_ALIASES, consumed) || null,
+    condition:          pickT(row, CONDITION_ALIASES, consumed) || null,
+    your_price:         parseNumSafe(pickT(row, ["your-price", "your price", "price"], consumed)),
+    mfn_listing_exists: parseBoolLoose(pickT(row, ["mfn-listing-exists", "mfn listing exists"], consumed)),
+    mfn_fulfillable_quantity: parseIntSafe(pickT(row, ["mfn-fulfillable-quantity", "mfn fulfillable quantity"], consumed)),
+    afn_listing_exists: parseBoolLoose(pickT(row, ["afn-listing-exists", "afn listing exists"], consumed)),
+    afn_warehouse_quantity: parseIntSafe(pickT(row, ["afn-warehouse-quantity", "afn warehouse quantity"], consumed)),
+    afn_fulfillable_quantity: parseIntSafe(pickT(row, ["afn-fulfillable-quantity", "afn fulfillable quantity"], consumed)),
+    afn_unsellable_quantity: parseIntSafe(pickT(row, ["afn-unsellable-quantity", "afn unsellable quantity"], consumed)),
+    afn_reserved_quantity: parseIntSafe(pickT(row, ["afn-reserved-quantity", "afn reserved quantity"], consumed)),
+    afn_total_quantity: parseIntSafe(pickT(row, ["afn-total-quantity", "afn total quantity"], consumed)),
+    per_unit_volume: parseNumSafe(pickT(row, ["per-unit-volume", "per unit volume"], consumed)),
+    afn_inbound_working_quantity: parseIntSafe(pickT(row, ["afn-inbound-working-quantity", "afn inbound working quantity"], consumed)),
+    afn_inbound_shipped_quantity: parseIntSafe(pickT(row, ["afn-inbound-shipped-quantity", "afn inbound shipped quantity"], consumed)),
+    afn_inbound_receiving_quantity: parseIntSafe(pickT(row, ["afn-inbound-receiving-quantity", "afn inbound receiving quantity"], consumed)),
+    afn_researching_quantity: parseIntSafe(pickT(row, ["afn-researching-quantity", "afn researching quantity"], consumed)),
+    afn_reserved_future_supply: parseIntSafe(pickT(row, ["afn-reserved-future-supply", "afn reserved future supply"], consumed)),
+    afn_future_supply_buyable: parseIntSafe(pickT(row, ["afn-future-supply-buyable", "afn future supply buyable"], consumed)),
+    store:              pickT(row, ["store"], consumed) || null,
+    raw_data:           buildRawData(row, consumed),
+  };
+}
+
+// ── FBA_INVENTORY (Inventory Health) ──────────────────────────────────────────
+
+export type AmazonFbaInventoryInsert = {
+  organization_id: string;
+  store_id: string | null;
+  source_upload_id: string;
+  source_line_hash: string;
+  snapshot_date: string | null;
+  sku: string | null;
+  fnsku: string | null;
+  asin: string | null;
+  product_name: string | null;
+  condition: string | null;
+  available: number | null;
+  pending_removal_quantity: number | null;
+  inv_age_0_to_90_days: number | null;
+  inv_age_91_to_180_days: number | null;
+  inv_age_181_to_270_days: number | null;
+  inv_age_271_to_365_days: number | null;
+  inv_age_366_to_455_days: number | null;
+  inv_age_456_plus_days: number | null;
+  currency: string | null;
+  units_shipped_t7: number | null;
+  units_shipped_t30: number | null;
+  units_shipped_t60: number | null;
+  units_shipped_t90: number | null;
+  alert: string | null;
+  your_price: number | null;
+  sales_price: number | null;
+  recommended_action: string | null;
+  sell_through: number | null;
+  item_volume: number | null;
+  volume_unit_measurement: string | null;
+  storage_type: string | null;
+  storage_volume: number | null;
+  marketplace: string | null;
+  product_group: string | null;
+  sales_rank: number | null;
+  days_of_supply: number | null;
+  estimated_excess_quantity: number | null;
+  weeks_of_cover_t30: number | null;
+  weeks_of_cover_t90: number | null;
+  estimated_storage_cost_next_month: number | null;
+  inbound_quantity: number | null;
+  inbound_working: number | null;
+  inbound_shipped: number | null;
+  inbound_received: number | null;
+  no_sale_last_6_months: number | null;
+  total_reserved_quantity: number | null;
+  unfulfillable_quantity: number | null;
+  historical_days_of_supply: number | null;
+  fba_minimum_inventory_level: number | null;
+  fba_inventory_level_health_status: string | null;
+  recommended_ship_in_quantity: number | null;
+  recommended_ship_in_date: string | null;
+  inventory_age_snapshot_date: string | null;
+  inventory_supply_at_fba: number | null;
+  reserved_fc_transfer: number | null;
+  reserved_fc_processing: number | null;
+  reserved_customer_order: number | null;
+  total_days_of_supply_including_open_shipments: number | null;
+  supplier: string | null;
+  is_seasonal_in_next_3_months: boolean | null;
+  season_name: string | null;
+  season_start_date: string | null;
+  season_end_date: string | null;
+  raw_data: Record<string, string> | null;
+};
+
+export function mapRowToAmazonFbaInventory(
+  row: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+  storeId: string | null,
+): AmazonFbaInventoryInsert | null {
+  const hasContent = Object.values(row).some((v) => v != null && String(v).trim() !== "");
+  if (!hasContent) return null;
+
+  const source_line_hash = computeSourceLineHash(orgId, row);
+  const consumed = new Set<string>();
+  const num = (a: string[]) => parseNumSafe(pickT(row, a, consumed));
+  const int = (a: string[]) => parseIntSafe(pickT(row, a, consumed));
+  const txt = (a: string[]) => pickT(row, a, consumed) || null;
+  const dt  = (a: string[]) => passThroughDateText(pickT(row, a, consumed));
+
+  return {
+    organization_id: orgId,
+    store_id: storeId || null,
+    source_upload_id: uploadId,
+    source_line_hash,
+    snapshot_date: dt(["snapshot-date", "snapshot date"]),
+    sku: txt(["sku", "merchant-sku", "msku"]),
+    fnsku: txt(FNSKU_ALIASES),
+    asin: txt(ASIN_ALIASES),
+    product_name: txt(PRODUCT_NAME_ALIASES),
+    condition: txt(CONDITION_ALIASES),
+    available: int(["available", "afn-fulfillable-quantity"]),
+    pending_removal_quantity: int(["pending-removal-quantity", "pending removal quantity"]),
+    inv_age_0_to_90_days: int(["inv-age-0-to-90-days", "inv age 0 to 90 days"]),
+    inv_age_91_to_180_days: int(["inv-age-91-to-180-days", "inv age 91 to 180 days"]),
+    inv_age_181_to_270_days: int(["inv-age-181-to-270-days", "inv age 181 to 270 days"]),
+    inv_age_271_to_365_days: int(["inv-age-271-to-365-days", "inv age 271 to 365 days"]),
+    inv_age_366_to_455_days: int(["inv-age-366-to-455-days", "inv age 366 to 455 days"]),
+    inv_age_456_plus_days: int(["inv-age-456-plus-days", "inv age 456 plus days"]),
+    currency: txt(["currency"]),
+    units_shipped_t7: int(["units-shipped-t7", "units shipped t7"]),
+    units_shipped_t30: int(["units-shipped-t30", "units shipped t30"]),
+    units_shipped_t60: int(["units-shipped-t60", "units shipped t60"]),
+    units_shipped_t90: int(["units-shipped-t90", "units shipped t90"]),
+    alert: txt(["alert"]),
+    your_price: num(["your-price", "your price"]),
+    sales_price: num(["sales-price", "sales price"]),
+    recommended_action: txt(["recommended-action", "recommended action"]),
+    sell_through: num(["sell-through", "sell through"]),
+    item_volume: num(["item-volume", "item volume"]),
+    volume_unit_measurement: txt(["volume-unit-measurement", "volume unit measurement"]),
+    storage_type: txt(["storage-type", "storage type"]),
+    storage_volume: num(["storage-volume", "storage volume"]),
+    marketplace: txt(["marketplace"]),
+    product_group: txt(["product-group", "product group"]),
+    sales_rank: int(["sales-rank", "sales rank"]),
+    days_of_supply: int(["days-of-supply", "days of supply"]),
+    estimated_excess_quantity: int(["estimated-excess-quantity", "estimated excess quantity"]),
+    weeks_of_cover_t30: num(["weeks-of-cover-t30", "weeks of cover t30"]),
+    weeks_of_cover_t90: num(["weeks-of-cover-t90", "weeks of cover t90"]),
+    estimated_storage_cost_next_month: num(["estimated-storage-cost-next-month", "estimated storage cost next month"]),
+    inbound_quantity: int(["inbound-quantity", "inbound quantity"]),
+    inbound_working: int(["inbound-working", "inbound working"]),
+    inbound_shipped: int(["inbound-shipped", "inbound shipped"]),
+    inbound_received: int(["inbound-received", "inbound received"]),
+    no_sale_last_6_months: int(["no-sale-last-6-months", "no sale last 6 months"]),
+    total_reserved_quantity: int(["total-reserved-quantity", "total reserved quantity"]),
+    unfulfillable_quantity: int(["unfulfillable-quantity", "unfulfillable quantity"]),
+    historical_days_of_supply: int(["historical-days-of-supply", "historical days of supply"]),
+    fba_minimum_inventory_level: int(["fba-minimum-inventory-level", "fba minimum inventory level"]),
+    fba_inventory_level_health_status: txt(["fba-inventory-level-health-status", "fba inventory level health status"]),
+    recommended_ship_in_quantity: int(["recommended-ship-in-quantity", "recommended ship in quantity"]),
+    recommended_ship_in_date: dt(["recommended-ship-in-date", "recommended ship in date"]),
+    inventory_age_snapshot_date: dt(["inventory-age-snapshot-date", "inventory age snapshot date"]),
+    inventory_supply_at_fba: int(["inventory-supply-at-fba", "inventory supply at fba"]),
+    reserved_fc_transfer: int(["reserved-fc-transfer", "reserved fc transfer"]),
+    reserved_fc_processing: int(["reserved-fc-processing", "reserved fc processing"]),
+    reserved_customer_order: int(["reserved-customer-order", "reserved customer order"]),
+    total_days_of_supply_including_open_shipments: int([
+      "total-days-of-supply-including-open-shipments",
+      "total days of supply including open shipments",
+    ]),
+    supplier: txt(["supplier"]),
+    is_seasonal_in_next_3_months: parseBoolLoose(pickT(row, ["is-seasonal-in-next-3-months", "is seasonal in next 3 months"], consumed)),
+    season_name: txt(["season-name", "season name"]),
+    season_start_date: dt(["season-start-date", "season start date"]),
+    season_end_date: dt(["season-end-date", "season end date"]),
+    raw_data: buildRawData(row, consumed),
+  };
+}
+
+// ── INBOUND_PERFORMANCE ───────────────────────────────────────────────────────
+
+export type AmazonInboundPerformanceInsert = {
+  organization_id: string;
+  store_id: string | null;
+  source_upload_id: string;
+  source_line_hash: string;
+  issue_reported_date: string | null;
+  shipment_creation_date: string | null;
+  fba_shipment_id: string | null;
+  fba_carton_id: string | null;
+  fulfillment_center_id: string | null;
+  sku: string | null;
+  fnsku: string | null;
+  asin: string | null;
+  product_name: string | null;
+  problem_type: string | null;
+  problem_quantity: number | null;
+  expected_quantity: number | null;
+  received_quantity: number | null;
+  performance_measurement_unit: string | null;
+  coaching_level: string | null;
+  fee_type: string | null;
+  currency: string | null;
+  fee_total: number | null;
+  problem_level: string | null;
+  alert_status: string | null;
+  raw_data: Record<string, string> | null;
+};
+
+export function mapRowToAmazonInboundPerformance(
+  row: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+  storeId: string | null,
+): AmazonInboundPerformanceInsert | null {
+  const hasContent = Object.values(row).some((v) => v != null && String(v).trim() !== "");
+  if (!hasContent) return null;
+
+  const source_line_hash = computeSourceLineHash(orgId, row);
+  const consumed = new Set<string>();
+  const num = (a: string[]) => parseNumSafe(pickT(row, a, consumed));
+  const int = (a: string[]) => parseIntSafe(pickT(row, a, consumed));
+  const txt = (a: string[]) => pickT(row, a, consumed) || null;
+  const dt  = (a: string[]) => passThroughDateText(pickT(row, a, consumed));
+
+  return {
+    organization_id: orgId,
+    store_id: storeId || null,
+    source_upload_id: uploadId,
+    source_line_hash,
+    issue_reported_date: dt(["issue-reported-date", "issue reported date"]),
+    shipment_creation_date: dt(["shipment-creation-date", "shipment creation date"]),
+    fba_shipment_id: txt(["fba-shipment-id", "fba shipment id", "shipment-id", "shipment id"]),
+    fba_carton_id: txt(["fba-carton-id", "fba carton id", "carton-id"]),
+    fulfillment_center_id: txt(["fulfillment-center-id", "fulfillment center id", "fulfillment-center"]),
+    sku: txt(["sku", "merchant-sku", "msku"]),
+    fnsku: txt(FNSKU_ALIASES),
+    asin: txt(ASIN_ALIASES),
+    product_name: txt(PRODUCT_NAME_ALIASES),
+    problem_type: txt(["problem-type", "problem type"]),
+    problem_quantity: int(["problem-quantity", "problem quantity"]),
+    expected_quantity: int(["expected-quantity", "expected quantity"]),
+    received_quantity: int(["received-quantity", "received quantity"]),
+    performance_measurement_unit: txt(["performance-measurement-unit", "performance measurement unit"]),
+    coaching_level: txt(["coaching-level", "coaching level"]),
+    fee_type: txt(["fee-type", "fee type"]),
+    currency: txt(["currency"]),
+    fee_total: num(["fee-total", "fee total"]),
+    problem_level: txt(["problem-level", "problem level"]),
+    alert_status: txt(["alert-status", "alert status"]),
+    raw_data: buildRawData(row, consumed),
+  };
+}
+
+// ── AMAZON_FULFILLED_INVENTORY ────────────────────────────────────────────────
+
+export type AmazonAmazonFulfilledInventoryInsert = {
+  organization_id: string;
+  store_id: string | null;
+  source_upload_id: string;
+  source_line_hash: string;
+  seller_sku: string | null;
+  fulfillment_channel_sku: string | null;
+  asin: string | null;
+  condition_type: string | null;
+  warehouse_condition_code: string | null;
+  quantity_available: number | null;
+  raw_data: Record<string, string> | null;
+};
+
+export function mapRowToAmazonAmazonFulfilledInventory(
+  row: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+  storeId: string | null,
+): AmazonAmazonFulfilledInventoryInsert | null {
+  const hasContent = Object.values(row).some((v) => v != null && String(v).trim() !== "");
+  if (!hasContent) return null;
+
+  const source_line_hash = computeSourceLineHash(orgId, row);
+  const consumed = new Set<string>();
+
+  return {
+    organization_id: orgId,
+    store_id: storeId || null,
+    source_upload_id: uploadId,
+    source_line_hash,
+    seller_sku: pickT(row, ["seller-sku", "seller sku", "sku", "merchant-sku"], consumed) || null,
+    fulfillment_channel_sku: pickT(row, ["fulfillment-channel-sku", "fulfillment channel sku", "fnsku"], consumed) || null,
+    asin: pickT(row, ASIN_ALIASES, consumed) || null,
+    condition_type: pickT(row, ["condition-type", "condition type", "condition"], consumed) || null,
+    warehouse_condition_code: pickT(row, ["warehouse-condition-code", "warehouse condition code"], consumed) || null,
+    quantity_available: parseIntSafe(pickT(row, ["quantity-available", "quantity available"], consumed)),
+    raw_data: buildRawData(row, consumed),
   };
 }

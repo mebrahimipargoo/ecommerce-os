@@ -75,10 +75,14 @@ SUPPORTED Amazon report types (report_type must be one of these):
   canonical: order_id, replacement_order_id, asin, sku, order_date
 - FBA_GRADE_AND_RESELL: signals = "grade" AND ("fnsku" OR "asin") AND ("units" OR "quantity")
   canonical: asin, fnsku, sku, grade, units
-- MANAGE_FBA_INVENTORY: signals = ("afn-fulfillable-quantity" OR "afn-reserved-quantity") AND "fnsku"
-  canonical: asin, fnsku, sku, afn_fulfillable_quantity
-- FBA_INVENTORY: signals = "available" AND "fnsku" AND ("reserved-customerorders" OR "inv-age" OR "unfulfillable-quantity")
-  canonical: asin, fnsku, sku, quantity
+- MANAGE_FBA_INVENTORY: signals = "fnsku" AND "afn-fulfillable-quantity" AND ("afn-warehouse-quantity" OR "afn-inbound-working-quantity" OR "afn-inbound-receiving-quantity")
+  canonical: sku, fnsku, asin, product_name, condition, your_price, afn_warehouse_quantity, afn_fulfillable_quantity, afn_unsellable_quantity, afn_reserved_quantity, afn_total_quantity, afn_inbound_working_quantity, afn_inbound_shipped_quantity, afn_inbound_receiving_quantity
+- FBA_INVENTORY: signals = "snapshot-date" AND "fnsku" AND "available" AND ("inbound-quantity" OR "inbound-working" OR "inbound-received" OR "inventory-supply-at-fba" OR "total-reserved-quantity")
+  canonical: snapshot_date, sku, fnsku, asin, product_name, condition, available, inbound_quantity, inbound_working, inbound_received, inventory_supply_at_fba, total_reserved_quantity
+- INBOUND_PERFORMANCE: signals = "fba-shipment-id" AND "problem-type" AND ("expected-quantity" OR "received-quantity" OR "problem-quantity" OR "fba-carton-id")
+  canonical: fba_shipment_id, fba_carton_id, problem_type, problem_quantity, expected_quantity, received_quantity, sku, fnsku, asin
+- AMAZON_FULFILLED_INVENTORY: signals = "seller-sku" AND "fulfillment-channel-sku" AND "asin" AND "quantity-available" (DO NOT classify as ALL_LISTINGS or ACTIVE_LISTINGS)
+  canonical: seller_sku, fulfillment_channel_sku, asin, condition_type, warehouse_condition_code, quantity_available
 - RESERVED_INVENTORY: signals = ("reserved-customerorders" OR "reserved-fc-transfers") AND ("fnsku" OR "asin")
   canonical: asin, fnsku, sku, reserved_quantity
 - FEE_PREVIEW: signals = ("estimated-referral-fee-per-unit" OR "expected-fulfillment-fee-per-unit") AND ("fnsku" OR "asin")
@@ -95,7 +99,7 @@ SUPPORTED Amazon report types (report_type must be one of these):
 
 Respond ONLY with a single valid JSON object:
 {
-  "report_type": "FBA_RETURNS" | "REMOVAL_ORDER" | "REMOVAL_SHIPMENT" | "INVENTORY_LEDGER" | "REIMBURSEMENTS" | "SETTLEMENT" | "SAFET_CLAIMS" | "TRANSACTIONS" | "REPORTS_REPOSITORY" | "ALL_ORDERS" | "REPLACEMENTS" | "FBA_GRADE_AND_RESELL" | "MANAGE_FBA_INVENTORY" | "FBA_INVENTORY" | "RESERVED_INVENTORY" | "FEE_PREVIEW" | "MONTHLY_STORAGE_FEES" | "CATEGORY_LISTINGS" | "ALL_LISTINGS" | "ACTIVE_LISTINGS" | "UNKNOWN",
+  "report_type": "FBA_RETURNS" | "REMOVAL_ORDER" | "REMOVAL_SHIPMENT" | "INVENTORY_LEDGER" | "REIMBURSEMENTS" | "SETTLEMENT" | "SAFET_CLAIMS" | "TRANSACTIONS" | "REPORTS_REPOSITORY" | "ALL_ORDERS" | "REPLACEMENTS" | "FBA_GRADE_AND_RESELL" | "MANAGE_FBA_INVENTORY" | "FBA_INVENTORY" | "INBOUND_PERFORMANCE" | "AMAZON_FULFILLED_INVENTORY" | "RESERVED_INVENTORY" | "FEE_PREVIEW" | "MONTHLY_STORAGE_FEES" | "CATEGORY_LISTINGS" | "ALL_LISTINGS" | "ACTIVE_LISTINGS" | "UNKNOWN",
   "detected_file_type": "Human-readable name of the file, e.g. 'Amazon Removal Shipment Detail', 'Walmart Sales Report', 'Shopify Inventory Export', 'Unknown File'",
   "is_supported": true or false (true ONLY if report_type is not UNKNOWN),
   "mapping": { "<canonical_field>": "<exact CSV header string>" },
