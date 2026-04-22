@@ -170,14 +170,19 @@ async function fetchSourceBatch(
   /**
    * Selects only what we need. Aliases the table-specific FNSKU/SKU/ASIN
    * columns to canonical names so the rest of the pipeline can stay generic.
+   *
+   * PostgREST select syntax (NOT SQL): `alias:column::type`. Using SQL-style
+   * `column::text AS alias` makes PostgREST parse the whole expression as a
+   * type name, raising `type "textasfnsku" does not exist`.
+   * Reference: https://docs.postgrest.org/en/latest/references/api/resource_representation.html#renaming-columns
    */
   const select = [
     "id",
-    `${spec.fnskuColumn}::text AS fnsku`,
-    `${spec.skuColumn}::text AS sku`,
-    `${spec.asinColumn}::text AS asin`,
+    `fnsku:${spec.fnskuColumn}::text`,
+    `sku:${spec.skuColumn}::text`,
+    `asin:${spec.asinColumn}::text`,
     "raw_data",
-  ].join(", ");
+  ].join(",");
 
   const { data, error } = await supabase
     .from(spec.table)

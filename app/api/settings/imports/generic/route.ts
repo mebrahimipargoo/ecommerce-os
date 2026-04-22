@@ -117,6 +117,48 @@ async function enrichExpectedPackagesFromShipmentAllocations(opts: {
   }
 }
 
+/**
+ * Direct fallback: when the allocation-layer enricher returns 0 (no demand row,
+ * canonical key disagreement, or multi-container path) the typed shipment fields
+ * already on amazon_removal_shipments must still propagate to expected_packages.
+ * Fill-null only, ambiguity-aware, 4-tier priority match. See migration
+ * 20260628_backfill_expected_packages_shipment_meta.sql.
+ */
+async function backfillExpectedPackagesShipmentMeta(opts: {
+  organizationId: string;
+  uploadId: string;
+}): Promise<void> {
+  const { organizationId, uploadId } = opts;
+  try {
+    const { data, error } = await supabaseServer.rpc("backfill_expected_packages_shipment_meta", {
+      p_organization_id: organizationId,
+      p_upload_id: uploadId,
+    });
+    if (error) {
+      console.warn("[generic] backfill_expected_packages_shipment_meta:", error.message);
+      return;
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    if (!row || typeof row !== "object") return;
+    const r = row as Record<string, unknown>;
+    console.log(
+      JSON.stringify({
+        phase: "expected_packages_shipment_meta_backfill",
+        upload_id: uploadId,
+        organization_id: organizationId,
+        rows_filled: r.rows_filled,
+        rows_skipped_ambiguous: r.rows_skipped_ambiguous,
+        rows_no_match: r.rows_no_match,
+      }),
+    );
+  } catch (e) {
+    console.warn(
+      "[generic] backfill_expected_packages_shipment_meta:",
+      e instanceof Error ? e.message : e,
+    );
+  }
+}
+
 export async function POST(req: Request): Promise<Response> {
   let uploadIdForFail: string | null = null;
   let orgId = "";
@@ -332,6 +374,11 @@ export async function POST(req: Request): Promise<Response> {
           organizationId: orgId,
           uploadId,
           storeId: importStoreId,
+        });
+
+        await backfillExpectedPackagesShipmentMeta({
+          organizationId: orgId,
+          uploadId,
         });
 
         const { data: prevRow } = await supabaseServer
