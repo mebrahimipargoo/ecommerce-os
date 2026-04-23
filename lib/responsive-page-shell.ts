@@ -21,3 +21,10 @@ export const responsivePageNarrow =
 /** Shared form control ring (matches shadcn-style inputs). */
 export const responsiveFormInput =
   "h-10 w-full rounded-lg border border-input bg-background px-3 text-sm text-foreground shadow-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2";
+
+/**
+ * Native `<select>` — same chrome as {@link responsiveFormInput}, with a slightly taller
+ * min height on small screens for touch targets; matches `h-10` from `sm` up.
+ */
+export const responsiveFormSelect =
+  "min-h-11 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm text-foreground shadow-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 sm:h-10 sm:min-h-0 sm:py-0";

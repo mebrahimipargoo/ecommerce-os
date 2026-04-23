@@ -33,9 +33,8 @@ export type WorkspaceOrganizationOption = {
  *   2. organizations.name                          (canonical DB name)
  *   3. raw UUID                                    (last resort)
  *
- * This exists because list_workspace_organizations_for_admin() only checks
- * company_display_name and silently falls back to the raw UUID when that
- * column is NULL — hiding the real name stored in organizations.name.
+ * `list_workspace_organizations_for_admin()` applies the same COALESCE server-side;
+ * this helper is still used to label org ids resolved outside that RPC (e.g. profile load).
  */
 export async function getOrganizationNames(
   orgIds: string[],
@@ -86,36 +85,67 @@ export async function getOrganizationNames(
   }
 }
 
+function collectRpcOrganizationIds(data: unknown): string[] {
+  const rows = (data ?? []) as { organization_id?: string; company_id?: string }[];
+  const ids: string[] = [];
+  for (const raw of rows) {
+    const id = String(raw.organization_id ?? raw.company_id ?? "").trim();
+    if (id) ids.push(id);
+  }
+  return ids;
+}
+
 /**
- * Organizations visible in Super Admin filters (distinct orgs with data or settings).
+ * Organizations for the header / Settings workspace pickers (internal staff).
+ *
+ * Merges the legacy RPC with a direct read of `organizations` so new tenants always
+ * appear even if the RPC is missing on a remote DB, errors, or returns an older snapshot.
+ * Display names use {@link getOrganizationNames} (`company_display_name` → `name` → id).
  */
 export async function listWorkspaceOrganizationsForAdmin(): Promise<
   { ok: true; rows: WorkspaceOrganizationOption[] } | { ok: false; error: string }
 > {
   try {
-    const { data, error } = await supabaseServer.rpc(
+    const idSet = new Set<string>();
+
+    const { data: rpcData, error: rpcError } = await supabaseServer.rpc(
       "list_workspace_organizations_for_admin",
     );
-    if (error) {
-      return { ok: false, error: error.message };
+    if (!rpcError && rpcData) {
+      for (const id of collectRpcOrganizationIds(rpcData)) idSet.add(id);
     }
-    const rows = (data ?? []) as {
-      organization_id?: string;
-      display_name?: string;
-    }[];
-    const out: WorkspaceOrganizationOption[] = rows
-      .map((r) => {
-        const raw = r as { organization_id?: string; company_id?: string };
-        const id = String(raw.organization_id ?? raw.company_id ?? "").trim();
-        const dn =
-          typeof r.display_name === "string" && r.display_name.trim().length > 0
-            ? r.display_name.trim()
-            : "";
-        return { organization_id: id, display_name: dn || id };
-      })
-      .filter((row) => row.organization_id.length > 0);
-    out.sort((a, b) => a.display_name.localeCompare(b.display_name));
-    return { ok: true, rows: out };
+
+    const { data: registryRows, error: regError } = await supabaseServer
+      .from("organizations")
+      .select("id")
+      .or("is_active.is.null,is_active.eq.true");
+
+    if (!regError && registryRows) {
+      for (const row of registryRows) {
+        const id = row.id != null ? String(row.id).trim() : "";
+        if (id) idSet.add(id);
+      }
+    }
+
+    if (idSet.size === 0) {
+      if (rpcError && regError) {
+        const msg =
+          rpcError.message
+          + (regError.message ? `; ${regError.message}` : "");
+        return { ok: false, error: msg || "Failed to list organizations." };
+      }
+      return { ok: true, rows: [] };
+    }
+
+    const nm = await getOrganizationNames([...idSet]);
+    if (!nm.ok) {
+      const fallback: WorkspaceOrganizationOption[] = [...idSet]
+        .map((organization_id) => ({ organization_id, display_name: organization_id }))
+        .sort((a, b) => a.display_name.localeCompare(b.display_name));
+      return { ok: true, rows: fallback };
+    }
+    nm.rows.sort((a, b) => a.display_name.localeCompare(b.display_name));
+    return { ok: true, rows: nm.rows };
   } catch (e) {
     return {
       ok: false,

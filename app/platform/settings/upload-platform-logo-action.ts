@@ -1,6 +1,7 @@
 "use server";
 
 import { supabaseServer } from "../../../lib/supabase-server";
+import { canEditPlatformProductSettings } from "../../../lib/platform-product-settings-access";
 import { getAuthenticatedPlatformRoleKey } from "./platform-settings-actions";
 
 const PRIMARY_LOGO_BUCKET = "logos";
@@ -33,7 +34,7 @@ export async function uploadPlatformLogoAction(
 ): Promise<{ ok: true; publicUrl: string } | { ok: false; error: string }> {
   const roleKey = await getAuthenticatedPlatformRoleKey();
   if (!roleKey) return { ok: false, error: "You must be signed in." };
-  if (roleKey !== "super_admin") {
+  if (!canEditPlatformProductSettings(roleKey)) {
     return { ok: false, error: "You do not have permission to upload a platform logo." };
   }
 

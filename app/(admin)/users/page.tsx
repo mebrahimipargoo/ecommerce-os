@@ -6,6 +6,7 @@ import {
   ArrowLeft, KeyRound, Loader2, Pencil, Plus, Save, Tag, Trash2, UserRound, X,
 } from "lucide-react";
 import { isAdminRole, useUserRole } from "../../../components/UserRoleContext";
+import { useRbacPermissions } from "../../../hooks/useRbacPermissions";
 import { UserProfileAvatar } from "./UserProfileAvatar";
 import {
   assignUserGroup,
@@ -20,7 +21,7 @@ import {
   updateUserProfile,
   type AssignableRoleRow,
 } from "./users-actions";
-import type { OrgGroupRow, ProfileRow } from "./users-types";
+import type { OrgGroupRow, ProfileRow, UserGroupAssignment } from "./users-types";
 import type { CompanyOption } from "../../../lib/imports-types";
 import { listCompaniesForImports } from "../imports/companies-actions";
 import { uploadUserProfilePhotoAction } from "./upload-profile-photo-action";
@@ -60,6 +61,7 @@ function normalizeRolePickerValue(
 
 export default function UsersPage() {
   const { role, actorUserId, organizationId } = useUserRole();
+  const perms = useRbacPermissions();
   const [rows, setRows] = useState<ProfileRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<Toast>(null);
@@ -92,7 +94,17 @@ export default function UsersPage() {
   const [groupsEditLoading, setGroupsEditLoading] = useState(false);
   const [groupPickId, setGroupPickId] = useState("");
   const [groupBusy, setGroupBusy] = useState(false);
+  const [roleApplyBusy, setRoleApplyBusy] = useState(false);
+  /** Group memberships to apply after create (same org as {@link createCompanyId}). */
+  const [pendingCreateGroups, setPendingCreateGroups] = useState<
+    Pick<UserGroupAssignment, "group_id" | "key" | "name">[]
+  >([]);
   const editLoadSeq = useRef(0);
+
+  const isEditMode = Boolean(editing);
+  const effectiveOrgForGroups = (
+    editing ? (editing.organization_id ?? "").trim() : createCompanyId.trim()
+  );
 
   const showToast = useCallback((msg: string, ok: boolean) => {
     setToast({ msg, ok });
@@ -169,11 +181,11 @@ export default function UsersPage() {
     const pick =
       companies.some((c) => c.id === tenantDefaultCompanyId) ? tenantDefaultCompanyId : companies[0]?.id ?? "";
     setCreateCompanyId(pick);
+    setPendingCreateGroups([]);
     setModalOpen(true);
   }
 
   function openEdit(row: ProfileRow) {
-    const seq = ++editLoadSeq.current;
     setEditing(row);
     setFullName(row.full_name ?? "");
     setEmail(row.email);
@@ -182,13 +194,36 @@ export default function UsersPage() {
     setGroupPickId("");
     setGroupsForEdit([]);
     setModalOpen(true);
-    if (!row.organization_id) {
+  }
+
+  function closeModal() {
+    setModalOpen(false);
+    setEditing(null);
+    setGroupsForEdit([]);
+    setGroupPickId("");
+    setGroupsEditLoading(false);
+    setPendingCreateGroups([]);
+  }
+
+  useEffect(() => {
+    if (!modalOpen || editing) return;
+    setPendingCreateGroups([]);
+  }, [createCompanyId, modalOpen, editing]);
+
+  useEffect(() => {
+    if (!modalOpen) {
       setGroupsEditLoading(false);
       return;
     }
+    if (!effectiveOrgForGroups) {
+      setGroupsForEdit([]);
+      setGroupsEditLoading(false);
+      return;
+    }
+    const seq = ++editLoadSeq.current;
     setGroupsEditLoading(true);
     void (async () => {
-      const g = await listGroupsForOrganization(row.organization_id!, {
+      const g = await listGroupsForOrganization(effectiveOrgForGroups, {
         actorProfileId: actorUserId,
         filterOrganizationId: organizationId,
       });
@@ -200,15 +235,19 @@ export default function UsersPage() {
         showToast(g.error, false);
       }
     })();
-  }
+  }, [modalOpen, editing?.id, effectiveOrgForGroups, actorUserId, organizationId, showToast]);
 
-  function closeModal() {
-    setModalOpen(false);
-    setEditing(null);
-    setGroupsForEdit([]);
-    setGroupPickId("");
-    setGroupsEditLoading(false);
-  }
+  const assignedGroupsForModal: UserGroupAssignment[] = React.useMemo(() => {
+    if (isEditMode) {
+      return editing!.assigned_groups ?? [];
+    }
+    return pendingCreateGroups.map((p) => ({
+      user_group_id: `pending:${p.group_id}`,
+      group_id: p.group_id,
+      key: p.key,
+      name: p.name,
+    }));
+  }, [isEditMode, editing?.assigned_groups, editing?.id, pendingCreateGroups]);
 
   function openResetPassword(row: ProfileRow) {
     setResetTarget(row);
@@ -282,7 +321,15 @@ export default function UsersPage() {
           setPhotoUploading(false);
           if (!up.ok) throw new Error(up.error);
         }
+        for (const pg of pendingCreateGroups) {
+          const ag = await assignUserGroup(res.id, pg.group_id, {
+            actorProfileId: actorUserId,
+            filterOrganizationId: organizationId,
+          });
+          if (!ag.ok) throw new Error(ag.error ?? "Failed to assign group.");
+        }
         setPendingPhoto(null);
+        setPendingCreateGroups([]);
         showToast("User created.", true);
       }
       closeModal();
@@ -305,12 +352,24 @@ export default function UsersPage() {
     await load();
   }
 
-  async function handleAddGroup() {
-    if (!editing || !groupPickId) return;
+  async function handleAddGroup(pickedId?: string) {
+    const gid = (pickedId ?? groupPickId).trim();
+    if (!gid) return;
+    if (!editing) {
+      const row = groupsForEdit.find((g) => g.id === gid);
+      if (!row) return;
+      setPendingCreateGroups((prev) =>
+        prev.some((p) => p.group_id === row.id)
+          ? prev
+          : [...prev, { group_id: row.id, key: row.key, name: row.name }],
+      );
+      setGroupPickId("");
+      return;
+    }
     const profileId = editing.id;
     setGroupBusy(true);
     try {
-      const res = await assignUserGroup(profileId, groupPickId, {
+      const res = await assignUserGroup(profileId, gid, {
         actorProfileId: actorUserId,
         filterOrganizationId: organizationId,
       });
@@ -332,7 +391,10 @@ export default function UsersPage() {
   }
 
   async function handleRemoveGroup(groupId: string) {
-    if (!editing) return;
+    if (!editing) {
+      setPendingCreateGroups((prev) => prev.filter((p) => p.group_id !== groupId));
+      return;
+    }
     const profileId = editing.id;
     setGroupBusy(true);
     try {
@@ -721,9 +783,20 @@ export default function UsersPage() {
                 </select>
                 <p className="mt-1 text-xs text-muted-foreground">
                   Tenant roles apply to customer organizations; system roles are for internal staff.
+                  {editing
+                    ? " Pick a role and use Save changes."
+                    : " Pick a role for the new user; it is stored when you create the user. Groups below apply after create."}
                 </p>
+                {perms.canSeePlatformAccess ? (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    <Link href="/platform/access" className="font-medium text-primary underline hover:text-primary/90">
+                      Access management
+                    </Link>
+                    {" — permissions, roles, and groups."}
+                  </p>
+                ) : null}
               </div>
-              {editing && editing.organization_id ? (
+              {effectiveOrgForGroups ? (
                 <div className="rounded-lg border border-border bg-muted/15 p-3">
                   <div className="mb-2 flex items-center gap-2 text-sm font-medium">
                     <Tag className="h-3.5 w-3.5 text-muted-foreground" />
@@ -737,10 +810,10 @@ export default function UsersPage() {
                   ) : (
                     <>
                       <div className="mb-2 flex flex-wrap gap-1">
-                        {(editing.assigned_groups ?? []).length === 0 ? (
+                        {assignedGroupsForModal.length === 0 ? (
                           <span className="text-xs text-muted-foreground">No groups assigned.</span>
                         ) : (
-                          (editing.assigned_groups ?? []).map((g) => (
+                          assignedGroupsForModal.map((g) => (
                             <span
                               key={g.user_group_id}
                               className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2 py-0.5 text-xs"
@@ -759,39 +832,36 @@ export default function UsersPage() {
                           ))
                         )}
                       </div>
-                      <div className="flex flex-wrap items-end gap-2">
-                        <div className="min-w-0 flex-1">
-                          <label className={LABEL} htmlFor="addGroup">Add group</label>
-                          <select
-                            id="addGroup"
-                            className={INPUT}
-                            value={groupPickId}
-                            onChange={(e) => setGroupPickId(e.target.value)}
-                            disabled={groupBusy || groupsForEdit.length === 0}
-                          >
-                            <option value="">
-                              {groupsForEdit.length === 0 ? "No groups in this org" : "Select…"}
-                            </option>
-                            {groupsForEdit
-                              .filter((g) => !(editing.assigned_groups ?? []).some((a) => a.group_id === g.id))
-                              .map((g) => (
-                                <option key={g.id} value={g.id}>
-                                  {g.name} ({g.key})
-                                </option>
-                              ))}
-                          </select>
-                        </div>
-                        <button
-                          type="button"
-                          className={[BTN_SECONDARY, "h-10 shrink-0"].join(" ")}
-                          disabled={groupBusy || !groupPickId}
-                          onClick={() => void handleAddGroup()}
+                      <div className="min-w-0">
+                        <label className={LABEL} htmlFor="addGroup">Add group</label>
+                        <select
+                          id="addGroup"
+                          className={INPUT}
+                          value={groupPickId}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setGroupPickId(v);
+                            if (!v.trim() || groupBusy || groupsForEdit.length === 0) return;
+                            void handleAddGroup(v);
+                          }}
+                          disabled={groupBusy || groupsForEdit.length === 0}
                         >
-                          Add
-                        </button>
+                          <option value="">
+                            {groupsForEdit.length === 0 ? "No groups in this org" : "Select a group to assign…"}
+                          </option>
+                          {groupsForEdit
+                            .filter((g) => !assignedGroupsForModal.some((a) => a.group_id === g.id))
+                            .map((g) => (
+                              <option key={g.id} value={g.id}>
+                                {g.name} ({g.key})
+                              </option>
+                            ))}
+                        </select>
                       </div>
                       <p className="mt-1 text-[11px] text-muted-foreground">
-                        Groups are scoped to this user&apos;s company organization.
+                        {editing
+                          ? "Groups are scoped to this user's company organization."
+                          : "Staged groups are written when you click Create user."}
                       </p>
                     </>
                   )}

@@ -18,6 +18,11 @@ export type OrgGroupRow = {
 export type ProfileRow = {
   id: string;
   organization_id: string | null;
+  /**
+   * From `organizations.type` when the list query embeds `organizations(type)` (e.g. platform directory).
+   * Otherwise omitted/null.
+   */
+  organization_type?: "tenant" | "internal" | null;
   /** Resolved via a single Supabase join — no secondary fetch needed. */
   company_name: string | null;
   full_name: string | null;

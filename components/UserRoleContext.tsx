@@ -234,113 +234,125 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
   const [viewAsProfileOptions, setViewAsProfileOptions] = useState<ViewAsProfileRow[]>([]);
   const [viewAsProfileOptionsLoading, setViewAsProfileOptionsLoading] = useState(false);
 
+  /** Increments each time `loadProfile` runs; stale async completions ignore their results. */
+  const loadProfileGenerationRef = React.useRef(0);
+
   const loadProfile = useCallback(async () => {
+    const gen = ++loadProfileGenerationRef.current;
     setProfileLoading(true);
     setProfileError(null);
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
 
-    const authUserId = user?.id ?? null;
-    setActorUserId(authUserId);
+      if (gen !== loadProfileGenerationRef.current) return;
 
-    if (!authUserId) {
-      setRbacRole("admin");
-      setCanonicalRoleKey(null);
-      setCanonicalRoleLabel("User");
-      setActorName("Operator");
-      setTeamGroups([]);
-      setHomeOrganizationName(null);
-      setSessionCanWorkspaceSwitch(false);
-      setViewAsProfileIdState(null);
-      setViewAsSnapshot(null);
-      setViewAsProfileOptions([]);
-      if (typeof window !== "undefined") {
-        window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
+      const authUserId = user?.id ?? null;
+      setActorUserId(authUserId);
+
+      if (!authUserId) {
+        if (gen !== loadProfileGenerationRef.current) return;
+        setRbacRole("admin");
+        setCanonicalRoleKey(null);
+        setCanonicalRoleLabel("User");
+        setActorName("Operator");
+        setTeamGroups([]);
+        setHomeOrganizationName(null);
+        setSessionCanWorkspaceSwitch(false);
+        setViewAsProfileIdState(null);
+        setViewAsSnapshot(null);
+        setViewAsProfileOptions([]);
+        if (typeof window !== "undefined") {
+          window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
+        }
+        const fallback =
+          process.env.NEXT_PUBLIC_ORGANIZATION_ID?.trim() ||
+          "00000000-0000-0000-0000-000000000001";
+        setHomeOrganizationId(isUuidString(fallback) ? fallback : "00000000-0000-0000-0000-000000000001");
+        setSuperAdminOrganizationOverride(null);
+        return;
       }
-      const fallback =
-        process.env.NEXT_PUBLIC_ORGANIZATION_ID?.trim() ||
-        "00000000-0000-0000-0000-000000000001";
-      setHomeOrganizationId(isUuidString(fallback) ? fallback : "00000000-0000-0000-0000-000000000001");
-      setSuperAdminOrganizationOverride(null);
-      setProfileLoading(false);
-      return;
-    }
 
-    const { data: profileData, error: profileSelectError } = await supabase
-      .from("profiles")
-      .select(
-        [
-          "id, organization_id, full_name, role, team_groups",
-          "roles!profiles_role_id_fkey(key, name, scope)",
-          "organizations!profiles_organization_id_fkey(name)",
-        ].join(", "),
-      )
-      .eq("id", authUserId)
-      .maybeSingle();
+      const { data: profileData, error: profileSelectError } = await supabase
+        .from("profiles")
+        .select(
+          [
+            "id, organization_id, full_name, role, team_groups",
+            "roles!profiles_role_id_fkey(key, name, scope)",
+            "organizations!profiles_organization_id_fkey(name)",
+          ].join(", "),
+        )
+        .eq("id", authUserId)
+        .maybeSingle();
 
-    if (profileSelectError) {
-      setHomeOrganizationName(null);
-      setProfileError(profileSelectError.message);
-      setSessionCanWorkspaceSwitch(false);
-      setProfileLoading(false);
-      return;
-    }
+      if (gen !== loadProfileGenerationRef.current) return;
 
-    if (!profileData || typeof profileData !== "object") {
-      setHomeOrganizationName(null);
-      setProfileError(`Authenticated user is missing a profiles row (id=${authUserId}).`);
-      setSessionCanWorkspaceSwitch(false);
-      setProfileLoading(false);
-      return;
-    }
-
-    const profileRow = profileData as Record<string, unknown>;
-
-    const joined = splitJoined<{ key?: string | null; name?: string | null; scope?: string | null }>(
-      profileRow.roles,
-    );
-    const joinedKey = joined?.key != null ? String(joined.key).trim().toLowerCase() : null;
-    const catalogKeyNorm = normalizeRoleKeyForBranding(
-      joinedKey ?? String(profileRow.role ?? ""),
-    );
-    const nr = normalizeRole(catalogKeyNorm || String(profileRow.role ?? ""));
-    setRbacRole(nr);
-
-    const canonKey = catalogKeyNorm.length > 0 ? catalogKeyNorm : null;
-    setCanonicalRoleKey(canonKey);
-
-    const canWs =
-      INTERNAL_STAFF_ROLE_KEYS.has(catalogKeyNorm)
-      || nr === "super_admin"
-      || nr === "system_employee";
-    setSessionCanWorkspaceSwitch(canWs);
-    const catalogName =
-      joined?.name != null && String(joined.name).trim().length > 0
-        ? String(joined.name).trim()
-        : titleCaseRoleKey(canonKey);
-    setCanonicalRoleLabel(catalogName);
-
-    setActorName(String(profileRow.full_name ?? "").trim() || "User");
-    setTeamGroups(Array.isArray(profileRow.team_groups) ? profileRow.team_groups.map(String) : []);
-    const cid = String(profileRow.organization_id ?? "").trim();
-    const homeId = cid && isUuidString(cid) ? cid : null;
-    setHomeOrganizationId(homeId);
-
-    const orgEmbed = splitJoined<{ name?: string | null }>(profileRow.organizations);
-    const joinedName = orgEmbed != null && typeof orgEmbed.name === "string" ? orgEmbed.name.trim() : "";
-    setHomeOrganizationName(joinedName.length > 0 ? joinedName : null);
-
-    let workspaceSelectionId: string | null = null;
-    if (canWs) {
-      const stored = readStoredWorkspaceCompanyId();
-      if (stored && isUuidString(stored)) {
-        workspaceSelectionId = stored;
-      } else if (homeId) {
-        workspaceSelectionId = homeId;
+      if (profileSelectError) {
+        setHomeOrganizationName(null);
+        setProfileError(profileSelectError.message);
+        setSessionCanWorkspaceSwitch(false);
+        return;
       }
-      setSuperAdminOrganizationOverride(workspaceSelectionId);
-      void listWorkspaceOrganizationsForAdmin().then((orgRes) => {
+
+      if (!profileData || typeof profileData !== "object") {
+        setHomeOrganizationName(null);
+        setProfileError(`Authenticated user is missing a profiles row (id=${authUserId}).`);
+        setSessionCanWorkspaceSwitch(false);
+        return;
+      }
+
+      const profileRow = profileData as Record<string, unknown>;
+
+      const joined = splitJoined<{ key?: string | null; name?: string | null; scope?: string | null }>(
+        profileRow.roles,
+      );
+      const joinedKey = joined?.key != null ? String(joined.key).trim().toLowerCase() : null;
+      const catalogKeyNorm = normalizeRoleKeyForBranding(
+        joinedKey ?? String(profileRow.role ?? ""),
+      );
+      const nr = normalizeRole(catalogKeyNorm || String(profileRow.role ?? ""));
+      setRbacRole(nr);
+
+      const canonKey = catalogKeyNorm.length > 0 ? catalogKeyNorm : null;
+      setCanonicalRoleKey(canonKey);
+
+      const canWs =
+        INTERNAL_STAFF_ROLE_KEYS.has(catalogKeyNorm)
+        || nr === "super_admin"
+        || nr === "system_employee";
+      setSessionCanWorkspaceSwitch(canWs);
+      const catalogName =
+        joined?.name != null && String(joined.name).trim().length > 0
+          ? String(joined.name).trim()
+          : titleCaseRoleKey(canonKey);
+      setCanonicalRoleLabel(catalogName);
+
+      setActorName(String(profileRow.full_name ?? "").trim() || "User");
+      setTeamGroups(Array.isArray(profileRow.team_groups) ? profileRow.team_groups.map(String) : []);
+      const cid = String(profileRow.organization_id ?? "").trim();
+      const homeId = cid && isUuidString(cid) ? cid : null;
+      setHomeOrganizationId(homeId);
+
+      const orgEmbed = splitJoined<{ name?: string | null }>(profileRow.organizations);
+      const joinedName = orgEmbed != null && typeof orgEmbed.name === "string" ? orgEmbed.name.trim() : "";
+      setHomeOrganizationName(joinedName.length > 0 ? joinedName : null);
+
+      let workspaceSelectionId: string | null = null;
+      let mergedWorkspaceList: WorkspaceOrganizationOption[] = [];
+
+      if (canWs) {
+        const stored = readStoredWorkspaceCompanyId();
+        if (stored && isUuidString(stored)) {
+          workspaceSelectionId = stored;
+        } else if (homeId) {
+          workspaceSelectionId = homeId;
+        }
+        setSuperAdminOrganizationOverride(workspaceSelectionId);
+
+        const orgRes = await listWorkspaceOrganizationsForAdmin();
+        if (gen !== loadProfileGenerationRef.current) return;
+
         const rows: WorkspaceOrganizationOption[] = orgRes.ok ? [...orgRes.rows] : [];
         const ids = new Set(rows.map((r) => r.organization_id));
         if (homeId && !ids.has(homeId)) {
@@ -360,54 +372,61 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
           });
           ids.add(workspaceSelectionId);
         }
-        const unique = dedupeWorkspaceOrganizations(rows);
-        unique.sort((a, b) => a.display_name.localeCompare(b.display_name));
-        setWorkspaceOrganizations(unique);
-      });
-    } else {
-      setSuperAdminOrganizationOverride(null);
-      setWorkspaceOrganizations([]);
-    }
-
-    const idsToLabel = [
-      ...new Set(
-        [homeId, workspaceSelectionId].filter((x): x is string => !!x && isUuidString(x)),
-      ),
-    ];
-    if (idsToLabel.length > 0) {
-      const nm = await getOrganizationNames(idsToLabel);
-      if (nm.ok) {
-        setOrgLabelsById((prev) => {
-          const next = { ...prev };
-          for (const r of nm.rows) {
-            next[r.organization_id] = r.display_name;
-          }
-          return next;
-        });
+        mergedWorkspaceList = dedupeWorkspaceOrganizations(rows);
+        mergedWorkspaceList.sort((a, b) => a.display_name.localeCompare(b.display_name));
+        setWorkspaceOrganizations(mergedWorkspaceList);
+      } else {
+        setSuperAdminOrganizationOverride(null);
+        setWorkspaceOrganizations([]);
       }
-    }
 
-    if (canWs) {
-      const va = readStoredViewAsProfileId();
-      if (va && va !== authUserId) {
-        setViewAsProfileIdState(va);
+      const labelIdSet = new Set<string>();
+      if (homeId && isUuidString(homeId)) labelIdSet.add(homeId);
+      if (workspaceSelectionId && isUuidString(workspaceSelectionId)) {
+        labelIdSet.add(workspaceSelectionId);
+      }
+      for (const r of mergedWorkspaceList) {
+        if (isUuidString(r.organization_id)) labelIdSet.add(r.organization_id);
+      }
+      if (labelIdSet.size > 0) {
+        const nm = await getOrganizationNames([...labelIdSet]);
+        if (nm.ok && gen === loadProfileGenerationRef.current) {
+          setOrgLabelsById((prev) => {
+            const next = { ...prev };
+            for (const r of nm.rows) {
+              next[r.organization_id] = r.display_name;
+            }
+            return next;
+          });
+        }
+      }
+
+      if (gen !== loadProfileGenerationRef.current) return;
+
+      if (canWs) {
+        const va = readStoredViewAsProfileId();
+        if (va && va !== authUserId) {
+          setViewAsProfileIdState(va);
+        } else {
+          setViewAsProfileIdState(null);
+          setViewAsSnapshot(null);
+          if (typeof window !== "undefined") {
+            window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
+          }
+        }
       } else {
         setViewAsProfileIdState(null);
         setViewAsSnapshot(null);
+        setViewAsProfileOptions([]);
         if (typeof window !== "undefined") {
           window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
         }
       }
-    } else {
-      setViewAsProfileIdState(null);
-      setViewAsSnapshot(null);
-      setViewAsProfileOptions([]);
-      if (typeof window !== "undefined") {
-        window.localStorage.removeItem(LS_VIEW_AS_PROFILE_ID);
+    } finally {
+      if (gen === loadProfileGenerationRef.current) {
+        setProfileLoading(false);
       }
     }
-
-    setProfileLoading(false);
   }, []);
 
   useEffect(() => { void loadProfile(); }, [loadProfile]);

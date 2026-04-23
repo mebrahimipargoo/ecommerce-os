@@ -19,6 +19,9 @@ import type { OrgGroupRow, ProfileRow, UserGroupAssignment } from "./users-types
 const PROFILE_LIST_SELECT =
   "id, organization_id, full_name, role, photo_url, created_at, updated_at, roles!profiles_role_id_fkey(key, name, scope)";
 
+/** Platform directory: include org classification (`public.organizations.type`). */
+const PROFILE_PLATFORM_LIST_SELECT = `${PROFILE_LIST_SELECT}, organizations!profiles_organization_id_fkey(type)`;
+
 function splitJoined<T>(raw: unknown): T | null {
   if (raw == null) return null;
   if (Array.isArray(raw)) return (raw[0] as T | undefined) ?? null;
@@ -198,6 +201,11 @@ function inferRoleScope(
 type UsersActionCtx = {
   actorProfileId?: string | null;
   filterOrganizationId?: string | null;
+  /**
+   * When true, group listing/assignments skip tenant list-scope filtering so platform
+   * directory admins can manage users in any organization (still requires profile/group org match).
+   */
+  platformUserDirectoryBypass?: boolean;
 };
 
 async function resolveActorProfileId(ctx?: UsersActionCtx | null): Promise<string | null> {
@@ -228,7 +236,13 @@ export async function listGroupsForOrganization(
     filterOrganizationId: ctx?.filterOrganizationId?.trim() ?? null,
   });
   if (scope.mode === "single" && oid !== scope.organizationId) {
-    return { ok: false, error: "Forbidden: organization mismatch." };
+    if (!ctx?.platformUserDirectoryBypass) {
+      return { ok: false, error: "Forbidden: organization mismatch." };
+    }
+    const actorProfile = await loadTenantProfile(actorId);
+    if (!actorProfile || !isSuperAdminRole(actorProfile.role)) {
+      return { ok: false, error: "Forbidden: organization mismatch." };
+    }
   }
   if (scope.mode === "all") {
     const actorProfile = await loadTenantProfile(actorId);
@@ -332,7 +346,13 @@ export async function listUserGroupAssignmentsForProfiles(
         gJoin?.organization_id != null ? String(gJoin.organization_id).trim() : "";
       const pOrg = profileOrg.get(profileId) ?? "";
       if (!ugId || !groupId || !profileId || !gOrg || pOrg !== gOrg) continue;
-      if (scope.mode === "single" && gOrg !== scope.organizationId) continue;
+      if (
+        !ctx?.platformUserDirectoryBypass
+        && scope.mode === "single"
+        && gOrg !== scope.organizationId
+      ) {
+        continue;
+      }
 
       const key = String(gJoin?.key ?? "").trim();
       const name =
@@ -387,11 +407,15 @@ async function assertUserGroupMutationAllowed(
     actorProfileId: actorId,
     filterOrganizationId: ctx?.filterOrganizationId?.trim() ?? null,
   });
+  const actorProfile = await loadTenantProfile(actorId);
+  const platformDir = actorProfile && isSuperAdminRole(actorProfile.role);
+
   if (scope.mode === "single" && groupOrg !== scope.organizationId) {
-    return { ok: false, error: "Forbidden: outside your organization." };
+    if (!platformDir) {
+      return { ok: false, error: "Forbidden: outside your organization." };
+    }
   }
   if (scope.mode === "all") {
-    const actorProfile = await loadTenantProfile(actorId);
     if (!actorProfile || !isSuperAdminRole(actorProfile.role)) {
       return { ok: false, error: "Forbidden." };
     }
@@ -446,6 +470,71 @@ export async function removeUserGroup(
   }
 }
 
+async function mapRawProfileRowsToProfileRows(
+  rawRows: Record<string, unknown>[],
+): Promise<ProfileRow[]> {
+  const authEmails = await emailByUserIdMap();
+  const distinctOrgIds = [
+    ...new Set(
+      rawRows
+        .map((r) => (r.organization_id != null ? String(r.organization_id).trim() : ""))
+        .filter(Boolean),
+    ),
+  ];
+  const orgNameMap = await fetchOrgNameMap(distinctOrgIds);
+
+  return rawRows.map((r) => {
+    const id = String(r.id ?? "");
+    const fromAuth = authEmails.get(id)?.trim() ?? "";
+    const fn = r.full_name != null ? String(r.full_name).trim() : "";
+    const displayName = fn.length > 0 ? fn : null;
+    const oid = r.organization_id != null ? String(r.organization_id).trim() : null;
+    const companyName = oid ? (orgNameMap.get(oid) ?? null) : null;
+
+    /** Set only when the query embeds `organizations(...)`. */
+    let organization_type: "tenant" | "internal" | null | undefined;
+    if (Object.prototype.hasOwnProperty.call(r, "organizations")) {
+      const orgTypeJoin = splitJoined<{ type?: string | null }>(r.organizations);
+      if (orgTypeJoin?.type != null && String(orgTypeJoin.type).trim() !== "") {
+        const t = String(orgTypeJoin.type).trim().toLowerCase();
+        organization_type = t === "internal" ? "internal" : t === "tenant" ? "tenant" : null;
+      } else {
+        organization_type = oid ? "tenant" : null;
+      }
+    }
+
+    const join = splitJoined<{ key?: string | null; name?: string | null; scope?: string | null }>(r.roles);
+    const resolvedKey = String(
+      (join?.key ?? r.role ?? ""),
+    ).trim().toLowerCase() || null;
+    const roleLabel =
+      join?.name != null && String(join.name).trim().length > 0
+        ? String(join.name).trim()
+        : null;
+    const scopeKey =
+      resolvedKey === "admin"
+        ? "tenant_admin"
+        : resolvedKey;
+    const row: ProfileRow = {
+      id,
+      organization_id: oid,
+      company_name: companyName,
+      full_name: displayName,
+      email: fromAuth,
+      role: resolvedKey,
+      role_display_name: roleLabel,
+      role_scope: inferRoleScope(scopeKey ?? "", join?.scope),
+      photo_url: r.photo_url != null ? String(r.photo_url) : null,
+      created_at: String(r.created_at ?? ""),
+      updated_at: r.updated_at != null ? String(r.updated_at) : null,
+    };
+    if (organization_type !== undefined) {
+      row.organization_type = organization_type;
+    }
+    return row;
+  });
+}
+
 export async function listUserProfiles(ctx?: {
   actorProfileId?: string | null;
   /** Effective tenant (super_admin workspace); ignored for non–super-admins server-side. */
@@ -489,54 +578,41 @@ export async function listUserProfiles(ctx?: {
     if (error) return { ok: false, error: error.message };
 
     const rawRows = (data ?? []) as Record<string, unknown>[];
+    const rows = await mapRawProfileRowsToProfileRows(rawRows);
 
-    /** Resolve display email: `auth.users` is source of truth (profiles may not store email). */
-    const authEmails = await emailByUserIdMap();
+    return { ok: true, rows };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Failed to load users." };
+  }
+}
 
-    /** Resolve company display names from `organization_settings` (Rule 5 tenant table). */
-    const distinctOrgIds = [
-      ...new Set(
-        rawRows
-          .map((r) => (r.organization_id != null ? String(r.organization_id).trim() : ""))
-          .filter(Boolean),
-      ),
-    ];
-    const orgNameMap = await fetchOrgNameMap(distinctOrgIds);
+/**
+ * All profiles (every organization) for `/platform/users`.
+ * Allowed only for `super_admin` (canonical role key).
+ */
+export async function listAllUserProfilesForPlatformDirectory(): Promise<
+  { ok: true; rows: ProfileRow[] } | { ok: false; error: string }
+> {
+  try {
+    const fromSession = await getSessionUserIdFromCookies();
+    const actorId =
+      fromSession && isUuidString(fromSession) ? fromSession : null;
+    if (!actorId) {
+      return { ok: false, error: "Not authenticated." };
+    }
+    const actor = await loadTenantProfile(actorId);
+    if (!actor || !isSuperAdminRole(actor.role)) {
+      return { ok: false, error: "Forbidden." };
+    }
 
-    const rows: ProfileRow[] = rawRows.map((r) => {
-      const id = String(r.id ?? "");
-      const fromAuth = authEmails.get(id)?.trim() ?? "";
-      const fn = r.full_name != null ? String(r.full_name).trim() : "";
-      const displayName = fn.length > 0 ? fn : null;
-      const oid = r.organization_id != null ? String(r.organization_id).trim() : null;
-      const companyName = oid ? (orgNameMap.get(oid) ?? null) : null;
-      const join = splitJoined<{ key?: string | null; name?: string | null; scope?: string | null }>(r.roles);
-      const resolvedKey = String(
-        (join?.key ?? r.role ?? ""),
-      ).trim().toLowerCase() || null;
-      const roleLabel =
-        join?.name != null && String(join.name).trim().length > 0
-          ? String(join.name).trim()
-          : null;
-      const scopeKey =
-        resolvedKey === "admin"
-          ? "tenant_admin"
-          : resolvedKey;
-      return {
-        id,
-        organization_id: oid,
-        company_name: companyName,
-        full_name: displayName,
-        email: fromAuth,
-        role: resolvedKey,
-        role_display_name: roleLabel,
-        role_scope: inferRoleScope(scopeKey ?? "", join?.scope),
-        photo_url: r.photo_url != null ? String(r.photo_url) : null,
-        created_at: String(r.created_at ?? ""),
-        updated_at: r.updated_at != null ? String(r.updated_at) : null,
-      };
-    });
+    const { data, error } = await supabaseServer
+      .from("profiles")
+      .select(PROFILE_PLATFORM_LIST_SELECT)
+      .order("full_name", { ascending: true });
+    if (error) return { ok: false, error: error.message };
 
+    const rawRows = (data ?? []) as Record<string, unknown>[];
+    const rows = await mapRawProfileRowsToProfileRows(rawRows);
     return { ok: true, rows };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Failed to load users." };

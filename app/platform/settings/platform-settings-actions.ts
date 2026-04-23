@@ -1,5 +1,6 @@
 "use server";
 
+import { canEditPlatformProductSettings } from "../../../lib/platform-product-settings-access";
 import { supabaseServer } from "../../../lib/supabase-server";
 import { getSessionUserIdFromCookies } from "../../../lib/supabase-server-auth";
 
@@ -48,7 +49,7 @@ export async function getPlatformSettingsAction(): Promise<PlatformSettingsView>
   if (!roleKey) {
     return { app_name: "", logo_url: "", accessDenied: "not_authenticated" };
   }
-  if (roleKey !== "super_admin") {
+  if (!canEditPlatformProductSettings(roleKey)) {
     return { app_name: "", logo_url: "", accessDenied: "forbidden" };
   }
 
@@ -70,7 +71,9 @@ export async function savePlatformSettingsAction(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const roleKey = await getAuthenticatedPlatformRoleKey();
   if (!roleKey) return { ok: false, error: "You must be signed in." };
-  if (roleKey !== "super_admin") return { ok: false, error: "Only super_admin can edit platform settings." };
+  if (!canEditPlatformProductSettings(roleKey)) {
+    return { ok: false, error: "Only super_admin can edit platform settings." };
+  }
 
   const app_name = String(input.app_name ?? "").trim();
   if (!app_name) {

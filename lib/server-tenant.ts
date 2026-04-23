@@ -4,9 +4,11 @@ import { supabaseServer } from "./supabase-server";
 import { getSessionUserIdFromCookies } from "./supabase-server-auth";
 import { resolveOrganizationId } from "./organization";
 import { isUuidString } from "./uuid";
+import { canEditPlatformProductSettings } from "./platform-product-settings-access";
 import {
   canEditTenantOrganizationBrandingByRoleKey,
   canPickWorkspaceOrganizationForTenantBranding,
+  normalizeRoleKeyForBranding,
 } from "./tenant-branding-permissions";
 
 function splitJoined<T>(raw: unknown): T | null {
@@ -157,15 +159,15 @@ export function canEditTenantOrganizationBranding(profile: TenantProfileRow | nu
 
 /**
  * True when the profile may edit `public.platform_settings` (platform product branding).
- * Restricted to `super_admin` only.
+ * Canonical role: `super_admin` (matches platform settings server actions).
  */
 export function canManagePlatformSettings(profile: TenantProfileRow | null): boolean {
   if (!profile) return false;
-  return isSuperAdminRole(profile.role);
+  return canEditPlatformProductSettings(profile.role);
 }
 
 export function isSuperAdminRole(role: string | null | undefined): boolean {
-  return (role ?? "").trim().toLowerCase() === "super_admin";
+  return normalizeRoleKeyForBranding(role) === "super_admin";
 }
 
 /**

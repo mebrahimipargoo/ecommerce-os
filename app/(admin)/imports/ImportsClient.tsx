@@ -15,6 +15,7 @@
  */
 
 import React, { useCallback, useEffect, useState } from "react";
+import { usePathname } from "next/navigation";
 import { Building2, Database } from "lucide-react";
 import { UniversalImporter } from "./UniversalImporter";
 import { RawReportImportsPanel } from "./RawReportImportsPanel";
@@ -23,8 +24,11 @@ import {
   listWorkspaceOrganizationsForAdmin,
   type WorkspaceOrganizationOption,
 } from "../../session/tenant-actions";
+import { SettingsPageAccessPanel } from "@/components/settings/SettingsPageAccessPanel";
 
 export function ImportsClient() {
+  const pathname = usePathname();
+  const isSettingsImportsRoute = (pathname ?? "").includes("/settings/imports");
   const { role, organizationId } = useUserRole();
 
   /** Bumps to tell Import History to refetch — do NOT remount the panel (avoids empty-table flicker). */
@@ -127,6 +131,13 @@ export function ImportsClient() {
           </span>
         </div>
       )}
+
+      {isSettingsImportsRoute && (effectiveOrgId || organizationId) ? (
+        <SettingsPageAccessPanel
+          organizationId={(effectiveOrgId || organizationId || "").trim() || null}
+          pageFeature="imports"
+        />
+      ) : null}
 
       {/* ── Importer card ───────────────────────────────────────────────────── */}
       <UniversalImporter

@@ -4,7 +4,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   ArrowLeft, BadgeCheck, BarChart3, Building2, CheckCircle2, CreditCard, Cpu, Crown,
-  Globe, HardDrive, ImageIcon, KeyRound, Loader2, Package, PackageX, Palette, Pencil, Plus, Printer,
+  Globe, HardDrive, ImageIcon, KeyRound, Loader2, Package, PackageX, Pencil, Plus, Printer,
   RefreshCw, RotateCcw, Save, ScanLine, Settings, ShieldAlert, ShieldCheck, Store, Tag, Trash2,
   Truck, TriangleAlert, UserCog, Users, Wifi, X, Zap,
 } from "lucide-react";
@@ -1418,17 +1418,6 @@ export default function SettingsPage() {
               </div>
             ))}
 
-            {perms.canSeePlatformAdmin ? (
-              <Link
-                href="/platform/settings"
-                className="mb-3 flex w-full items-center gap-3 rounded-xl border border-violet-200 bg-violet-50 px-4 py-3 text-sm font-semibold text-violet-800 shadow-sm transition hover:bg-violet-100 dark:border-violet-900/60 dark:bg-violet-950/40 dark:text-violet-200 dark:hover:bg-violet-950/70"
-              >
-                <Palette className="h-4 w-4 shrink-0" />
-                <span className="flex-1 text-left">Platform Settings</span>
-                <span className="text-[10px] font-normal uppercase tracking-wide text-violet-600/80 dark:text-violet-300/80">Super admin</span>
-              </Link>
-            ) : null}
-
             {/* Plan badge in sidebar */}
             <div className="hidden md:block mt-4 rounded-xl border border-border bg-muted/40 px-4 py-3">
               <p className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground">Current Plan</p>
@@ -1466,8 +1455,8 @@ export default function SettingsPage() {
                         <span className="font-semibold">claim PDFs</span>, and other tenant-facing surfaces.
                         Loaded automatically for the organization you belong to (or the workspace you select below / in the header).
                         Stored in <code className="rounded bg-muted px-1 font-mono text-[11px]">organization_settings</code> only — not platform branding (
-                        <code className="rounded bg-muted px-1 font-mono text-[11px]">platform_settings</code> is edited under{" "}
-                        <span className="font-semibold">Platform Settings</span>).
+                        <code className="rounded bg-muted px-1 font-mono text-[11px]">platform_settings</code> is edited from the main sidebar under{" "}
+                        <span className="font-semibold">Platform Settings → Product branding</span>).
                       </p>
                     </div>
                   </div>

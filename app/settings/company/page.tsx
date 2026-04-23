@@ -15,6 +15,7 @@ import {
   responsivePageNarrow,
   responsivePageOuter,
 } from "../../../lib/responsive-page-shell";
+import { SettingsPageAccessPanel } from "@/components/settings/SettingsPageAccessPanel";
 
 export default function CompanySettingsPage() {
   const { organizationId: workspaceOrganizationId, profileLoading } = useUserRole();
@@ -164,6 +165,10 @@ export default function CompanySettingsPage() {
             ← Back to Settings
           </Link>
         </header>
+
+        {organizationId ? (
+          <SettingsPageAccessPanel organizationId={organizationId} pageFeature="company" />
+        ) : null}
 
         {error ? (
           <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">

@@ -2,7 +2,6 @@
 
 import React, { useEffect, useState } from "react";
 import { ImageIcon, Loader2, Save } from "lucide-react";
-import Link from "next/link";
 import {
   getPlatformSettingsAction,
   savePlatformSettingsAction,
@@ -14,6 +13,7 @@ import {
   responsivePageNarrow,
   responsivePageOuter,
 } from "../../../lib/responsive-page-shell";
+import { PageHeaderWithInfo } from "../components/page-header-with-info";
 
 export default function PlatformSettingsPage() {
   const [loading, setLoading] = useState(true);
@@ -102,12 +102,6 @@ export default function PlatformSettingsPage() {
               ? "You must be signed in to view this page."
               : "Only super_admin can edit platform settings."}
           </p>
-          <Link
-            href="/settings"
-            className="mt-4 inline-block text-sm font-medium text-primary hover:underline"
-          >
-            ← Back to Settings
-          </Link>
         </div>
       </div>
     );
@@ -116,24 +110,19 @@ export default function PlatformSettingsPage() {
   return (
     <div className={responsivePageOuter}>
       <div className={`${responsivePageInner} space-y-6`}>
-        <header className="space-y-2">
-          <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
-            Platform branding
-          </h1>
-          <p className="max-w-3xl text-sm text-muted-foreground">
+        <PageHeaderWithInfo
+          title="Platform branding"
+          titleClassName="text-2xl font-bold tracking-tight text-foreground sm:text-3xl"
+          infoAriaLabel="About platform branding"
+        >
+          <p>
             Super-admin-only platform identity. This writes only to{" "}
             <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px]">
               platform_settings
             </code>
             .
           </p>
-          <Link
-            href="/settings"
-            className="inline-block text-xs font-medium text-primary hover:underline"
-          >
-            ← Back to Settings
-          </Link>
-        </header>
+        </PageHeaderWithInfo>
 
         {error ? (
           <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">

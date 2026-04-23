@@ -17,7 +17,11 @@ import {
   INTERNAL_DEV_BADGE_ROLE_KEYS,
   type UserRole,
 } from "../components/UserRoleContext";
-import { canEditTenantOrganizationBrandingByRoleKey } from "../lib/tenant-branding-permissions";
+import { canManagePlatformAccessCatalog } from "../lib/platform-access-management";
+import {
+  canEditTenantOrganizationBrandingByRoleKey,
+  normalizeRoleKeyForBranding,
+} from "../lib/tenant-branding-permissions";
 
 export type RbacPermissions = {
   // ── Operations (visible to everyone except pure operator) ──
@@ -34,8 +38,24 @@ export type RbacPermissions = {
   canSeeImports:         boolean;
   canSeeSystemAdmin:     boolean;
 
-  // ── Platform (super_admin only) ───────────────────────────
+  /**
+   * Platform Settings nav (`/platform/*` orgs, branding, platform users) — signed-in `super_admin` only (canonical role key).
+   */
   canSeePlatformAdmin:   boolean;
+
+  /**
+   * Global user directory (`/platform/users`) — same gate as {@link canSeePlatformAdmin}.
+   */
+  canSeePlatformUserDirectory: boolean;
+
+  /** Provision new tenant org (`/platform/organizations/new`) — same gate as {@link canSeePlatformAdmin}. */
+  canSeeCreateOrganization: boolean;
+
+  /**
+   * Platform access management (`/platform/access`) — signed-in catalog roles:
+   * `super_admin`, `programmer`, `system_admin` (via {@link canManagePlatformAccessCatalog}).
+   */
+  canSeePlatformAccess: boolean;
 
   /** Tenant company name / logo on `organization_settings` — tenant_admin (tier `admin`), super_admin, and catalog `programmer`. */
   canEditTenantBranding: boolean;
@@ -74,12 +94,14 @@ export function useRbacPermissions(): RbacPermissions {
   const ck = (canonicalRoleKey ?? "").trim().toLowerCase();
   /** Workspace chrome must follow the signed-in account, not “view as” simulation. */
   const actorCk = (actorCanonicalRoleKey ?? "").trim().toLowerCase();
+  const actorNorm = normalizeRoleKeyForBranding(actorCanonicalRoleKey);
 
   return useMemo((): RbacPermissions => {
     const isAtLeast = (minRole: UserRole): boolean =>
       ROLE_HIERARCHY.indexOf(role) >= ROLE_HIERARCHY.indexOf(minRole);
 
     const isOperator = role === "operator";
+    const canPlatformSettings = actorNorm === "super_admin";
 
     return {
       // Ops modules: everyone except pure warehouse operators
@@ -96,8 +118,13 @@ export function useRbacPermissions(): RbacPermissions {
       canSeeImports:        isAtLeast("admin"),
       canSeeSystemAdmin:    isAtLeast("admin"),
 
-      // Platform menu: super_admin only
-      canSeePlatformAdmin:  role === "super_admin",
+      canSeePlatformAdmin: canPlatformSettings,
+
+      canSeePlatformUserDirectory: canPlatformSettings,
+
+      canSeeCreateOrganization: canPlatformSettings,
+
+      canSeePlatformAccess: canManagePlatformAccessCatalog(actorCanonicalRoleKey),
 
       // Tenant org branding: canonical role keys only (not 5-tier UI labels).
       canEditTenantBranding: canEditTenantOrganizationBrandingByRoleKey(canonicalRoleKey),
@@ -117,5 +144,5 @@ export function useRbacPermissions(): RbacPermissions {
 
       isAtLeast,
     };
-  }, [role, ck, actorCk]);
+  }, [role, ck, actorCk, actorNorm, actorCanonicalRoleKey]);
 }
