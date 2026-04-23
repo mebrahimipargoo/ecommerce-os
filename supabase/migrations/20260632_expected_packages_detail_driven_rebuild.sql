@@ -1,146 +1,84 @@
--- Part B — Removal Expected Build redesigned around real Amazon truth:
---   amazon_removals          (Removal Order Detail)     — line-level truth
---   amazon_removal_shipments (Removal Shipment Detail)  — shipment-level split truth
+-- Rebuild expected_packages must be DETAIL-DRIVEN, not SHIPMENT-DRIVEN.
 --
--- expected_packages becomes the *derived* scan plan:
---   one row per matched (detail_line × shipment_line) pair, plus
---   one remainder row per detail line whose detail.shipped_quantity exceeds
---   the sum of matching shipment.shipped_quantity.
---   Conflict state when shipments overflow detail.shipped_quantity.
+-- Replaces public.rebuild_expected_packages_from_removals so the contract is:
 --
--- Reuses expected_packages (additive columns only) instead of creating a new
--- table. Existing rows are preserved and tagged build_source = 'legacy'; the
--- canonical-cross-file unique index is converted to a partial index over those
--- legacy rows so the old generate-worklist code path keeps working unchanged
--- alongside the new rebuild.
+--   1) Every amazon_removals row in scope MUST appear in expected_packages.
+--      No detail row may disappear because shipment match is missing.
 --
--- Destructive note (single change requiring justification):
---   The existing unique index uq_expected_packages_canonical_cross_file is
---   DROPPED and immediately re-created as a PARTIAL index restricted to
---   build_source IN (NULL, 'legacy'). Without this change the new model
---   (multiple ep rows per canonical 7-tuple, one per shipment row) cannot exist
---   at all, because the current index forbids it. No data is lost; the index
---   is recreated covering the same rows it covered before.
+--   2) expected_packages preserves the full quantity snapshot from the detail:
+--        requested_quantity
+--        shipped_quantity
+--        disposed_quantity
+--        cancelled_quantity
+--        in_process_quantity   <- new column on expected_packages
+--        removal_fee           <- new column on expected_packages
+--        currency              <- new column on expected_packages
+--      The snapshot is denormalized onto every derived row produced from that
+--      detail line, so it is queryable per row regardless of shipment state.
 --
--- Wave 5 identity enrichment, every other importer, and every UI route are
--- untouched.
+--   3) amazon_removal_shipments is used ONLY to SPLIT or ENRICH:
+--        adds tracking_number, carrier, shipment_date
+--        splits one detail row into multiple expected rows when multiple
+--        shipment rows match.
+--
+--   4) If no shipment rows match a detail line:
+--        keep ONE unsplit expected row
+--        tracking_number / carrier / shipment_date stay NULL
+--        the detail row still exists (build_source = 'detail_remainder',
+--        build_status = 'awaiting_shipment_match' when shipped_quantity > 0,
+--        build_status = 'no_shipment_expected'    when shipped_quantity = 0).
+--
+--   5) If shipment rows cover only part of the detail.shipped_quantity:
+--        emit shipment-backed split rows for what they cover, plus ONE
+--        remainder row for the unresolved part. Disposed / cancelled /
+--        in_process quantities remain visible on every emitted row.
+--
+--   6) Disposed / cancelled / in_process quantities remain visible on
+--      expected_packages even when no shipment rows exist.
+--
+--   7) No code path requires shipment rows for a detail row to exist in
+--      expected_packages.
+--
+-- Reuses every existing column, constraint, FK, and partial unique index
+-- introduced by 20260631_expected_packages_derived_rebuild.sql. Only additive
+-- columns are added; the function is replaced via CREATE OR REPLACE.
+--
+-- Idempotent. Safe to re-run.
 
 BEGIN;
 
--- ── 1) Additive columns on expected_packages ────────────────────────────────
+-- ── 1) Additive columns to carry the full detail quantity snapshot ──────────
 ALTER TABLE public.expected_packages
-  ADD COLUMN IF NOT EXISTS build_source                  text,
-  ADD COLUMN IF NOT EXISTS build_status                  text,
-  ADD COLUMN IF NOT EXISTS source_detail_row_id          uuid,
-  ADD COLUMN IF NOT EXISTS source_shipment_row_id        uuid,
-  ADD COLUMN IF NOT EXISTS detail_shipped_quantity_total integer,
-  ADD COLUMN IF NOT EXISTS expected_scan_quantity        integer,
-  ADD COLUMN IF NOT EXISTS shipment_row_quantity         integer,
-  ADD COLUMN IF NOT EXISTS detail_grouping_key           text,
-  ADD COLUMN IF NOT EXISTS rebuild_run_at                timestamptz;
+  ADD COLUMN IF NOT EXISTS in_process_quantity integer,
+  ADD COLUMN IF NOT EXISTS removal_fee         numeric(18, 6),
+  ADD COLUMN IF NOT EXISTS currency            text;
 
-COMMENT ON COLUMN public.expected_packages.build_source IS
-  'How this row was created: legacy (pre-rebuild rows) | detail_shipment | detail_remainder.';
-COMMENT ON COLUMN public.expected_packages.build_status IS
-  'Operational state set by rebuild: matched | awaiting_shipment_match | shipment_overflow_conflict.';
-COMMENT ON COLUMN public.expected_packages.source_detail_row_id IS
-  'amazon_removals.id of the detail line that produced this expected row.';
-COMMENT ON COLUMN public.expected_packages.source_shipment_row_id IS
-  'amazon_removal_shipments.id of the shipment row that produced this expected row; NULL on remainder rows.';
-COMMENT ON COLUMN public.expected_packages.detail_shipped_quantity_total IS
-  'detail.shipped_quantity at the time this row was last rebuilt.';
-COMMENT ON COLUMN public.expected_packages.expected_scan_quantity IS
-  'Quantity the warehouse must scan against this row.';
-COMMENT ON COLUMN public.expected_packages.shipment_row_quantity IS
-  'Shipment row shipped_quantity feeding this row; NULL on remainder rows.';
-COMMENT ON COLUMN public.expected_packages.detail_grouping_key IS
-  'Stable canonical key for grouping rows produced by the same detail line: '
-  'organization_id|store_id|order_id|order_type|order_date|sku|fnsku|disposition.';
+COMMENT ON COLUMN public.expected_packages.in_process_quantity IS
+  'amazon_removals.in_process_quantity snapshot copied at rebuild time. '
+  'Visible on every derived row produced from the detail line, even when no '
+  'shipment rows exist.';
+COMMENT ON COLUMN public.expected_packages.removal_fee IS
+  'amazon_removals.removal_fee snapshot copied at rebuild time. Denormalized '
+  'onto every derived row produced from the detail line.';
+COMMENT ON COLUMN public.expected_packages.currency IS
+  'amazon_removals.currency snapshot copied at rebuild time. Denormalized '
+  'onto every derived row produced from the detail line.';
 
--- Soft FK references — derived rows lose their pointer (not the row) when a
--- source row is deleted. The next rebuild reconciles them.
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conname = 'expected_packages_source_detail_fk'
-  ) THEN
-    ALTER TABLE public.expected_packages
-      ADD CONSTRAINT expected_packages_source_detail_fk
-      FOREIGN KEY (source_detail_row_id)
-      REFERENCES public.amazon_removals (id)
-      ON DELETE SET NULL;
-  END IF;
-
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conname = 'expected_packages_source_shipment_fk'
-  ) THEN
-    ALTER TABLE public.expected_packages
-      ADD CONSTRAINT expected_packages_source_shipment_fk
-      FOREIGN KEY (source_shipment_row_id)
-      REFERENCES public.amazon_removal_shipments (id)
-      ON DELETE SET NULL;
-  END IF;
-END $$;
-
--- ── 2) Tag every pre-existing row as legacy so the partial indexes split cleanly
-UPDATE public.expected_packages
-SET build_source = 'legacy'
-WHERE build_source IS NULL;
-
--- ── 3) Convert canonical-cross-file unique index to a PARTIAL index that
---      covers only legacy rows. Derived rows live under the new partial unique
---      below.
-DROP INDEX IF EXISTS public.uq_expected_packages_canonical_cross_file;
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_expected_packages_canonical_legacy
-  ON public.expected_packages (
-    organization_id, store_id, order_id, order_type, sku, fnsku, disposition
-  )
-  NULLS NOT DISTINCT
-  WHERE build_source = 'legacy';
-
-COMMENT ON INDEX public.uq_expected_packages_canonical_legacy IS
-  'Legacy canonical-cross-file unique (org, store, order_id, order_type, sku, fnsku, disposition) — '
-  'preserves the contract used by the existing generate-worklist upsert. Applies only to '
-  'build_source = ''legacy'' rows; derived rows have their own partial unique below.';
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_expected_packages_derived_pair
-  ON public.expected_packages (
-    organization_id, source_detail_row_id, source_shipment_row_id
-  )
-  NULLS NOT DISTINCT
-  WHERE build_source IN ('detail_shipment', 'detail_remainder');
-
-COMMENT ON INDEX public.uq_expected_packages_derived_pair IS
-  'Derived expected_packages identity: (org, source_detail_row_id, source_shipment_row_id). '
-  'NULL source_shipment_row_id is the remainder row for the detail. Allows multiple ep rows per '
-  'canonical 7-tuple, one per shipment.';
-
-CREATE INDEX IF NOT EXISTS idx_expected_packages_derived_status
-  ON public.expected_packages (organization_id, build_status)
-  WHERE build_source IN ('detail_shipment', 'detail_remainder');
-
-CREATE INDEX IF NOT EXISTS idx_expected_packages_derived_detail
-  ON public.expected_packages (source_detail_row_id)
-  WHERE source_detail_row_id IS NOT NULL;
-
--- ── 4) Rebuild function — dedicated DB-side action, idempotent ──────────────
+-- ── 2) Detail-driven rebuild ────────────────────────────────────────────────
 --
--- For each amazon_removals row in scope:
---   * find amazon_removal_shipments rows where
---       organization_id, store_id, order_id, order_type,
---       order_date (request_date), sku, fnsku, disposition
---     match (NULL-safe);
---   * insert one ep row per matched shipment (build_source = 'detail_shipment');
---   * insert one remainder ep row when sum(shipment.shipped_quantity) <
---     detail.shipped_quantity (build_source = 'detail_remainder');
---   * stamp build_status = 'shipment_overflow_conflict' on every matched row
---     for that detail when sum(shipment.shipped_quantity) > detail.shipped_quantity.
+-- Keys & contracts intentionally unchanged from 20260631:
+--   * partial unique uq_expected_packages_derived_pair on
+--     (organization_id, source_detail_row_id, source_shipment_row_id)
+--     WHERE build_source IN ('detail_shipment','detail_remainder')
+--   * legacy partial unique uq_expected_packages_canonical_legacy untouched
+--   * FKs expected_packages_source_detail_fk / _source_shipment_fk untouched
 --
--- Idempotent via UPSERT keyed on (org, source_detail_row_id, source_shipment_row_id);
--- obsolete derived rows in scope (whose pair no longer exists) are deleted.
+-- Output enum:
+--   build_source IN ('detail_shipment', 'detail_remainder')
+--   build_status IN ('matched',
+--                    'shipment_overflow_conflict',
+--                    'awaiting_shipment_match',
+--                    'no_shipment_expected')
 
 CREATE OR REPLACE FUNCTION public.rebuild_expected_packages_from_removals(
   p_organization_id uuid,
@@ -167,6 +105,10 @@ DECLARE
 BEGIN
   -- (a) Build target rows in a temp table so we can use it for both
   --     UPSERT and obsolete-cleanup against the same scope.
+  --
+  --     CRITICAL: detail is the driver. shipment LEFT JOINs to detail.
+  --     A detail line with NO matching shipment still produces a row
+  --     (the remainder/no-shipment-expected row).
   CREATE TEMP TABLE _rebuild_target ON COMMIT DROP AS
   WITH detail AS (
     SELECT
@@ -184,6 +126,9 @@ BEGIN
       d.requested_quantity,
       d.disposed_quantity,
       d.cancelled_quantity,
+      d.in_process_quantity,
+      d.removal_fee,
+      d.currency,
       d.order_status
     FROM public.amazon_removals d
     WHERE d.organization_id = p_organization_id
@@ -226,6 +171,9 @@ BEGIN
       d.requested_quantity,
       d.disposed_quantity,
       d.cancelled_quantity,
+      d.in_process_quantity,
+      d.removal_fee,
+      d.currency,
       d.order_status,
       s.shipment_id,
       s.shipment_upload_id,
@@ -247,12 +195,16 @@ BEGIN
   agg AS (
     SELECT
       detail_id,
-      sum(COALESCE(shipment_shipped_qty, 0)) FILTER (WHERE shipment_id IS NOT NULL) AS shipment_total,
-      max(detail_shipped_qty)                                                          AS detail_total
+      count(*) FILTER (WHERE shipment_id IS NOT NULL)                AS shipment_count,
+      sum(COALESCE(shipment_shipped_qty, 0))
+        FILTER (WHERE shipment_id IS NOT NULL)                        AS shipment_total,
+      max(detail_shipped_qty)                                          AS detail_total
     FROM pair
     GROUP BY detail_id
   ),
   matched_rows AS (
+    -- One row per (detail × shipment) when shipment matched.
+    -- Quantity snapshot from detail is denormalized onto every shipment row.
     SELECT
       p.organization_id,
       p.store_id,
@@ -267,6 +219,9 @@ BEGIN
       p.detail_shipped_qty                                            AS shipped_quantity,
       p.disposed_quantity,
       p.cancelled_quantity,
+      p.in_process_quantity,
+      p.removal_fee,
+      p.currency,
       p.order_status,
       p.tracking_number,
       p.carrier,
@@ -296,6 +251,14 @@ BEGIN
     WHERE p.shipment_id IS NOT NULL
   ),
   remainder_rows AS (
+    -- DETAIL-DRIVEN GUARANTEE: every detail line that is not fully covered
+    -- by shipment-backed rows gets exactly one remainder row.
+    --
+    --   * No shipment matched at all  → one remainder row
+    --     (expected_scan_quantity = detail.shipped_quantity, may be 0)
+    --   * Shipments cover only part   → one remainder row for the rest
+    --   * Shipments cover all/over    → no remainder row (matched rows suffice;
+    --                                   overflow is flagged on matched rows)
     SELECT DISTINCT ON (p.detail_id)
       p.organization_id,
       p.store_id,
@@ -310,6 +273,9 @@ BEGIN
       p.detail_shipped_qty                                            AS shipped_quantity,
       p.disposed_quantity,
       p.cancelled_quantity,
+      p.in_process_quantity,
+      p.removal_fee,
+      p.currency,
       p.order_status,
       NULL::text                                                      AS tracking_number,
       NULL::text                                                      AS carrier,
@@ -318,9 +284,17 @@ BEGIN
       NULL::uuid                                                      AS source_shipment_row_id,
       p.detail_shipped_qty                                            AS detail_shipped_quantity_total,
       NULL::integer                                                   AS shipment_row_quantity,
-      (a.detail_total - COALESCE(a.shipment_total, 0))::integer       AS expected_scan_quantity,
+      GREATEST(
+        a.detail_total - COALESCE(a.shipment_total, 0),
+        0
+      )::integer                                                      AS expected_scan_quantity,
       'detail_remainder'::text                                        AS build_source,
-      'awaiting_shipment_match'::text                                 AS build_status,
+      CASE
+        WHEN COALESCE(a.shipment_count, 0) = 0
+         AND COALESCE(a.detail_total, 0) = 0
+          THEN 'no_shipment_expected'
+        ELSE 'awaiting_shipment_match'
+      END                                                             AS build_status,
       concat_ws('|',
         p.organization_id::text,
         COALESCE(p.store_id::text, ''),
@@ -333,7 +307,8 @@ BEGIN
       )                                                               AS detail_grouping_key
     FROM pair p
     JOIN agg a USING (detail_id)
-    WHERE a.detail_total > COALESCE(a.shipment_total, 0)
+    WHERE COALESCE(a.shipment_count, 0) = 0
+       OR a.detail_total > COALESCE(a.shipment_total, 0)
     ORDER BY p.detail_id
   )
   SELECT * FROM matched_rows
@@ -353,6 +328,7 @@ BEGIN
     order_id, order_type, order_date,
     sku, fnsku, disposition,
     requested_quantity, shipped_quantity, disposed_quantity, cancelled_quantity,
+    in_process_quantity, removal_fee, currency,
     order_status, tracking_number, carrier, shipment_date,
     source_detail_row_id, source_shipment_row_id,
     detail_shipped_quantity_total, shipment_row_quantity, expected_scan_quantity,
@@ -363,6 +339,7 @@ BEGIN
     order_id, order_type, order_date,
     sku, fnsku, disposition,
     requested_quantity, shipped_quantity, disposed_quantity, cancelled_quantity,
+    in_process_quantity, removal_fee, currency,
     order_status, tracking_number, carrier, shipment_date,
     source_detail_row_id, source_shipment_row_id,
     detail_shipped_quantity_total, shipment_row_quantity, expected_scan_quantity,
@@ -383,7 +360,10 @@ BEGIN
     shipped_quantity               = excluded.shipped_quantity,
     disposed_quantity              = excluded.disposed_quantity,
     cancelled_quantity             = excluded.cancelled_quantity,
-    order_status                   = COALESCE(ep.order_status, excluded.order_status),
+    in_process_quantity            = excluded.in_process_quantity,
+    removal_fee                    = excluded.removal_fee,
+    currency                       = excluded.currency,
+    order_status                   = COALESCE(ep.order_status,    excluded.order_status),
     tracking_number                = COALESCE(ep.tracking_number, excluded.tracking_number),
     carrier                        = COALESCE(ep.carrier,         excluded.carrier),
     shipment_date                  = COALESCE(ep.shipment_date,   excluded.shipment_date),
@@ -397,6 +377,8 @@ BEGIN
     updated_at                     = now();
 
   -- (c) Delete derived rows in scope whose target pair no longer exists.
+  --     Only touches build_source IN ('detail_shipment','detail_remainder').
+  --     Legacy rows are never touched.
   WITH del AS (
     DELETE FROM public.expected_packages ep
     USING (
@@ -422,11 +404,14 @@ END;
 $function$;
 
 COMMENT ON FUNCTION public.rebuild_expected_packages_from_removals(uuid, uuid) IS
-  'Idempotent rebuild of expected_packages derived rows from amazon_removals (detail) × '
-  'amazon_removal_shipments (shipment). One ep row per matched shipment row; one remainder row '
-  'per detail line whose detail.shipped_quantity exceeds matched shipment total. Stamps '
-  'build_status = ''shipment_overflow_conflict'' on rows where shipment total > detail total. '
-  'Safe to rerun after each removal-detail or removal-shipment import.';
+  'Detail-driven rebuild of expected_packages from amazon_removals (detail) × '
+  'amazon_removal_shipments (shipment). Every detail row in scope produces at least '
+  'one expected row; shipments only SPLIT (one ep row per matched shipment) or '
+  'ENRICH (tracking_number, carrier, shipment_date). Detail quantity snapshot — '
+  'requested, shipped, disposed, cancelled, in_process, removal_fee, currency — is '
+  'denormalized onto every emitted row. build_status: matched | '
+  'shipment_overflow_conflict | awaiting_shipment_match | no_shipment_expected. '
+  'Idempotent. Safe to rerun after each detail or shipment import.';
 
 GRANT EXECUTE ON FUNCTION public.rebuild_expected_packages_from_removals(uuid, uuid) TO service_role;
 
