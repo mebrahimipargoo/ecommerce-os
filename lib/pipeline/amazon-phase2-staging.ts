@@ -33,7 +33,18 @@ import { logImportPhase } from "./amazon-import-engine-log";
 import { resolveAmazonImportEngineConfig, resolveAmazonImportSyncKind } from "./amazon-report-registry";
 
 const STAGING_TABLE = "amazon_staging";
+/**
+ * Conflict target for amazon_staging upserts.
+ * Backs index `uq_amazon_staging_org_upload_row_number` (organization_id, upload_id, row_number).
+ * We must NEVER drop or rename this index — chunked + idempotent staging depends on it.
+ */
+const STAGING_CONFLICT = "organization_id,upload_id,row_number";
 const BATCH_SIZE = 500;
+/**
+ * Maximum age of a `processing` lock before we treat it as stale and allow Phase 2 to take over.
+ * Must exceed the maxDuration of /process (300s) plus a safety margin.
+ */
+const PROCESSING_STALE_MS = 6 * 60 * 1000;
 /** Minimum interval between progress writes when not forced (e.g. per batch forces a write). */
 const PROGRESS_EVERY = 25;
 const LISTING_PROGRESS_EVERY = 8;
@@ -92,6 +103,82 @@ function rowMatchesDateRange(
     return true;
   }
   return true;
+}
+
+/**
+ * Resume support: returns the highest already-staged `row_number` for this upload,
+ * plus the count of rows currently in `amazon_staging` for it. Used to:
+ *   1) skip the re-DELETE on retry (avoids statement_timeout on big files),
+ *   2) skip parser rows that were already inserted (no duplicate-key on
+ *      `uq_amazon_staging_org_upload_row_number`),
+ *   3) seed progress counters so reported %/staged_rows reflect actual DB state.
+ */
+async function getStagingResumeState(
+  orgId: string,
+  uploadId: string,
+): Promise<{ maxRowNumber: number; rowCount: number }> {
+  const { data: maxRow } = await supabaseServer
+    .from(STAGING_TABLE)
+    .select("row_number")
+    .eq("organization_id", orgId)
+    .eq("upload_id", uploadId)
+    .order("row_number", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const maxRowNumber =
+    maxRow && typeof (maxRow as { row_number?: unknown }).row_number === "number"
+      ? Math.floor((maxRow as { row_number: number }).row_number)
+      : 0;
+
+  if (maxRowNumber === 0) return { maxRowNumber: 0, rowCount: 0 };
+
+  const { count } = await supabaseServer
+    .from(STAGING_TABLE)
+    .select("*", { count: "exact", head: true })
+    .eq("organization_id", orgId)
+    .eq("upload_id", uploadId);
+  return { maxRowNumber, rowCount: typeof count === "number" ? count : 0 };
+}
+
+/**
+ * If a prior Phase 2 worker died mid-run, status remains `processing` forever
+ * (Vercel maxDuration cap kills the request without notifying the DB). Free
+ * such locks once they exceed PROCESSING_STALE_MS so the next click can resume.
+ * Returns true when this call performed the unstuck step (caller uses this for
+ * logging only — the normal lock acquisition still runs after).
+ */
+async function unstickStaleProcessingLock(
+  orgId: string,
+  uploadId: string,
+  startedAtIso: string | null | undefined,
+): Promise<boolean> {
+  if (!startedAtIso) return false;
+  const startedAt = new Date(startedAtIso).getTime();
+  if (!Number.isFinite(startedAt)) return false;
+  if (Date.now() - startedAt < PROCESSING_STALE_MS) return false;
+
+  const { data: prevRow } = await supabaseServer
+    .from("raw_report_uploads")
+    .select("metadata")
+    .eq("id", uploadId)
+    .maybeSingle();
+
+  const { data: flipped } = await supabaseServer
+    .from("raw_report_uploads")
+    .update({
+      status: "failed",
+      metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
+        error_message: "Recovered stale processing lock (worker timed out).",
+        failed_phase: "process",
+        import_metrics: { current_phase: "failed", failure_reason: "stale_processing_lock_recovered" },
+      }),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", uploadId)
+    .eq("organization_id", orgId)
+    .eq("status", "processing")
+    .select("id");
+  return Array.isArray(flipped) && flipped.length > 0;
 }
 
 async function audit(orgId: string, action: string, entityId: string, detail?: Record<string, unknown>): Promise<void> {
@@ -163,7 +250,9 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
 
     const { data: row, error: fetchErr } = await supabaseServer
       .from("raw_report_uploads")
-      .select("id, organization_id, metadata, status, report_type, column_mapping, file_name")
+      .select(
+        "id, organization_id, metadata, status, report_type, column_mapping, file_name, import_pipeline_started_at",
+      )
       .eq("id", uploadId)
       .maybeSingle();
 
@@ -176,7 +265,19 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       return NextResponse.json({ ok: false, error: "Invalid upload row (organization_id)." }, { status: 500 });
     }
 
-    const status = String((row as { status?: unknown }).status ?? "");
+    let status = String((row as { status?: unknown }).status ?? "");
+
+    // Recover stale `processing` locks (worker died past Vercel maxDuration). After
+    // the flip, status becomes `failed` and the normal retry path takes over.
+    if (status === "processing") {
+      const startedAt =
+        (row as { import_pipeline_started_at?: string | null }).import_pipeline_started_at ?? null;
+      const recovered = await unstickStaleProcessingLock(orgId, uploadId, startedAt);
+      if (recovered) {
+        status = "failed";
+      }
+    }
+
     const retryableStatuses = ["mapped", "ready", "uploaded", "pending", "failed"];
     if (!retryableStatuses.includes(status)) {
       return NextResponse.json(
@@ -252,13 +353,13 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
     // live row_count and can be stale from a prior run on the same upload row.
     const estimatedRows = totalRowsFromMeta > 0 ? totalRowsFromMeta : null;
 
+    // Lock without resetting progress fields — those will be refreshed below from
+    // the resume state so the UI never regresses from "150,000 staged" to "0 staged".
     const { data: locked, error: lockErr } = await supabaseServer
       .from("raw_report_uploads")
       .update({
         status: "processing",
         metadata: mergeUploadMetadata(meta, {
-          process_progress: 0,
-          row_count: 0,
           error_message: "",
           import_metrics: { current_phase: "staging" },
         }),
@@ -280,11 +381,36 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       );
     }
 
+    /**
+     * Resume-aware staging: never blindly DELETE the existing rows for this upload.
+     * On a fresh run there are no rows (no-op cost). On retry of a partially-staged
+     * large file, deleting tens/hundreds of thousands of rows is exactly what was
+     * causing statement_timeout — and the subsequent re-INSERT then collided with
+     * surviving rows on uq_amazon_staging_org_upload_row_number. Instead we resume
+     * from the highest already-staged row_number and let upsert handle any overlap.
+     */
+    const resumeState = await getStagingResumeState(orgId, uploadId);
+    const resumeFromRowNumber = resumeState.maxRowNumber;
+    const resumeRowCount = resumeState.rowCount;
+    if (resumeFromRowNumber > 0) {
+      console.log(
+        `[phase2-staging] Resuming upload ${uploadId} from row_number=${resumeFromRowNumber} (${resumeRowCount} rows already staged).`,
+      );
+    }
+
     await audit(orgId, "import.stage_started", uploadId, {
       fileName: (row as { file_name?: string }).file_name,
       totalParts,
       pipeline: "unified_phase2_staging",
+      resume_from_row_number: resumeFromRowNumber,
+      resume_row_count: resumeRowCount,
     });
+
+    // Seed FPS with cumulative counters so the UI does not flash back to 0% on retry.
+    const initialPctNum =
+      estimatedRows && estimatedRows > 0 && resumeRowCount > 0
+        ? Math.min(99, Math.round((resumeRowCount / Math.max(estimatedRows, resumeRowCount)) * 100))
+        : 0;
 
     await supabaseServer.from("file_processing_status").upsert(
       {
@@ -301,17 +427,17 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         next_action_label: FPS_NEXT_ACTION_LABEL_SYNC,
         current_phase_label: FPS_LABEL_PROCESS,
         upload_pct: 100,
-        process_pct: 0,
+        process_pct: initialPctNum,
+        phase2_stage_pct: initialPctNum,
         sync_pct: 0,
-        processed_rows: 0,
+        processed_rows: resumeRowCount,
+        staged_rows_written: resumeRowCount,
         total_rows: estimatedRows && estimatedRows > 0 ? estimatedRows : null,
         error_message: null,
-        import_metrics: { current_phase: "staging" },
+        import_metrics: { current_phase: "staging", rows_staged: resumeRowCount },
       },
       { onConflict: "upload_id" },
     );
-
-    await supabaseServer.from(STAGING_TABLE).delete().eq("upload_id", uploadId).eq("organization_id", orgId);
 
     const headerRowIndex =
       typeof metaObj.header_row_index === "number" && metaObj.header_row_index > 0
@@ -365,33 +491,37 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       let dataLinesPassed = 0;
       const fileRowsTotal = Math.max(0, lines.length - 1);
       const dataRowsTotal = fileRowsTotal;
-      let approxStaged = 0;
+      // Seed with rows already in DB so progress and counters keep climbing across resumes.
+      let approxStaged = resumeRowCount;
       let batch: Record<string, unknown>[] = [];
       let lastListingProgressWrite = 0;
 
       const flushListingProgress = async (force: boolean, physicalDone: number) => {
         if (!force && physicalDone - lastListingProgressWrite < LISTING_PROGRESS_EVERY) return;
         lastListingProgressWrite = physicalDone;
-        const denom = Math.max(1, dataRowsTotal, estimatedRows ?? 0, physicalDone);
-        const pct = Math.min(99, Math.round((physicalDone / denom) * 100));
+        // Cumulative for resume — physicalDone counts only this-run new rows.
+        const cumulativeDone = resumeRowCount + physicalDone;
+        const denom = Math.max(1, dataRowsTotal, estimatedRows ?? 0, cumulativeDone);
+        const pct = Math.min(99, Math.round((cumulativeDone / denom) * 100));
         const { data: prevRow } = await supabaseServer
           .from("raw_report_uploads")
           .select("metadata")
           .eq("id", uploadId)
           .maybeSingle();
+        const cumulativeDataSeen = resumeRowCount + dataLinesPassed;
         await supabaseServer
           .from("raw_report_uploads")
           .update({
             metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
-              row_count: physicalDone,
+              row_count: cumulativeDone,
               total_rows: dataRowsTotal,
               process_progress: pct,
               physical_lines_seen: fileRowsTotal,
-              data_rows_seen: dataLinesPassed,
+              data_rows_seen: cumulativeDataSeen,
               import_metrics: {
                 current_phase: "staging",
                 physical_lines_seen: fileRowsTotal,
-                data_rows_seen: dataLinesPassed,
+                data_rows_seen: cumulativeDataSeen,
                 rows_staged: approxStaged + batch.length,
               },
             }),
@@ -421,7 +551,7 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
             phase3_raw_sync_pct: 0,
             phase4_generic_pct: 0,
             sync_pct: 0,
-            processed_rows: physicalDone,
+            processed_rows: cumulativeDone,
             total_rows: denom,
             staged_rows_written: approxStaged + batch.length,
             file_rows_total: fileRowsTotal,
@@ -436,9 +566,14 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
 
       const flushBatch = async (rows: Record<string, unknown>[]) => {
         if (rows.length === 0) return;
-        const { error: insErr } = await supabaseServer.from(STAGING_TABLE).insert(rows);
+        // Idempotent insert: ignore rows already staged for this (org, upload, row_number).
+        // This is what makes large-file retries safe — the prior run's rows are kept
+        // and only the missing tail gets written.
+        const { error: insErr } = await supabaseServer
+          .from(STAGING_TABLE)
+          .upsert(rows, { onConflict: STAGING_CONFLICT, ignoreDuplicates: true });
         if (insErr) {
-          throw new Error(`Insert into ${STAGING_TABLE} failed: ${insErr.message}`);
+          throw new Error(`Upsert into ${STAGING_TABLE} failed: ${insErr.message}`);
         }
         approxStaged += rows.length;
         await flushListingProgress(true, dataLinesPassed);
@@ -454,10 +589,15 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           void flushListingProgress(false, dataLinesPassed).catch(() => {});
           continue;
         }
-        dataLinesPassed += 1;
 
         /** 1-based physical line index in the original file (matches listing raw `row_number`). */
         const fileLineNumber = headerRowIndex + lineIdx + 1;
+        // Resume: this physical line was already staged by a prior partial run.
+        // dataLinesPassed only counts this-run NEW rows so cumulative math elsewhere stays correct.
+        if (resumeFromRowNumber > 0 && fileLineNumber <= resumeFromRowNumber) {
+          continue;
+        }
+        dataLinesPassed += 1;
         const dataCells = splitDataLineIntoCells(rawLine, sep);
         const row: Record<string, string> = {};
         for (let j = 0; j < headerCells.length; j++) {
@@ -514,25 +654,29 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         .eq("id", uploadId)
         .maybeSingle();
 
+      // Cumulative completion counters: dataLinesPassed counts only this-run NEW rows
+      // after my resume edit, so use rowsInDb (authoritative DB count) for the totals.
+      const cumulativeDataSeenAtEnd = rowsInDb;
+
       await supabaseServer
         .from("raw_report_uploads")
         .update({
           status: "staged",
           import_pipeline_completed_at: null,
           metadata: mergeUploadMetadata((prevRowListing as { metadata?: unknown } | null)?.metadata, {
-            row_count: dataLinesPassed,
-            total_rows: dataLinesPassed,
+            row_count: cumulativeDataSeenAtEnd,
+            total_rows: cumulativeDataSeenAtEnd,
             processed_rows: rowsInDb,
             process_progress: 100,
             physical_lines_seen: fileRowsTotal,
-            data_rows_seen: dataLinesPassed,
+            data_rows_seen: cumulativeDataSeenAtEnd,
             staging_row_count: rowsInDb,
             catalog_listing_file_rows_seen: fileRowsTotal,
-            catalog_listing_data_rows_seen: dataLinesPassed,
+            catalog_listing_data_rows_seen: cumulativeDataSeenAtEnd,
             import_metrics: {
               current_phase: "staged",
               physical_lines_seen: fileRowsTotal,
-              data_rows_seen: dataLinesPassed,
+              data_rows_seen: cumulativeDataSeenAtEnd,
               rows_staged: rowsInDb,
               rows_skipped_empty: skippedEmpty,
               rows_skipped_malformed: 0,
@@ -565,7 +709,7 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           phase3_raw_sync_pct: 0,
           phase4_generic_pct: 0,
           processed_rows: rowsInDb,
-          total_rows: Math.max(rowsInDb, dataLinesPassed, 1),
+          total_rows: Math.max(rowsInDb, cumulativeDataSeenAtEnd, 1),
           staged_rows_written: rowsInDb,
           file_rows_total: fileRowsTotal,
           data_rows_total: dataRowsTotal,
@@ -575,7 +719,7 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           import_metrics: {
             current_phase: "staged",
             physical_lines_seen: fileRowsTotal,
-            data_rows_seen: dataLinesPassed,
+            data_rows_seen: cumulativeDataSeenAtEnd,
             rows_staged: rowsInDb,
           },
         },
@@ -616,7 +760,7 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
     /** Lines that passed the date filter (before per-line dedupe). */
     let dataLinesPassed = 0;
     /** Rows successfully inserted into amazon_staging (1:1 with physical data lines). */
-    let approxStaged = 0;
+    let approxStaged = resumeRowCount;
     let totalSeen = 0;
     let dataRowNumber = 0;
     let batch: Record<string, unknown>[] = [];
@@ -626,12 +770,14 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       if (!force && dataLinesPassed - lastProgressWrite < PROGRESS_EVERY) return;
       lastProgressWrite = dataLinesPassed;
       /**
-       * Denominator for process % — scoped to this upload only (estimatedRows from this row's metadata).
-       * If Phase-1 total_rows was wildly higher than rows we are actually processing (stale/wrong guess),
-       * blend toward live counts so the bar keeps moving instead of freezing near ~50%.
+       * Cumulative counters (resume-aware): `dataRowNumber` and `approxStaged` already
+       * include rows from a prior partial run. Use them — not `dataLinesPassed` (this-run
+       * only) — so process_progress/staged_rows do not regress on retry.
        */
+      const cumulativeDataRows = dataRowNumber;
+      const cumulativePhysicalSeen = Math.max(totalSeen, cumulativeDataRows);
       const baseEst = estimatedRows && estimatedRows > 0 ? estimatedRows : null;
-      const live = Math.max(1, dataLinesPassed, totalSeen);
+      const live = Math.max(1, cumulativeDataRows, cumulativePhysicalSeen);
       let denom = live;
       if (baseEst != null) {
         if (baseEst <= live * 1.25) {
@@ -640,7 +786,7 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           denom = Math.max(live, Math.ceil(live + (baseEst - live) * (live / Math.max(baseEst, 1))));
         }
       }
-      const pct = Math.min(99, Math.round((dataLinesPassed / denom) * 100));
+      const pct = Math.min(99, Math.round((cumulativeDataRows / denom) * 100));
       const { data: prevRow } = await supabaseServer
         .from("raw_report_uploads")
         .select("metadata")
@@ -650,15 +796,15 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         .from("raw_report_uploads")
         .update({
           metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
-            row_count: dataLinesPassed,
+            row_count: cumulativeDataRows,
             process_progress: pct,
             etl_phase: "staging",
-            physical_lines_seen: totalSeen,
-            data_rows_seen: dataLinesPassed,
+            physical_lines_seen: cumulativePhysicalSeen,
+            data_rows_seen: cumulativeDataRows,
             import_metrics: {
               current_phase: "staging",
-              physical_lines_seen: totalSeen,
-              data_rows_seen: dataLinesPassed,
+              physical_lines_seen: cumulativePhysicalSeen,
+              data_rows_seen: cumulativeDataRows,
               rows_staged: approxStaged,
             },
           }),
@@ -688,13 +834,13 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           phase3_raw_sync_pct: 0,
           phase4_generic_pct: 0,
           sync_pct: 0,
-          processed_rows: dataLinesPassed,
+          processed_rows: cumulativeDataRows,
           total_rows: denom,
           staged_rows_written: approxStaged,
-          data_rows_total: dataLinesPassed,
+          data_rows_total: cumulativeDataRows,
           import_metrics: {
-            physical_lines_seen: totalSeen,
-            data_rows_seen: dataLinesPassed,
+            physical_lines_seen: cumulativePhysicalSeen,
+            data_rows_seen: cumulativeDataRows,
             rows_staged: approxStaged,
             current_phase: "staging",
           },
@@ -705,10 +851,15 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
 
     const flushBatch = async (rows: Record<string, unknown>[]) => {
       if (rows.length === 0) return;
-      const { error: insErr } = await supabaseServer.from(STAGING_TABLE).insert(rows);
+      // Idempotent insert: ignore rows already staged for this (org, upload, row_number).
+      // Each batch is its own implicit transaction so a timeout in one batch does not
+      // roll back all prior work — the next attempt resumes from the highest row_number.
+      const { error: insErr } = await supabaseServer
+        .from(STAGING_TABLE)
+        .upsert(rows, { onConflict: STAGING_CONFLICT, ignoreDuplicates: true });
       if (insErr) {
-        console.error(`[phase2-staging] Insert into ${STAGING_TABLE} failed:`, insErr.message, { uploadId, orgId });
-        throw new Error(`Insert into ${STAGING_TABLE} failed: ${insErr.message}`);
+        console.error(`[phase2-staging] Upsert into ${STAGING_TABLE} failed:`, insErr.message, { uploadId, orgId });
+        throw new Error(`Upsert into ${STAGING_TABLE} failed: ${insErr.message}`);
       }
       approxStaged += rows.length;
       await flushProgress(true);
@@ -730,6 +881,12 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         const normalizedRow = normalizeAmazonReportRowKeys(csvRow);
         const mappedRow = applyColumnMappingToRow(normalizedRow, columnMapping);
         dataRowNumber += 1;
+        // Resume: skip rows already present in amazon_staging from a prior partial run.
+        // We still increment dataRowNumber (and totalSeen above) so the row_number for
+        // newly-staged rows matches what they would have been on a fresh run.
+        if (resumeFromRowNumber > 0 && dataRowNumber <= resumeFromRowNumber) {
+          return;
+        }
         dataLinesPassed += 1;
         const source_line_hash = computeSourceLineHash(orgId, mappedRow);
 
@@ -787,24 +944,30 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
               .eq("id", uploadId)
               .maybeSingle();
 
+            // Cumulative counters (resume-aware): dataRowNumber includes rows whose
+            // row_number was assigned (incl. resumed/skipped ones); dataLinesPassed only
+            // includes rows actually inserted this run.
+            const cumulativeDataSeen = dataRowNumber;
+            const cumulativePhysicalSeen = Math.max(totalSeen, cumulativeDataSeen);
+
             await supabaseServer
               .from("raw_report_uploads")
               .update({
                 status: "staged",
                 import_pipeline_completed_at: null,
                 metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
-                  row_count: dataLinesPassed,
-                  total_rows: dataLinesPassed,
+                  row_count: cumulativeDataSeen,
+                  total_rows: cumulativeDataSeen,
                   processed_rows: rowsInDb,
                   process_progress: 100,
-                  physical_lines_seen: totalSeen,
-                  data_rows_seen: dataLinesPassed,
+                  physical_lines_seen: cumulativePhysicalSeen,
+                  data_rows_seen: cumulativeDataSeen,
                   staging_row_count: rowsInDb,
                   error_message: undefined,
                   import_metrics: {
                     current_phase: "staged",
-                    physical_lines_seen: totalSeen,
-                    data_rows_seen: dataLinesPassed,
+                    physical_lines_seen: cumulativePhysicalSeen,
+                    data_rows_seen: cumulativeDataSeen,
                     rows_staged: rowsInDb,
                     rows_skipped_empty: 0,
                     rows_skipped_malformed: 0,
@@ -840,16 +1003,16 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
                 phase3_raw_sync_pct: 0,
                 phase4_generic_pct: 0,
                 processed_rows: rowsInDb,
-                total_rows: Math.max(rowsInDb, dataLinesPassed, 1),
+                total_rows: Math.max(rowsInDb, cumulativeDataSeen, 1),
                 staged_rows_written: rowsInDb,
-                file_rows_total: totalSeen,
-                data_rows_total: dataLinesPassed,
+                file_rows_total: cumulativePhysicalSeen,
+                data_rows_total: cumulativeDataSeen,
                 phase2_status: "complete",
                 phase2_completed_at: new Date().toISOString(),
                 error_message: null,
                 import_metrics: {
-                  physical_lines_seen: totalSeen,
-                  data_rows_seen: dataLinesPassed,
+                  physical_lines_seen: cumulativePhysicalSeen,
+                  data_rows_seen: cumulativeDataSeen,
                   rows_staged: rowsInDb,
                   current_phase: "staged",
                 },

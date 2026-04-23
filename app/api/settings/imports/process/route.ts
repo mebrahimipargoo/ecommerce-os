@@ -36,7 +36,7 @@ export async function POST(req: Request): Promise<Response> {
 
     const { data: row, error: fetchErr } = await supabaseServer
       .from("raw_report_uploads")
-      .select("id, organization_id, metadata, status, report_type")
+      .select("id, organization_id, metadata, status, report_type, import_pipeline_started_at")
       .eq("id", uploadId)
       .maybeSingle();
 
@@ -47,6 +47,30 @@ export async function POST(req: Request): Promise<Response> {
     const orgId = String((row as { organization_id?: unknown }).organization_id ?? "").trim();
     if (!isUuidString(orgId)) {
       return NextResponse.json({ ok: false, error: "Invalid upload row (organization_id)." }, { status: 500 });
+    }
+
+    // Stale-lock recovery: a prior worker that exceeded Vercel's maxDuration leaves
+    // status="processing" forever. After PROCESSING_STALE_MS minutes flip it to
+    // "failed" so the user can re-run Process. The actual Phase 2 logic in
+    // amazon-phase2-staging then resumes from the highest already-staged row_number,
+    // so no rows are lost or duplicated.
+    {
+      const stStr = String((row as { status?: unknown }).status ?? "");
+      if (stStr === "processing") {
+        const startedAtIso =
+          (row as { import_pipeline_started_at?: string | null }).import_pipeline_started_at ?? null;
+        const startedAt = startedAtIso ? new Date(startedAtIso).getTime() : NaN;
+        const STALE_MS = 6 * 60 * 1000;
+        if (Number.isFinite(startedAt) && Date.now() - startedAt >= STALE_MS) {
+          await supabaseServer
+            .from("raw_report_uploads")
+            .update({ status: "failed", updated_at: new Date().toISOString() })
+            .eq("id", uploadId)
+            .eq("organization_id", orgId)
+            .eq("status", "processing");
+          (row as { status?: string }).status = "failed";
+        }
+      }
     }
 
     const meta = (row as { metadata?: unknown }).metadata;
