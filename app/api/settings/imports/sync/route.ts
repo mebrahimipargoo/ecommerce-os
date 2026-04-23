@@ -228,6 +228,267 @@ function guardFbaReturnsPhysicalRowBatchUniqueness(
   return out;
 }
 
+// =============================================================================
+// ── REPORTS_REPOSITORY physical-line guard ──────────────────────────────────
+// Same shape as the FBA_RETURNS guard above. The conflict target for
+// `amazon_reports_repository` is the unique index
+// `uq_amazon_reports_repo_org_file_row (organization_id, source_file_sha256, source_physical_row_number)`.
+// We must ensure no two rows in a single INSERT statement collide on this tuple,
+// or Postgres would raise either:
+//   • "ON CONFLICT DO UPDATE command cannot affect row a second time"  (in-batch duplicate vs the targeted index), or
+//   • "duplicate key value violates unique constraint <other>"          (in-batch duplicate vs a stale orphan unique index that
+//     the migration history claims to have dropped — this manifests as
+//     `uq_amazon_reports_repo_natural` or `uq_amazon_reports_repo_org_line_hash` if the DROP wasn't applied).
+//
+// Importantly, we key on PHYSICAL identity (source_physical_row_number) — NOT on
+// source_line_hash or any natural business tuple — so genuinely distinct
+// financial sub-lines (Principal / FBA Fee / Commission rows that happen to
+// share date_time/order_id/sku/description) are PRESERVED, not collapsed.
+// =============================================================================
+
+const REPORTS_REPO_DEDUPE_LOG_SAMPLES = 8;
+
+function reportsRepoFileRowIdentityKey(row: Record<string, unknown>): string {
+  const org = String(row.organization_id ?? "")
+    .trim()
+    .replace(/^\{|\}$/g, "")
+    .toLowerCase();
+  const sha = String(row.source_file_sha256 ?? "").trim().toLowerCase();
+  const prRaw = row.source_physical_row_number;
+  const pr =
+    typeof prRaw === "number" && Number.isFinite(prRaw)
+      ? String(Math.trunc(prRaw))
+      : (() => {
+          const s = String(prRaw ?? "").trim();
+          if (s === "") return "";
+          const n = Number(s.replace(/,/g, ""));
+          return Number.isFinite(n) ? String(Math.trunc(n)) : s;
+        })();
+  return `${org}|${sha}|${pr}`;
+}
+
+function listDuplicateReportsRepoFileRowKeys(rows: Record<string, unknown>[]): string[] {
+  const counts = new Map<string, number>();
+  for (const r of rows) {
+    const k = reportsRepoFileRowIdentityKey(r);
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  return [...counts.entries()].filter(([, c]) => c > 1).map(([k]) => k);
+}
+
+/**
+ * Last-row-wins collapse on the physical-line key. Mirrors the FBA_RETURNS
+ * helper but never touches business fields (transaction_type, total_amount,
+ * description) — only deduplicates rows that share the *same physical CSV line*.
+ */
+function dedupeReportsRepoRowsByFileRowKey(packed: Record<string, unknown>[]): {
+  rows: Record<string, unknown>[];
+  collapsedCount: number;
+  duplicateKeySamples: string[];
+} {
+  const seen = new Map<string, Record<string, unknown>>();
+  const duplicateKeySamples: string[] = [];
+  for (const row of packed) {
+    const key = reportsRepoFileRowIdentityKey(row);
+    if (seen.has(key) && duplicateKeySamples.length < REPORTS_REPO_DEDUPE_LOG_SAMPLES) {
+      duplicateKeySamples.push(key);
+    }
+    seen.set(key, row);
+  }
+  const rows = [...seen.values()];
+  return {
+    rows,
+    collapsedCount: Math.max(0, packed.length - rows.length),
+    duplicateKeySamples,
+  };
+}
+
+function uniqueReportsRepoFileRowKeyCount(rows: Record<string, unknown>[]): number {
+  return new Set(rows.map(reportsRepoFileRowIdentityKey)).size;
+}
+
+/**
+ * Hard pre-write guard for REPORTS_REPOSITORY. Runs BEFORE the upsert is
+ * dispatched to PostgREST. If any physical-line key collides within the chunk
+ * we collapse and try again; if collisions persist after retries we throw a
+ * structured diagnostic so the failure surfaces as something the user can act
+ * on instead of a raw Postgres "duplicate key" error.
+ */
+function guardReportsRepoPhysicalRowBatchUniqueness(
+  rows: Record<string, unknown>[],
+  label: string,
+): Record<string, unknown>[] {
+  let out = rows;
+  for (let iter = 0; iter < 8; iter++) {
+    const u = uniqueReportsRepoFileRowKeyCount(out);
+    if (u === out.length) return out;
+    const dupKeys = listDuplicateReportsRepoFileRowKeys(out);
+    console.warn(
+      `[REPORTS_REPOSITORY] ${label}: length ${out.length} !== uniqueKeyCount ${u} — re-collapsing (iter ${iter}); ` +
+        `duplicate_file_row_keys(sample)=${JSON.stringify(dupKeys.slice(0, REPORTS_REPO_DEDUPE_LOG_SAMPLES))}`,
+    );
+    out = dedupeReportsRepoRowsByFileRowKey(out).rows;
+  }
+  const u = uniqueReportsRepoFileRowKeyCount(out);
+  if (out.length !== u) {
+    const dupKeys = listDuplicateReportsRepoFileRowKeys(out);
+    throw new Error(
+      `[REPORTS_REPOSITORY] ${label}: finalRows.length (${out.length}) !== uniqueKeyCount (${u}); ` +
+        `duplicate_file_row_keys(sample)=${JSON.stringify(dupKeys.slice(0, REPORTS_REPO_DEDUPE_LOG_SAMPLES))}. ` +
+        `This means two rows in the same batch share (organization_id, source_file_sha256, source_physical_row_number). ` +
+        `Confirm amazon_staging has no duplicate row_number rows for this upload_id.`,
+    );
+  }
+  return out;
+}
+
+/**
+ * Pre-sync staging integrity assertion for REPORTS_REPOSITORY (and any other
+ * report whose conflict target is the physical-line tuple).
+ *
+ * Verifies in `amazon_staging` for this (org, upload):
+ *   1. count(*) > 0                        (cannot sync empty staging)
+ *   2. count(*) === count(distinct row_number) — no duplicate physical rows
+ *   3. count(*) === max(row_number) - min(row_number) + 1 — no gaps
+ *
+ * Also LOGS (does NOT fail) the count of duplicate `source_line_hash` values:
+ * Reports Repository legitimately repeats sub-line content across distinct
+ * physical lines (Principal / FBA Fee / Commission), so duplicate hashes are
+ * NOT an error here — they are reported for visibility only.
+ *
+ * Throws a structured Error if (1)-(3) fail. The outer catch then marks the
+ * upload `failed` with a clear message — no silent staged-but-broken state.
+ */
+async function assertReportsRepoStagingPhysicalIntegrity(
+  orgId: string,
+  uploadId: string,
+): Promise<{
+  stagingCount: number;
+  duplicateHashCount: number;
+  minRowNumber: number;
+  maxRowNumber: number;
+}> {
+  const { count: stagingCountResp, error: cntErr } = await supabaseServer
+    .from(STAGING_TABLE)
+    .select("*", { count: "exact", head: true })
+    .eq("organization_id", orgId)
+    .eq("upload_id", uploadId);
+  if (cntErr) {
+    throw new Error(
+      `[REPORTS_REPOSITORY] staging integrity check (count) failed: ${cntErr.message}. upload_id=${uploadId}`,
+    );
+  }
+  const stagingCount = typeof stagingCountResp === "number" ? stagingCountResp : 0;
+  if (stagingCount === 0) {
+    throw new Error(
+      `[REPORTS_REPOSITORY] staging is empty for upload_id=${uploadId}. Run Phase 2 (Process) first.`,
+    );
+  }
+
+  const { data: maxRow, error: maxErr } = await supabaseServer
+    .from(STAGING_TABLE)
+    .select("row_number")
+    .eq("organization_id", orgId)
+    .eq("upload_id", uploadId)
+    .order("row_number", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (maxErr) {
+    throw new Error(`[REPORTS_REPOSITORY] staging integrity check (max) failed: ${maxErr.message}`);
+  }
+  const { data: minRow, error: minErr } = await supabaseServer
+    .from(STAGING_TABLE)
+    .select("row_number")
+    .eq("organization_id", orgId)
+    .eq("upload_id", uploadId)
+    .order("row_number", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (minErr) {
+    throw new Error(`[REPORTS_REPOSITORY] staging integrity check (min) failed: ${minErr.message}`);
+  }
+  const maxRowNumber =
+    maxRow && typeof (maxRow as { row_number?: unknown }).row_number === "number"
+      ? Math.floor((maxRow as { row_number: number }).row_number)
+      : 0;
+  const minRowNumber =
+    minRow && typeof (minRow as { row_number?: unknown }).row_number === "number"
+      ? Math.floor((minRow as { row_number: number }).row_number)
+      : 0;
+
+  // Gap / duplicate-row-number assertion. If the unique index
+  // `uq_amazon_staging_org_upload_row_number` is intact this is impossible; the
+  // check is a defense in depth so we surface the issue as a clear pre-flight
+  // error instead of a cryptic Postgres "duplicate key" inside an upsert.
+  const span = stagingCount === 0 ? 0 : maxRowNumber - minRowNumber + 1;
+  if (span !== stagingCount) {
+    throw new Error(
+      `[REPORTS_REPOSITORY] staging integrity failed for upload_id=${uploadId}: ` +
+        `count=${stagingCount}, min(row_number)=${minRowNumber}, max(row_number)=${maxRowNumber}, span=${span}. ` +
+        `Either staging has duplicate row_numbers (uq_amazon_staging_org_upload_row_number compromised) ` +
+        `or there are gaps. Re-run Phase 2 (Process) to restage.`,
+    );
+  }
+
+  // INFORMATIONAL ONLY — distinct source_line_hash duplicates are EXPECTED in
+  // REPORTS_REPOSITORY (e.g. Principal/FBA Fee/Commission may share content
+  // across distinct physical lines). We log the count and a few sample hashes
+  // for diagnostics but never fail on this — collapsing here would lose
+  // line-level financial granularity.
+  let duplicateHashCount = 0;
+  try {
+    const { data: hashSample } = await supabaseServer
+      .from(STAGING_TABLE)
+      .select("source_line_hash, row_number")
+      .eq("organization_id", orgId)
+      .eq("upload_id", uploadId)
+      .order("source_line_hash", { ascending: true })
+      .limit(50000); // hard cap for the diagnostic — large enough to be useful, small enough not to blow memory
+    if (Array.isArray(hashSample)) {
+      const counts = new Map<string, number>();
+      for (const r of hashSample) {
+        const h = String((r as { source_line_hash?: unknown }).source_line_hash ?? "");
+        if (!h) continue;
+        counts.set(h, (counts.get(h) ?? 0) + 1);
+      }
+      const dupEntries = [...counts.entries()].filter(([, c]) => c > 1);
+      duplicateHashCount = dupEntries.reduce((sum, [, c]) => sum + (c - 1), 0);
+      if (duplicateHashCount > 0) {
+        console.log(
+          JSON.stringify({
+            event: "REPORTS_REPOSITORY_staging_duplicate_hash_info",
+            note: "Duplicate source_line_hash rows kept on purpose — line-level financial granularity is preserved via source_physical_row_number.",
+            upload_id: uploadId,
+            organization_id: orgId,
+            duplicate_hash_extra_rows_in_sample: duplicateHashCount,
+            sample_hashes_with_count: dupEntries
+              .slice(0, REPORTS_REPO_DEDUPE_LOG_SAMPLES)
+              .map(([h, c]) => ({ hash: h, occurrences: c })),
+          }),
+        );
+      }
+    }
+  } catch (e) {
+    console.warn(
+      `[REPORTS_REPOSITORY] staging duplicate-hash sample failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+
+  console.log(
+    JSON.stringify({
+      event: "REPORTS_REPOSITORY_staging_integrity_ok",
+      upload_id: uploadId,
+      organization_id: orgId,
+      staging_count: stagingCount,
+      min_row_number: minRowNumber,
+      max_row_number: maxRowNumber,
+      duplicate_hash_extra_rows_in_sample: duplicateHashCount,
+    }),
+  );
+
+  return { stagingCount, duplicateHashCount, minRowNumber, maxRowNumber };
+}
+
 type Body = { upload_id?: string };
 
 type SyncKind = AmazonSyncKind;
@@ -1086,6 +1347,15 @@ export async function POST(req: Request): Promise<Response> {
       .eq("organization_id", orgId);
 
     const totalStagingRows = typeof stagingRowCount === "number" ? stagingRowCount : 0;
+
+    // ── REPORTS_REPOSITORY pre-flight: assert physical-line integrity in staging ─
+    // Throws a clear, structured error if the staging table is missing rows,
+    // has duplicate row_numbers, or has gaps. Logs (does not fail) the count
+    // of duplicate source_line_hash rows so the operator can see them — those
+    // are kept on purpose to preserve Principal/FBA Fee/Commission granularity.
+    if (kind === "REPORTS_REPOSITORY") {
+      await assertReportsRepoStagingPhysicalIntegrity(orgId, uploadId);
+    }
     const syncUpserted = { value: 0 };
 
     const syncMetricTotals: BatchUpsertMetricDelta = {
@@ -2137,6 +2407,18 @@ async function flushDomainBatch(
       deduped = guardFbaReturnsPhysicalRowBatchUniqueness(deduped, "pre-write");
       collapsedInBatch += Math.max(0, before - deduped.length);
     }
+    if (kind === "REPORTS_REPOSITORY") {
+      const before = deduped.length;
+      deduped = guardReportsRepoPhysicalRowBatchUniqueness(deduped, "pre-write");
+      const dropped = Math.max(0, before - deduped.length);
+      collapsedInBatch += dropped;
+      if (dropped > 0) {
+        console.warn(
+          `[REPORTS_REPOSITORY] within-batch dedupe collapsed ${dropped} row(s) on (organization_id, source_file_sha256, source_physical_row_number). ` +
+            `This is unexpected — investigate amazon_staging for duplicate row_numbers for this upload.`,
+        );
+      }
+    }
     console.log(`[${kind}] Original batch size: ${packed.length}, Cleaned batch size: ${deduped.length}`);
   }
 
@@ -2206,6 +2488,42 @@ async function flushDomainBatch(
         .upsert(chunk, { onConflict: conflictKey, ignoreDuplicates: false });
 
       if (error) {
+        // Structured diagnostic for REPORTS_REPOSITORY duplicate-key failures:
+        // surface the chunk size, distinct physical-line count, sample
+        // conflicting keys, and a hint to check for orphan unique indexes
+        // (uq_amazon_reports_repo_natural / uq_amazon_reports_repo_org_line_hash)
+        // that the migration history claims to drop but may still exist in
+        // some environments — those would also raise duplicate-key errors
+        // even though the application's own ON CONFLICT target is fine.
+        if (kind === "REPORTS_REPOSITORY") {
+          const distinctPhysical = uniqueReportsRepoFileRowKeyCount(chunk);
+          const dupKeys = listDuplicateReportsRepoFileRowKeys(chunk);
+          console.error(
+            JSON.stringify({
+              event: "REPORTS_REPOSITORY_upsert_failure",
+              upload_id: syncProgress?.uploadId,
+              organization_id: syncProgress?.orgId,
+              chunk_size: chunk.length,
+              distinct_physical_line_keys_in_chunk: distinctPhysical,
+              duplicate_physical_line_keys_in_chunk_sample: dupKeys.slice(0, REPORTS_REPO_DEDUPE_LOG_SAMPLES),
+              chunk_first_physical_row_number: (chunk[0] as { source_physical_row_number?: unknown } | undefined)
+                ?.source_physical_row_number,
+              chunk_last_physical_row_number: (chunk[chunk.length - 1] as { source_physical_row_number?: unknown } | undefined)
+                ?.source_physical_row_number,
+              postgres_error: error.message,
+              hint:
+                "If chunk_size === distinct_physical_line_keys_in_chunk, the failing constraint is NOT the application's " +
+                "ON CONFLICT target (organization_id, source_file_sha256, source_physical_row_number). Likely cause is a " +
+                "stale orphan unique index. Run the verification SQL in the patch deliverable to inspect pg_indexes for " +
+                "amazon_reports_repository and drop any non-current unique index(es).",
+            }),
+          );
+          throw new Error(
+            `[REPORTS_REPOSITORY] upsert into ${table} failed: ${error.message} ` +
+              `(conflict key: ${conflictKey}, chunk size: ${chunk.length}, distinct physical lines in chunk: ${distinctPhysical}). ` +
+              `If chunk_size === distinct, a stale unique index on amazon_reports_repository is the cause — see server logs for diagnostic and verification SQL.`,
+          );
+        }
         throw new Error(
           `[${kind}] upsert into ${table} failed: ${error.message}` +
             ` (conflict key: ${conflictKey}, chunk size: ${chunk.length})`,

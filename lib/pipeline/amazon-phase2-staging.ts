@@ -39,13 +39,29 @@ const STAGING_TABLE = "amazon_staging";
  * We must NEVER drop or rename this index — chunked + idempotent staging depends on it.
  */
 const STAGING_CONFLICT = "organization_id,upload_id,row_number";
-const BATCH_SIZE = 500;
+/**
+ * Conservative batch size for `amazon_staging` upserts.
+ * 500 was triggering Postgres statement_timeout on wide REPORTS_REPOSITORY/INVENTORY_LEDGER
+ * rows (large `raw_row` JSONB) around the ~100K-row mark. 250 trades a small amount of
+ * throughput for predictable per-batch latency well under any reasonable timeout.
+ * Each batch is its own implicit transaction (single PostgREST upsert call) so a failure
+ * in batch N+1 cannot roll back batch N.
+ */
+const BATCH_SIZE = 250;
 /**
  * Maximum age of a `processing` lock before we treat it as stale and allow Phase 2 to take over.
  * Must exceed the maxDuration of /process (300s) plus a safety margin.
  */
 const PROCESSING_STALE_MS = 6 * 60 * 1000;
-/** Minimum interval between progress writes when not forced (e.g. per batch forces a write). */
+/**
+ * Throttle progress writes. Without this, every batch caused 3 round-trips
+ * (select metadata + update raw_report_uploads + upsert file_processing_status),
+ * and on a 150K-row file that becomes hundreds of seconds of pure progress overhead
+ * — directly contributing to mid-run timeouts. Forced writes (per-batch via flushProgress(true))
+ * still bypass the throttle for the final completion record.
+ */
+const PROGRESS_MIN_INTERVAL_MS = 2000;
+/** Legacy "every N rows" fallback gate (kept so a 0ms-elapsed retry still emits a write occasionally). */
 const PROGRESS_EVERY = 25;
 const LISTING_PROGRESS_EVERY = 8;
 
@@ -179,6 +195,163 @@ async function unstickStaleProcessingLock(
     .eq("status", "processing")
     .select("id");
   return Array.isArray(flipped) && flipped.length > 0;
+}
+
+/**
+ * Hard verification — run after staging finishes (or after a resume completes).
+ * Reads the **actual DB state** for (org, upload_id) and asserts:
+ *   - `count(*) === expectedCount`
+ *   - `max(row_number) === expectedMaxRowNumber`
+ *   - For non-listing (contiguous) reports: `min(row_number) === 1`
+ *     and `count === max - min + 1` (no gaps)
+ *
+ * Throws `Error` on any mismatch. The outer catch in
+ * `executeAmazonPhase2Staging` will then mark the upload `failed` with the
+ * verification message — we never silently mark `staged` when rows are
+ * missing or duplicated.
+ */
+async function assertStagingComplete(opts: {
+  orgId: string;
+  uploadId: string;
+  expectedCount: number;
+  expectedMaxRowNumber: number;
+  isListing: boolean;
+}): Promise<{ dbCount: number; dbMin: number; dbMax: number }> {
+  const { orgId, uploadId, expectedCount, expectedMaxRowNumber, isListing } = opts;
+
+  const { count: countResp, error: countErr } = await supabaseServer
+    .from(STAGING_TABLE)
+    .select("*", { count: "exact", head: true })
+    .eq("organization_id", orgId)
+    .eq("upload_id", uploadId);
+  if (countErr) {
+    throw new Error(
+      `Staging verification failed (count query): ${countErr.message}. upload_id=${uploadId}`,
+    );
+  }
+  const dbCount = typeof countResp === "number" ? countResp : 0;
+
+  const { data: maxRow, error: maxErr } = await supabaseServer
+    .from(STAGING_TABLE)
+    .select("row_number")
+    .eq("organization_id", orgId)
+    .eq("upload_id", uploadId)
+    .order("row_number", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (maxErr) {
+    throw new Error(
+      `Staging verification failed (max query): ${maxErr.message}. upload_id=${uploadId}`,
+    );
+  }
+  const dbMax =
+    maxRow && typeof (maxRow as { row_number?: unknown }).row_number === "number"
+      ? Math.floor((maxRow as { row_number: number }).row_number)
+      : 0;
+
+  const { data: minRow, error: minErr } = await supabaseServer
+    .from(STAGING_TABLE)
+    .select("row_number")
+    .eq("organization_id", orgId)
+    .eq("upload_id", uploadId)
+    .order("row_number", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (minErr) {
+    throw new Error(
+      `Staging verification failed (min query): ${minErr.message}. upload_id=${uploadId}`,
+    );
+  }
+  const dbMin =
+    minRow && typeof (minRow as { row_number?: unknown }).row_number === "number"
+      ? Math.floor((minRow as { row_number: number }).row_number)
+      : 0;
+
+  const ctx = `upload_id=${uploadId} expected_count=${expectedCount} db_count=${dbCount} expected_max=${expectedMaxRowNumber} db_max=${dbMax} db_min=${dbMin} listing=${isListing}`;
+
+  if (dbCount !== expectedCount) {
+    throw new Error(
+      `Staging verification failed: row count mismatch (expected ${expectedCount}, found ${dbCount} in amazon_staging). ${ctx}`,
+    );
+  }
+  if (dbMax !== expectedMaxRowNumber) {
+    throw new Error(
+      `Staging verification failed: max(row_number) mismatch (expected ${expectedMaxRowNumber}, found ${dbMax}). ${ctx}`,
+    );
+  }
+  if (!isListing) {
+    if (dbCount > 0 && dbMin !== 1) {
+      throw new Error(
+        `Staging verification failed: min(row_number) expected 1 for contiguous report, found ${dbMin}. ${ctx}`,
+      );
+    }
+    const span = dbCount === 0 ? 0 : dbMax - dbMin + 1;
+    if (span !== dbCount) {
+      throw new Error(
+        `Staging verification failed: row_number gaps detected (count=${dbCount}, span=${span}). ${ctx}`,
+      );
+    }
+  }
+
+  console.log(
+    JSON.stringify({
+      event: "phase2_staging_verified",
+      upload_id: uploadId,
+      organization_id: orgId,
+      db_count: dbCount,
+      db_min_row_number: dbMin,
+      db_max_row_number: dbMax,
+      is_listing: isListing,
+    }),
+  );
+
+  return { dbCount, dbMin, dbMax };
+}
+
+/**
+ * Structured failure log captured at the moment a batch upsert throws.
+ * Records what we tried, what is actually committed in the DB right now,
+ * and where the next retry will resume from. Best-effort — diagnostic
+ * failures are themselves swallowed so they cannot mask the real error.
+ */
+async function logBatchFailureDiagnostic(opts: {
+  orgId: string;
+  uploadId: string;
+  batchStartRowNumber: number | null;
+  batchEndRowNumber: number | null;
+  batchSize: number;
+  inMemoryStagedBefore: number;
+  errorMessage: string;
+}): Promise<void> {
+  const { orgId, uploadId, batchStartRowNumber, batchEndRowNumber, batchSize, inMemoryStagedBefore, errorMessage } =
+    opts;
+  try {
+    const { count: committedAfter } = await supabaseServer
+      .from(STAGING_TABLE)
+      .select("*", { count: "exact", head: true })
+      .eq("organization_id", orgId)
+      .eq("upload_id", uploadId);
+    const next = await getStagingResumeState(orgId, uploadId);
+    console.error(
+      JSON.stringify({
+        event: "phase2_staging_batch_failure",
+        upload_id: uploadId,
+        organization_id: orgId,
+        batch_start_row_number: batchStartRowNumber,
+        batch_end_row_number: batchEndRowNumber,
+        batch_size: batchSize,
+        committed_count_before_attempt: inMemoryStagedBefore,
+        committed_count_after_failure: typeof committedAfter === "number" ? committedAfter : null,
+        next_resume_from_row_number: next.maxRowNumber,
+        next_resume_row_count: next.rowCount,
+        error: errorMessage,
+      }),
+    );
+  } catch (logErr) {
+    console.error(
+      `[phase2-staging] Diagnostic log itself failed: ${logErr instanceof Error ? logErr.message : String(logErr)}`,
+    );
+  }
 }
 
 async function audit(orgId: string, action: string, entityId: string, detail?: Record<string, unknown>): Promise<void> {
@@ -407,10 +580,50 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
     });
 
     // Seed FPS with cumulative counters so the UI does not flash back to 0% on retry.
-    const initialPctNum =
+    // Compute target pct from estimatedRows + resumeRowCount, then take MAX with the
+    // existing FPS row's process_pct and the existing metadata.process_progress so
+    // progress can never visibly regress — no matter where the prior worker died.
+    const computedInitialPctRaw =
       estimatedRows && estimatedRows > 0 && resumeRowCount > 0
         ? Math.min(99, Math.round((resumeRowCount / Math.max(estimatedRows, resumeRowCount)) * 100))
         : 0;
+
+    const { data: existingFps } = await supabaseServer
+      .from("file_processing_status")
+      .select("process_pct, phase2_stage_pct, processed_rows, staged_rows_written")
+      .eq("upload_id", uploadId)
+      .maybeSingle();
+
+    const existingProcessPct =
+      existingFps && typeof (existingFps as { process_pct?: unknown }).process_pct === "number"
+        ? Math.max(0, Math.min(99, Math.floor((existingFps as { process_pct: number }).process_pct)))
+        : 0;
+    const existingPhase2Pct =
+      existingFps && typeof (existingFps as { phase2_stage_pct?: unknown }).phase2_stage_pct === "number"
+        ? Math.max(0, Math.min(99, Math.floor((existingFps as { phase2_stage_pct: number }).phase2_stage_pct)))
+        : 0;
+    const existingProcessedRows =
+      existingFps && typeof (existingFps as { processed_rows?: unknown }).processed_rows === "number"
+        ? Math.max(0, Math.floor((existingFps as { processed_rows: number }).processed_rows))
+        : 0;
+    const existingStagedRowsWritten =
+      existingFps && typeof (existingFps as { staged_rows_written?: unknown }).staged_rows_written === "number"
+        ? Math.max(0, Math.floor((existingFps as { staged_rows_written: number }).staged_rows_written))
+        : 0;
+
+    const metaPrevPct = (() => {
+      const v = metaObj.process_progress;
+      if (typeof v === "number" && Number.isFinite(v)) return Math.max(0, Math.min(99, Math.floor(v)));
+      if (typeof v === "string" && v.trim() !== "") {
+        const n = Number(v);
+        if (Number.isFinite(n)) return Math.max(0, Math.min(99, Math.floor(n)));
+      }
+      return 0;
+    })();
+
+    const initialProcessPct = Math.max(computedInitialPctRaw, existingProcessPct, existingPhase2Pct, metaPrevPct);
+    const initialProcessedRows = Math.max(resumeRowCount, existingProcessedRows);
+    const initialStagedRowsWritten = Math.max(resumeRowCount, existingStagedRowsWritten);
 
     await supabaseServer.from("file_processing_status").upsert(
       {
@@ -427,14 +640,14 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         next_action_label: FPS_NEXT_ACTION_LABEL_SYNC,
         current_phase_label: FPS_LABEL_PROCESS,
         upload_pct: 100,
-        process_pct: initialPctNum,
-        phase2_stage_pct: initialPctNum,
+        process_pct: initialProcessPct,
+        phase2_stage_pct: initialProcessPct,
         sync_pct: 0,
-        processed_rows: resumeRowCount,
-        staged_rows_written: resumeRowCount,
+        processed_rows: initialProcessedRows,
+        staged_rows_written: initialStagedRowsWritten,
         total_rows: estimatedRows && estimatedRows > 0 ? estimatedRows : null,
         error_message: null,
-        import_metrics: { current_phase: "staging", rows_staged: resumeRowCount },
+        import_metrics: { current_phase: "staging", rows_staged: initialStagedRowsWritten },
       },
       { onConflict: "upload_id" },
     );
@@ -489,16 +702,24 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
 
       let skippedEmpty = 0;
       let dataLinesPassed = 0;
+      let lastFileLineNumberStaged = resumeFromRowNumber; // tracks expected MAX(row_number) for verify
       const fileRowsTotal = Math.max(0, lines.length - 1);
       const dataRowsTotal = fileRowsTotal;
       // Seed with rows already in DB so progress and counters keep climbing across resumes.
       let approxStaged = resumeRowCount;
       let batch: Record<string, unknown>[] = [];
       let lastListingProgressWrite = 0;
+      let lastListingProgressTs = 0;
 
       const flushListingProgress = async (force: boolean, physicalDone: number) => {
-        if (!force && physicalDone - lastListingProgressWrite < LISTING_PROGRESS_EVERY) return;
+        if (!force) {
+          const rowsDelta = physicalDone - lastListingProgressWrite;
+          const msSinceLast = Date.now() - lastListingProgressTs;
+          // Throttle: skip unless either the row-stride OR the time-stride has elapsed.
+          if (rowsDelta < LISTING_PROGRESS_EVERY && msSinceLast < PROGRESS_MIN_INTERVAL_MS) return;
+        }
         lastListingProgressWrite = physicalDone;
+        lastListingProgressTs = Date.now();
         // Cumulative for resume — physicalDone counts only this-run new rows.
         const cumulativeDone = resumeRowCount + physicalDone;
         const denom = Math.max(1, dataRowsTotal, estimatedRows ?? 0, cumulativeDone);
@@ -567,16 +788,33 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       const flushBatch = async (rows: Record<string, unknown>[]) => {
         if (rows.length === 0) return;
         // Idempotent insert: ignore rows already staged for this (org, upload, row_number).
-        // This is what makes large-file retries safe — the prior run's rows are kept
-        // and only the missing tail gets written.
+        // Each upsert is a single, independently-committed PostgREST request. A failure
+        // here cannot roll back any prior batch — the next attempt resumes from the
+        // highest existing row_number.
+        const startRn = (rows[0] as { row_number?: number } | undefined)?.row_number ?? null;
+        const endRn = (rows[rows.length - 1] as { row_number?: number } | undefined)?.row_number ?? null;
+        const inMemoryStagedBefore = approxStaged;
         const { error: insErr } = await supabaseServer
           .from(STAGING_TABLE)
           .upsert(rows, { onConflict: STAGING_CONFLICT, ignoreDuplicates: true });
         if (insErr) {
-          throw new Error(`Upsert into ${STAGING_TABLE} failed: ${insErr.message}`);
+          await logBatchFailureDiagnostic({
+            orgId,
+            uploadId,
+            batchStartRowNumber: startRn,
+            batchEndRowNumber: endRn,
+            batchSize: rows.length,
+            inMemoryStagedBefore,
+            errorMessage: insErr.message,
+          });
+          throw new Error(
+            `Upsert into ${STAGING_TABLE} failed (rows ${startRn}..${endRn}, batch_size=${rows.length}): ${insErr.message}`,
+          );
         }
         approxStaged += rows.length;
-        await flushListingProgress(true, dataLinesPassed);
+        if (typeof endRn === "number") lastFileLineNumberStaged = endRn;
+        // Throttled progress (no longer forced per batch — see PROGRESS_MIN_INTERVAL_MS).
+        await flushListingProgress(false, dataLinesPassed);
       };
 
       const headerLine = lines[0] ?? "";
@@ -641,12 +879,18 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       await flushBatch(batch);
       batch = [];
 
-      const { count: stagingCount } = await supabaseServer
-        .from(STAGING_TABLE)
-        .select("*", { count: "exact", head: true })
-        .eq("upload_id", uploadId)
-        .eq("organization_id", orgId);
-      const rowsInDb = typeof stagingCount === "number" ? stagingCount : approxStaged;
+      // HARD VERIFICATION — must run before we mark the upload as `staged`.
+      // For listing exports the row_number space is sparse (empty physical lines are
+      // skipped) so we only assert count + max(row_number); gap-detection does not apply.
+      const expectedListingCount = resumeRowCount + dataLinesPassed;
+      const verified = await assertStagingComplete({
+        orgId,
+        uploadId,
+        expectedCount: expectedListingCount,
+        expectedMaxRowNumber: lastFileLineNumberStaged,
+        isListing: true,
+      });
+      const rowsInDb = verified.dbCount;
 
       const { data: prevRowListing } = await supabaseServer
         .from("raw_report_uploads")
@@ -765,10 +1009,17 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
     let dataRowNumber = 0;
     let batch: Record<string, unknown>[] = [];
     let lastProgressWrite = 0;
+    let lastProgressTs = 0;
 
     const flushProgress = async (force = false) => {
-      if (!force && dataLinesPassed - lastProgressWrite < PROGRESS_EVERY) return;
+      if (!force) {
+        const rowsDelta = dataLinesPassed - lastProgressWrite;
+        const msSinceLast = Date.now() - lastProgressTs;
+        // Throttle: skip unless either the row-stride OR the time-stride elapsed.
+        if (rowsDelta < PROGRESS_EVERY && msSinceLast < PROGRESS_MIN_INTERVAL_MS) return;
+      }
       lastProgressWrite = dataLinesPassed;
+      lastProgressTs = Date.now();
       /**
        * Cumulative counters (resume-aware): `dataRowNumber` and `approxStaged` already
        * include rows from a prior partial run. Use them — not `dataLinesPassed` (this-run
@@ -852,17 +1103,32 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
     const flushBatch = async (rows: Record<string, unknown>[]) => {
       if (rows.length === 0) return;
       // Idempotent insert: ignore rows already staged for this (org, upload, row_number).
-      // Each batch is its own implicit transaction so a timeout in one batch does not
-      // roll back all prior work — the next attempt resumes from the highest row_number.
+      // Each upsert is a single, independently-committed PostgREST request — a failure
+      // here cannot roll back any prior batch. Next attempt resumes from MAX(row_number).
+      const startRn = (rows[0] as { row_number?: number } | undefined)?.row_number ?? null;
+      const endRn = (rows[rows.length - 1] as { row_number?: number } | undefined)?.row_number ?? null;
+      const inMemoryStagedBefore = approxStaged;
       const { error: insErr } = await supabaseServer
         .from(STAGING_TABLE)
         .upsert(rows, { onConflict: STAGING_CONFLICT, ignoreDuplicates: true });
       if (insErr) {
-        console.error(`[phase2-staging] Upsert into ${STAGING_TABLE} failed:`, insErr.message, { uploadId, orgId });
-        throw new Error(`Upsert into ${STAGING_TABLE} failed: ${insErr.message}`);
+        await logBatchFailureDiagnostic({
+          orgId,
+          uploadId,
+          batchStartRowNumber: startRn,
+          batchEndRowNumber: endRn,
+          batchSize: rows.length,
+          inMemoryStagedBefore,
+          errorMessage: insErr.message,
+        });
+        throw new Error(
+          `Upsert into ${STAGING_TABLE} failed (rows ${startRn}..${endRn}, batch_size=${rows.length}): ${insErr.message}`,
+        );
       }
       approxStaged += rows.length;
-      await flushProgress(true);
+      // Throttled (no longer forced per batch) — avoids hundreds of progress round-trips
+      // on large files which were themselves a source of mid-run timeouts.
+      await flushProgress(false);
     };
 
     let stagedRowCountForResponse = 0;
@@ -931,12 +1197,18 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
             await flushBatch(batch);
             batch = [];
 
-            const { count: stagingCount } = await supabaseServer
-              .from(STAGING_TABLE)
-              .select("*", { count: "exact", head: true })
-              .eq("upload_id", uploadId)
-              .eq("organization_id", orgId);
-            const rowsInDb = typeof stagingCount === "number" ? stagingCount : approxStaged;
+            // HARD VERIFICATION — must run before we mark the upload `staged`.
+            // CSV (non-listing) reports get contiguous row_number 1..N, so we assert
+            // count, max, AND no-gaps. Any mismatch throws and the outer catch flips
+            // status to `failed` with the structured message — never silently `staged`.
+            const verified = await assertStagingComplete({
+              orgId,
+              uploadId,
+              expectedCount: dataRowNumber,
+              expectedMaxRowNumber: dataRowNumber,
+              isListing: false,
+            });
+            const rowsInDb = verified.dbCount;
 
             const { data: prevRow } = await supabaseServer
               .from("raw_report_uploads")
