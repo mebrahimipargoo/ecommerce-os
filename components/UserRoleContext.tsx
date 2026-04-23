@@ -6,8 +6,10 @@ import React, {
 import { supabase } from "@/src/lib/supabase";
 import {
   getOrganizationNames,
+  getWorkspaceViewModeForOrganizationAction,
   listWorkspaceOrganizationsForAdmin,
   type WorkspaceOrganizationOption,
+  type WorkspaceViewMode,
 } from "../app/session/tenant-actions";
 import {
   getViewAsProfileSnapshot,
@@ -108,6 +110,13 @@ type UserRoleContextValue = {
   /** Dev-mode only: cycle through all 5 roles in hierarchy order */
   toggleRole: () => void;
   refreshProfile: () => Promise<void>;
+  /**
+   * Shell UI mode for the **effective** `organizationId`: `internal` org → platform
+   * (full platform nav); any other org → tenant (hide platform-only nav for internal staff).
+   */
+  workspaceViewMode: WorkspaceViewMode;
+  /** Becomes true after `organizations.type` is resolved (or when there is no org to resolve). */
+  workspaceViewModeReady: boolean;
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -191,6 +200,7 @@ export const INTERNAL_DEV_BADGE_ROLE_KEYS = new Set([
   "system_admin",
 ]);
 
+
 export function canShowInternalDevBadge(canonicalRoleKey: string | null | undefined): boolean {
   const k = (canonicalRoleKey ?? "").trim().toLowerCase();
   return INTERNAL_DEV_BADGE_ROLE_KEYS.has(k);
@@ -221,6 +231,8 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
   const [profileLoading,  setProfileLoading]  = useState(true);
   const [profileError,    setProfileError]    = useState<string | null>(null);
   const [orgLabelsById,   setOrgLabelsById]   = useState<Record<string, string>>({});
+  const [workspaceViewMode, setWorkspaceViewMode] = useState<WorkspaceViewMode>("platform");
+  const [workspaceViewModeReady, setWorkspaceViewModeReady] = useState(false);
 
   const [sessionCanWorkspaceSwitch, setSessionCanWorkspaceSwitch] = useState(false);
   const [viewAsProfileId, setViewAsProfileIdState] = useState<string | null>(null);
@@ -454,6 +466,32 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
   }, [sessionCanWorkspaceSwitch, superAdminOrganizationOverride, homeOrganizationId]);
 
   useEffect(() => {
+    if (profileLoading) {
+      return;
+    }
+    const oid = (organizationId ?? "").trim();
+    if (!oid) {
+      setWorkspaceViewMode("tenant");
+      setWorkspaceViewModeReady(true);
+      return;
+    }
+    let cancelled = false;
+    setWorkspaceViewModeReady(false);
+    void getWorkspaceViewModeForOrganizationAction(oid).then((res) => {
+      if (cancelled) return;
+      if (res.ok) {
+        setWorkspaceViewMode(res.viewMode);
+      } else {
+        setWorkspaceViewMode("platform");
+      }
+      setWorkspaceViewModeReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [organizationId, profileLoading]);
+
+  useEffect(() => {
     if (!sessionCanWorkspaceSwitch || profileLoading || !organizationId) {
       setViewAsProfileOptions([]);
       setViewAsProfileOptionsLoading(false);
@@ -641,6 +679,8 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
       setDebugRole,
       toggleRole,
       refreshProfile: loadProfile,
+      workspaceViewMode,
+      workspaceViewModeReady,
     }),
     [
       role,
@@ -668,6 +708,8 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
       setDebugRole,
       toggleRole,
       loadProfile,
+      workspaceViewMode,
+      workspaceViewModeReady,
     ],
   );
 
@@ -705,7 +747,11 @@ export function useUserRole(): UserRoleContextValue {
       setDebugRole: () => {},
       toggleRole: () => {},
       refreshProfile: async () => {},
+      workspaceViewMode: "platform",
+      workspaceViewModeReady: true,
     };
   }
   return ctx;
 }
+
+export type { WorkspaceViewMode } from "../app/session/tenant-actions";

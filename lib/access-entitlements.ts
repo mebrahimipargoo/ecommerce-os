@@ -190,15 +190,26 @@ export function filterModuleFeatureTreeToOrgLicensing(
   return tree
     .filter((node) => modModes[node.module.id] === "enabled")
     .map((node) => {
-      if (featuresExplicit[node.module.id] !== true) {
-        return node;
+      if (featuresExplicit[node.module.id] === true) {
+        const features = node.features.filter((b) => {
+          const feat = b.feature;
+          if (!feat || String(feat.id).startsWith("synthetic:")) {
+            return false;
+          }
+          return featModes[String(feat.id)] === "enabled";
+        });
+        return { ...node, features };
       }
+      /** Per-feature org disables in `moduleFeatureEntitlementModeById` must apply even in module-level-only mode. */
       const features = node.features.filter((b) => {
         const feat = b.feature;
         if (!feat || String(feat.id).startsWith("synthetic:")) {
           return false;
         }
-        return featModes[String(feat.id)] === "enabled";
+        if (featModes[String(feat.id)] === "disabled") {
+          return false;
+        }
+        return true;
       });
       return { ...node, features };
     })

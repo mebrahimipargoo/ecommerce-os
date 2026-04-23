@@ -135,3 +135,36 @@ export function findAllFeatureBucketsInModule(
   if (!node) return [];
   return node.features;
 }
+
+/** Update a granted permission set for one feature: replace all bucket ids with the ids for `level`. */
+export function applyFeatureLevelToPermissionSet(
+  granted: Set<string>,
+  bucket: ModuleFeatureBucket,
+  level: UiAccessLevel,
+): void {
+  for (const id of allPermissionIdsInFeatureBucket(bucket)) {
+    granted.delete(id);
+  }
+  for (const id of permissionIdsForUiLevel(bucket, level)) {
+    granted.add(id);
+  }
+}
+
+export function applyModuleLevelToPermissionSet(
+  granted: Set<string>,
+  tree: ModuleFeatureTreeNode[],
+  moduleId: string,
+  level: UiAccessLevel,
+): void {
+  for (const b of findAllFeatureBucketsInModule(tree, moduleId)) {
+    applyFeatureLevelToPermissionSet(granted, b, level);
+  }
+}
+
+export function arePermissionIdSetsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const x of a) {
+    if (!b.has(x)) return false;
+  }
+  return true;
+}

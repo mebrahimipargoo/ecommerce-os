@@ -2,6 +2,13 @@ import "server-only";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 /**
+ * Next.js may cache `fetch` by default; PostgREST calls must stay fresh (roles, permissions, reports).
+ */
+function noStoreFetch(input: RequestInfo | URL, init?: RequestInit): ReturnType<typeof fetch> {
+  return fetch(input, { ...init, cache: "no-store" });
+}
+
+/**
  * Server-only Supabase client using the service role key.
  * Use this for operations that require bypassing RLS or accessing sensitive data
  * (e.g. lwa_client_secret). Never import this file in client components.
@@ -21,6 +28,7 @@ function getServerSupabase(): SupabaseClient {
 
   return createClient(supabaseUrl, serviceRoleKey, {
     auth: { persistSession: false },
+    global: { fetch: noStoreFetch },
   });
 }
 

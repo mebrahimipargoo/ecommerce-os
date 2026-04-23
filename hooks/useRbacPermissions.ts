@@ -81,6 +81,12 @@ export type RbacPermissions = {
   canSwitchOrganization: boolean;
 
   /**
+   * When false, the effective org is a tenant company: hide platform-only nav and
+   * use tenant-style UI, even for `super_admin` (backend authority unchanged).
+   */
+  isPlatformShellView: boolean;
+
+  /**
    * Utility: returns true when the current role is at or above `minRole`
    * in the 5-tier hierarchy.
    *
@@ -90,7 +96,13 @@ export type RbacPermissions = {
 };
 
 export function useRbacPermissions(): RbacPermissions {
-  const { role, canonicalRoleKey, actorCanonicalRoleKey } = useUserRole();
+  const {
+    role,
+    canonicalRoleKey,
+    actorCanonicalRoleKey,
+    workspaceViewMode,
+    workspaceViewModeReady,
+  } = useUserRole();
   const ck = (canonicalRoleKey ?? "").trim().toLowerCase();
   /** Workspace chrome must follow the signed-in account, not “view as” simulation. */
   const actorCk = (actorCanonicalRoleKey ?? "").trim().toLowerCase();
@@ -101,7 +113,11 @@ export function useRbacPermissions(): RbacPermissions {
       ROLE_HIERARCHY.indexOf(role) >= ROLE_HIERARCHY.indexOf(minRole);
 
     const isOperator = role === "operator";
-    const canPlatformSettings = actorNorm === "super_admin";
+    /** Super_admin (actor) in tenant org context: hide platform nav until type resolves, then follow org type. */
+    const isPlatformShellView =
+      !workspaceViewModeReady || workspaceViewMode === "platform";
+
+    const canPlatformSettings = actorNorm === "super_admin" && isPlatformShellView;
 
     return {
       // Ops modules: everyone except pure warehouse operators
@@ -131,8 +147,8 @@ export function useRbacPermissions(): RbacPermissions {
 
       // Tech Debug panel: super_admin tier, or internal staff by catalog role key.
       canSeeTechDebug:
-        role === "super_admin"
-        || INTERNAL_DEV_BADGE_ROLE_KEYS.has(ck),
+        isPlatformShellView
+        && (role === "super_admin" || INTERNAL_DEV_BADGE_ROLE_KEYS.has(ck)),
 
       // WMS: available to all roles; operators see only this section
       canSeeWmsTools:       true,
@@ -142,7 +158,18 @@ export function useRbacPermissions(): RbacPermissions {
       canSwitchOrganization:
         actorCk === "super_admin" || actorCk === "programmer" || actorCk === "system_admin",
 
+      isPlatformShellView,
+
       isAtLeast,
     };
-  }, [role, ck, actorCk, actorNorm, actorCanonicalRoleKey]);
+  }, [
+    role,
+    ck,
+    actorCk,
+    actorNorm,
+    actorCanonicalRoleKey,
+    canonicalRoleKey,
+    workspaceViewMode,
+    workspaceViewModeReady,
+  ]);
 }

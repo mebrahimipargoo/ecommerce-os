@@ -1,5 +1,6 @@
 "use server";
 
+import { unstable_noStore as noStore } from "next/cache";
 import {
   allPermissionIdsInFeatureBucket,
   effectiveLevelFromFeatureBucket,
@@ -79,6 +80,7 @@ export type EffectivePermissionRow = PermissionCatalogRow & {
 
 export type UserEffectiveAccessResult = {
   profile_id: string;
+  /** Org used for entitlements + group scope (may differ from `profiles.organization_id` when simulating another company). */
   organization_id: string;
   full_name: string;
   organization_name: string;
@@ -89,6 +91,11 @@ export type UserEffectiveAccessResult = {
   /** Per licensed module_feature: baseline = max(role, group), override from `user_feature_access_overrides`, effective after org + override. */
   userFeatureAccessByModuleFeatureId: Record<string, UserFeatureAccessRow>;
   orgEntitlements: OrgEntitlementsPayload | null;
+};
+
+/** Optional context for {@link getUserEffectiveAccessAction}: resolve as if the user were in this org. */
+export type UserEffectiveAccessContext = {
+  organizationId?: string | null;
 };
 
 function toPermissionRow(raw: Record<string, unknown>): PermissionCatalogRow {
@@ -482,6 +489,7 @@ function findNodeAndBucketByModuleFeatureId(
 
 export async function getUserEffectiveAccessAction(
   profileId: string,
+  context?: UserEffectiveAccessContext,
 ): Promise<{ ok: true; data: UserEffectiveAccessResult } | { ok: false; error: string }> {
   const g = await assertManagePlatformAccess();
   if (!g.ok) return { ok: false, error: deniedMessage(g.denied) };
@@ -500,12 +508,24 @@ export async function getUserEffectiveAccessAction(
     if (!prof) return { ok: false, error: "User not found." };
 
     const r = prof as Record<string, unknown>;
-    const orgId = String(r.organization_id ?? "").trim();
+    const profileHomeOrgId = String(r.organization_id ?? "").trim();
+    const ctxOrg = (context?.organizationId ?? "").trim();
+    const effectiveOrgId =
+      ctxOrg && isUuidString(ctxOrg) ? ctxOrg : profileHomeOrgId;
     const orgJoin = splitJoined<{ name?: string | null }>(r.organizations);
-    const organization_name =
+    let organization_name =
       orgJoin?.name != null && String(orgJoin.name).trim()
         ? String(orgJoin.name).trim()
-        : orgId;
+        : profileHomeOrgId;
+    if (effectiveOrgId && effectiveOrgId !== profileHomeOrgId) {
+      const { data: effOrg } = await supabaseServer
+        .from("organizations")
+        .select("name")
+        .eq("id", effectiveOrgId)
+        .maybeSingle();
+      const nm = effOrg != null ? String((effOrg as { name?: unknown }).name ?? "").trim() : "";
+      organization_name = nm || effectiveOrgId;
+    }
     const full_name = String(r.full_name ?? "").trim() || pid;
     const roleJoin = splitJoined<{ key?: string | null; name?: string | null }>(r.roles);
     const keyFromJoin = roleJoin?.key != null ? String(roleJoin.key).trim() : "";
@@ -552,12 +572,12 @@ export async function getUserEffectiveAccessAction(
     )];
 
     const groupsOut: UserEffectiveGroupRow[] = [];
-    if (candidateGroupIds.length > 0 && orgId && isUuidString(orgId)) {
+    if (candidateGroupIds.length > 0 && effectiveOrgId && isUuidString(effectiveOrgId)) {
       const { data: gRows, error: gErr } = await supabaseServer
         .from("groups")
         .select("id, organization_id, key, name")
         .in("id", candidateGroupIds)
-        .eq("organization_id", orgId);
+        .eq("organization_id", effectiveOrgId);
       if (gErr) return { ok: false, error: gErr.message };
       const orgGroupIds: string[] = [];
       for (const raw of gRows ?? []) {
@@ -602,8 +622,8 @@ export async function getUserEffectiveAccessAction(
 
     let orgEntitlements: OrgEntitlementsPayload | null = null;
     let userFeatureAccessByModuleFeatureId: Record<string, UserFeatureAccessRow> = {};
-    if (orgId && isUuidString(orgId)) {
-      const licensed = await buildLicensedModuleFeatureTreeForOrg(orgId);
+    if (effectiveOrgId && isUuidString(effectiveOrgId)) {
+      const licensed = await buildLicensedModuleFeatureTreeForOrg(effectiveOrgId);
       if (!licensed.ok) return { ok: false, error: licensed.error };
       orgEntitlements = licensed.orgEntitlements;
       for (const node of licensed.moduleFeatureTree) {
@@ -654,6 +674,9 @@ export async function getUserEffectiveAccessAction(
               featureKey: bucket.featureKey,
             });
             const ovr: UserOverrideChoice = overrideByMf.get(mfId) ?? "inherit";
+            if (!org.entitled) {
+              continue;
+            }
             const effective = effectiveUserFeatureAfterOverride({
               orgEntitled: org.entitled,
               baseline,
@@ -694,7 +717,7 @@ export async function getUserEffectiveAccessAction(
       ok: true,
       data: {
         profile_id: pid,
-        organization_id: orgId,
+        organization_id: effectiveOrgId,
         full_name,
         organization_name,
         role: { key: role_key, display_name: role_display_name },
@@ -721,11 +744,14 @@ function accessLevelRankForReport(l: UiAccessLevel): number {
 }
 
 async function buildModuleFeatureLabelMapByIdFromPrimary(): Promise<
-  Map<string, { moduleKey: string; moduleName: string; featureKey: string; featureName: string }>
+  Map<string, { moduleId: string; moduleKey: string; moduleName: string; featureKey: string; featureName: string }>
 > {
   const r = await buildPrimaryModuleFeatureTree();
   if (!r.ok) return new Map();
-  const map = new Map<string, { moduleKey: string; moduleName: string; featureKey: string; featureName: string }>();
+  const map = new Map<
+    string,
+    { moduleId: string; moduleKey: string; moduleName: string; featureKey: string; featureName: string }
+  >();
   for (const node of r.tree) {
     for (const b of node.features) {
       const feat = b.feature;
@@ -733,6 +759,7 @@ async function buildModuleFeatureLabelMapByIdFromPrimary(): Promise<
       const id = String(feat.id);
       const name = String((feat as { name?: unknown }).name ?? "").trim() || b.featureKey;
       map.set(id, {
+        moduleId: String(node.module.id),
         moduleKey: String(node.module.key),
         moduleName: String(node.module.name ?? node.module.key),
         featureKey: b.featureKey,
@@ -780,6 +807,7 @@ export async function getAccessMatrixReportForOrganizationAction(
   | { ok: true; rows: AccessReportRow[]; userCount: number; truncated: boolean }
   | { ok: false; error: string }
 > {
+  noStore();
   const g = await assertManagePlatformAccess();
   if (!g.ok) return { ok: false, error: deniedMessage(g.denied) };
   const oid = input.organizationId.trim();
@@ -812,7 +840,9 @@ export async function getAccessMatrixReportForOrganizationAction(
     for (let i = 0; i < profRows.length; i += ACCESS_REPORT_CONCURRENCY) {
       const batch = profRows.slice(i, i + ACCESS_REPORT_CONCURRENCY);
       const results = await Promise.all(
-        batch.map((raw) => getUserEffectiveAccessAction(String(raw.id ?? "").trim())),
+        batch.map((raw) =>
+          getUserEffectiveAccessAction(String(raw.id ?? "").trim(), { organizationId: oid }),
+        ),
       );
       for (let k = 0; k < batch.length; k++) {
         const res = results[k];
@@ -826,11 +856,22 @@ export async function getAccessMatrixReportForOrganizationAction(
           if (!matchUser) continue;
         }
         for (const [mfId, ufa] of Object.entries(data.userFeatureAccessByModuleFeatureId)) {
+          const meta = labelMap.get(mfId);
+          if (meta && data.orgEntitlements) {
+            const { entitled: orgEntitledForFeature } = orgAllowsPermission({
+              snapshot: data.orgEntitlements,
+              moduleId: meta.moduleId,
+              moduleFeatureId: mfId,
+              featureKey: meta.featureKey,
+            });
+            if (!orgEntitledForFeature) {
+              continue;
+            }
+          }
           const eff = ufa.effective;
           if (minEff === "read_or_more" && accessLevelRankForReport(eff) < 1) continue;
           if (minEff === "write_or_more" && accessLevelRankForReport(eff) < 2) continue;
           if (minEff === "manage_only" && eff !== "manage") continue;
-          const meta = labelMap.get(mfId);
           const moduleKey = meta?.moduleKey ?? "—";
           const moduleName = meta?.moduleName ?? "—";
           const featureKey = meta?.featureKey ?? mfId;

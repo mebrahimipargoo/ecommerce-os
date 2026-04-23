@@ -1,10 +1,14 @@
 "use server";
 
 import { supabaseServer } from "../../lib/supabase-server";
+import { isUuidString } from "../../lib/uuid";
 import {
   loadTenantProfile,
   type TenantProfileRow,
 } from "../../lib/server-tenant";
+
+/** UI / nav mode from `public.organizations.type` for the effective workspace org. */
+export type WorkspaceViewMode = "platform" | "tenant";
 
 /**
  * Loads the signed-in workspace user (`profiles` row) for client session bootstrap.
@@ -150,6 +154,36 @@ export async function listWorkspaceOrganizationsForAdmin(): Promise<
     return {
       ok: false,
       error: e instanceof Error ? e.message : "Failed to list organizations.",
+    };
+  }
+}
+
+/**
+ * Resolves whether the app shell should show platform-only nav (`internal` org) or
+ * tenant-style nav (any other `organizations.type`).
+ */
+export async function getWorkspaceViewModeForOrganizationAction(
+  organizationId: string,
+): Promise<
+  { ok: true; viewMode: WorkspaceViewMode } | { ok: false; error: string }
+> {
+  const id = (organizationId ?? "").trim();
+  if (!isUuidString(id)) {
+    return { ok: false, error: "Invalid organization id." };
+  }
+  try {
+    const { data, error } = await supabaseServer
+      .from("organizations")
+      .select("type")
+      .eq("id", id)
+      .maybeSingle();
+    if (error) return { ok: false, error: error.message };
+    const t = (data?.type != null ? String(data.type) : "").trim().toLowerCase();
+    return { ok: true, viewMode: t === "internal" ? "platform" : "tenant" };
+  } catch (e) {
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : "Failed to resolve organization type.",
     };
   }
 }

@@ -6,7 +6,8 @@
  * ─ Desktop  : Persistent collapsible sidebar + TopHeader (theme/profile live ONLY here).
  * ─ Mobile   : TopHeader (hamburger + logo + theme + profile) + drawer for nav.
  *
- * Sidebar visibility is driven entirely by useRbacPermissions (no role comparisons here).
+ * Sidebar visibility is driven by useRbacPermissions (incl. platform vs tenant shell from
+ * effective org `workspaceViewMode` — not raw `super_admin` alone).
  * Content column: TopHeader (shrink-0) + scrollable main (flex-1 min-h-0 overflow-auto).
  *
  * Shell product row: platform name + `LogoMark` from `public.platform_settings` via

@@ -1,12 +1,12 @@
 "use client";
 
-import React, { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import React, { Suspense, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import * as XLSX from "xlsx";
-import { ArrowLeft, Info, Loader2 } from "lucide-react";
-import { PageHeaderWithInfo } from "../components/page-header-with-info";
+import { ArrowLeft, Check, ChevronDown, Info, Loader2 } from "lucide-react";
 import { useUserRole } from "../../../components/UserRoleContext";
+import { PageHeaderWithInfo } from "../components/page-header-with-info";
 import {
   getPlatformAccessPageAccessAction,
   listGroupsForOrganizationAccessAction,
@@ -17,9 +17,19 @@ import {
   type RoleCatalogRow,
 } from "./access-actions";
 import type { ModuleFeatureTreeNode, OrgEntitlementsPayload } from "../../../lib/access-entitlements";
+import { ORG_ENTITLEMENTS_UPDATED_EVENT, type OrgEntitlementsUpdatedDetail } from "../../../lib/org-entitlements-events";
 import { accessTreeModuleMatchesScope, REPORT_MODULE_GROUP_CHOICES } from "../../../lib/access-report-filters";
-import { UI_ACCESS_LEVEL_LABEL, type UiAccessLevel } from "../../../lib/access-level";
-import type { UserOverrideChoice } from "../../../lib/user-feature-access";
+import {
+  applyFeatureLevelToPermissionSet,
+  applyModuleLevelToPermissionSet,
+  effectiveLevelFromFeatureBucket,
+  findAllFeatureBucketsInModule,
+  findFeatureBucket,
+  UI_ACCESS_LEVEL_LABEL,
+  type UiAccessLevel,
+} from "../../../lib/access-level";
+import { orgAllowsPermission, totalPermissionsInBucket } from "../../../lib/access-entitlements";
+import { effectiveUserFeatureAfterOverride, type UserOverrideChoice, type UserFeatureAccessRow } from "../../../lib/user-feature-access";
 import { FeatureAccessTree } from "./feature-access-tree";
 import {
   getAccessMatrixReportForOrganizationAction,
@@ -41,15 +51,574 @@ const INPUT =
   "flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50";
 const LABEL = "mb-2 block text-sm font-medium leading-none";
 
+function setToKey(s: Set<string>): string {
+  return [...s].sort().join("\0");
+}
+function keyToSet(k: string): Set<string> {
+  return k ? new Set(k.split("\0")) : new Set();
+}
+
 function organizationTypeIsInternal(type: string | null | undefined): boolean {
   return (type ?? "").trim().toLowerCase() === "internal";
 }
 
 type TabKey = "users" | "roles" | "groups" | "report";
 
+const USER_COMBO_PANEL =
+  "absolute left-0 right-0 top-full z-50 mt-1 max-h-[min(24rem,70vh)] flex flex-col overflow-hidden rounded-md border border-border bg-popover p-0 text-popover-foreground shadow-lg";
+
+function AccessUserCombobox({
+  id,
+  labelId,
+  users,
+  value,
+  onChange,
+  disabled,
+  loading,
+}: {
+  id: string;
+  labelId: string;
+  users: AccessInspectorUserRow[];
+  value: string;
+  onChange: (id: string) => void;
+  disabled?: boolean;
+  loading?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchId = useId();
+
+  const q = query.trim().toLowerCase();
+  const filtered = useMemo(() => {
+    if (!q) return users;
+    return users.filter(
+      (u) =>
+        u.full_name.toLowerCase().includes(q)
+        || u.organization_name.toLowerCase().includes(q)
+        || u.role_key.toLowerCase().includes(q)
+        || (u.role_display_name && u.role_display_name.toLowerCase().includes(q)),
+    );
+  }, [users, q]);
+
+  const selected = useMemo(() => users.find((u) => u.id === value) ?? null, [users, value]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (open) {
+      setQuery("");
+      const t = requestAnimationFrame(() => searchInputRef.current?.focus());
+      return () => cancelAnimationFrame(t);
+    }
+  }, [open]);
+
+  const displayLabel = selected
+    ? `${selected.full_name} — ${selected.organization_name} — ${selected.role_key}`
+    : "";
+
+  return (
+    <div ref={rootRef} className="relative w-full min-w-0">
+      <button
+        type="button"
+        id={id}
+        disabled={disabled || loading}
+        aria-labelledby={labelId}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        onClick={() => !disabled && !loading && setOpen((o) => !o)}
+        className={[
+          "flex h-10 w-full min-w-0 items-center justify-between gap-2 rounded-md border border-input bg-background px-3 py-2 text-left text-sm shadow-sm ring-offset-background",
+          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+          "disabled:cursor-not-allowed disabled:opacity-50",
+        ].join(" ")}
+      >
+        <span
+          className={[
+            "min-w-0 flex-1 truncate",
+            !displayLabel && !loading ? "text-muted-foreground" : "text-foreground",
+          ].join(" ")}
+        >
+          {loading ? "Loading…" : displayLabel || "Select a user"}
+        </span>
+        <ChevronDown className={`h-4 w-4 shrink-0 opacity-60 transition ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        <div className={USER_COMBO_PANEL} role="listbox" aria-labelledby={labelId}>
+          <div className="shrink-0 border-b border-border p-2">
+            <label htmlFor={searchId} className="sr-only">
+              Search users
+            </label>
+            <input
+              id={searchId}
+              ref={searchInputRef}
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.stopPropagation();
+                  setOpen(false);
+                }
+              }}
+              placeholder="Search name, company, or role…"
+              className={INPUT}
+              autoComplete="off"
+            />
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto p-1">
+            {filtered.length === 0 ? (
+              <p className="px-3 py-4 text-center text-sm text-muted-foreground">No matches</p>
+            ) : (
+              filtered.map((u) => {
+                const isSel = value === u.id;
+                return (
+                  <button
+                    key={u.id}
+                    type="button"
+                    role="option"
+                    aria-selected={isSel}
+                    onClick={() => {
+                      onChange(u.id);
+                      setOpen(false);
+                    }}
+                    className={[
+                      "flex w-full min-w-0 items-start gap-2 rounded-md px-2.5 py-2 text-left text-sm transition",
+                      isSel
+                        ? "bg-muted font-medium"
+                        : "hover:bg-muted/80",
+                    ].join(" ")}
+                  >
+                    <Check
+                      className={[
+                        "mt-0.5 h-4 w-4 shrink-0",
+                        isSel ? "text-primary opacity-100" : "opacity-0",
+                      ].join(" ")}
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium leading-tight">{u.full_name}</span>
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        {u.organization_name} · {u.role_key}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+type SearchableOption = { value: string; label: string; sublabel?: string };
+
+function AccessSearchableOptionsCombobox({
+  id,
+  labelId,
+  value,
+  onChange,
+  options,
+  disabled,
+  loading,
+  placeholder,
+  searchPlaceholder = "Search…",
+  noMatches = "No matches",
+  emptyList,
+}: {
+  id: string;
+  labelId: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: readonly SearchableOption[];
+  disabled?: boolean;
+  loading?: boolean;
+  placeholder: string;
+  searchPlaceholder?: string;
+  noMatches?: string;
+  emptyList?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchId = useId();
+
+  const q = query.trim().toLowerCase();
+  const filtered = useMemo(() => {
+    if (!q) return options;
+    return options.filter(
+      (o) =>
+        o.label.toLowerCase().includes(q)
+        || (o.sublabel && o.sublabel.toLowerCase().includes(q))
+        || o.value.toLowerCase().includes(q),
+    );
+  }, [options, q]);
+
+  const selected = useMemo(
+    () => options.find((o) => o.value === value) ?? null,
+    [options, value],
+  );
+  const display = loading
+    ? "Loading…"
+    : (selected
+      ? selected.label
+      : placeholder);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (open) {
+      setQuery("");
+      const t = requestAnimationFrame(() => searchInputRef.current?.focus());
+      return () => cancelAnimationFrame(t);
+    }
+  }, [open]);
+
+  return (
+    <div ref={rootRef} className="relative w-full min-w-0">
+      <button
+        type="button"
+        id={id}
+        disabled={disabled || loading}
+        aria-labelledby={labelId}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        onClick={() => !disabled && !loading && setOpen((o) => !o)}
+        className={[
+          "flex h-10 w-full min-w-0 items-center justify-between gap-2 rounded-md border border-input bg-background px-3 py-2 text-left text-sm shadow-sm ring-offset-background",
+          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+          "disabled:cursor-not-allowed disabled:opacity-50",
+        ].join(" ")}
+      >
+        <span
+          className={[
+            "min-w-0 flex-1 truncate",
+            !selected && !loading ? "text-muted-foreground" : "text-foreground",
+          ].join(" ")}
+        >
+          {display}
+        </span>
+        <ChevronDown className={`h-4 w-4 shrink-0 opacity-60 transition ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        <div className={USER_COMBO_PANEL} role="listbox" aria-labelledby={labelId}>
+          <div className="shrink-0 border-b border-border p-2">
+            <label htmlFor={searchId} className="sr-only">
+              {searchPlaceholder}
+            </label>
+            <input
+              id={searchId}
+              ref={searchInputRef}
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.stopPropagation();
+                  setOpen(false);
+                }
+              }}
+              placeholder={searchPlaceholder}
+              className={INPUT}
+              autoComplete="off"
+            />
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto p-1">
+            {options.length === 0 && emptyList ? (
+              <p className="px-3 py-4 text-center text-sm text-muted-foreground">{emptyList}</p>
+            ) : filtered.length === 0 ? (
+              <p className="px-3 py-4 text-center text-sm text-muted-foreground">{noMatches}</p>
+            ) : (
+              filtered.map((o) => {
+                const isSel = value === o.value;
+                return (
+                  <button
+                    key={o.value || "__empty__"}
+                    type="button"
+                    role="option"
+                    aria-selected={isSel}
+                    onClick={() => {
+                      onChange(o.value);
+                      setOpen(false);
+                    }}
+                    className={[
+                      "flex w-full min-w-0 items-start gap-2 rounded-md px-2.5 py-2 text-left text-sm transition",
+                      isSel
+                        ? "bg-muted font-medium"
+                        : "hover:bg-muted/80",
+                    ].join(" ")}
+                  >
+                    <Check
+                      className={[
+                        "mt-0.5 h-4 w-4 shrink-0",
+                        isSel ? "text-primary opacity-100" : "opacity-0",
+                      ].join(" ")}
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium leading-tight">{o.label}</span>
+                      {o.sublabel ? (
+                        <span className="mt-0.5 block text-xs text-muted-foreground">{o.sublabel}</span>
+                      ) : null}
+                    </span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AccessCompanyFilterCombobox({
+  id,
+  labelId,
+  orgs,
+  value,
+  onChange,
+  disabled,
+  includeAllRow = true,
+  selectWhenEmptyLabel = "Select a company",
+}: {
+  id: string;
+  labelId: string;
+  orgs: OrganizationOptionRow[];
+  value: string;
+  onChange: (organizationId: string) => void;
+  disabled?: boolean;
+  /** If false, no “All companies” row; use for Role/Group/Report (must pick a company). */
+  includeAllRow?: boolean;
+  selectWhenEmptyLabel?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchId = useId();
+
+  const q = query.trim().toLowerCase();
+  const filteredOrgs = useMemo(() => {
+    if (!q) return orgs;
+    return orgs.filter(
+      (o) =>
+        o.displayName.toLowerCase().includes(q)
+        || o.name.toLowerCase().includes(q)
+        || (o.type && String(o.type).toLowerCase().includes(q)),
+    );
+  }, [orgs, q]);
+
+  const displayLabel = useMemo(() => {
+    if (!value.trim()) return includeAllRow ? "All companies" : selectWhenEmptyLabel;
+    const o = orgs.find((x) => x.id === value);
+    if (o) return o.displayName;
+    return "Company";
+  }, [value, orgs, includeAllRow, selectWhenEmptyLabel]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  useLayoutEffect(() => {
+    if (open) {
+      setQuery("");
+      const t = requestAnimationFrame(() => searchInputRef.current?.focus());
+      return () => cancelAnimationFrame(t);
+    }
+  }, [open]);
+
+  const allSelected = !value.trim() && includeAllRow;
+
+  return (
+    <div ref={rootRef} className="relative w-full min-w-0">
+      <button
+        type="button"
+        id={id}
+        disabled={disabled}
+        aria-labelledby={labelId}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        onClick={() => !disabled && setOpen((o) => !o)}
+        className={[
+          "flex h-10 w-full min-w-0 items-center justify-between gap-2 rounded-md border border-input bg-background px-3 py-2 text-left text-sm shadow-sm ring-offset-background",
+          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+          "disabled:cursor-not-allowed disabled:opacity-50",
+        ].join(" ")}
+      >
+        <span
+          className={[
+            "min-w-0 flex-1 truncate",
+            allSelected && includeAllRow ? "text-foreground" : !value.trim() && !includeAllRow ? "text-muted-foreground" : "text-foreground",
+          ].join(" ")}
+        >
+          {displayLabel}
+        </span>
+        <ChevronDown className={`h-4 w-4 shrink-0 opacity-60 transition ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        <div className={USER_COMBO_PANEL} role="listbox" aria-labelledby={labelId}>
+          <div className="shrink-0 border-b border-border p-2">
+            <label htmlFor={searchId} className="sr-only">
+              Search companies
+            </label>
+            <input
+              id={searchId}
+              ref={searchInputRef}
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.stopPropagation();
+                  setOpen(false);
+                }
+              }}
+              placeholder="Search company name or type…"
+              className={INPUT}
+              autoComplete="off"
+            />
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto p-1">
+            {includeAllRow ? (
+              <button
+                type="button"
+                role="option"
+                aria-selected={allSelected}
+                onClick={() => {
+                  onChange("");
+                  setOpen(false);
+                }}
+                className={[
+                  "flex w-full min-w-0 items-start gap-2 rounded-md px-2.5 py-2 text-left text-sm transition",
+                  allSelected ? "bg-muted font-medium" : "hover:bg-muted/80",
+                ].join(" ")}
+              >
+                <Check
+                  className={[
+                    "mt-0.5 h-4 w-4 shrink-0",
+                    allSelected ? "text-primary opacity-100" : "opacity-0",
+                  ].join(" ")}
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block font-medium leading-tight">All companies</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">No org filter</span>
+                </span>
+              </button>
+            ) : null}
+            {filteredOrgs.length === 0 && orgs.length > 0 ? (
+              <p className="px-3 py-3 text-center text-sm text-muted-foreground">No matching companies</p>
+            ) : null}
+            {filteredOrgs.map((o) => {
+              const isSel = value === o.id;
+              const sub = [o.name !== o.displayName ? o.name : null, o.type].filter(Boolean).join(" · ");
+              return (
+                <button
+                  key={o.id}
+                  type="button"
+                  role="option"
+                  aria-selected={isSel}
+                  onClick={() => {
+                    onChange(o.id);
+                    setOpen(false);
+                  }}
+                  className={[
+                    "flex w-full min-w-0 items-start gap-2 rounded-md px-2.5 py-2 text-left text-sm transition",
+                    isSel
+                      ? "bg-muted font-medium"
+                      : "hover:bg-muted/80",
+                  ].join(" ")}
+                >
+                  <Check
+                    className={[
+                      "mt-0.5 h-4 w-4 shrink-0",
+                      isSel ? "text-primary opacity-100" : "opacity-0",
+                    ].join(" ")}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate font-medium leading-tight">{o.displayName}</span>
+                    {sub ? (
+                      <span className="mt-0.5 block truncate text-xs text-muted-foreground">{sub}</span>
+                    ) : null}
+                  </span>
+                </button>
+              );
+            })}
+            {orgs.length === 0 ? (
+              <p className="px-3 py-3 text-center text-sm text-muted-foreground">No organizations loaded</p>
+            ) : null}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PlatformAccessPageInner() {
   const searchParams = useSearchParams();
-  const { organizationId, homeOrganizationId } = useUserRole();
+  const {
+    organizationId: workspaceOrganizationId,
+    actorUserId,
+    setWorkspaceOrganizationId,
+    sessionCanWorkspaceSwitch,
+  } = useUserRole();
+
+  const commitWorkspaceOrgScope = useCallback(
+    (id: string) => {
+      const t = id.trim();
+      if (!t) return;
+      if (sessionCanWorkspaceSwitch) setWorkspaceOrganizationId(t);
+    },
+    [sessionCanWorkspaceSwitch, setWorkspaceOrganizationId],
+  );
 
   const [loadingGate, setLoadingGate] = useState(true);
   const [accessDenied, setAccessDenied] = useState<"not_authenticated" | "forbidden" | null>(null);
@@ -68,19 +637,21 @@ function PlatformAccessPageInner() {
 
   const [users, setUsers] = useState<AccessInspectorUserRow[]>([]);
   const [usersLoading, setUsersLoading] = useState(false);
-  const [userFilter, setUserFilter] = useState("");
+  /** User Access tab: empty = all companies */
+  const [userAccessCompanyFilterId, setUserAccessCompanyFilterId] = useState("");
   const [selectedUserId, setSelectedUserId] = useState("");
   const [userAccessLoading, setUserAccessLoading] = useState(false);
   const [userAccessError, setUserAccessError] = useState<string | null>(null);
-  const [userAccessEditBusy, setUserAccessEditBusy] = useState(false);
   const [userEffective, setUserEffective] = useState<UserEffectiveAccessResult | null>(null);
+  /** Unsaved per-feature user overrides; applied on Save */
+  const [userOverrideDraft, setUserOverrideDraft] = useState<Record<string, UserOverrideChoice>>({});
 
   const [roles, setRoles] = useState<RoleCatalogRow[]>([]);
   const [rolesLoading, setRolesLoading] = useState(false);
   const [selectedRoleId, setSelectedRoleId] = useState("");
   const [rolePermLoading, setRolePermLoading] = useState(false);
-  const [rolePermBusy, setRolePermBusy] = useState(false);
   const [roleAssigned, setRoleAssigned] = useState<Set<string>>(() => new Set());
+  const [rolePermBaselineKey, setRolePermBaselineKey] = useState("");
 
   const [orgs, setOrgs] = useState<OrganizationOptionRow[]>([]);
   const [orgFilterId, setOrgFilterId] = useState("");
@@ -88,8 +659,8 @@ function PlatformAccessPageInner() {
   const [groupsLoading, setGroupsLoading] = useState(false);
   const [selectedGroupId, setSelectedGroupId] = useState("");
   const [groupPermLoading, setGroupPermLoading] = useState(false);
-  const [groupPermBusy, setGroupPermBusy] = useState(false);
   const [groupAssigned, setGroupAssigned] = useState<Set<string>>(() => new Set());
+  const [groupPermBaselineKey, setGroupPermBaselineKey] = useState("");
 
   const [accessTreeScope, setAccessTreeScope] = useState("");
   const [reportTabHelpOpen, setReportTabHelpOpen] = useState(false);
@@ -98,24 +669,26 @@ function PlatformAccessPageInner() {
   const [reportMeta, setReportMeta] = useState<{ userCount: number; truncated: boolean } | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
   const [reportError, setReportError] = useState<string | null>(null);
-  const [reportMin, setReportMin] = useState<"all" | "read_or_more" | "write_or_more" | "manage_only">("all");
-  const [reportUserQ, setReportUserQ] = useState("");
-  const [reportFeatureQ, setReportFeatureQ] = useState("");
+  const [reportMin, setReportMin] = useState<"" | "all" | "read_or_more" | "write_or_more" | "manage_only">("");
+  const [reportSelectedUserId, setReportSelectedUserId] = useState("");
+  const [reportFeatureToken, setReportFeatureToken] = useState("");
   const [reportModuleGroup, setReportModuleGroup] = useState("");
 
-  const runAccessReport = useCallback(async () => {
+  const [accessFooterBusy, setAccessFooterBusy] = useState(false);
+
+  const runAccessReport = useCallback(async (): Promise<boolean> => {
     if (!orgFilterId?.trim()) {
       showToast("Choose a company first.", false);
-      return;
+      return false;
     }
     setReportLoading(true);
     setReportError(null);
     const r = await getAccessMatrixReportForOrganizationAction({
       organizationId: orgFilterId,
-      minEffective: reportMin,
-      userSearch: reportUserQ.trim() || undefined,
-      featureSearch: reportFeatureQ.trim() || undefined,
-      reportModuleGroup: reportModuleGroup.trim() || undefined,
+      minEffective: reportMin || undefined,
+      userSearch: reportSelectedUserId?.trim() || undefined,
+      featureSearch: reportFeatureToken?.trim() || undefined,
+      reportModuleGroup: reportModuleGroup?.trim() || undefined,
     });
     setReportLoading(false);
     if (!r.ok) {
@@ -123,11 +696,19 @@ function PlatformAccessPageInner() {
       setReportRows([]);
       setReportMeta(null);
       showToast(r.error, false);
-      return;
+      return false;
     }
     setReportRows(r.rows);
     setReportMeta({ userCount: r.userCount, truncated: r.truncated });
-  }, [orgFilterId, reportMin, reportUserQ, reportFeatureQ, reportModuleGroup, showToast]);
+    return true;
+  }, [
+    orgFilterId,
+    reportMin,
+    reportModuleGroup,
+    reportSelectedUserId,
+    reportFeatureToken,
+    showToast,
+  ]);
 
   const downloadAccessReportCsv = useCallback(() => {
     if (reportRows.length === 0) return;
@@ -285,18 +866,16 @@ function PlatformAccessPageInner() {
       return;
     }
     setOrgs(res.rows);
-    const preferred =
-      (organizationId && res.rows.some((o) => o.id === organizationId) ? organizationId : null)
-      ?? (homeOrganizationId && res.rows.some((o) => o.id === homeOrganizationId)
-        ? homeOrganizationId
-        : null)
-      ?? res.rows[0]?.id
-      ?? "";
-    setOrgFilterId((prev) => {
-      if (prev && res.rows.some((o) => o.id === prev)) return prev;
-      return preferred;
-    });
-  }, [organizationId, homeOrganizationId, showToast]);
+    setOrgFilterId((prev) => (prev && res.rows.some((o) => o.id === prev) ? prev : ""));
+  }, [showToast]);
+
+  useEffect(() => {
+    const w = (workspaceOrganizationId ?? "").trim();
+    if (!w || orgs.length === 0) return;
+    if (!orgs.some((o) => o.id === w)) return;
+    setOrgFilterId((cur) => (cur === w ? cur : w));
+    setUserAccessCompanyFilterId((cur) => (cur === w ? cur : w));
+  }, [workspaceOrganizationId, orgs]);
 
   const loadGroups = useCallback(
     async (oid: string) => {
@@ -317,7 +896,43 @@ function PlatformAccessPageInner() {
   );
 
   useEffect(() => {
-    if (tab !== "users") return;
+    const onOrgEntitlementsUpdated = (ev: Event) => {
+      const detail = (ev as CustomEvent<OrgEntitlementsUpdatedDetail>).detail;
+      const oid = detail?.organizationId?.trim();
+      if (!oid) return;
+      void loadOrgs();
+      if (orgFilterId === oid) {
+        void loadAccessTreeForOrg(oid, true);
+      }
+      if (tab === "users" && userAccessCompanyFilterId === oid) {
+        void loadAccessTreeForOrg(oid, false);
+      }
+      if (tab === "users" && userAccessCompanyFilterId === oid) {
+        const target = (selectedUserId.trim() || actorUserId?.trim() || "");
+        if (!target) return;
+        void (async () => {
+          const res = await getUserEffectiveAccessAction(target, { organizationId: oid });
+          if (!res.ok) return;
+          setUserEffective(res.data);
+        })();
+      }
+    };
+    window.addEventListener(ORG_ENTITLEMENTS_UPDATED_EVENT, onOrgEntitlementsUpdated);
+    return () => {
+      window.removeEventListener(ORG_ENTITLEMENTS_UPDATED_EVENT, onOrgEntitlementsUpdated);
+    };
+  }, [
+    tab,
+    orgFilterId,
+    userAccessCompanyFilterId,
+    selectedUserId,
+    actorUserId,
+    loadOrgs,
+    loadAccessTreeForOrg,
+  ]);
+
+  useEffect(() => {
+    if (tab !== "users" && tab !== "report") return;
     void loadUsers();
   }, [tab, loadUsers]);
 
@@ -337,6 +952,26 @@ function PlatformAccessPageInner() {
   }, [tab, orgFilterId, loadGroups]);
 
   useEffect(() => {
+    if (tab !== "report" || !orgFilterId?.trim()) return;
+    void loadAccessTreeForOrg(orgFilterId, true);
+  }, [tab, orgFilterId, loadAccessTreeForOrg]);
+
+  const reportOrgKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (tab !== "report") {
+      return;
+    }
+    const o = orgFilterId?.trim() || null;
+    if (reportOrgKeyRef.current != null && reportOrgKeyRef.current !== o) {
+      setReportSelectedUserId("");
+      setReportFeatureToken("");
+      setReportMin("");
+      setReportModuleGroup("");
+    }
+    reportOrgKeyRef.current = o;
+  }, [tab, orgFilterId]);
+
+  useEffect(() => {
     if (tab !== "roles" && tab !== "groups") return;
     if (!orgFilterId) {
       setModuleFeatureTree([]);
@@ -348,31 +983,37 @@ function PlatformAccessPageInner() {
 
   useEffect(() => {
     if (tab !== "users") return;
-    if (!userEffective?.organization_id) return;
-    if (userEffective.profile_id !== selectedUserId) return;
-    void loadAccessTreeForOrg(userEffective.organization_id, false);
-  }, [tab, userEffective, selectedUserId, loadAccessTreeForOrg]);
+    const oid = userAccessCompanyFilterId.trim();
+    if (!oid) return;
+    void loadAccessTreeForOrg(oid, false);
+  }, [tab, userAccessCompanyFilterId, loadAccessTreeForOrg]);
+
+  useEffect(() => {
+    setUserOverrideDraft({});
+  }, [selectedUserId, userAccessCompanyFilterId]);
 
   useEffect(() => {
     if (tab !== "users") return;
-    if (selectedUserId) {
-      setModuleFeatureTree([]);
-      setCatalogError(null);
-    }
-  }, [tab, selectedUserId]);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!selectedUserId) {
+    const oid = userAccessCompanyFilterId.trim();
+    if (!oid) {
       setUserEffective(null);
       setUserAccessError(null);
+      setUserAccessLoading(false);
       return;
     }
-    void (async () => {
-      setUserAccessError(null);
+    const target = (selectedUserId.trim() || actorUserId?.trim() || "");
+    if (!target) {
       setUserEffective(null);
-      setUserAccessLoading(true);
-      const res = await getUserEffectiveAccessAction(selectedUserId);
+      setUserAccessError(null);
+      setUserAccessLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setUserAccessError(null);
+    setUserEffective(null);
+    setUserAccessLoading(true);
+    void (async () => {
+      const res = await getUserEffectiveAccessAction(target, { organizationId: oid });
       if (cancelled) return;
       setUserAccessLoading(false);
       if (!res.ok) {
@@ -386,12 +1027,13 @@ function PlatformAccessPageInner() {
     return () => {
       cancelled = true;
     };
-  }, [selectedUserId, showToast]);
+  }, [tab, userAccessCompanyFilterId, selectedUserId, actorUserId, showToast]);
 
   useEffect(() => {
     let cancelled = false;
     if (!selectedRoleId) {
       setRoleAssigned(new Set());
+      setRolePermBaselineKey("");
       return;
     }
     void (async () => {
@@ -402,8 +1044,11 @@ function PlatformAccessPageInner() {
       if (!res.ok) {
         showToast(res.error, false);
         setRoleAssigned(new Set());
+        setRolePermBaselineKey("");
         return;
       }
+      const next = new Set(res.permissionIds);
+      setRolePermBaselineKey(setToKey(next));
       setRoleAssigned(new Set(res.permissionIds));
     })();
     return () => {
@@ -415,6 +1060,7 @@ function PlatformAccessPageInner() {
     let cancelled = false;
     if (!selectedGroupId) {
       setGroupAssigned(new Set());
+      setGroupPermBaselineKey("");
       return;
     }
     void (async () => {
@@ -425,8 +1071,10 @@ function PlatformAccessPageInner() {
       if (!res.ok) {
         showToast(res.error, false);
         setGroupAssigned(new Set());
+        setGroupPermBaselineKey("");
         return;
       }
+      setGroupPermBaselineKey(setToKey(new Set(res.permissionIds)));
       setGroupAssigned(new Set(res.permissionIds));
     })();
     return () => {
@@ -434,16 +1082,17 @@ function PlatformAccessPageInner() {
     };
   }, [selectedGroupId, showToast]);
 
-  const filteredUsers = useMemo(() => {
-    const q = userFilter.trim().toLowerCase();
-    if (!q) return users;
-    return users.filter(
-      (u) =>
-        u.full_name.toLowerCase().includes(q)
-        || u.organization_name.toLowerCase().includes(q)
-        || u.role_key.toLowerCase().includes(q),
-    );
-  }, [users, userFilter]);
+  const usersForUserAccessPicker = useMemo(() => {
+    if (!userAccessCompanyFilterId.trim()) return [] as AccessInspectorUserRow[];
+    return users.filter((u) => u.organization_id === userAccessCompanyFilterId);
+  }, [users, userAccessCompanyFilterId]);
+
+  useEffect(() => {
+    if (!userAccessCompanyFilterId.trim()) return;
+    const sel = users.find((u) => u.id === selectedUserId);
+    if (sel && sel.organization_id === userAccessCompanyFilterId) return;
+    if (selectedUserId) setSelectedUserId("");
+  }, [userAccessCompanyFilterId, users, selectedUserId]);
 
   const licensedOrgLabel = useMemo(() => {
     if (!orgFilterId) return "";
@@ -465,6 +1114,89 @@ function PlatformAccessPageInner() {
     setSelectedRoleId("");
   }, [tab, selectedRoleId, rolesForSelectedOrg]);
 
+  const roleSelectOptions = useMemo(
+    () =>
+      rolesForSelectedOrg.map((r) => ({
+        value: r.id,
+        label: `${r.name} (${r.key})`,
+        sublabel: r.scope,
+      })),
+    [rolesForSelectedOrg],
+  );
+
+  const groupSelectOptions = useMemo(
+    () =>
+      groups.map((g) => ({
+        value: g.id,
+        label: `${g.name} (${g.key})`,
+        sublabel: g.organization_name ?? undefined,
+      })),
+    [groups],
+  );
+
+  const treeScopeOptions = useMemo(
+    () => [
+      { value: "", label: "All modules" },
+      ...REPORT_MODULE_GROUP_CHOICES.map((m) => ({ value: m.value, label: m.label })),
+    ],
+    [],
+  );
+
+  const reportMinOptions = useMemo(
+    () => [
+      { value: "all", label: "Any (include none)" },
+      { value: "read_or_more", label: "Read or higher" },
+      { value: "write_or_more", label: "Write or higher" },
+      { value: "manage_only", label: "Manage only" },
+    ],
+    [],
+  );
+
+  const reportModuleOptions = useMemo(
+    () => REPORT_MODULE_GROUP_CHOICES.map((m) => ({ value: m.value, label: m.label })),
+    [],
+  );
+
+  const usersInReportOrg = useMemo(
+    () => (orgFilterId ? users.filter((u) => u.organization_id === orgFilterId) : []),
+    [users, orgFilterId],
+  );
+
+  const reportFeatureOptions = useMemo((): SearchableOption[] => {
+    const out: SearchableOption[] = [];
+    for (const node of moduleFeatureTree) {
+      for (const bucket of node.features) {
+        const f = bucket.feature;
+        if (!f || String(f.id).startsWith("synthetic:") || !String(f.id).trim()) continue;
+        const modKey = node.module.key;
+        const fk = bucket.featureKey;
+        const name = f.name && String(f.name).trim() ? String(f.name) : fk;
+        const token = `${modKey} ${fk}`.trim();
+        if (out.some((x) => x.value === token)) continue;
+        out.push({
+          value: token,
+          label: name,
+          sublabel: node.module.name?.trim() || modKey,
+        });
+      }
+    }
+    return out;
+  }, [moduleFeatureTree]);
+
+  useEffect(() => {
+    if (!reportFeatureToken) return;
+    if (!reportFeatureOptions.some((o) => o.value === reportFeatureToken)) {
+      setReportFeatureToken("");
+    }
+  }, [reportFeatureToken, reportFeatureOptions]);
+
+  useEffect(() => {
+    if (!reportSelectedUserId) return;
+    if (!usersInReportOrg.some((u) => u.id === reportSelectedUserId)) {
+      setReportSelectedUserId("");
+    }
+  }, [reportSelectedUserId, usersInReportOrg]);
+
   const selectedUserOrgLabel = useMemo(() => {
     if (!userEffective?.organization_id) return "";
     return (
@@ -483,133 +1215,292 @@ function PlatformAccessPageInner() {
     return moduleFeatureTree.filter((n) => accessTreeModuleMatchesScope(accessTreeScope, n.module.key));
   }, [moduleFeatureTree, accessTreeScope]);
 
-  const onUserOverride = useCallback(
-    async (args: { moduleFeatureId: string; level: UserOverrideChoice }) => {
-      if (!selectedUserId) return;
-      if (tab !== "users") return;
-      setUserAccessEditBusy(true);
-      const res = await setUserFeatureOverrideAction({
-        profileId: selectedUserId,
-        moduleFeatureId: args.moduleFeatureId,
-        level: args.level,
-      });
-      setUserAccessEditBusy(false);
-      if (!res.ok) {
-        showToast(res.error, false);
-        return;
+  const mergedUserFeatureAccessByModuleFeatureId = useMemo((): Record<string, UserFeatureAccessRow> | null => {
+    if (!userEffective?.userFeatureAccessByModuleFeatureId) return null;
+    const base = userEffective.userFeatureAccessByModuleFeatureId;
+    const org = userEffective.orgEntitlements;
+    const out: Record<string, UserFeatureAccessRow> = { ...base };
+    for (const node of moduleFeatureTree) {
+      for (const bucket of node.features) {
+        const feat = bucket.feature;
+        const mfId = feat && !String(feat.id).startsWith("synthetic:") ? String(feat.id) : null;
+        if (!mfId) continue;
+        const orig = base[mfId];
+        if (!orig) continue;
+        const ovr = userOverrideDraft[mfId] ?? orig.override;
+        const entitled = orgAllowsPermission({
+          snapshot: org,
+          moduleId: node.module.id,
+          moduleFeatureId: mfId,
+          featureKey: bucket.featureKey,
+        }).entitled;
+        out[mfId] = {
+          ...orig,
+          module_feature_id: mfId,
+          override: ovr,
+          effective: effectiveUserFeatureAfterOverride({
+            orgEntitled: entitled,
+            baseline: orig.baseline,
+            override: ovr,
+          }),
+        };
       }
-      const next = await getUserEffectiveAccessAction(selectedUserId);
-      if (next.ok) setUserEffective(next.data);
-      showToast("User override updated.", true);
+    }
+    return out;
+  }, [userEffective, moduleFeatureTree, userOverrideDraft]);
+
+  const accessFormDirty = useMemo(() => {
+    if (tab === "users") return Object.keys(userOverrideDraft).length > 0;
+    if (tab === "roles") {
+      if (!rolePermBaselineKey) return false;
+      return setToKey(roleAssigned) !== rolePermBaselineKey;
+    }
+    if (tab === "groups") {
+      if (!groupPermBaselineKey) return false;
+      return setToKey(groupAssigned) !== groupPermBaselineKey;
+    }
+    return false;
+  }, [
+    tab,
+    userOverrideDraft,
+    roleAssigned,
+    rolePermBaselineKey,
+    groupAssigned,
+    groupPermBaselineKey,
+  ]);
+
+  const onUserOverride = useCallback(
+    (args: { moduleFeatureId: string; level: UserOverrideChoice }) => {
+      if (!selectedUserId || tab !== "users" || !userEffective) return;
+      const orig = userEffective.userFeatureAccessByModuleFeatureId[args.moduleFeatureId]?.override;
+      setUserOverrideDraft((d) => {
+        const next = { ...d };
+        if (args.level === orig) {
+          delete next[args.moduleFeatureId];
+        } else {
+          next[args.moduleFeatureId] = args.level;
+        }
+        return next;
+      });
     },
-    [tab, selectedUserId, showToast],
+    [tab, selectedUserId, userEffective],
   );
 
   const onUserModuleBulk = useCallback(
-    async (args: { moduleId: string; level: UiAccessLevel | "inherit" }) => {
-      if (!selectedUserId) return;
-      if (tab !== "users") return;
-      setUserAccessEditBusy(true);
-      const res = await setUserModuleBulkOverrideAction({
-        profileId: selectedUserId,
-        moduleId: args.moduleId,
-        level: args.level,
+    (args: { moduleId: string; level: UiAccessLevel | "inherit" }) => {
+      if (!selectedUserId || tab !== "users" || !userEffective) return;
+      const choice: UserOverrideChoice =
+        args.level === "inherit"
+          ? "inherit"
+          : args.level === "none"
+            ? "none"
+            : args.level === "read"
+              ? "read"
+              : "write";
+      setUserOverrideDraft((d) => {
+        const next = { ...d };
+        for (const b of findAllFeatureBucketsInModule(moduleFeatureTree, args.moduleId)) {
+          const f = b.feature;
+          if (!f || String(f.id).startsWith("synthetic:") || !String(f.id).trim()) continue;
+          const mfId = String(f.id);
+          const orig = userEffective.userFeatureAccessByModuleFeatureId[mfId]?.override;
+          if (choice === orig) {
+            delete next[mfId];
+          } else {
+            next[mfId] = choice;
+          }
+        }
+        return next;
       });
-      setUserAccessEditBusy(false);
-      if (!res.ok) {
-        showToast(res.error, false);
-        return;
-      }
-      const next = await getUserEffectiveAccessAction(selectedUserId);
-      if (next.ok) setUserEffective(next.data);
-      showToast("User overrides updated for module.", true);
     },
-    [tab, selectedUserId, showToast],
+    [tab, selectedUserId, userEffective, moduleFeatureTree],
   );
 
   const onFeatureAccessLevel = useCallback(
-    async (args: { moduleId: string; featureKey: string; level: UiAccessLevel; scope: "target" }) => {
+    (args: { moduleId: string; featureKey: string; level: UiAccessLevel; scope: "target" }) => {
       if (tab === "roles" && selectedRoleId) {
-        setRolePermBusy(true);
-        const res = await setFeatureAccessLevelForTargetAction({
-          target: "role",
-          targetId: selectedRoleId,
-          moduleId: args.moduleId,
-          featureKey: args.featureKey,
-          level: args.level,
+        setRoleAssigned((prev) => {
+          const b = findFeatureBucket(moduleFeatureTree, args.moduleId, args.featureKey);
+          if (!b) return prev;
+          const next = new Set(prev);
+          applyFeatureLevelToPermissionSet(next, b, args.level);
+          return next;
         });
-        setRolePermBusy(false);
-        if (!res.ok) {
-          showToast(res.error, false);
-          return;
-        }
-        const r2 = await getAssignedPermissionIdsForRoleAction(selectedRoleId);
-        if (r2.ok) setRoleAssigned(new Set(r2.permissionIds));
-        showToast("Role access updated.", true);
         return;
       }
       if (tab === "groups" && selectedGroupId) {
-        setGroupPermBusy(true);
-        const res = await setFeatureAccessLevelForTargetAction({
-          target: "group",
-          targetId: selectedGroupId,
-          moduleId: args.moduleId,
-          featureKey: args.featureKey,
-          level: args.level,
+        setGroupAssigned((prev) => {
+          const b = findFeatureBucket(moduleFeatureTree, args.moduleId, args.featureKey);
+          if (!b) return prev;
+          const next = new Set(prev);
+          applyFeatureLevelToPermissionSet(next, b, args.level);
+          return next;
         });
-        setGroupPermBusy(false);
-        if (!res.ok) {
-          showToast(res.error, false);
-          return;
-        }
-        const g2 = await getAssignedPermissionIdsForGroupAction(selectedGroupId);
-        if (g2.ok) setGroupAssigned(new Set(g2.permissionIds));
-        showToast("Group access updated.", true);
       }
     },
-    [tab, selectedRoleId, selectedGroupId, showToast],
+    [tab, selectedRoleId, selectedGroupId, moduleFeatureTree],
   );
 
   const onModuleTargetLevel = useCallback(
-    async (args: { moduleId: string; level: UiAccessLevel }) => {
+    (args: { moduleId: string; level: UiAccessLevel }) => {
       if (tab === "roles" && selectedRoleId) {
-        setRolePermBusy(true);
-        const res = await setFeatureAccessLevelForEntireModuleForTargetAction({
-          target: "role",
-          targetId: selectedRoleId,
-          moduleId: args.moduleId,
-          level: args.level,
+        setRoleAssigned((prev) => {
+          const next = new Set(prev);
+          applyModuleLevelToPermissionSet(next, moduleFeatureTree, args.moduleId, args.level);
+          return next;
         });
-        setRolePermBusy(false);
-        if (!res.ok) {
-          showToast(res.error, false);
-          return;
-        }
-        const r2 = await getAssignedPermissionIdsForRoleAction(selectedRoleId);
-        if (r2.ok) setRoleAssigned(new Set(r2.permissionIds));
-        showToast("Role access updated for whole module.", true);
         return;
       }
       if (tab === "groups" && selectedGroupId) {
-        setGroupPermBusy(true);
-        const res = await setFeatureAccessLevelForEntireModuleForTargetAction({
-          target: "group",
-          targetId: selectedGroupId,
-          moduleId: args.moduleId,
-          level: args.level,
+        setGroupAssigned((prev) => {
+          const next = new Set(prev);
+          applyModuleLevelToPermissionSet(next, moduleFeatureTree, args.moduleId, args.level);
+          return next;
         });
-        setGroupPermBusy(false);
-        if (!res.ok) {
-          showToast(res.error, false);
-          return;
-        }
-        const g2 = await getAssignedPermissionIdsForGroupAction(selectedGroupId);
-        if (g2.ok) setGroupAssigned(new Set(g2.permissionIds));
-        showToast("Group access updated for whole module.", true);
       }
     },
-    [tab, selectedRoleId, selectedGroupId, showToast],
+    [tab, selectedRoleId, selectedGroupId, moduleFeatureTree],
   );
+
+  const handleAccessTabCancel = useCallback(() => {
+    if (tab === "users") {
+      setUserOverrideDraft({});
+    } else if (tab === "roles") {
+      if (rolePermBaselineKey) setRoleAssigned(keyToSet(rolePermBaselineKey));
+    } else if (tab === "groups") {
+      if (groupPermBaselineKey) setGroupAssigned(keyToSet(groupPermBaselineKey));
+    }
+  }, [tab, rolePermBaselineKey, groupPermBaselineKey]);
+
+  const handleAccessTabSave = useCallback(async () => {
+    setAccessFooterBusy(true);
+    try {
+      if (tab === "users") {
+        if (!selectedUserId) {
+          showToast("Select a user first.", false);
+          return;
+        }
+        const toApply = { ...userOverrideDraft };
+        if (Object.keys(toApply).length === 0) {
+          showToast("No access changes to save.", false);
+          return;
+        }
+        setUserAccessError(null);
+        for (const [moduleFeatureId, level] of Object.entries(toApply)) {
+          const res = await setUserFeatureOverrideAction({
+            profileId: selectedUserId,
+            moduleFeatureId,
+            level,
+          });
+          if (!res.ok) {
+            showToast(res.error, false);
+            return;
+          }
+        }
+        setUserOverrideDraft({});
+        const orgCtx = userAccessCompanyFilterId.trim();
+        const next = await getUserEffectiveAccessAction(selectedUserId, orgCtx ? { organizationId: orgCtx } : undefined);
+        if (next.ok) {
+          setUserEffective(next.data);
+          if (next.data.organization_id) {
+            await loadAccessTreeForOrg(next.data.organization_id, false);
+          }
+          showToast("Access changes saved.", true);
+        } else {
+          setUserAccessError(next.error);
+          showToast(next.error, false);
+        }
+        return;
+      }
+      if (tab === "roles") {
+        if (!selectedRoleId) {
+          showToast("Select a role first.", false);
+          return;
+        }
+        const baseSet = keyToSet(rolePermBaselineKey);
+        for (const node of moduleFeatureTree) {
+          for (const bucket of node.features) {
+            if (totalPermissionsInBucket(bucket) === 0) continue;
+            const bL = effectiveLevelFromFeatureBucket(bucket, baseSet);
+            const dL = effectiveLevelFromFeatureBucket(bucket, roleAssigned);
+            if (bL === dL) continue;
+            const res = await setFeatureAccessLevelForTargetAction({
+              target: "role",
+              targetId: selectedRoleId,
+              moduleId: node.module.id,
+              featureKey: bucket.featureKey,
+              level: dL,
+            });
+            if (!res.ok) {
+              showToast(res.error, false);
+              return;
+            }
+          }
+        }
+        const r2 = await getAssignedPermissionIdsForRoleAction(selectedRoleId);
+        if (!r2.ok) {
+          showToast(r2.error, false);
+          return;
+        }
+        const u = new Set(r2.permissionIds);
+        setRoleAssigned(u);
+        setRolePermBaselineKey(setToKey(u));
+        showToast("Role access saved.", true);
+        return;
+      }
+      if (tab === "groups") {
+        if (!selectedGroupId) {
+          showToast("Select a group first.", false);
+          return;
+        }
+        const baseSet = keyToSet(groupPermBaselineKey);
+        for (const node of moduleFeatureTree) {
+          for (const bucket of node.features) {
+            if (totalPermissionsInBucket(bucket) === 0) continue;
+            const bL = effectiveLevelFromFeatureBucket(bucket, baseSet);
+            const dL = effectiveLevelFromFeatureBucket(bucket, groupAssigned);
+            if (bL === dL) continue;
+            const res = await setFeatureAccessLevelForTargetAction({
+              target: "group",
+              targetId: selectedGroupId,
+              moduleId: node.module.id,
+              featureKey: bucket.featureKey,
+              level: dL,
+            });
+            if (!res.ok) {
+              showToast(res.error, false);
+              return;
+            }
+          }
+        }
+        const g2 = await getAssignedPermissionIdsForGroupAction(selectedGroupId);
+        if (!g2.ok) {
+          showToast(g2.error, false);
+          return;
+        }
+        const u = new Set(g2.permissionIds);
+        setGroupAssigned(u);
+        setGroupPermBaselineKey(setToKey(u));
+        showToast("Group access saved.", true);
+        return;
+      }
+    } finally {
+      setAccessFooterBusy(false);
+    }
+  }, [
+    tab,
+    selectedUserId,
+    userOverrideDraft,
+    moduleFeatureTree,
+    rolePermBaselineKey,
+    roleAssigned,
+    selectedRoleId,
+    groupPermBaselineKey,
+    groupAssigned,
+    selectedGroupId,
+    showToast,
+    loadAccessTreeForOrg,
+  ]);
 
   if (loadingGate) {
     return (
@@ -639,7 +1530,7 @@ function PlatformAccessPageInner() {
   }
 
   return (
-    <div className="mx-auto w-full min-w-0 max-w-6xl px-4 py-8 sm:px-6">
+    <div className="mx-auto flex min-h-screen w-full min-w-0 max-w-6xl flex-col px-4 py-8 pb-28 sm:px-6">
       <Link
         href="/platform/settings"
         className="mb-6 inline-flex items-center gap-2 text-sm font-medium text-muted-foreground transition hover:text-foreground"
@@ -747,64 +1638,74 @@ function PlatformAccessPageInner() {
         </div>
       </div>
 
+      <div className="flex-1 min-w-0">
       {tab === "users" ? (
         <div className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <div>
-              <label className={LABEL} htmlFor="access-user-filter">
-                Search users
-              </label>
-              <input
-                id="access-user-filter"
-                className={INPUT}
-                value={userFilter}
-                onChange={(e) => setUserFilter(e.target.value)}
-                placeholder="Name, organization, or role…"
+              <span className={LABEL} id="access-user-company-label">
+                Company
+              </span>
+              <AccessCompanyFilterCombobox
+                id="access-user-company-combobox"
+                labelId="access-user-company-label"
+                orgs={orgs}
+                value={userAccessCompanyFilterId}
+                onChange={(id) => {
+                  setUserAccessCompanyFilterId(id);
+                  commitWorkspaceOrgScope(id);
+                }}
+                includeAllRow={false}
+                selectWhenEmptyLabel="Select a company"
               />
             </div>
             <div>
-              <label className={LABEL} htmlFor="access-user-select">
+              <span className={LABEL} id="access-user-select-label">
                 User
-              </label>
-              <select
-                id="access-user-select"
-                className={INPUT}
+              </span>
+              <AccessUserCombobox
+                id="access-user-combobox"
+                labelId="access-user-select-label"
+                users={usersForUserAccessPicker}
                 value={selectedUserId}
-                onChange={(e) => setSelectedUserId(e.target.value)}
-                disabled={usersLoading}
-              >
-                <option value="">{usersLoading ? "Loading…" : "Select a user"}</option>
-                {filteredUsers.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {u.full_name} — {u.organization_name} — {u.role_key}
-                  </option>
-                ))}
-              </select>
+                onChange={setSelectedUserId}
+                disabled={!userAccessCompanyFilterId || (!users.length && !usersLoading)}
+                loading={usersLoading}
+              />
             </div>
           </div>
 
-          {catalogLoading ? (
+          {!userAccessCompanyFilterId.trim() ? (
+            <p className="text-sm text-muted-foreground">
+              Select a company. Effective access is resolved for that organization (and for a specific user if you pick one; otherwise your own account in this org).
+            </p>
+          ) : catalogLoading ? (
             <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
               <Loader2 className="h-5 w-5 shrink-0 animate-spin" />
-              <span>Loading access catalog for this user&apos;s organization…</span>
+              <span>Loading module catalog for the selected company…</span>
             </div>
           ) : catalogError ? (
             <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-4 text-sm text-rose-900 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-100">
               <p className="font-medium">Permission catalog could not be loaded</p>
               <p className="mt-1 text-rose-800/90 dark:text-rose-200/90">{catalogError}</p>
             </div>
-          ) : !selectedUserId ? null : userAccessLoading ? (
+          ) : userAccessLoading ? (
             <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
               <Loader2 className="h-5 w-5 shrink-0 animate-spin" />
-              Loading this user’s effective access (role, groups, entitlements)…
+              <span>Resolving effective access (role, groups, entitlements) for the selected org…</span>
             </div>
           ) : userAccessError ? (
             <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-4 text-sm text-rose-900 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-100">
-              <p className="font-medium">Could not load this user’s access</p>
+              <p className="font-medium">Could not load effective access</p>
               <p className="mt-1 text-rose-800/90 dark:text-rose-200/90">{userAccessError}</p>
             </div>
           ) : userEffective ? (
             <div className="space-y-4">
+              {!selectedUserId && userEffective.profile_id === actorUserId ? (
+                <p className="rounded-md border border-dashed border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                  Preview: your account&apos;s role, groups, and overrides in this company — as if you were only scoped to this org. Select a user above to edit someone else.
+                </p>
+              ) : null}
               <p className="text-sm text-foreground/90">
                 <span className="font-medium">{userEffective.full_name}</span>{" "}
                 <span className="text-muted-foreground">
@@ -820,24 +1721,20 @@ function PlatformAccessPageInner() {
                 ) : null}
               </p>
               <div>
-                <h2 className="mb-2 text-sm font-semibold text-foreground">Tree scope (filter only)</h2>
                 <div className="mb-3 max-w-md">
-                  <label className={LABEL} htmlFor="access-tree-scope">
-                    Show modules
-                  </label>
-                  <select
+                  <span className={LABEL} id="access-tree-scope-label">
+                    Area
+                  </span>
+                  <AccessSearchableOptionsCombobox
                     id="access-tree-scope"
-                    className={INPUT}
+                    labelId="access-tree-scope-label"
                     value={accessTreeScope}
-                    onChange={(e) => setAccessTreeScope(e.target.value)}
-                  >
-                    <option value="">All (full catalog layout)</option>
-                    {REPORT_MODULE_GROUP_CHOICES.map((m) => (
-                      <option key={m.value} value={m.value}>
-                        {m.label}
-                      </option>
-                    ))}
-                  </select>
+                    onChange={setAccessTreeScope}
+                    options={treeScopeOptions}
+                    placeholder="All modules"
+                    searchPlaceholder="Search areas…"
+                    emptyList="No area options"
+                  />
                 </div>
                 <h2 className="mb-2 text-sm font-semibold text-foreground">
                   Access{selectedUserOrgLabel || userEffective.organization_name
@@ -848,11 +1745,14 @@ function PlatformAccessPageInner() {
                   tree={filteredModuleFeatureTree}
                   mode="user"
                   effectivePermissionIds={effectiveUserPermIds}
-                  userFeatureAccessByModuleFeatureId={userEffective.userFeatureAccessByModuleFeatureId}
+                  userFeatureAccessByModuleFeatureId={
+                    mergedUserFeatureAccessByModuleFeatureId
+                    ?? userEffective.userFeatureAccessByModuleFeatureId
+                  }
                   orgEntitlements={userEffective.orgEntitlements}
-                  busy={userAccessEditBusy}
-                  disabled={userAccessEditBusy}
-                  onSetLevel={(p) => void onFeatureAccessLevel(p)}
+                  busy={accessFooterBusy}
+                  disabled={accessFooterBusy || !selectedUserId}
+                  onSetLevel={() => {}}
                   onSetUserOverride={(a) => void onUserOverride(a)}
                   onSetModuleUserBulk={(a) => void onUserModuleBulk(a)}
                 />
@@ -866,47 +1766,39 @@ function PlatformAccessPageInner() {
         <div className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <div>
-              <label className={LABEL} htmlFor="access-role-org-select">
+              <span className={LABEL} id="access-role-org-label">
                 Company
-              </label>
-              <select
-                id="access-role-org-select"
-                className={INPUT}
+              </span>
+              <AccessCompanyFilterCombobox
+                id="access-role-org-combobox"
+                labelId="access-role-org-label"
+                orgs={orgs}
                 value={orgFilterId}
-                onChange={(e) => {
-                  setOrgFilterId(e.target.value);
+                onChange={(id) => {
+                  setOrgFilterId(id);
+                  commitWorkspaceOrgScope(id);
                   setSelectedRoleId("");
                 }}
-              >
-                {orgs.length === 0 ? (
-                  <option value="">No organizations</option>
-                ) : (
-                  orgs.map((o) => (
-                    <option key={o.id} value={o.id}>
-                      {o.displayName}
-                    </option>
-                  ))
-                )}
-              </select>
+                includeAllRow={false}
+                selectWhenEmptyLabel="Select a company"
+              />
             </div>
             <div>
-              <label className={LABEL} htmlFor="access-role-select">
+              <span className={LABEL} id="access-role-select-label">
                 Role
-              </label>
-              <select
-                id="access-role-select"
-                className={INPUT}
+              </span>
+              <AccessSearchableOptionsCombobox
+                id="access-role-combobox"
+                labelId="access-role-select-label"
                 value={selectedRoleId}
-                onChange={(e) => setSelectedRoleId(e.target.value)}
-                disabled={rolesLoading}
-              >
-                <option value="">{rolesLoading ? "Loading…" : "Select a role"}</option>
-                {rolesForSelectedOrg.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.name} ({r.key})
-                  </option>
-                ))}
-              </select>
+                onChange={setSelectedRoleId}
+                options={roleSelectOptions}
+                disabled={!orgFilterId}
+                loading={rolesLoading}
+                placeholder="Select a role"
+                searchPlaceholder="Search by name or key…"
+                emptyList="No roles for this company"
+              />
             </div>
           </div>
           {licensedOrgLabel && orgFilterId ? (
@@ -937,8 +1829,8 @@ function PlatformAccessPageInner() {
               mode="role"
               effectivePermissionIds={roleAssigned}
               orgEntitlements={contextOrgEntitlements}
-              busy={rolePermBusy}
-              disabled={rolePermBusy}
+              busy={accessFooterBusy}
+              disabled={accessFooterBusy}
               onSetLevel={(p) => void onFeatureAccessLevel(p)}
               onSetModuleLevel={(a) => void onModuleTargetLevel(a)}
             />
@@ -950,49 +1842,43 @@ function PlatformAccessPageInner() {
         <div className="space-y-4">
           <div className="grid gap-4 sm:grid-cols-2">
             <div>
-              <label className={LABEL} htmlFor="access-org-filter">
+              <span className={LABEL} id="access-group-org-label">
                 Company
-              </label>
-              <select
-                id="access-org-filter"
-                className={INPUT}
+              </span>
+              <AccessCompanyFilterCombobox
+                id="access-group-org-combobox"
+                labelId="access-group-org-label"
+                orgs={orgs}
                 value={orgFilterId}
-                onChange={(e) => {
-                  setOrgFilterId(e.target.value);
+                onChange={(id) => {
+                  setOrgFilterId(id);
+                  commitWorkspaceOrgScope(id);
                   setSelectedGroupId("");
                 }}
-              >
-                {orgs.length === 0 ? (
-                  <option value="">No organizations</option>
-                ) : (
-                  orgs.map((o) => (
-                    <option key={o.id} value={o.id}>
-                      {o.displayName}
-                    </option>
-                  ))
-                )}
-              </select>
+                includeAllRow={false}
+                selectWhenEmptyLabel="Select a company"
+              />
             </div>
             <div>
-              <label className={LABEL} htmlFor="access-group-select">
+              <span className={LABEL} id="access-group-select-label">
                 Group
-              </label>
-              <select
-                id="access-group-select"
-                className={INPUT}
+              </span>
+              <AccessSearchableOptionsCombobox
+                id="access-group-combobox"
+                labelId="access-group-select-label"
                 value={selectedGroupId}
-                onChange={(e) => setSelectedGroupId(e.target.value)}
-                disabled={groupsLoading || !orgFilterId}
-              >
-                <option value="">
-                  {groupsLoading ? "Loading…" : orgFilterId ? "Select a group" : "Pick an organization first"}
-                </option>
-                {groups.map((g) => (
-                  <option key={g.id} value={g.id}>
-                    {g.name} ({g.key})
-                  </option>
-                ))}
-              </select>
+                onChange={setSelectedGroupId}
+                options={groupSelectOptions}
+                disabled={!orgFilterId}
+                loading={groupsLoading}
+                placeholder={
+                  !orgFilterId
+                    ? "Pick a company first"
+                    : "Select a group"
+                }
+                searchPlaceholder="Search by name or key…"
+                emptyList={orgFilterId ? "No groups for this company" : undefined}
+              />
             </div>
           </div>
           {licensedOrgLabel && orgFilterId ? (
@@ -1023,8 +1909,8 @@ function PlatformAccessPageInner() {
               mode="group"
               effectivePermissionIds={groupAssigned}
               orgEntitlements={contextOrgEntitlements}
-              busy={groupPermBusy}
-              disabled={groupPermBusy}
+              busy={accessFooterBusy}
+              disabled={accessFooterBusy}
               onSetLevel={(p) => void onFeatureAccessLevel(p)}
               onSetModuleLevel={(a) => void onModuleTargetLevel(a)}
             />
@@ -1051,44 +1937,38 @@ function PlatformAccessPageInner() {
           <div className="space-y-3">
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <div className="sm:col-span-2">
-                <label className={LABEL} htmlFor="access-report-org">
+                <span className={LABEL} id="access-report-org-label">
                   Company
-                </label>
-                <select
-                  id="access-report-org"
-                  className={INPUT}
+                </span>
+                <AccessCompanyFilterCombobox
+                  id="access-report-org-combobox"
+                  labelId="access-report-org-label"
+                  orgs={orgs}
                   value={orgFilterId}
-                  onChange={(e) => setOrgFilterId(e.target.value)}
-                >
-                  {orgs.length === 0 ? (
-                    <option value="">No companies</option>
-                  ) : (
-                    orgs.map((o) => (
-                      <option key={o.id} value={o.id}>
-                        {o.displayName}
-                      </option>
-                    ))
-                  )}
-                </select>
+                  onChange={(id) => {
+                    setOrgFilterId(id);
+                    commitWorkspaceOrgScope(id);
+                  }}
+                  includeAllRow={false}
+                  selectWhenEmptyLabel="Select a company"
+                />
               </div>
               <div>
-                <label className={LABEL} htmlFor="access-report-min">
+                <span className={LABEL} id="access-report-min-label">
                   Minimum access
-                </label>
-                <select
-                  id="access-report-min"
-                  className={INPUT}
+                </span>
+                <AccessSearchableOptionsCombobox
+                  id="access-report-min-combobox"
+                  labelId="access-report-min-label"
                   value={reportMin}
-                  onChange={(e) =>
+                  onChange={(v) =>
                     setReportMin(
-                      e.target.value as "all" | "read_or_more" | "write_or_more" | "manage_only",
+                      v as "all" | "read_or_more" | "write_or_more" | "manage_only" | "",
                     )}
-                >
-                  <option value="all">Any (include none)</option>
-                  <option value="read_or_more">Read or higher</option>
-                  <option value="write_or_more">Write or higher</option>
-                  <option value="manage_only">Manage only</option>
-                </select>
+                  options={reportMinOptions}
+                  placeholder="Select minimum access"
+                  searchPlaceholder="Search options…"
+                />
               </div>
               <div className="flex items-end">
                 <button
@@ -1103,46 +1983,54 @@ function PlatformAccessPageInner() {
               </div>
             </div>
             <div>
-              <label className={LABEL} htmlFor="access-report-module-group">
+              <span className={LABEL} id="access-report-module-label">
                 Module (report areas)
-              </label>
-              <select
-                id="access-report-module-group"
-                className={INPUT}
+              </span>
+              <AccessSearchableOptionsCombobox
+                id="access-report-module-combobox"
+                labelId="access-report-module-label"
                 value={reportModuleGroup}
-                onChange={(e) => setReportModuleGroup(e.target.value)}
-              >
-                <option value="">All areas</option>
-                {REPORT_MODULE_GROUP_CHOICES.map((m) => (
-                  <option key={m.value} value={m.value}>
-                    {m.label}
-                  </option>
-                ))}
-              </select>
+                onChange={setReportModuleGroup}
+                options={reportModuleOptions}
+                placeholder="Select a report area"
+                searchPlaceholder="Search report areas…"
+                emptyList="No report areas"
+              />
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
               <div>
-                <label className={LABEL} htmlFor="access-report-user-q">
-                  User filter
-                </label>
-                <input
-                  id="access-report-user-q"
-                  className={INPUT}
-                  value={reportUserQ}
-                  onChange={(e) => setReportUserQ(e.target.value)}
-                  placeholder="Name, id, or role key…"
+                <span className={LABEL} id="access-report-user-label">
+                  User
+                </span>
+                <AccessUserCombobox
+                  id="access-report-user-combobox"
+                  labelId="access-report-user-label"
+                  users={usersInReportOrg}
+                  value={reportSelectedUserId}
+                  onChange={setReportSelectedUserId}
+                  disabled={!orgFilterId}
+                  loading={usersLoading}
                 />
               </div>
               <div>
-                <label className={LABEL} htmlFor="access-report-feat-q">
-                  Feature (search)
-                </label>
-                <input
-                  id="access-report-feat-q"
-                  className={INPUT}
-                  value={reportFeatureQ}
-                  onChange={(e) => setReportFeatureQ(e.target.value)}
-                  placeholder="Module / feature name or key"
+                <span className={LABEL} id="access-report-feature-label">
+                  Feature
+                </span>
+                <AccessSearchableOptionsCombobox
+                  id="access-report-feature-combobox"
+                  labelId="access-report-feature-label"
+                  value={reportFeatureToken}
+                  onChange={setReportFeatureToken}
+                  options={reportFeatureOptions}
+                  disabled={!orgFilterId}
+                  loading={catalogLoading}
+                  placeholder="Select a feature"
+                  searchPlaceholder="Search by feature or module…"
+                  emptyList={
+                    !orgFilterId
+                      ? "Select a company first"
+                      : "No features in catalog for this company"
+                  }
                 />
               </div>
             </div>
@@ -1229,6 +2117,36 @@ function PlatformAccessPageInner() {
           ) : !reportLoading && reportMeta && reportRows.length === 0 ? (
             <p className="text-sm text-muted-foreground">No rows match the filters. Try a lower minimum access or clear filters.</p>
           ) : null}
+        </div>
+      ) : null}
+      </div>
+
+      {accessFormDirty ? (
+        <div
+          className="fixed bottom-0 left-0 right-0 z-50 border-t border-border bg-background/95 py-3 shadow-[0_-4px_24px_rgba(0,0,0,0.06)] backdrop-blur supports-[backdrop-filter]:bg-background/80"
+        >
+          <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-4 sm:px-6">
+            <p className="min-w-0 text-sm text-muted-foreground">You have unsaved changes on this page.</p>
+            <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={handleAccessTabCancel}
+                disabled={accessFooterBusy}
+                className="inline-flex h-10 min-w-[5.5rem] items-center justify-center rounded-md border border-border bg-background px-4 text-sm font-medium transition hover:bg-muted/60 disabled:pointer-events-none disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleAccessTabSave()}
+                disabled={accessFooterBusy}
+                className="inline-flex h-10 min-w-[5.5rem] items-center justify-center gap-2 rounded-md border border-primary bg-primary px-4 text-sm font-medium text-primary-foreground shadow-sm transition hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
+              >
+                {accessFooterBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                Save
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
     </div>
