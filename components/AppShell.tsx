@@ -120,6 +120,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   const [expanded,      setExpanded]      = useState<Record<string, boolean>>({});
   const { companyName: brandName } = useBranding();
   const pathname = usePathname();
+  const isAuthRoute = pathname === "/login";
 
   useEffect(() => {
     setMounted(true);
@@ -458,6 +459,17 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
       </div>
     </>
   );
+
+  // Auth routes render without the main app shell chrome.
+  if (isAuthRoute) {
+    return (
+      <GlobalSearchProvider>
+        <MobileMenuCtx.Provider value={{ openMobileMenu: () => setMobileOpen(true) }}>
+          <div className="min-h-screen bg-background">{children}</div>
+        </MobileMenuCtx.Provider>
+      </GlobalSearchProvider>
+    );
+  }
 
   // ── Full layout ───────────────────────────────────────────────────────────
   return (

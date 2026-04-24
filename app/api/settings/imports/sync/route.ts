@@ -111,7 +111,8 @@ import { isUuidString } from "../../../../../lib/uuid";
 
 export const runtime = "nodejs";
 /** Large listing files — Phase 3 raw upserts only (catalog is Phase 4 Generic). */
-export const maxDuration = 60;
+/** Vercel Hobby: maxDuration must be 1–300s. Upgrade to Pro for higher limits if imports need longer. */
+export const maxDuration = 300;
 
 const BATCH_SIZE = 500;
 /** Max rows per Postgres upsert call — enables granular sync_progress updates. */

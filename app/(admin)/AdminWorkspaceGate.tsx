@@ -4,7 +4,6 @@ import React, { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { isAdminRole, useUserRole } from "../../components/UserRoleContext";
 import { isUuidString } from "../../lib/uuid";
-import { supabase } from "../../src/lib/supabase";
 import type { CompanyOption } from "../../lib/imports-types";
 import { listCompaniesForImports, saveHomeCompanyForProfile } from "./imports/companies-actions";
 
@@ -14,33 +13,10 @@ import { listCompaniesForImports, saveHomeCompanyForProfile } from "./imports/co
  */
 export function AdminWorkspaceGate({ children }: { children: React.ReactNode }) {
   const { role, actorUserId, homeOrganizationId, profileLoading, refreshProfile } = useUserRole();
-  const [syncing, setSyncing] = useState(true);
   const [companies, setCompanies] = useState<CompanyOption[]>([]);
   const [pick, setPick] = useState("");
   const [saving, setSaving] = useState(false);
   const [gateErr, setGateErr] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const { data: { user } } = await supabase.auth.getUser();
-        const uid = user?.id?.trim();
-        if (uid && isUuidString(uid) && typeof window !== "undefined") {
-          const cur = window.localStorage.getItem("current_user_profile_id")?.trim();
-          if (cur !== uid) {
-            window.localStorage.setItem("current_user_profile_id", uid);
-            await refreshProfile();
-          }
-        }
-      } finally {
-        if (!cancelled) setSyncing(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [refreshProfile]);
 
   useEffect(() => {
     if (!isAdminRole(role)) return;
@@ -74,7 +50,7 @@ export function AdminWorkspaceGate({ children }: { children: React.ReactNode }) 
     await refreshProfile();
   }
 
-  if (profileLoading || syncing) {
+  if (profileLoading) {
     return (
       <div className="flex min-h-[40vh] items-center justify-center gap-2 text-muted-foreground">
         <Loader2 className="h-6 w-6 animate-spin" aria-hidden />

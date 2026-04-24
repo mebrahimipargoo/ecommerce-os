@@ -3,8 +3,8 @@
 import React, {
   createContext, useCallback, useContext, useEffect, useMemo, useState,
 } from "react";
+import { supabase } from "@/src/lib/supabase";
 import {
-  fetchUserProfileById,
   listWorkspaceOrganizationsForAdmin,
   type WorkspaceOrganizationOption,
 } from "../app/session/tenant-actions";
@@ -68,14 +68,6 @@ export function isAdminRole(role: UserRole): boolean {
   return role === "admin" || role === "system_employee" || role === "super_admin";
 }
 
-function readActorUserId(): string | null {
-  if (typeof window === "undefined") return null;
-  const fromStore = window.localStorage.getItem("current_user_profile_id")?.trim();
-  if (fromStore && isUuidString(fromStore)) return fromStore;
-  const env = process.env.NEXT_PUBLIC_CURRENT_USER_PROFILE_ID?.trim();
-  return env && isUuidString(env) ? env : null;
-}
-
 function readStoredWorkspaceCompanyId(): string | null {
   if (typeof window === "undefined") return null;
   const t = window.localStorage.getItem(LS_WORKSPACE_ORGANIZATION)?.trim();
@@ -112,9 +104,14 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
   const loadProfile = useCallback(async () => {
     setProfileLoading(true);
     setProfileError(null);
-    const id = readActorUserId();
-    setActorUserId(id);
-    if (!id) {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+
+    const authUserId = user?.id ?? null;
+    setActorUserId(authUserId);
+
+    if (!authUserId) {
       setProfileRole("admin");
       setActorName("Operator");
       setTeamGroups([]);
@@ -126,18 +123,24 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
       setProfileLoading(false);
       return;
     }
-    const res = await fetchUserProfileById(id);
-    if (!res.ok) {
-      setProfileError(res.error);
+
+    const { data: profileRow } = await supabase
+      .from("profiles")
+      .select("id, organization_id, full_name, role, team_groups")
+      .eq("id", authUserId)
+      .maybeSingle();
+
+    if (!profileRow) {
+      setProfileError(`Authenticated user is missing a profiles row (id=${authUserId}).`);
       setProfileLoading(false);
       return;
     }
-    const p = res.profile;
-    const nr = normalizeRole(p.role);
+
+    const nr = normalizeRole(profileRow.role);
     setProfileRole(nr);
-    setActorName((p.full_name ?? "").trim() || p.email || "User");
-    setTeamGroups(p.team_groups ?? []);
-    const cid = (p.organization_id ?? "").trim();
+    setActorName(String(profileRow.full_name ?? "").trim() || "User");
+    setTeamGroups(Array.isArray(profileRow.team_groups) ? profileRow.team_groups.map(String) : []);
+    const cid = String(profileRow.organization_id ?? "").trim();
     setHomeOrganizationId(cid && isUuidString(cid) ? cid : null);
 
     if (nr === "super_admin" || nr === "system_employee") {
@@ -163,16 +166,23 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => { void loadProfile(); }, [loadProfile]);
 
+  // Keep profile/role in sync with auth transitions (login/logout/token refresh).
+  useEffect(() => {
+    const { data: subscription } = supabase.auth.onAuthStateChange(() => {
+      void loadProfile();
+    });
+    return () => {
+      subscription.subscription.unsubscribe();
+    };
+  }, [loadProfile]);
+
   // Reset debug role when debug mode is turned off
   useEffect(() => {
     if (!debugMode) setDebugRoleState(null);
   }, [debugMode]);
 
-  // Effective role: debug override wins when debug mode is active
-  const role = useMemo((): UserRole => {
-    if (debugMode && debugRole !== null) return debugRole;
-    return profileRole;
-  }, [debugMode, debugRole, profileRole]);
+  // Effective role: always use authenticated profile role.
+  const role = useMemo((): UserRole => profileRole, [profileRole]);
 
   const setWorkspaceOrganizationId = useCallback((id: string) => {
     const t = id.trim();
@@ -239,8 +249,8 @@ export function useUserRole(): UserRoleContextValue {
   const ctx = useContext(UserRoleContext);
   if (!ctx) {
     return {
-      role: "admin",
-      actorName: "Operator",
+      role: "operator",
+      actorName: "User",
       actorUserId: null,
       homeOrganizationId: null,
       organizationId: null,
