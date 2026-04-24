@@ -19,7 +19,11 @@ import {
   streamToBuffer,
 } from "../import-listing-physical-lines";
 import { applyColumnMappingToRow, computeSourceLineHash, normalizeAmazonReportRowKeys } from "../import-sync-mappers";
-import { mergeUploadMetadata, parseRawReportMetadata } from "../raw-report-upload-metadata";
+import {
+  mergeUploadMetadata,
+  parseRawReportMetadata,
+  type ImportRunMetrics,
+} from "../raw-report-upload-metadata";
 import { supabaseServer } from "../supabase-server";
 import { isUuidString } from "../uuid";
 import { isListingReportType } from "../raw-report-types";
@@ -41,18 +45,42 @@ const STAGING_TABLE = "amazon_staging";
 const STAGING_CONFLICT = "organization_id,upload_id,row_number";
 /**
  * Conservative batch size for `amazon_staging` upserts.
- * 500 was triggering Postgres statement_timeout on wide REPORTS_REPOSITORY/INVENTORY_LEDGER
- * rows (large `raw_row` JSONB) around the ~100K-row mark. 250 trades a small amount of
- * throughput for predictable per-batch latency well under any reasonable timeout.
- * Each batch is its own implicit transaction (single PostgREST upsert call) so a failure
- * in batch N+1 cannot roll back batch N.
+ * Empirically: 500 hit Postgres statement_timeout on wide REPORTS_REPOSITORY /
+ * INVENTORY_LEDGER rows around ~100K rows; 250 was better but still occasionally
+ * timed out on the very widest rows. 200 is the safe default. Tune via env var
+ * `PHASE2_BATCH_SIZE` (clamped to 50..500) without redeploy if needed.
+ * Each batch is its own implicit transaction (single PostgREST upsert call) so
+ * a failure in batch N+1 cannot roll back batch N.
  */
-const BATCH_SIZE = 250;
+const BATCH_SIZE = (() => {
+  const raw = process.env.PHASE2_BATCH_SIZE;
+  if (!raw) return 200;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 200;
+  return Math.min(500, Math.max(50, Math.floor(n)));
+})();
 /**
  * Maximum age of a `processing` lock before we treat it as stale and allow Phase 2 to take over.
  * Must exceed the maxDuration of /process (300s) plus a safety margin.
  */
 const PROCESSING_STALE_MS = 6 * 60 * 1000;
+/**
+ * Soft time budget per request. Vercel `maxDuration` for /process is 300s; we
+ * stop accepting new batches at 270s and let the in-flight batch finish, then
+ * cleanly mark the upload `failed` with a "time budget exhausted, click Process
+ * again to resume" message. This prevents Vercel from hard-killing us mid-batch
+ * (which leaves status=`processing` until the stale-lock recovery kicks in).
+ * For files larger than ~250K wide rows the user will need to click Process
+ * multiple times — each click resumes from the contiguous-prefix watermark.
+ * Tune via env var `PHASE2_SOFT_BUDGET_MS` (e.g. 540000 on Vercel Pro 600s).
+ */
+const SOFT_BUDGET_MS = (() => {
+  const raw = process.env.PHASE2_SOFT_BUDGET_MS;
+  if (!raw) return 270 * 1000;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 270 * 1000;
+  return Math.max(30 * 1000, Math.floor(n));
+})();
 /**
  * Throttle progress writes. Without this, every batch caused 3 round-trips
  * (select metadata + update raw_report_uploads + upsert file_processing_status),
@@ -61,6 +89,13 @@ const PROCESSING_STALE_MS = 6 * 60 * 1000;
  * still bypass the throttle for the final completion record.
  */
 const PROGRESS_MIN_INTERVAL_MS = 2000;
+/**
+ * How often to re-anchor `staged_rows_written` / `processed_rows` to the live
+ * `count(*)` from the DB instead of the in-memory accumulator. Cheap because
+ * Supabase exposes count via head=true (no row payload). Anchored counts
+ * eliminate any UI/DB drift caused by silent in-memory off-by-ones.
+ */
+const DB_COUNT_REANCHOR_INTERVAL_MS = 10 * 1000;
 /** Legacy "every N rows" fallback gate (kept so a 0ms-elapsed retry still emits a write occasionally). */
 const PROGRESS_EVERY = 25;
 const LISTING_PROGRESS_EVERY = 8;
@@ -121,19 +156,32 @@ function rowMatchesDateRange(
   return true;
 }
 
+/** Page size for scanning row_number values when computing the watermark on a corrupt staging set. */
+const WATERMARK_SCAN_PAGE = 5000;
+
 /**
- * Resume support: returns the highest already-staged `row_number` for this upload,
- * plus the count of rows currently in `amazon_staging` for it. Used to:
- *   1) skip the re-DELETE on retry (avoids statement_timeout on big files),
- *   2) skip parser rows that were already inserted (no duplicate-key on
- *      `uq_amazon_staging_org_upload_row_number`),
- *   3) seed progress counters so reported %/staged_rows reflect actual DB state.
+ * Returns the live cardinality of `amazon_staging` for (org, upload):
+ * - `count`  — total rows for this upload
+ * - `min`    — smallest row_number (0 if empty)
+ * - `max`    — largest row_number (0 if empty)
+ * Cheap: 3 head=true queries.
  */
-async function getStagingResumeState(
+async function readStagingCardinality(
   orgId: string,
   uploadId: string,
-): Promise<{ maxRowNumber: number; rowCount: number }> {
-  const { data: maxRow } = await supabaseServer
+): Promise<{ count: number; min: number; max: number }> {
+  const { count: cntResp, error: cntErr } = await supabaseServer
+    .from(STAGING_TABLE)
+    .select("*", { count: "exact", head: true })
+    .eq("organization_id", orgId)
+    .eq("upload_id", uploadId);
+  if (cntErr) {
+    throw new Error(`Staging cardinality (count) failed: ${cntErr.message}. upload_id=${uploadId}`);
+  }
+  const count = typeof cntResp === "number" ? cntResp : 0;
+  if (count === 0) return { count: 0, min: 0, max: 0 };
+
+  const { data: maxRow, error: maxErr } = await supabaseServer
     .from(STAGING_TABLE)
     .select("row_number")
     .eq("organization_id", orgId)
@@ -141,19 +189,141 @@ async function getStagingResumeState(
     .order("row_number", { ascending: false })
     .limit(1)
     .maybeSingle();
-  const maxRowNumber =
+  if (maxErr) {
+    throw new Error(`Staging cardinality (max) failed: ${maxErr.message}. upload_id=${uploadId}`);
+  }
+  const max =
     maxRow && typeof (maxRow as { row_number?: unknown }).row_number === "number"
       ? Math.floor((maxRow as { row_number: number }).row_number)
       : 0;
 
-  if (maxRowNumber === 0) return { maxRowNumber: 0, rowCount: 0 };
-
-  const { count } = await supabaseServer
+  const { data: minRow, error: minErr } = await supabaseServer
     .from(STAGING_TABLE)
-    .select("*", { count: "exact", head: true })
+    .select("row_number")
     .eq("organization_id", orgId)
-    .eq("upload_id", uploadId);
-  return { maxRowNumber, rowCount: typeof count === "number" ? count : 0 };
+    .eq("upload_id", uploadId)
+    .order("row_number", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (minErr) {
+    throw new Error(`Staging cardinality (min) failed: ${minErr.message}. upload_id=${uploadId}`);
+  }
+  const min =
+    minRow && typeof (minRow as { row_number?: unknown }).row_number === "number"
+      ? Math.floor((minRow as { row_number: number }).row_number)
+      : 0;
+
+  return { count, min, max };
+}
+
+/**
+ * Returns the highest N such that {1, 2, …, N} are ALL present in
+ * amazon_staging for this (org, upload). Walks row_numbers ascending in pages
+ * and stops at the first gap. Falls back to a single-row LIMIT 1 read when no
+ * rows exist (returns 0).
+ *
+ * For the common case (no gaps, contiguous from 1) this is one ascending page
+ * read. For corrupt staging (gaps), it pages through until the first gap is
+ * found. Memory is bounded to one page (5000 ints).
+ */
+async function findContiguousPrefixWatermark(
+  orgId: string,
+  uploadId: string,
+  expectedMax: number,
+): Promise<number> {
+  if (expectedMax === 0) return 0;
+  let next = 1;
+  let scanned = 0;
+  while (next <= expectedMax) {
+    const upper = Math.min(expectedMax, next + WATERMARK_SCAN_PAGE - 1);
+    const { data, error } = await supabaseServer
+      .from(STAGING_TABLE)
+      .select("row_number")
+      .eq("organization_id", orgId)
+      .eq("upload_id", uploadId)
+      .gte("row_number", next)
+      .lte("row_number", upper)
+      .order("row_number", { ascending: true })
+      .limit(WATERMARK_SCAN_PAGE);
+    if (error) {
+      throw new Error(`Watermark scan failed: ${error.message}. upload_id=${uploadId}`);
+    }
+    const rows = (data ?? []) as { row_number: number }[];
+    if (rows.length === 0) {
+      // No rows in [next, upper]. The watermark is next-1.
+      return next - 1;
+    }
+    for (const r of rows) {
+      const rn = Math.floor(Number(r.row_number));
+      if (rn !== next) {
+        // First gap is at `next`; watermark stops at next-1.
+        return next - 1;
+      }
+      next += 1;
+      scanned += 1;
+    }
+    if (rows.length < WATERMARK_SCAN_PAGE) {
+      // No more rows beyond what we just scanned — watermark is (next - 1).
+      return next - 1;
+    }
+  }
+  // Walked all the way to expectedMax with no gaps.
+  void scanned;
+  return expectedMax;
+}
+
+/**
+ * Resume support: returns the contiguous-prefix watermark and the live row
+ * count for `amazon_staging`. Used to:
+ *   1) skip the re-DELETE on retry (avoids statement_timeout on big files),
+ *   2) skip parser rows that were already inserted up to the WATERMARK
+ *      (NOT max(row_number) — the previous behavior would skip past gaps),
+ *   3) seed progress counters so reported %/staged_rows reflect actual DB state.
+ *
+ * The watermark guarantees lossless resume: every parser row from
+ * `watermark+1` onward is offered to the upsert. Rows already present beyond
+ * the gap are no-oped by `ignoreDuplicates: true`; rows in the gap are
+ * actually inserted. After the run completes, the gap is filled.
+ */
+async function getStagingResumeState(
+  orgId: string,
+  uploadId: string,
+): Promise<{
+  watermark: number;
+  rowCount: number;
+  minRowNumber: number;
+  maxRowNumber: number;
+  hasGaps: boolean;
+}> {
+  const card = await readStagingCardinality(orgId, uploadId);
+  if (card.count === 0) {
+    return { watermark: 0, rowCount: 0, minRowNumber: 0, maxRowNumber: 0, hasGaps: false };
+  }
+  const expectedSpan = card.max - card.min + 1;
+  const noGapsAndStartsAtOne = card.min === 1 && card.count === expectedSpan;
+  if (noGapsAndStartsAtOne) {
+    // Fast path: contiguous from 1..max with no gaps.
+    return {
+      watermark: card.max,
+      rowCount: card.count,
+      minRowNumber: card.min,
+      maxRowNumber: card.max,
+      hasGaps: false,
+    };
+  }
+  // Slow path: scan ascending to locate the first gap. Watermark is the
+  // highest contiguous-from-1 row_number. If min > 1, watermark is 0 (no
+  // contiguous prefix at all — the parser will offer all rows from 1, the
+  // existing rows beyond will be no-oped by ignoreDuplicates upsert).
+  const watermark =
+    card.min === 1 ? await findContiguousPrefixWatermark(orgId, uploadId, card.max) : 0;
+  return {
+    watermark,
+    rowCount: card.count,
+    minRowNumber: card.min,
+    maxRowNumber: card.max,
+    hasGaps: true,
+  };
 }
 
 /**
@@ -559,15 +729,47 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
      * On a fresh run there are no rows (no-op cost). On retry of a partially-staged
      * large file, deleting tens/hundreds of thousands of rows is exactly what was
      * causing statement_timeout — and the subsequent re-INSERT then collided with
-     * surviving rows on uq_amazon_staging_org_upload_row_number. Instead we resume
-     * from the highest already-staged row_number and let upsert handle any overlap.
+     * surviving rows on uq_amazon_staging_org_upload_row_number.
+     *
+     * CRITICAL: resume from the CONTIGUOUS-PREFIX WATERMARK, NOT max(row_number).
+     * If a prior run (or a manual reset, or a partial sync that deleted some
+     * staging rows) left gaps, the previous max-only resume would skip past the
+     * gap and the missing rows would never be re-staged — leaving the upload
+     * permanently broken. The watermark is the highest N such that {1..N} are
+     * ALL present in staging; the parser re-offers everything from N+1, the
+     * upsert with `ignoreDuplicates: true` no-ops on rows that already exist
+     * past the gap, and the gap itself gets filled in this run.
      */
     const resumeState = await getStagingResumeState(orgId, uploadId);
-    const resumeFromRowNumber = resumeState.maxRowNumber;
+    const resumeFromRowNumber = resumeState.watermark;
     const resumeRowCount = resumeState.rowCount;
+
+    if (resumeState.hasGaps) {
+      console.warn(
+        JSON.stringify({
+          event: "phase2_staging_corruption_detected",
+          severity: "warn",
+          message:
+            "amazon_staging for this upload is non-contiguous. Resume will start at the watermark and the upsert will fill the gap; a non-empty gap is usually caused by a prior partial sync that deleted some staging rows or a manual SQL edit.",
+          upload_id: uploadId,
+          organization_id: orgId,
+          db_min_row_number: resumeState.minRowNumber,
+          db_max_row_number: resumeState.maxRowNumber,
+          db_row_count: resumeState.rowCount,
+          contiguous_prefix_watermark: resumeFromRowNumber,
+          gap_total: Math.max(0, resumeState.maxRowNumber - resumeState.rowCount),
+        }),
+      );
+    }
     if (resumeFromRowNumber > 0) {
       console.log(
-        `[phase2-staging] Resuming upload ${uploadId} from row_number=${resumeFromRowNumber} (${resumeRowCount} rows already staged).`,
+        `[phase2-staging] Resuming upload ${uploadId} from contiguous-prefix watermark=${resumeFromRowNumber} ` +
+          `(rows_in_staging=${resumeRowCount}, max_row_number=${resumeState.maxRowNumber}, gaps=${resumeState.hasGaps}).`,
+      );
+    } else if (resumeRowCount > 0) {
+      console.log(
+        `[phase2-staging] Staging has ${resumeRowCount} rows for upload ${uploadId} but no contiguous prefix from row_number=1 ` +
+          `(min=${resumeState.minRowNumber}, max=${resumeState.maxRowNumber}). Re-parsing from row 1; existing rows past the gap will be no-oped by upsert.`,
       );
     }
 
@@ -577,7 +779,20 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       pipeline: "unified_phase2_staging",
       resume_from_row_number: resumeFromRowNumber,
       resume_row_count: resumeRowCount,
+      db_min_row_number: resumeState.minRowNumber,
+      db_max_row_number: resumeState.maxRowNumber,
+      has_gaps: resumeState.hasGaps,
+      batch_size: BATCH_SIZE,
+      soft_budget_ms: SOFT_BUDGET_MS,
     });
+
+    /**
+     * Soft time budget — the worker self-terminates a few seconds before
+     * Vercel's hard `maxDuration` so we can write a clean "click Process again
+     * to resume" failure state instead of getting hard-killed mid-batch.
+     */
+    const requestStartedAt = Date.now();
+    const isSoftBudgetExhausted = (): boolean => Date.now() - requestStartedAt > SOFT_BUDGET_MS;
 
     // Seed FPS with cumulative counters so the UI does not flash back to 0% on retry.
     // Compute target pct from estimatedRows + resumeRowCount, then take MAX with the
@@ -682,8 +897,17 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       if (dlErr || !blob) {
         throw new Error(dlErr?.message ?? `Could not download file from storage: ${rawFilePath}`);
       }
-      const arrayBuf = await blob.arrayBuffer();
-      source = Readable.from(Buffer.from(arrayBuf));
+      // CRITICAL: stream the blob — DO NOT buffer the entire file. The previous
+      // `Buffer.from(await blob.arrayBuffer())` materialized the whole file in
+      // memory which OOM-killed the worker on >300MB CSVs (the symptom: status
+      // stuck at `processing` with 0 rows in amazon_staging). Streaming via
+      // Readable.fromWeb keeps memory bounded to BATCH_SIZE * row_size + the
+      // csv-parser internal buffer, regardless of file size.
+      // Listing reports still go through the buffered path (`streamToBuffer`)
+      // because they need the full text for header-aware physical-line splitting;
+      // they're handled below in their own branch and outside this code path.
+      const webStream = blob.stream() as unknown as ReadableStream<Uint8Array>;
+      source = Readable.fromWeb(webStream as Parameters<typeof Readable.fromWeb>[0]);
     } else {
       source = createConcatenatedPartsReadable(supabaseServer, storagePrefix, totalParts);
     }
@@ -1010,6 +1234,10 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
     let batch: Record<string, unknown>[] = [];
     let lastProgressWrite = 0;
     let lastProgressTs = 0;
+    /** Last time we re-read count(*) from amazon_staging — controls how often DB anchoring runs. */
+    let lastDbCountReanchorTs = 0;
+    /** Authoritative `count(*)` for this upload — refreshed periodically, used in progress writes so the UI never drifts. */
+    let dbAnchoredStagedCount = resumeRowCount;
 
     const flushProgress = async (force = false) => {
       if (!force) {
@@ -1020,13 +1248,37 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       }
       lastProgressWrite = dataLinesPassed;
       lastProgressTs = Date.now();
+
+      // Periodically re-anchor `staged_rows_written` and `processed_rows` to the
+      // ACTUAL `count(*)` from amazon_staging — not the in-memory accumulator.
+      // This is what eliminates the "UI count vs DB count mismatch" symptom and
+      // satisfies requirement 6 ("Progress must come from real DB state").
+      if (force || Date.now() - lastDbCountReanchorTs > DB_COUNT_REANCHOR_INTERVAL_MS) {
+        lastDbCountReanchorTs = Date.now();
+        try {
+          const { count: liveCount } = await supabaseServer
+            .from(STAGING_TABLE)
+            .select("*", { count: "exact", head: true })
+            .eq("organization_id", orgId)
+            .eq("upload_id", uploadId);
+          if (typeof liveCount === "number") {
+            // Anchor monotonically — never let a transient query glitch decrease it.
+            dbAnchoredStagedCount = Math.max(dbAnchoredStagedCount, liveCount);
+          }
+        } catch {
+          // Non-fatal — we keep the previous anchored count.
+        }
+      }
       /**
-       * Cumulative counters (resume-aware): `dataRowNumber` and `approxStaged` already
-       * include rows from a prior partial run. Use them — not `dataLinesPassed` (this-run
-       * only) — so process_progress/staged_rows do not regress on retry.
+       * Cumulative counters (resume-aware): `dataRowNumber` already includes
+       * rows from a prior partial run. `dbAnchoredStagedCount` is the live
+       * `count(*)` from the DB so reported progress is always >= reality.
        */
       const cumulativeDataRows = dataRowNumber;
       const cumulativePhysicalSeen = Math.max(totalSeen, cumulativeDataRows);
+      // For the progress denominators we use the LARGER of in-memory counter
+      // and DB anchor, so the UI never regresses.
+      const cumulativeStagedReported = Math.max(approxStaged, dbAnchoredStagedCount);
       const baseEst = estimatedRows && estimatedRows > 0 ? estimatedRows : null;
       const live = Math.max(1, cumulativeDataRows, cumulativePhysicalSeen);
       let denom = live;
@@ -1052,11 +1304,12 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
             etl_phase: "staging",
             physical_lines_seen: cumulativePhysicalSeen,
             data_rows_seen: cumulativeDataRows,
+            staging_row_count: cumulativeStagedReported,
             import_metrics: {
               current_phase: "staging",
               physical_lines_seen: cumulativePhysicalSeen,
               data_rows_seen: cumulativeDataRows,
-              rows_staged: approxStaged,
+              rows_staged: cumulativeStagedReported,
             },
           }),
           updated_at: new Date().toISOString(),
@@ -1085,14 +1338,14 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           phase3_raw_sync_pct: 0,
           phase4_generic_pct: 0,
           sync_pct: 0,
-          processed_rows: cumulativeDataRows,
+          processed_rows: cumulativeStagedReported,
           total_rows: denom,
-          staged_rows_written: approxStaged,
+          staged_rows_written: cumulativeStagedReported,
           data_rows_total: cumulativeDataRows,
           import_metrics: {
             physical_lines_seen: cumulativePhysicalSeen,
             data_rows_seen: cumulativeDataRows,
-            rows_staged: approxStaged,
+            rows_staged: cumulativeStagedReported,
             current_phase: "staging",
           },
         },
@@ -1104,7 +1357,7 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       if (rows.length === 0) return;
       // Idempotent insert: ignore rows already staged for this (org, upload, row_number).
       // Each upsert is a single, independently-committed PostgREST request — a failure
-      // here cannot roll back any prior batch. Next attempt resumes from MAX(row_number).
+      // here cannot roll back any prior batch. Next attempt resumes from the WATERMARK.
       const startRn = (rows[0] as { row_number?: number } | undefined)?.row_number ?? null;
       const endRn = (rows[rows.length - 1] as { row_number?: number } | undefined)?.row_number ?? null;
       const inMemoryStagedBefore = approxStaged;
@@ -1131,13 +1384,23 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       await flushProgress(false);
     };
 
+    /**
+     * Sentinel thrown when SOFT_BUDGET_MS is exhausted. Caught at the outer
+     * level and converted to a "click Process again" failure state — never
+     * rethrown to Vercel as a generic 500.
+     */
+    const SOFT_BUDGET_SENTINEL = "PHASE2_SOFT_BUDGET_EXHAUSTED";
+
     let stagedRowCountForResponse = 0;
+
+    let softTerminationTriggered = false;
 
     await new Promise<void>((resolve, reject) => {
       source.on("error", reject);
       parser.on("error", reject);
 
       parser.on("data", (csvRow: Record<string, string>) => {
+        if (softTerminationTriggered) return;
         totalSeen += 1;
 
         if (filterStartDate || filterEndDate) {
@@ -1147,9 +1410,9 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         const normalizedRow = normalizeAmazonReportRowKeys(csvRow);
         const mappedRow = applyColumnMappingToRow(normalizedRow, columnMapping);
         dataRowNumber += 1;
-        // Resume: skip rows already present in amazon_staging from a prior partial run.
-        // We still increment dataRowNumber (and totalSeen above) so the row_number for
-        // newly-staged rows matches what they would have been on a fresh run.
+        // Resume: skip rows whose row_number is at or below the contiguous-prefix watermark.
+        // We still increment dataRowNumber so the row_number we WOULD assign matches the
+        // file order regardless of resume — guaranteeing 1..N contiguous semantics.
         if (resumeFromRowNumber > 0 && dataRowNumber <= resumeFromRowNumber) {
           return;
         }
@@ -1186,7 +1449,24 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           parser.pause();
           const chunk = batch;
           batch = [];
-          void flushBatch(chunk).then(() => parser.resume())
+          void flushBatch(chunk)
+            .then(async () => {
+              // Soft budget check between batches — stop accepting new rows
+              // and let the parser drain so we can mark the upload "failed,
+              // please click Process again to resume from row N" cleanly.
+              if (isSoftBudgetExhausted()) {
+                softTerminationTriggered = true;
+                parser.removeAllListeners("data");
+                try {
+                  source.unpipe?.(parser);
+                } catch {
+                  /* ignore */
+                }
+                reject(new Error(SOFT_BUDGET_SENTINEL));
+                return;
+              }
+              parser.resume();
+            })
             .catch(reject);
         }
       });
@@ -1326,23 +1606,51 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       pipeline: "phase2_staging",
     });
   } catch (e) {
-    const message = e instanceof Error ? e.message : "Staging failed.";
+    const rawMessage = e instanceof Error ? e.message : "Staging failed.";
+    // Convert the soft-budget sentinel into a friendly, recoverable failure
+    // state that explicitly tells the user (and any automation) the next step.
+    const isSoftBudget = rawMessage === "PHASE2_SOFT_BUDGET_EXHAUSTED";
+    const message = isSoftBudget
+      ? "Staging time budget exhausted. Click Process again to resume from the last successfully staged row."
+      : rawMessage;
     if (uploadIdForFail && isUuidString(uploadIdForFail) && isUuidString(orgId)) {
+      // Read live cardinality after the failure so the metadata reflects DB truth.
+      let postFailureCount = 0;
+      let postFailureMaxRn = 0;
+      try {
+        const card = await readStagingCardinality(orgId, uploadIdForFail);
+        postFailureCount = card.count;
+        postFailureMaxRn = card.max;
+      } catch {
+        // Diagnostic-only — never let a count failure mask the original failure.
+      }
       const { data: prevRow } = await supabaseServer
         .from("raw_report_uploads")
         .select("metadata")
         .eq("id", uploadIdForFail)
         .maybeSingle();
+      // The diagnostic-only keys `phase2_*` are stored as runtime extras inside
+      // the JSONB `metadata` column. They are not part of the strict
+      // `RawReportUploadMetadata` typed surface, so the patch object is cast at
+      // the call site.
+      const failurePatch = {
+        error_message: message,
+        failed_phase: "process",
+        staging_row_count: postFailureCount,
+        import_metrics: {
+          current_phase: "failed",
+          failure_reason: message,
+        },
+        phase2_recoverable: isSoftBudget,
+        phase2_committed_rows_at_failure: postFailureCount,
+        phase2_max_row_number_at_failure: postFailureMaxRn,
+      } as unknown as Parameters<typeof mergeUploadMetadata>[1];
       await supabaseServer
         .from("raw_report_uploads")
         .update({
           status: "failed",
           import_pipeline_failed_at: new Date().toISOString(),
-          metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
-            error_message: message,
-            failed_phase: "process",
-            import_metrics: { current_phase: "failed", failure_reason: message },
-          }),
+          metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, failurePatch),
           updated_at: new Date().toISOString(),
         })
         .eq("id", uploadIdForFail)
@@ -1358,12 +1666,45 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           next_action_key: null,
           next_action_label: null,
           upload_pct: 100,
-          process_pct: 0,
+          // Don't drop process_pct to 0 on soft-budget exit — the rows we DID
+          // stage are real; the next click resumes from the watermark.
+          ...(isSoftBudget
+            ? {}
+            : { process_pct: 0 }),
+          processed_rows: postFailureCount,
+          staged_rows_written: postFailureCount,
           error_message: message,
-          import_metrics: { current_phase: "failed", failure_reason: message },
+          // FPS `import_metrics` column is JSONB and accepts ad-hoc keys for
+          // diagnostic visibility; cast to satisfy the strict typed-client
+          // overload while preserving the runtime fields.
+          import_metrics: {
+            current_phase: "failed",
+            failure_reason: message,
+            recoverable: isSoftBudget,
+            committed_rows_at_failure: postFailureCount,
+            max_row_number_at_failure: postFailureMaxRn,
+          } as unknown as ImportRunMetrics,
         },
         { onConflict: "upload_id" },
       );
+
+      console.log(
+        JSON.stringify({
+          event: "phase2_staging_terminated",
+          upload_id: uploadIdForFail,
+          organization_id: orgId,
+          recoverable: isSoftBudget,
+          committed_rows_at_failure: postFailureCount,
+          max_row_number_at_failure: postFailureMaxRn,
+          message,
+        }),
+      );
+    }
+    // Soft-budget termination is a planned, recoverable outcome — return 200
+    // with `ok: false, recoverable: true` so the UI can surface a "Click
+    // Process again" hint instead of a generic 500. Hard failures still 500.
+    if (isSoftBudget) {
+      return NextResponse.json({ ok: false, error: message, recoverable: true }, { status: 200 });
     }
     return NextResponse.json({ ok: false, error: message }, { status: 500 });
   }
