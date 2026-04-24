@@ -6,8 +6,13 @@
  * ─ Desktop  : Persistent collapsible sidebar + TopHeader (theme/profile live ONLY here).
  * ─ Mobile   : TopHeader (hamburger + logo + theme + profile) + drawer for nav.
  *
- * Sidebar visibility is driven entirely by useRbacPermissions (no role comparisons here).
+ * Sidebar visibility is driven by useRbacPermissions (incl. platform vs tenant shell from
+ * effective org `workspaceViewMode` — not raw `super_admin` alone).
  * Content column: TopHeader (shrink-0) + scrollable main (flex-1 min-h-0 overflow-auto).
+ *
+ * Shell product row: platform name + `LogoMark` from `public.platform_settings` via
+ * `PlatformBrandingContext`. Tenant org label + optional tenant logo live in `TopHeader`
+ * (`UserRoleContext` + `BrandingContext`).
  */
 
 import React, {
@@ -15,73 +20,51 @@ import React, {
 } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
+import { DrawerWorkspaceBar } from "./DrawerWorkspaceBar";
 import { usePathname } from "next/navigation";
-import {
-  Banknote, Building2, ChevronDown,
-  ClipboardList, Database, DollarSign, FileText,
-  Package,
-  PanelLeftClose, PanelLeftOpen,
-  RotateCcw, ScanLine, Settings, Shield, ShieldAlert, Users, Wrench, X,
-} from "lucide-react";
+import { ChevronDown, PanelLeftClose, PanelLeftOpen, Wrench, X } from "lucide-react";
 import { TopHeader } from "./TopHeader";
-import { BrandingProvider, useBranding } from "./BrandingContext";
-import { BrandLogoImage } from "./BrandLogoImage";
+import { BrandingProvider } from "./BrandingContext";
+import { PlatformBrandingProvider, usePlatformBranding } from "./PlatformBrandingContext";
+import { LogoMark } from "./LogoMark";
+import { PLATFORM_TAGLINE } from "../lib/platform-branding";
 import { GlobalSearchProvider } from "./GlobalSearchContext";
 import { UserRoleProvider } from "./UserRoleContext";
 import { TechDebugPanel } from "./TechDebugPanel";
 import { useRbacPermissions } from "../hooks/useRbacPermissions";
+import { MAIN_SIDEBAR, WMS_ONLY_NAV, isLeafVisibleByRbac, type SidebarGroup } from "../lib/sidebar-config";
+import { getSidebarIcon } from "../lib/sidebar-icons";
 
-// ─── Nav Definitions ──────────────────────────────────────────────────────────
+// ─── Nav (from `lib/sidebar-config.ts`) ─────────────────────────────────────
 
-type NavChild   = { label: string; href: string; icon?: React.ElementType; disabled?: boolean; badge?: string };
+type NavChild = { label: string; href: string; icon: React.ElementType; disabled?: boolean; badge?: string };
 type NavItemDef = {
-  label: string; icon: React.ElementType;
-  href?: string; disabled?: boolean; badge?: string;
+  label: string;
+  icon: React.ElementType;
+  href?: string;
+  disabled?: boolean;
+  badge?: string;
   children?: NavChild[];
 };
-type NavSection = { id: string; label: string; items: NavItemDef[] };
 
-/** Warehouse Operations — accordion group */
-const WAREHOUSE_GROUP: NavItemDef = {
-  label: "Warehouse Operations",
-  icon:  Package,
-  children: [
-    { label: "Returns Processing", icon: RotateCcw,     href: "/returns"   },
-    { label: "Inventory Ledger",   icon: ClipboardList, href: "/inventory" },
-  ],
-};
-
-/** Finance & Claims — accordion group */
-const FINANCE_GROUP: NavItemDef = {
-  label: "Finance & Claims",
-  icon:  DollarSign,
-  children: [
-    { label: "Settlements",    icon: Banknote,    href: "/settlements"             },
-    { label: "Claim Engine",   icon: ShieldAlert, href: "/claim-engine"            },
-    { label: "Report History", icon: FileText,    href: "/claim-engine/report-history" },
-  ],
-};
-
-/** System Settings — accordion group (admin+) */
-const SYSTEM_GROUP: NavItemDef = {
-  label: "System Settings",
-  icon:  Settings,
-  children: [
-    { label: "Stores & Adapters", icon: Building2, href: "/settings" },
-    { label: "Users",             icon: Users,     href: "/users"    },
-  ],
-};
-
-/** WMS section — operators only */
-const WMS_NAV: NavSection = {
-  id: "wms", label: "WMS",
-  items: [
-    { label: "Scan Item", icon: ScanLine, href: "/returns", badge: "WMS" },
-  ],
-};
-
-// All accordion groups — used for auto-expand on navigation
-const ACCORDION_GROUPS = [WAREHOUSE_GROUP, FINANCE_GROUP, SYSTEM_GROUP];
+function navChildrenForGroup(
+  g: SidebarGroup,
+  perms: ReturnType<typeof useRbacPermissions>,
+): NavChild[] {
+  return g.children
+    .filter((c) => {
+      if (c.showInSidebar === false) return false;
+      if (!isLeafVisibleByRbac(c, perms)) return false;
+      if (g.id === "admin_imports" && !perms.canSeeSystemAdmin) return false;
+      return true;
+    })
+    .map((c) => ({
+      label: c.label,
+      href: c.path,
+      icon: getSidebarIcon(c.icon ?? g.icon),
+      badge: c.id === "wms_scan" ? "WMS" : undefined,
+    }));
+}
 
 // ─── Shell context (mobile menu trigger) ──────────────────────────────────────
 
@@ -103,9 +86,11 @@ const CLS = {
 export function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <UserRoleProvider>
-      <BrandingProvider>
-        <AppShellInner>{children}</AppShellInner>
-      </BrandingProvider>
+      <PlatformBrandingProvider>
+        <BrandingProvider>
+          <AppShellInner>{children}</AppShellInner>
+        </BrandingProvider>
+      </PlatformBrandingProvider>
     </UserRoleProvider>
   );
 }
@@ -113,12 +98,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 // ─── Inner shell (has access to context) ─────────────────────────────────────
 
 function AppShellInner({ children }: { children: React.ReactNode }) {
+  const { platformAppName, loading: platformNameLoading } = usePlatformBranding();
   const [collapsed,     setCollapsed]     = useState(false);
   const [mobileOpen,    setMobileOpen]    = useState(false);
   const [techDebugOpen, setTechDebugOpen] = useState(false);
   const [mounted,       setMounted]       = useState(false);
   const [expanded,      setExpanded]      = useState<Record<string, boolean>>({});
-  const { companyName: brandName } = useBranding();
   const pathname = usePathname();
   const isAuthRoute = pathname === "/login";
 
@@ -155,11 +140,22 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   // Auto-expand accordion groups when a child route becomes active
   useEffect(() => {
     const auto: Record<string, boolean> = {};
-    ACCORDION_GROUPS.forEach((group) => {
-      if (group.children?.some((c) => isActive(c.href))) {
-        auto[`nav-${group.label}`] = true;
+    for (const sec of MAIN_SIDEBAR) {
+      for (const g of sec.groups) {
+        const key = `nav-${sec.id}-${g.label}`;
+        if (g.children.some((c) => isActive(c.path))) {
+          auto[key] = true;
+        }
       }
-    });
+    }
+    if (
+      pathname.startsWith("/platform/settings")
+      || pathname.startsWith("/platform/organizations")
+      || pathname.startsWith("/platform/users")
+      || pathname.startsWith("/platform/access")
+    ) {
+      auto["nav-core-platform"] = true;
+    }
     if (Object.keys(auto).length) setExpanded((p) => ({ ...p, ...auto }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pathname]);
@@ -213,7 +209,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                 {badge}
               </span>
             )}
-            {active && <span className="ml-1 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />}
+            {active && <span className="ml-1 h-1.5 w-1.5 shrink-0 rounded-full bg-sky-500 dark:bg-sky-400" />}
           </>
         )}
 
@@ -230,12 +226,20 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   }
 
   // ── AccordionItem ─────────────────────────────────────────────────────────
-  function AccordionItem({ item, sectionId, alwaysFull = false }: {
+  function AccordionItem({
+    item,
+    groupKey,
+    alwaysFull = false,
+    trailingExpandedContent,
+  }: {
     item:        NavItemDef;
-    sectionId:   string;
+    /** Stable id for expand state, e.g. `nav-core-warehouse` */
+    groupKey:   string;
     alwaysFull?: boolean;
+    /** Rendered inside the expanded panel after link children (e.g. Tech Debug). */
+    trailingExpandedContent?: React.ReactNode;
   }) {
-    const key         = `${sectionId}-${item.label}`;
+    const key         = groupKey;
     const open        = expanded[key] ?? false;
     const childActive = item.children?.some((c) => isActive(c.href));
     const Icon        = item.icon;
@@ -293,6 +297,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                 {item.children?.map((c) => (
                   <NavLink key={c.href} item={c} child alwaysFull={alwaysFull} />
                 ))}
+                {trailingExpandedContent}
               </div>
             </div>
           </div>
@@ -302,8 +307,6 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   }
 
   // ── SidebarBody ───────────────────────────────────────────────────────────
-  // All visibility logic is delegated to useRbacPermissions — zero role
-  // comparisons inside this component.
   function SidebarBody({
     alwaysFull = false,
     collapsed: sidebarCollapsed,
@@ -311,111 +314,106 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     alwaysFull?: boolean;
     collapsed:   boolean;
   }) {
-    const perms       = useRbacPermissions();
+    const perms = useRbacPermissions();
     const showSection = alwaysFull || !sidebarCollapsed;
 
-    // ── OPERATOR: WMS-only view ──────────────────────────────────────────────
     if (perms.isWmsOnly) {
+      const wmsVisible = WMS_ONLY_NAV.leaves.filter((c) => isLeafVisibleByRbac(c, perms));
       return (
         <div className="mb-4">
           {showSection
-            ? <p className={CLS.section}>{WMS_NAV.label}</p>
+            ? <p className={CLS.section}>{WMS_ONLY_NAV.label}</p>
             : <div className="mb-2 mx-3 h-px bg-border" />
           }
           <div className="space-y-0.5">
-            {WMS_NAV.items.map((item) => (
-              <NavLink key={item.label} item={item} alwaysFull={alwaysFull} />
+            {wmsVisible.map((leaf) => (
+              <NavLink
+                key={leaf.id}
+                item={{
+                  label: leaf.label,
+                  href: leaf.path,
+                  icon: getSidebarIcon(leaf.icon ?? "ScanLine"),
+                  badge: "WMS",
+                }}
+                alwaysFull={alwaysFull}
+              />
             ))}
           </div>
         </div>
       );
     }
 
-    // ── Build filtered children per accordion group ──────────────────────────
-
-    const warehouseChildren = [
-      perms.canSeeReturns && { label: "Returns Processing", icon: RotateCcw,     href: "/returns"   },
-                              { label: "Inventory Ledger",   icon: ClipboardList, href: "/inventory" },
-    ].filter(Boolean) as NavChild[];
-
-    const financeChildren = [
-                                  { label: "Settlements",    icon: Banknote,    href: "/settlements"             },
-      perms.canSeeClaimEngine   && { label: "Claim Engine",   icon: ShieldAlert, href: "/claim-engine"            },
-      perms.canSeeReportHistory && { label: "Report History", icon: FileText,    href: "/claim-engine/report-history" },
-    ].filter(Boolean) as NavChild[];
-
-    const systemChildren = [
-      perms.canSeeSettings && { label: "Stores & Adapters", icon: Building2, href: "/settings" },
-      perms.canSeeUsers    && { label: "Users",              icon: Users,     href: "/users"    },
-    ].filter(Boolean) as NavChild[];
+    const core = MAIN_SIDEBAR[0]!;
+    const admin = MAIN_SIDEBAR[1];
+    const adminVisible =
+      admin?.groups
+        .map((g) => navChildrenForGroup(g, perms))
+        .some((ch) => ch.length > 0) ?? false;
 
     return (
       <>
-        {/* ── Core accordion groups ─────────────────────────────────────── */}
         <div className="space-y-1">
-          {warehouseChildren.length > 0 && (
-            <AccordionItem
-              item={{ ...WAREHOUSE_GROUP, children: warehouseChildren }}
-              sectionId="nav"
-              alwaysFull={alwaysFull}
-            />
-          )}
-
-          {financeChildren.length > 0 && (
-            <AccordionItem
-              item={{ ...FINANCE_GROUP, children: financeChildren }}
-              sectionId="nav"
-              alwaysFull={alwaysFull}
-            />
-          )}
-
-          {systemChildren.length > 0 && (
-            <AccordionItem
-              item={{ ...SYSTEM_GROUP, children: systemChildren }}
-              sectionId="nav"
-              alwaysFull={alwaysFull}
-            />
-          )}
+          {core.groups.map((g) => {
+            const ch = navChildrenForGroup(g, perms);
+            if (g.id === "platform") {
+              const showTech = perms.canSeeTechDebug;
+              if (ch.length === 0 && !showTech) return null;
+              return (
+                <AccordionItem
+                  key={g.id}
+                  groupKey={`nav-${core.id}-${g.id}`}
+                  item={{ label: g.label, icon: getSidebarIcon(g.icon), children: ch }}
+                  alwaysFull={alwaysFull}
+                  trailingExpandedContent={
+                    showTech ? (
+                      <TechDebugNavButton
+                        child
+                        collapsed={sidebarCollapsed}
+                        alwaysFull={alwaysFull}
+                        onClick={openTechDebug}
+                      />
+                    ) : null
+                  }
+                />
+              );
+            }
+            if (ch.length === 0) return null;
+            return (
+              <AccordionItem
+                key={g.id}
+                groupKey={`nav-${core.id}-${g.id}`}
+                item={{ label: g.label, icon: getSidebarIcon(g.icon), children: ch }}
+                alwaysFull={alwaysFull}
+              />
+            );
+          })}
         </div>
 
-        {/* ── System Admin — Imports (admin+) ───────────────────────────── */}
-        {perms.canSeeSystemAdmin && perms.canSeeImports && (
+        {admin && adminVisible ? (
           <div className="mt-4">
             {showSection
-              ? <p className={CLS.section}>System Admin</p>
+              ? <p className={CLS.section}>{admin.label}</p>
               : <div className="mb-2 mx-3 h-px bg-border" />
             }
             <div className="space-y-0.5">
-              <NavLink
-                item={{ label: "Imports", icon: Database, href: "/imports" }}
-                alwaysFull={alwaysFull}
-              />
+              {admin.groups.map((g) => {
+                const ch = navChildrenForGroup(g, perms);
+                if (ch.length === 0) return null;
+                if (g.id === "admin_imports" && ch.length === 1) {
+                  return <NavLink key={g.id} item={ch[0]!} alwaysFull={alwaysFull} />;
+                }
+                return (
+                  <AccordionItem
+                    key={g.id}
+                    groupKey={`nav-${admin.id}-${g.id}`}
+                    item={{ label: g.label, icon: getSidebarIcon(g.icon), children: ch }}
+                    alwaysFull={alwaysFull}
+                  />
+                );
+              })}
             </div>
           </div>
-        )}
-
-        {/* ── Platform (super_admin only) ───────────────────────────────── */}
-        {perms.canSeePlatformAdmin && (
-          <div className="mt-4">
-            {showSection
-              ? <p className={CLS.section}>Platform</p>
-              : <div className="mb-2 mx-3 h-px bg-border" />
-            }
-            <div className="space-y-0.5">
-              <NavLink
-                item={{ label: "Admin Settings", icon: Shield, href: "/admin/settings" }}
-                alwaysFull={alwaysFull}
-              />
-              {perms.canSeeTechDebug && (
-                <TechDebugNavButton
-                  collapsed={sidebarCollapsed}
-                  alwaysFull={alwaysFull}
-                  onClick={openTechDebug}
-                />
-              )}
-            </div>
-          </div>
-        )}
+        ) : null}
       </>
     );
   }
@@ -434,15 +432,20 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         className="fixed left-0 top-0 z-[210] flex h-full w-[280px] max-w-[85vw] flex-col border-r border-sidebar-border bg-sidebar shadow-2xl animate-drawer-slide-in-left"
       >
         <div className="flex h-14 shrink-0 items-center justify-between border-b border-sidebar-border px-4">
-          <div className="flex min-w-0 flex-1 items-center gap-2.5">
-            <BrandLogoImage />
+          <Link
+            href="/"
+            onClick={closeMenu}
+            className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg outline-none ring-sidebar-ring transition hover:bg-sidebar-accent/25 focus-visible:ring-2"
+            title="Home / Dashboard"
+          >
+            <LogoMark />
             <div className="min-w-0">
-              <p className="text-sm font-bold text-sidebar-foreground">
-                {brandName || "E-commerce OS"}
+              <p className="truncate text-sm font-bold text-sidebar-foreground">
+                {platformNameLoading && !platformAppName ? "…" : platformAppName || "·"}
               </p>
-              <p className="text-[10px] text-muted-foreground">Returns ERP</p>
+              <p className="truncate text-[10px] text-muted-foreground">{PLATFORM_TAGLINE}</p>
             </div>
-          </div>
+          </Link>
           <button
             type="button"
             onClick={closeMenu}
@@ -453,7 +456,9 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
           </button>
         </div>
 
-        <nav className="flex-1 overflow-y-auto px-2 py-4">
+        <DrawerWorkspaceBar onClose={closeMenu} />
+
+        <nav className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
           <SidebarBody alwaysFull collapsed={false} />
         </nav>
       </div>
@@ -486,22 +491,26 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
               collapsed ? "w-16" : "w-60",
             ].join(" ")}
           >
-            <div className={[
-              "flex h-14 shrink-0 items-center border-b border-sidebar-border px-4 min-w-0 overflow-hidden",
-              collapsed ? "justify-center" : "gap-2.5",
-            ].join(" ")}>
-              <BrandLogoImage />
+            <Link
+              href="/"
+              className={[
+                "flex h-14 shrink-0 items-center border-b border-sidebar-border px-4 min-w-0 overflow-hidden outline-none ring-sidebar-ring transition hover:bg-sidebar-accent/25 focus-visible:ring-2",
+                collapsed ? "justify-center" : "gap-2.5",
+              ].join(" ")}
+              title="Home / Dashboard"
+            >
+              <LogoMark />
               {!collapsed && (
                 <div className="min-w-0">
                   <p className="truncate text-sm font-bold text-sidebar-foreground">
-                    {brandName || "E-commerce OS"}
+                    {platformNameLoading && !platformAppName ? "…" : platformAppName || "·"}
                   </p>
-                  <p className="text-[10px] text-muted-foreground">Returns ERP</p>
+                  <p className="truncate text-[10px] text-muted-foreground">{PLATFORM_TAGLINE}</p>
                 </div>
               )}
-            </div>
+            </Link>
 
-            <nav className="flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
+            <nav className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 py-4">
               <SidebarBody collapsed={collapsed} />
             </nav>
 
@@ -546,10 +555,13 @@ function TechDebugNavButton({
   collapsed,
   alwaysFull,
   onClick,
+  child = false,
 }: {
   collapsed:  boolean;
   alwaysFull: boolean;
   onClick:    () => void;
+  /** Indent like accordion sub-links (Platform Settings). */
+  child?:     boolean;
 }) {
   const showText = alwaysFull || !collapsed;
 
@@ -560,10 +572,11 @@ function TechDebugNavButton({
       aria-label="Open Tech Debug panel"
       className={[
         CLS.linkBase, CLS.linkIdle,
+        child && showText ? "pl-9 pr-3" : "",
         collapsed && !showText ? "justify-center" : "",
       ].join(" ")}
     >
-      <Wrench className="h-5 w-5 shrink-0" />
+      <Wrench className={[child ? "h-4 w-4" : "h-5 w-5", "shrink-0"].join(" ")} />
 
       {showText && (
         <>

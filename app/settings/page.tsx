@@ -10,12 +10,14 @@ import {
 } from "lucide-react";
 import {
   getClaimAgentConfig,
-  getCoreSettings,
   getFefoSettings,
   saveClaimAgentConfig,
   saveInventoryFefoSettings,
-  saveCoreSettings,
 } from "./workspace-settings-actions";
+import {
+  getTenantBrandingForActor,
+  saveTenantOrganizationBranding,
+} from "./tenant-organization-branding-actions";
 import { BRAND_LOGO_IMG_CLASSNAME } from "../../lib/brand-logo-classes";
 import { uploadOrganizationLogoAction } from "./upload-organization-logo-action";
 import { AgentApiKeysSection } from "./AgentApiKeysSection";
@@ -25,7 +27,6 @@ import {
   DEFAULT_CLAIM_AGENT_CONFIG,
   DEFAULT_FEFO,
   type ClaimAgentConfig,
-  type CoreSettings,
   type InventoryModuleConfig,
 } from "./workspace-settings-types";
 import {
@@ -53,6 +54,8 @@ import {
 } from "../../lib/openai-settings";
 import { useBranding } from "../../components/BrandingContext";
 import { isAdminRole, useUserRole } from "../../components/UserRoleContext";
+import { WorkspaceOrganizationPicker } from "../../components/WorkspaceOrganizationPicker";
+import { useRbacPermissions } from "../../hooks/useRbacPermissions";
 import { FALLBACK_ORGANIZATION_ID } from "../../lib/organization";
 import { isUuidString } from "../../lib/uuid";
 import { DatabaseTag } from "../../components/DatabaseTag";
@@ -348,9 +351,55 @@ function UsageMeter({
 
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
+const BRANDING_DEBUG =
+  typeof process !== "undefined" && process.env.NEXT_PUBLIC_BRANDING_DEBUG === "1";
+
+function brandingDlog(tag: string, data: Record<string, unknown>) {
+  if (!BRANDING_DEBUG) return;
+  console.log(`[settings] ${tag}`, data);
+}
+
 export default function SettingsPage() {
-  const { role, organizationId, actorUserId } = useUserRole();
+  const {
+    role,
+    organizationId,
+    actorUserId,
+    profileLoading,
+    canonicalRoleKey,
+    homeOrganizationId,
+    workspaceOrganizations,
+    setWorkspaceOrganizationId,
+  } = useUserRole();
+  const perms = useRbacPermissions();
+  const canEditTenantBranding = perms.canEditTenantBranding;
+  const canEditSystemSettings = ["super_admin", "programmer", "system_admin"].includes(
+    (canonicalRoleKey ?? "").trim().toLowerCase(),
+  );
   const { refresh: refreshBranding } = useBranding();
+
+  useEffect(() => {
+    brandingDlog("rbac-state", {
+      role,
+      canonicalRoleKey,
+      profileLoading,
+      actorUserId,
+      homeOrganizationId,
+      effectiveOrganizationId: organizationId,
+      canEditTenantBranding: perms.canEditTenantBranding,
+      canEditSystemSettings,
+      canSeePlatformAdmin: perms.canSeePlatformAdmin,
+    });
+  }, [
+    role,
+    canonicalRoleKey,
+    profileLoading,
+    actorUserId,
+    homeOrganizationId,
+    organizationId,
+    perms.canEditTenantBranding,
+    canEditSystemSettings,
+    perms.canSeePlatformAdmin,
+  ]);
 
   const tenantCtx = useMemo(
     () => ({ actorProfileId: actorUserId, organizationId }),
@@ -524,21 +573,39 @@ export default function SettingsPage() {
     };
   }, [mounted, tenantCtx]);
 
-  // ── Load core_settings (white-label) from DB ──────────────────────────────
+  // ── Tenant company branding: resolve org server-side from profile + hint (home org when scope not yet set)
+  const brandingOrganizationHint = organizationId ?? homeOrganizationId;
   useEffect(() => {
-    if (!mounted) return;
-    async function loadCoreSettings() {
+    if (!mounted || profileLoading) return;
+    if (!actorUserId?.trim()) {
+      brandingDlog("load-branding: no actor, clearing", { actorUserId });
+      setCompanyName("");
+      setCompanyLogoUrl("");
+      setCoreSettingsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    async function loadTenantBranding() {
       setCoreSettingsLoading(true);
+      brandingDlog("load-branding: fetching", {
+        actorUserId,
+        organizationIdHint: brandingOrganizationHint,
+      });
       try {
-        const cfg = await getCoreSettings(organizationId ?? undefined);
-        setCompanyName(cfg.company_name ?? "");
-        setCompanyLogoUrl(cfg.company_logo_url ?? "");
+        const b = await getTenantBrandingForActor(actorUserId, brandingOrganizationHint);
+        if (cancelled) return;
+        brandingDlog("load-branding: received", b);
+        setCompanyName(b.company_display_name ?? "");
+        setCompanyLogoUrl(b.logo_url ?? "");
       } finally {
-        setCoreSettingsLoading(false);
+        if (!cancelled) setCoreSettingsLoading(false);
       }
     }
-    loadCoreSettings();
-  }, [mounted, organizationId]);
+    void loadTenantBranding();
+    return () => {
+      cancelled = true;
+    };
+  }, [mounted, profileLoading, actorUserId, brandingOrganizationHint]);
 
   // ── Load FEFO settings from DB ─────────────────────────────────────────────
   useEffect(() => {
@@ -673,6 +740,7 @@ export default function SettingsPage() {
 
   // ── Logo file upload → server action (logos bucket + organization_settings) ─
   async function handleLogoFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    if (!canEditTenantBranding) return;
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
@@ -680,13 +748,11 @@ export default function SettingsPage() {
     try {
       const fd = new FormData();
       fd.append("file", file);
-      if (actorUserId) fd.append("actor_profile_id", actorUserId);
-      if (organizationId?.trim()) fd.append("organization_id", organizationId.trim());
+      const oid = (organizationId ?? "").trim();
+      if (oid) fd.append("organization_id", oid);
       const res = await uploadOrganizationLogoAction(fd);
       if (!res.ok) throw new Error(res.error ?? "Logo upload failed.");
       setCompanyLogoUrl(res.publicUrl);
-      const nameRes = await saveCoreSettings({ company_name: companyName.trim() }, tenantCtx);
-      if (!nameRes.ok) throw new Error(nameRes.error ?? "Failed to save workspace name.");
       void refreshBranding();
       showToast("Logo uploaded and saved.", true);
     } catch (err) {
@@ -699,20 +765,22 @@ export default function SettingsPage() {
   // ── White-label / Tenant save ──────────────────────────────────────────────
   async function handleSaveWhitelabel(e: React.FormEvent) {
     e.preventDefault();
+    if (!canEditTenantBranding) return;
     setCoreSettingsSaving(true);
-    const url = companyLogoUrl.trim();
-    const res = await saveCoreSettings({
-      company_name:     companyName.trim(),
-      company_logo_url: url,
-      logo_url:         url,
-    }, tenantCtx);
+    const res = await saveTenantOrganizationBranding(
+      {
+        company_display_name: companyName.trim(),
+        logo_url: companyLogoUrl.trim() || null,
+      },
+      tenantCtx,
+    );
     setCoreSettingsSaving(false);
     if (!res.ok) {
-      showToast(res.error ?? "Failed to save white-label settings.", false);
+      showToast(res.error ?? "Failed to save company branding.", false);
       return;
     }
     void refreshBranding();
-    showToast("White-label settings saved.", true);
+    showToast("Company branding saved.", true);
   }
 
   // ── Provider change ────────────────────────────────────────────────────────
@@ -1064,6 +1132,10 @@ export default function SettingsPage() {
   }
 
   function openAddStoreModal() {
+    if (!canEditSystemSettings) {
+      showToast("You do not have permission to edit system settings / stores & adapters.", false);
+      return;
+    }
     setEditingStoreId(null);
     setNewStoreName("");
     setNewStorePlatform("amazon");
@@ -1076,6 +1148,10 @@ export default function SettingsPage() {
   }
 
   async function openEditStoreModal(store: StorePublicRow) {
+    if (!canEditSystemSettings) {
+      showToast("You do not have permission to edit system settings / stores & adapters.", false);
+      return;
+    }
     setEditingStoreId(store.id);
     setNewStoreName(store.name);
     setNewStorePlatform(store.platform);
@@ -1121,6 +1197,10 @@ export default function SettingsPage() {
 
   async function handleAddStore(e: React.FormEvent) {
     e.preventDefault();
+    if (!canEditSystemSettings) {
+      showToast("You do not have permission to edit system settings / stores & adapters.", false);
+      return;
+    }
     if (!newStoreName.trim()) { showToast("Store name is required.", false); return; }
     setAddStoreSaving(true);
 
@@ -1209,6 +1289,10 @@ export default function SettingsPage() {
   }
 
   async function handleDeleteStore(store: StorePublicRow) {
+    if (!canEditSystemSettings) {
+      showToast("You do not have permission to edit system settings / stores & adapters.", false);
+      return;
+    }
     if (!window.confirm(`Delete "${store.name}"? This cannot be undone.`)) return;
     setDeletingStoreId(store.id);
     const res = await deleteStore(store.id, settingsRbac);
@@ -1237,10 +1321,11 @@ export default function SettingsPage() {
     );
   }
 
-  if (!mounted) {
+  if (!mounted || profileLoading) {
     return (
-      <div className="flex min-h-[60vh] items-center justify-center">
-        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      <div className="flex min-h-[60vh] items-center justify-center gap-3 text-sm text-muted-foreground">
+        <Loader2 className="h-6 w-6 animate-spin" />
+        Loading your settings…
       </div>
     );
   }
@@ -1252,7 +1337,7 @@ export default function SettingsPage() {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div className="w-full max-w-7xl mx-auto px-2 sm:px-4 py-8">
+    <div className="mx-auto w-full min-w-0 max-w-7xl px-3 py-8 sm:px-5 md:px-6">
       <Link
         href="/"
         className="mb-6 inline-flex items-center gap-2 text-sm font-medium text-muted-foreground transition hover:text-foreground"
@@ -1355,7 +1440,7 @@ export default function SettingsPage() {
           {activeTab === "general" && (
             <div className="space-y-6">
 
-              {/* ── Tenant Customization / White-label ───────────────────── */}
+              {/* ── Tenant / company branding (organization_settings only) ───── */}
               <form onSubmit={handleSaveWhitelabel} className="space-y-5">
                 <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-6">
                   <div className="flex items-start gap-3">
@@ -1363,36 +1448,70 @@ export default function SettingsPage() {
                       <Building2 className="h-5 w-5 text-violet-600 dark:text-violet-400" />
                     </div>
                     <div>
-                      <h2 className="text-base font-bold">Tenant Customization</h2>
+                      <h2 className="text-base font-bold">Company branding</h2>
                       <p className="text-xs text-muted-foreground mt-0.5">
-                        White-label branding fields. Used for{" "}
-                        <span className="font-semibold">report generation</span> and{" "}
-                        <span className="font-semibold">custom dashboard branding</span>.
-                        Stored in <code className="rounded bg-muted px-1 font-mono text-[11px]">core_settings</code>.
+                        Your tenant or company identity for this organization — name and logo used on{" "}
+                        <span className="font-semibold">reports</span>,{" "}
+                        <span className="font-semibold">claim PDFs</span>, and other tenant-facing surfaces.
+                        Loaded automatically for the organization you belong to (or the workspace you select below / in the header).
+                        Stored in <code className="rounded bg-muted px-1 font-mono text-[11px]">organization_settings</code> only — not platform branding (
+                        <code className="rounded bg-muted px-1 font-mono text-[11px]">platform_settings</code> is edited from the main sidebar under{" "}
+                        <span className="font-semibold">Platform Settings → Product branding</span>).
                       </p>
                     </div>
                   </div>
 
+                  {perms.canSwitchOrganization && workspaceOrganizations.length > 0 ? (
+                    <div className="space-y-1.5 rounded-lg border border-border bg-muted/30 px-3 py-3">
+                      <label htmlFor="settings-branding-workspace" className="text-xs font-medium text-muted-foreground">
+                        Workspace for branding
+                      </label>
+                      <WorkspaceOrganizationPicker
+                        buttonId="settings-branding-workspace"
+                        options={workspaceOrganizations}
+                        value={organizationId}
+                        onChange={setWorkspaceOrganizationId}
+                        leadingIcon={false}
+                        ariaLabel="Workspace organization for company branding"
+                        triggerClassName={`${SELECT_CLS} flex items-center justify-between gap-2`}
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        Name, logo, and saves apply to this organization (same as the header switcher when shown).
+                      </p>
+                    </div>
+                  ) : null}
+
+                  {!canEditTenantBranding ? (
+                    <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-100">
+                      Your role can view this organization&apos;s branding but cannot change it. Editing requires a tenant or platform admin role (
+                      <span className="font-mono">tenant_admin</span>, <span className="font-mono">admin</span>,{" "}
+                      <span className="font-mono">super_admin</span>, <span className="font-mono">programmer</span>,{" "}
+                      <span className="font-mono">system_admin</span>).
+                    </p>
+                  ) : null}
+
                   {coreSettingsLoading ? (
                     <div className="flex items-center gap-2 py-2">
                       <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-                      <span className="text-xs text-muted-foreground">Loading branding settings…</span>
+                      <span className="text-xs text-muted-foreground">Loading company branding…</span>
                     </div>
                   ) : (
                     <div className="grid gap-5 sm:grid-cols-2">
                       <div>
                         <div className="mb-1.5 flex items-center gap-2">
                           <Building2 className="h-3.5 w-3.5 text-muted-foreground" />
-                          <label className={LABEL_CLS}>Company Name</label>
+                          <label className={LABEL_CLS}>Company name</label>
                         </div>
                         <p className={HINT_CLS}>
-                          Displayed on generated reports, packing slips, and email footers.
+                          Saved as <code className="rounded bg-muted px-1 font-mono text-[10px]">organization_settings.company_display_name</code>.
+                          Shown on generated reports, packing slips, and similar tenant outputs.
                         </p>
                         <input
                           type="text"
                           value={companyName}
                           onChange={(e) => setCompanyName(e.target.value)}
                           placeholder="e.g. Acme Fulfillment Co."
+                          disabled={!canEditTenantBranding}
                           className={INPUT_CLS}
                         />
                       </div>
@@ -1400,53 +1519,89 @@ export default function SettingsPage() {
                       <div>
                         <div className="mb-1.5 flex items-center gap-2">
                           <ImageIcon className="h-3.5 w-3.5 text-muted-foreground" />
-                          <label className={LABEL_CLS}>Company Logo</label>
+                          <label className={LABEL_CLS}>Company logo file</label>
                         </div>
                         <p className={HINT_CLS}>
-                          PNG, SVG, or WebP. Stored in the public <code className="rounded bg-muted px-1 font-mono text-[10px]">logos</code> bucket
-                          and <code className="rounded bg-muted px-1 font-mono text-[10px]">organization_settings.logo_url</code>. Shown in the sidebar,
-                          settings preview, and claim PDF header (max 180×50 display).
+                          PNG, SVG, or WebP (public <code className="rounded bg-muted px-1 font-mono text-[10px]">logos</code> bucket). URL stored in{" "}
+                          <code className="rounded bg-muted px-1 font-mono text-[10px]">organization_settings.logo_url</code>.
                         </p>
-                        <label className={`flex w-full cursor-pointer items-center justify-center gap-2 rounded-md border-2 border-dashed border-input bg-muted/30 py-3 text-sm font-medium transition hover:bg-muted/50 ${logoUploading ? "text-muted-foreground" : companyLogoUrl ? "border-emerald-500/50 text-emerald-800 dark:text-emerald-200" : "text-foreground"}`}>
+                        <label
+                          className={[
+                            "flex w-full items-center justify-center gap-2 rounded-md border-2 border-dashed border-input bg-muted/30 py-3 text-sm font-medium transition",
+                            !canEditTenantBranding || logoUploading
+                              ? "cursor-not-allowed opacity-60"
+                              : "cursor-pointer hover:bg-muted/50",
+                            companyLogoUrl && canEditTenantBranding ? "border-emerald-500/50 text-emerald-800 dark:text-emerald-200" : "",
+                          ].join(" ")}
+                        >
                           {logoUploading
                             ? <><Loader2 className="h-4 w-4 animate-spin" />Uploading…</>
                             : companyLogoUrl
                               ? <><ImageIcon className="h-4 w-4" />Logo saved — click to replace</>
-                              : <><ImageIcon className="h-4 w-4" />Upload Logo File</>}
-                          <input type="file" accept="image/*" className="hidden" disabled={logoUploading} onChange={handleLogoFileUpload} />
+                              : <><ImageIcon className="h-4 w-4" />Upload logo file</>}
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            disabled={logoUploading || !canEditTenantBranding}
+                            onChange={handleLogoFileUpload}
+                          />
                         </label>
                       </div>
                     </div>
                   )}
 
-                  {companyLogoUrl && (
-                    <div className="flex items-center gap-3 rounded-lg border border-border bg-muted/30 px-4 py-3">
-                      <div className="flex h-[45px] w-full max-w-[160px] shrink-0 items-center justify-start overflow-hidden">
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img
-                          src={companyLogoUrl}
-                          alt="Company logo preview"
-                          className={BRAND_LOGO_IMG_CLASSNAME}
-                          onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = "none"; }}
-                        />
+                  {!coreSettingsLoading ? (
+                    <div className="flex items-start gap-4 rounded-lg border border-border bg-muted/30 px-4 py-3">
+                      <div
+                        className={[
+                          "flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-lg border bg-background",
+                          companyLogoUrl ? "border-border" : "border-dashed border-muted-foreground/30",
+                        ].join(" ")}
+                      >
+                        {companyLogoUrl ? (
+                          /* eslint-disable-next-line @next/next/no-img-element */
+                          <img
+                            src={companyLogoUrl}
+                            alt="Company logo preview"
+                            className={["max-h-full max-w-full object-contain", BRAND_LOGO_IMG_CLASSNAME].join(" ")}
+                            onError={(e) => {
+                              (e.currentTarget as HTMLImageElement).style.display = "none";
+                            }}
+                          />
+                        ) : (
+                          <ImageIcon className="h-8 w-8 text-muted-foreground/70" aria-hidden />
+                        )}
                       </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-xs font-semibold">Logo Preview</p>
-                        <p className="text-[11px] text-muted-foreground truncate">Displayed on sidebar &amp; reports.</p>
+                      <div className="min-w-0 flex-1 pt-0.5">
+                        <p className="text-xs font-semibold">Tenant logo preview</p>
+                        <p className="text-[11px] text-muted-foreground">
+                          {companyLogoUrl
+                            ? "How your company mark appears on tenant-facing outputs (not the platform sidebar logo)."
+                            : "No logo yet — upload a file above, then save company branding."}
+                        </p>
+                        {canEditTenantBranding && companyLogoUrl ? (
+                          <button
+                            type="button"
+                            onClick={() => setCompanyLogoUrl("")}
+                            className="mt-2 text-xs text-rose-600 underline hover:text-rose-700 dark:text-rose-400"
+                          >
+                            Remove logo from form
+                          </button>
+                        ) : null}
                       </div>
-                      <button type="button" onClick={() => setCompanyLogoUrl("")} className="shrink-0 text-xs text-rose-500 underline hover:text-rose-700">Remove</button>
                     </div>
-                  )}
+                  ) : null}
                 </div>
 
                 <button
                   type="submit"
-                  disabled={coreSettingsSaving || coreSettingsLoading}
+                  disabled={coreSettingsSaving || coreSettingsLoading || !canEditTenantBranding}
                   className="inline-flex min-w-[220px] items-center justify-center gap-2 rounded-md bg-violet-600 px-4 py-2 text-sm font-semibold text-white shadow transition hover:bg-violet-700 disabled:opacity-50"
                 >
                   {coreSettingsSaving
                     ? <><Loader2 className="h-4 w-4 animate-spin" />Saving…</>
-                    : <><Save    className="h-4 w-4" />Save White-label Settings</>}
+                    : <><Save className="h-4 w-4" />Save company branding</>}
                 </button>
               </form>
 
@@ -1531,6 +1686,12 @@ export default function SettingsPage() {
 
               {/* ── Connected Stores card ─────────────────────────────────── */}
               <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-5">
+                {!canEditSystemSettings ? (
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/40 dark:text-amber-100">
+                    You do not have permission to edit system settings / stores & adapters.
+                    Allowed roles: <strong>super_admin</strong>, <strong>programmer</strong>, <strong>system_admin</strong>.
+                  </div>
+                ) : null}
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div className="flex items-center gap-3">
                     <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-100 dark:bg-sky-950/50">
@@ -1548,7 +1709,7 @@ export default function SettingsPage() {
                   </div>
 
                   {/* Add New Store — paywall gated */}
-                  {canAddStore ? (
+                  {canAddStore && canEditSystemSettings ? (
                     <button
                       type="button"
                       onClick={openAddStoreModal}
@@ -1561,10 +1722,14 @@ export default function SettingsPage() {
                     <button
                       type="button"
                       disabled
-                      title="Upgrade your plan to connect more stores"
+                      title={
+                        !canEditSystemSettings
+                          ? "Insufficient role for system settings / stores & adapters."
+                          : "Upgrade your plan to connect more stores"
+                      }
                       className="inline-flex shrink-0 cursor-not-allowed items-center gap-2 rounded-xl bg-amber-400 px-4 py-2.5 text-sm font-bold text-amber-950 opacity-95"
                     >
-                      👑 Upgrade to Add Stores
+                      {canEditSystemSettings ? "👑 Upgrade to Add Stores" : "Access required"}
                     </button>
                   )}
                 </div>
@@ -1691,7 +1856,8 @@ export default function SettingsPage() {
                             <button
                               type="button"
                               onClick={() => void openEditStoreModal(s)}
-                              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground transition hover:border-sky-300 hover:text-sky-600"
+                              disabled={!canEditSystemSettings}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1.5 text-[11px] font-semibold text-muted-foreground transition hover:border-sky-300 hover:text-sky-600 disabled:cursor-not-allowed disabled:opacity-40"
                             >
                               <Pencil className="h-3 w-3" />
                               Edit
@@ -1701,8 +1867,8 @@ export default function SettingsPage() {
                             <button
                               type="button"
                               onClick={() => void handleDeleteStore(s)}
-                              disabled={isDeleting}
-                              className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-100 disabled:opacity-50 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
+                              disabled={isDeleting || !canEditSystemSettings}
+                              className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-rose-700/50 dark:bg-rose-950/30 dark:text-rose-400"
                             >
                               {isDeleting
                                 ? <Loader2 className="h-3 w-3 animate-spin" />
@@ -3162,7 +3328,7 @@ export default function SettingsPage() {
                   <p className="text-xs font-semibold text-sky-700 dark:text-sky-300">Role Switching (Dev / Demo)</p>
                   <p className="mt-1 text-xs text-sky-600 dark:text-sky-400">
                     In production, roles are enforced server-side via Supabase RLS policies.
-                    Use the role switcher in the top header to change roles for testing.
+                    Use Technical debug in the sidebar, then open Tech Debug and use Role simulation to test RBAC tiers.
                   </p>
                 </div>
               </div>

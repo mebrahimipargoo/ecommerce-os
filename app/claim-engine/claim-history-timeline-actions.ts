@@ -97,12 +97,12 @@ export async function resolveProfileDisplayName(profileId: string | null | undef
   if (!id || !isUuidString(id)) return "User";
   const { data, error } = await supabaseServer
     .from("profiles")
-    .select("full_name, name")
+    .select("full_name")
     .eq("id", id)
     .maybeSingle();
   if (error || !data) return "User";
-  const row = data as { full_name?: string | null; name?: string | null };
-  const n = (row.full_name ?? row.name ?? "").trim();
+  const row = data as { full_name?: string | null };
+  const n = (row.full_name ?? "").trim();
   return n || "User";
 }
 

@@ -18,16 +18,13 @@ export async function resolveProfileNames(
 
   const { data } = await supabaseServer
     .from("profiles")
-    .select("id, full_name, name")
+    .select("id, full_name")
     .in("id", validIds);
 
   const result: Record<string, string> = {};
   for (const row of data ?? []) {
     const id = String(row.id ?? "").trim();
-    const display = (
-      String(row.full_name ?? "").trim() ||
-      String(row.name ?? "").trim()
-    );
+    const display = String(row.full_name ?? "").trim();
     if (id && display) result[id] = display;
   }
   return result;

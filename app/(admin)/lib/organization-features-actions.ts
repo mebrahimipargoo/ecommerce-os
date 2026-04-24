@@ -21,11 +21,17 @@ async function requireSuperAdmin(
   }
   const { data, error } = await supabaseServer
     .from(DB_TABLES.profiles)
-    .select("role")
+    .select("role, roles:role_id(key, name, scope)")
     .eq("id", id)
     .maybeSingle();
   if (error || !data) return { ok: false, error: "Profile not found." };
-  const role = String((data as { role?: string }).role ?? "").trim();
+  const role = String(
+    (
+      (data as { roles?: { key?: string | null } | null; role?: string | null }).roles?.key
+      ?? (data as { role?: string | null }).role
+      ?? ""
+    ),
+  ).trim();
   if (role !== "super_admin") {
     return { ok: false, error: "Super Admin only." };
   }

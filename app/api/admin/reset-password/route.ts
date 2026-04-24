@@ -5,7 +5,15 @@ import { createServerClient } from "@supabase/ssr";
 
 import { isUuidString } from "@/lib/uuid";
 
-const ALLOWED_RESET_ROLES = new Set(["admin", "super_admin", "system_employee", "tenant_admin"]);
+const ALLOWED_RESET_ROLES = new Set([
+  "tenant_admin",
+  "super_admin",
+  "system_admin",
+  "system_employee",
+  "programmer",
+  "customer_service",
+  "admin",
+]);
 const MIN_PASSWORD_LENGTH = 8;
 
 type ResetPasswordBody = {
@@ -59,7 +67,7 @@ export async function POST(req: NextRequest) {
 
     const { data: actorProfile, error: actorError } = await supabase
       .from("profiles")
-      .select("role")
+      .select("role, roles:role_id(key, name, scope)")
       .eq("id", user.id)
       .maybeSingle();
 
@@ -67,7 +75,15 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: actorError.message }, { status: 500 });
     }
 
-    const actorRole = String(actorProfile?.role ?? "").trim().toLowerCase();
+    const actorRole = String(
+      (
+        (actorProfile as { roles?: { key?: string | null } | null } | null)?.roles?.key
+        ?? actorProfile?.role
+        ?? ""
+      ),
+    )
+      .trim()
+      .toLowerCase();
     if (!ALLOWED_RESET_ROLES.has(actorRole)) {
       return NextResponse.json({ error: "Forbidden." }, { status: 403 });
     }

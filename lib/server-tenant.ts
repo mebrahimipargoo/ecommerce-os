@@ -4,6 +4,18 @@ import { supabaseServer } from "./supabase-server";
 import { getSessionUserIdFromCookies } from "./supabase-server-auth";
 import { resolveOrganizationId } from "./organization";
 import { isUuidString } from "./uuid";
+import { canEditPlatformProductSettings } from "./platform-product-settings-access";
+import {
+  canEditTenantOrganizationBrandingByRoleKey,
+  canPickWorkspaceOrganizationForTenantBranding,
+  normalizeRoleKeyForBranding,
+} from "./tenant-branding-permissions";
+
+function splitJoined<T>(raw: unknown): T | null {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) return (raw[0] as T | undefined) ?? null;
+  return raw as T;
+}
 
 /**
  * Workspace user directory (`public.profiles`).
@@ -14,6 +26,11 @@ export type TenantProfileRow = {
   organization_id: string;
   full_name: string;
   role: string;
+  /**
+   * When `profiles.role_id` joins `roles`, the catalog scope (`system` | `tenant`).
+   * Null if the join did not resolve (legacy rows rely on `role` text only).
+   */
+  role_scope: string | null;
   photo_url: string | null;
   /** Email is stored in auth.users, not profiles — may be absent on legacy rows. */
   email?: string;
@@ -65,7 +82,9 @@ export async function loadTenantProfile(
   if (!id || !isUuidString(id)) return null;
   const { data, error } = await supabaseServer
     .from("profiles")
-    .select("id, organization_id, full_name, name, role, photo_url, team_groups")
+    .select(
+      "id, organization_id, full_name, role, role_id, photo_url, team_groups",
+    )
     .eq("id", id)
     .maybeSingle();
   if (error || !data) return null;
@@ -75,18 +94,80 @@ export async function loadTenantProfile(
   const team_groups: string[] = Array.isArray(rawGroups)
     ? rawGroups.map(String).filter(Boolean)
     : [];
+  const roleIdRaw = row.role_id;
+  const roleId =
+    roleIdRaw != null && isUuidString(String(roleIdRaw))
+      ? String(roleIdRaw).trim()
+      : null;
+  let roleKeyFromCatalog: string | null = null;
+  let roleScopeFromCatalog: string | null = null;
+  if (roleId) {
+    const { data: roleData } = await supabaseServer
+      .from("roles")
+      .select("key, scope")
+      .eq("id", roleId)
+      .maybeSingle();
+    if (roleData) {
+      const roleRow = roleData as Record<string, unknown>;
+      const k = String(roleRow.key ?? "").trim();
+      const s = String(roleRow.scope ?? "").trim();
+      roleKeyFromCatalog = k || null;
+      roleScopeFromCatalog = s || null;
+    }
+  }
+  const scopeRaw = roleScopeFromCatalog;
+  const role_scope =
+    scopeRaw != null && String(scopeRaw).trim() ? String(scopeRaw).trim() : null;
   return {
     id: String(row.id),
     organization_id: typeof oid === "string" && oid.trim() ? oid : "",
-    full_name: String(row.full_name ?? row.name ?? "").trim(),
-    role: String(row.role ?? "operator"),
+    full_name: String(row.full_name ?? "").trim(),
+    role: String(roleKeyFromCatalog ?? row.role ?? "operator").trim(),
+    role_scope,
     photo_url: row.photo_url != null ? String(row.photo_url) : null,
     team_groups,
   };
 }
 
+/**
+ * Resolves actor profile for permission checks.
+ * Prefers authenticated server session user id, then falls back to caller-provided profile id.
+ */
+export async function loadActorTenantProfile(
+  actorProfileId: string | null | undefined,
+): Promise<TenantProfileRow | null> {
+  try {
+    const sessionUserId = await getSessionUserIdFromCookies();
+    if (sessionUserId && isUuidString(sessionUserId)) {
+      const sessionProfile = await loadTenantProfile(sessionUserId);
+      if (sessionProfile) return sessionProfile;
+    }
+  } catch {
+    // Cookies may be unavailable in some server execution contexts; fallback below.
+  }
+  return loadTenantProfile(actorProfileId);
+}
+
+/**
+ * True when the profile may edit tenant company name / logo on `organization_settings`.
+ * Uses canonical role keys (see `canEditTenantOrganizationBrandingByRoleKey`).
+ */
+export function canEditTenantOrganizationBranding(profile: TenantProfileRow | null): boolean {
+  if (!profile) return false;
+  return canEditTenantOrganizationBrandingByRoleKey(profile.role);
+}
+
+/**
+ * True when the profile may edit `public.platform_settings` (platform product branding).
+ * Canonical role: `super_admin` (matches platform settings server actions).
+ */
+export function canManagePlatformSettings(profile: TenantProfileRow | null): boolean {
+  if (!profile) return false;
+  return canEditPlatformProductSettings(profile.role);
+}
+
 export function isSuperAdminRole(role: string | null | undefined): boolean {
-  return (role ?? "").trim() === "super_admin";
+  return normalizeRoleKeyForBranding(role) === "super_admin";
 }
 
 /**
@@ -137,7 +218,7 @@ export async function resolveWriteOrganizationId(
   // 1. Resolve via explicitly-passed profile id.
   const profile = await loadTenantProfile(actorProfileId);
   if (profile) {
-    if (isSuperAdminRole(profile.role)) {
+    if (canPickWorkspaceOrganizationForTenantBranding(profile.role)) {
       return reqOk ?? profile.organization_id;
     }
     return profile.organization_id;
@@ -151,7 +232,7 @@ export async function resolveWriteOrganizationId(
     if (sessionUserId) {
       const sessionProfile = await loadTenantProfile(sessionUserId);
       if (sessionProfile) {
-        if (isSuperAdminRole(sessionProfile.role)) {
+        if (canPickWorkspaceOrganizationForTenantBranding(sessionProfile.role)) {
           return reqOk ?? sessionProfile.organization_id;
         }
         return sessionProfile.organization_id;

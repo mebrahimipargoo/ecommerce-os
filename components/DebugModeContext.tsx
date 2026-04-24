@@ -3,8 +3,8 @@
 /**
  * DebugModeContext — master debug toggle + granular developer flags.
  *
- * Master `debugMode` uses useSyncExternalStore for cross-tab sync.
- * Granular flags use useState + useEffect (localStorage after mount) for SSR safety.
+ * Master `debugMode` is false until mount, then synced from localStorage + store events
+ * (avoids SSR/client hydration mismatch). Granular flags use useState + useEffect.
  * Server persistence for master toggle: saveOrganizationDebugMode.
  */
 
@@ -15,7 +15,6 @@ import React, {
   useEffect,
   useMemo,
   useState,
-  useSyncExternalStore,
 } from "react";
 import { saveOrganizationDebugMode } from "../app/settings/debug-mode-actions";
 
@@ -62,12 +61,21 @@ export type DebugModeContextValue = {
 const DebugModeContext = createContext<DebugModeContextValue | null>(null);
 
 export function DebugModeProvider({ children }: { children: React.ReactNode }) {
-  const debugMode = useSyncExternalStore(
-    subscribeDebugStore,
-    readDebugSnapshot,
-    readDebugSnapshot,
-  );
+  /**
+   * Master toggle is read from localStorage only after mount so the first
+   * client render matches the server (false). Using useSyncExternalStore with
+   * readDebugSnapshot as getServerSnapshot still compared getSnapshot() during
+   * hydration; when localStorage was "1", that mismatched SSR and broke the
+   * header (e.g. TopHeader role badge vs ThemeToggle subtree).
+   */
+  const [debugMode, setDebugModeState] = useState(false);
   const loaded = true;
+
+  useEffect(() => {
+    const sync = () => setDebugModeState(readDebugSnapshot());
+    sync();
+    return subscribeDebugStore(sync);
+  }, []);
 
   const [showDbTableNames, setShowDbTableNamesState] = useState(false);
   const [showApiLogs, setShowApiLogsState] = useState(false);

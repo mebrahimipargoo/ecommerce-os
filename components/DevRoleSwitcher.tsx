@@ -1,13 +1,12 @@
 "use client";
 
 /**
- * DevRoleSwitcher — always-visible colour-coded role <select> for dev/testing.
+ * DevRoleSwitcher — colour-coded role <select> for QA / permission testing.
  *
  * Selecting a role automatically enables Debug Mode so the permission system
  * reacts immediately — no manual toggle required.
  *
- * Usage:
- *   <DevRoleSwitcher />   ← place inside TopHeader or any nav bar
+ * Intended for the Tech Debug panel (not the production header).
  */
 
 import React from "react";
@@ -57,19 +56,16 @@ export function DevRoleSwitcher() {
 
   return (
     <label
-      className="flex items-center gap-1.5"
-      title="[DEV] Switch mock role — changes sidebar & permissions instantly"
+      className="flex min-w-0 flex-1 flex-col gap-1"
+      title="Switch mock role — changes sidebar and permissions instantly"
     >
-      {/* DEV pill */}
-      <span className="hidden rounded-full border border-orange-300 bg-orange-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-orange-700 dark:border-orange-600/60 dark:bg-orange-950/40 dark:text-orange-300 sm:inline">
-        DEV
-      </span>
+      <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Mock role tier</span>
       <select
         value={role}
         onChange={handleChange}
         aria-label="Dev: switch mock role"
         className={[
-          "h-9 cursor-pointer rounded-lg border px-2 text-xs font-semibold",
+          "h-9 w-full min-w-0 cursor-pointer rounded-lg border px-2 text-xs font-semibold",
           "outline-none transition hover:opacity-90",
           ROLE_CLS[role],
         ].join(" ")}

@@ -49,7 +49,8 @@ export async function getWorkspaceSettings(): Promise<WorkspaceSettings> {
 
 /**
  * Returns the core_settings (white-label / tenant branding). Always succeeds.
- * Pass `companyId` to resolve the logo for that tenant (sidebar multi-tenant branding).
+ * Pass `companyId` to resolve the logo/label for that tenant org (Settings UI, BrandingContext).
+ * Not used for app-shell platform branding (see `public.platform_settings` / `PlatformBrandingContext`).
  */
 export async function getCoreSettings(companyId?: string): Promise<CoreSettings> {
   const ws = await getWorkspaceSettings();

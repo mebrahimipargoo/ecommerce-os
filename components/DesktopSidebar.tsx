@@ -43,7 +43,7 @@ export function DesktopSidebar() {
           <span className="text-sm font-bold text-sky-500">OS</span>
         </div>
         <div>
-          <p className="text-sm font-bold text-slate-900 dark:text-white">E-commerce OS</p>
+          <p className="text-sm font-bold text-slate-900 dark:text-white">Workspace</p>
           <p className="text-[10px] text-slate-400">Returns ERP</p>
         </div>
       </div>
