@@ -82,6 +82,8 @@ export default function PlatformUsersPage() {
   const [tab, setTab] = useState<TabKey>("platform");
   const [searchQuery, setSearchQuery] = useState("");
   const [roleFilter, setRoleFilter] = useState("");
+  /** Tenant tab only: filter by `profiles.organization_id`. */
+  const [tenantCompanyFilter, setTenantCompanyFilter] = useState("");
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<ProfileRow | null>(null);
@@ -197,6 +199,25 @@ export default function PlatformUsersPage() {
     }
   }, [tab, roleFilter, roleFilterOptions]);
 
+  const tenantCompanyFilterOptions = React.useMemo(() => {
+    return companies
+      .filter((c) => (c.organization_type ?? "tenant") === "tenant")
+      .slice()
+      .sort((a, b) => a.display_name.localeCompare(b.display_name));
+  }, [companies]);
+
+  useEffect(() => {
+    if (tab !== "all") setTenantCompanyFilter("");
+  }, [tab]);
+
+  useEffect(() => {
+    const id = tenantCompanyFilter.trim();
+    if (!id) return;
+    if (!tenantCompanyFilterOptions.some((c) => c.id === id)) {
+      setTenantCompanyFilter("");
+    }
+  }, [tenantCompanyFilter, tenantCompanyFilterOptions]);
+
   const visibleRows = React.useMemo(() => {
     const base =
       tab === "platform"
@@ -204,7 +225,9 @@ export default function PlatformUsersPage() {
         : rows.filter((r) => r.organization_type === "tenant");
     const q = searchQuery.trim().toLowerCase();
     const rf = roleFilter.trim().toLowerCase();
+    const orgIdFilter = tenantCompanyFilter.trim();
     return base.filter((r) => {
+      if (orgIdFilter && (r.organization_id ?? "").trim() !== orgIdFilter) return false;
       if (rf && (r.role ?? "").trim().toLowerCase() !== rf) return false;
       if (!q) return true;
       const name = (r.full_name ?? "").toLowerCase();
@@ -212,7 +235,7 @@ export default function PlatformUsersPage() {
       const co = (r.company_name ?? "").toLowerCase();
       return name.includes(q) || em.includes(q) || co.includes(q);
     });
-  }, [rows, tab, searchQuery, roleFilter]);
+  }, [rows, tab, searchQuery, roleFilter, tenantCompanyFilter]);
 
   function companyOptionsForEdit(row: ProfileRow | null): CompanyOption[] {
     if (!row?.organization_id) return companies;
@@ -660,6 +683,24 @@ export default function PlatformUsersPage() {
             ))}
           </select>
         </div>
+        {tab === "all" ? (
+          <div className="w-full min-w-[200px] sm:w-56">
+            <label className={LABEL} htmlFor="platform-user-tenant-org">Organization</label>
+            <select
+              id="platform-user-tenant-org"
+              className={INPUT}
+              value={tenantCompanyFilter}
+              onChange={(e) => setTenantCompanyFilter(e.target.value)}
+            >
+              <option value="">All organizations</option>
+              {tenantCompanyFilterOptions.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.display_name}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : null}
       </div>
 
       <div className="rounded-xl border border-border bg-card shadow-sm">
