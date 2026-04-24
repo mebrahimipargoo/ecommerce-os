@@ -206,6 +206,14 @@ export function canShowInternalDevBadge(canonicalRoleKey: string | null | undefi
   return INTERNAL_DEV_BADGE_ROLE_KEYS.has(k);
 }
 
+/**
+ * Signed-in account only (not “view as”): show persistent Dev shell indicator for these catalog keys.
+ */
+export function shouldShowActorDevShellBadge(actorCanonicalRoleKey: string | null | undefined): boolean {
+  const k = normalizeRoleKeyForBranding(actorCanonicalRoleKey);
+  return k === "super_admin" || k === "programmer";
+}
+
 function normalizeRole(raw: string | null | undefined): UserRole {
   return canonicalRoleKeyToTier(raw);
 }

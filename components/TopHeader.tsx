@@ -4,7 +4,8 @@
  * Global top bar — search, notifications, theme, and profile menu.
  *
  * Role / RBAC label is not shown here (avoid duplication); it lives on `/profile` only.
- * DEV badge gating unchanged (`debugMode` + internal catalog keys).
+ * Dev badge: always for signed-in `super_admin` / `programmer`; also when Technical debug is on
+ * for other internal catalog keys (see {@link canShowInternalDevBadge}).
  *
  * Tenant context: the workspace strip uses `UserRoleContext.organizationName` plus
  * `BrandingContext.logoUrl` (tenant mark from `organization_settings.logo_url`) when set;
@@ -25,7 +26,11 @@ import { useRouter } from "next/navigation";
 import { ThemeToggle } from "./ThemeToggle";
 import { useGlobalSearch } from "./GlobalSearchContext";
 import { useDebugMode } from "./DebugModeContext";
-import { useUserRole, canShowInternalDevBadge } from "./UserRoleContext";
+import {
+  useUserRole,
+  canShowInternalDevBadge,
+  shouldShowActorDevShellBadge,
+} from "./UserRoleContext";
 import { useBranding } from "./BrandingContext";
 import { useRbacPermissions } from "../hooks/useRbacPermissions";
 import { supabase } from "@/src/lib/supabase";
@@ -104,6 +109,7 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
     isViewingAsAnotherUser,
     viewAsDisplayName,
     actorUserId,
+    actorCanonicalRoleKey,
   } = useUserRole();
   const { logoUrl: tenantLogoUrl } = useBranding();
   const perms = useRbacPermissions();
@@ -112,7 +118,9 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
   const profileMenuRef = React.useRef<HTMLDivElement>(null);
 
   const profileInitial = actorName.trim().charAt(0).toUpperCase() || "U";
-  const showDevBadge = debugMode && canShowInternalDevBadge(canonicalRoleKey);
+  const showDevBadge =
+    shouldShowActorDevShellBadge(actorCanonicalRoleKey)
+    || (debugMode && canShowInternalDevBadge(canonicalRoleKey));
 
   React.useEffect(() => {
     if (!profileMenuOpen) return;
@@ -271,10 +279,14 @@ export function TopHeader({ onMenuClick }: { onMenuClick: () => void }) {
 
         {showDevBadge ? (
           <span
-            className="hidden rounded-full border border-orange-300 bg-orange-50 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-orange-700 dark:border-orange-600/60 dark:bg-orange-950/40 dark:text-orange-300 sm:inline"
-            title="Technical debug mode is on"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-orange-300 bg-orange-50 text-[9px] font-bold leading-none tracking-tight text-orange-700 dark:border-orange-600/60 dark:bg-orange-950/40 dark:text-orange-300"
+            title={
+              shouldShowActorDevShellBadge(actorCanonicalRoleKey)
+                ? "Developer / platform account"
+                : "Technical debug mode is on"
+            }
           >
-            DEV
+            Dev
           </span>
         ) : null}
 
