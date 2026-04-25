@@ -152,13 +152,36 @@ export async function listRawReportUploads(input?: {
   organizationId?: string | null;
   actorUserId?: string | null;
 }): Promise<{ ok: true; rows: RawReportUploadRow[] } | { ok: false; error: string }> {
-  // Always resolve org from the actor's profile (or cookie) — never from storeId.
-  // Passing storeId as the requested org would give a different orgId for super_admins
-  // than what was used during insert, causing the Ghost History bug.
   const actorId = await resolveActorForImportAction(input?.actorUserId);
-  const orgId = await resolveWriteOrganizationId(actorId, null);
 
-  console.info("[listRawReportUploads] org:", orgId, "| actor:", actorId, "| passed actorUserId:", input?.actorUserId ?? "(none)");
+  // Validate the requested organizationId is actually an `organizations.id`
+  // (not a `stores.id`) before forwarding to the resolver. This preserves the
+  // Ghost History fix — historically the UI sometimes passed a storeId, which
+  // would mask the actor's home org for super_admins. `resolveWriteOrganizationId`
+  // already gates the override to roles that may pick a workspace org.
+  const requestedRaw = (input?.organizationId ?? "").trim();
+  let requestedOrgId: string | null = null;
+  if (isUuidString(requestedRaw)) {
+    const { data: orgRow } = await supabaseServer
+      .from("organizations")
+      .select("id")
+      .eq("id", requestedRaw)
+      .maybeSingle();
+    if (orgRow?.id) requestedOrgId = String(orgRow.id);
+  }
+
+  const orgId = await resolveWriteOrganizationId(actorId, requestedOrgId);
+
+  console.info(
+    "[listRawReportUploads] org:",
+    orgId,
+    "| actor:",
+    actorId,
+    "| requested:",
+    requestedOrgId ?? "(none)",
+    "| passed actorUserId:",
+    input?.actorUserId ?? "(none)",
+  );
 
   if (!isUuidString(orgId)) {
     return { ok: false, error: "Could not resolve organization — please sign in again." };
