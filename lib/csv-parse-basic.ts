@@ -117,6 +117,7 @@ const HEADER_KEYWORD_SET = new Set([
   "date", "event date", "snapshot date", "posted date", "date time", "date/time",
   "time", "currency", "status", "type", "marketplace", "condition",
   "title", "description", "quantity", "price", "amount", "total",
+  "seller sku", "product name", "vendor", "upc", "mfg #", "mfg",
   // FBA Returns
   "license plate number", "return reason code", "detailed disposition",
   // Removal Orders

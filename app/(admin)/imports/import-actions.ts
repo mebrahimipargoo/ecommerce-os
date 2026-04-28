@@ -24,6 +24,24 @@ import { DB_TABLES, RAW_REPORTS_BUCKET, RAW_REPORT_UPLOADS_SELECT } from "../lib
  * (or restart the Supabase API / project.)
  */
 
+/**
+ * Returns the `stores.organization_id` for a UUID, or `null` if not found.
+ * Used to derive the tenant scope for an import from the user-selected target store
+ * (so super_admins do not accidentally write under the platform/parent org).
+ */
+async function lookupStoreOrganizationId(storeId: string | null | undefined): Promise<string | null> {
+  const id = (storeId ?? "").trim();
+  if (!id || !isUuidString(id)) return null;
+  const { data, error } = await supabaseServer
+    .from(DB_TABLES.stores)
+    .select("organization_id")
+    .eq("id", id)
+    .maybeSingle();
+  if (error || !data) return null;
+  const oid = String((data as { organization_id?: unknown }).organization_id ?? "").trim();
+  return isUuidString(oid) ? oid : null;
+}
+
 function serializeColumnMappingJson(
   m: Record<string, string> | null | undefined,
 ): Record<string, string> | null {
@@ -117,6 +135,243 @@ async function audit(
     entity_id: entityId,
     detail: detail ?? null,
   });
+}
+
+/**
+ * Statuses that count as "still active" for duplicate-detection purposes.
+ * `failed` and `superseded` are intentionally excluded so the user can re-upload
+ * after fixing a bad import without being blocked, and so superseded duplicates
+ * stay invisible to the duplicate guard.
+ */
+const PRODUCT_IDENTITY_ACTIVE_STATUSES: readonly string[] = [
+  "uploading",
+  "pending",
+  "ready",
+  "uploaded",
+  "mapped",
+  "needs_mapping",
+  "processing",
+  "staged",
+  "synced",
+  "complete",
+];
+
+/** Snapshot of an existing Product Identity upload returned to the UI. */
+export type ExistingProductIdentityUpload = {
+  upload_id: string;
+  organization_id: string;
+  store_id: string | null;
+  status: string;
+  file_name: string;
+  content_sha256: string;
+  created_at: string;
+  updated_at: string;
+};
+
+/**
+ * Looks for an existing Product Identity upload that already covers the same
+ * (organization_id, store_id, content_sha256). Used by the UI as a preflight
+ * check before creating a new upload session and by `createRawReportUploadSession`
+ * as a server-side defense-in-depth guard.
+ *
+ * Only "active" statuses are considered (see PRODUCT_IDENTITY_ACTIVE_STATUSES) —
+ * failed or superseded prior attempts do not block a new upload.
+ */
+export async function findActiveProductIdentityImport(input: {
+  organizationId?: string | null;
+  storeId: string;
+  contentSha256: string;
+  actorUserId?: string | null;
+}): Promise<
+  | { ok: true; existing: ExistingProductIdentityUpload | null }
+  | { ok: false; error: string }
+> {
+  const userId = await resolveActorForImportAction(input.actorUserId);
+  const storeId = input.storeId?.trim() ?? "";
+  if (!isUuidString(storeId)) return { ok: false, error: "Invalid store id." };
+  const sha = input.contentSha256?.trim().toLowerCase() ?? "";
+  if (!/^[a-f0-9]{64}$/.test(sha)) {
+    return { ok: false, error: "Invalid content SHA-256 (must be 64 lowercase hex chars)." };
+  }
+
+  // Resolve org with the same store-aware priority used by createRawReportUploadSession,
+  // so the UI preflight always queries the same scope the server will write under.
+  const storeOwnerOrg = await lookupStoreOrganizationId(storeId);
+  const orgId = await resolveWriteOrganizationId(
+    userId,
+    (input.organizationId?.trim() || null) ?? storeOwnerOrg,
+  );
+  if (!isUuidString(orgId)) return { ok: false, error: "Invalid tenant scope." };
+
+  try {
+    const { data, error } = await supabaseServer
+      .from(DB_TABLES.rawReportUploads)
+      .select("id, organization_id, status, file_name, metadata, created_at, updated_at")
+      .eq("organization_id", orgId)
+      .eq("report_type", "PRODUCT_IDENTITY")
+      .in("status", PRODUCT_IDENTITY_ACTIVE_STATUSES)
+      .contains("metadata", { content_sha256: sha, import_store_id: storeId })
+      .order("created_at", { ascending: false })
+      .limit(1);
+
+    if (error) return { ok: false, error: error.message };
+
+    const row = (data ?? [])[0] as
+      | (Record<string, unknown> & { metadata?: Record<string, unknown> | null })
+      | undefined;
+    if (!row) return { ok: true, existing: null };
+
+    const meta = (row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata))
+      ? (row.metadata as Record<string, unknown>)
+      : {};
+    const importStoreId =
+      typeof meta.import_store_id === "string" && isUuidString(meta.import_store_id)
+        ? meta.import_store_id
+        : typeof meta.ledger_store_id === "string" && isUuidString(meta.ledger_store_id)
+          ? meta.ledger_store_id
+          : null;
+
+    return {
+      ok: true,
+      existing: {
+        upload_id: String(row.id),
+        organization_id: String(row.organization_id ?? ""),
+        store_id: importStoreId,
+        status: String(row.status ?? ""),
+        file_name: String(row.file_name ?? ""),
+        content_sha256: sha,
+        created_at: String(row.created_at ?? ""),
+        updated_at: String(row.updated_at ?? ""),
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Duplicate lookup failed." };
+  }
+}
+
+/**
+ * Mark a Product Identity upload as `superseded` and remove the rows it
+ * personally wrote so a re-import of the same file can run cleanly.
+ *
+ * Scope of cleanup (intentionally narrow):
+ *   * `product_identifier_map` — only rows tagged with `source_upload_id` of
+ *     the superseded upload AND `source_report_type` in the Product Identity
+ *     family. All Listings / inventory ledger bridge rows are NEVER touched.
+ *   * `catalog_products`        — only rows tagged with `source_upload_id` of
+ *     the superseded upload AND `source_report_type` in the Product Identity
+ *     family. Existing All Listings catalog rows survive.
+ *   * `catalog_identity_unresolved_backlog` — same source_upload_id scope.
+ *   * `products` — left alone. The replacement import will upsert by
+ *     (organization_id, store_id, sku) and the priority-aware merge
+ *     guarantees no field downgrade.
+ *   * `raw_report_uploads.status` flips to `superseded` and metadata records
+ *     `superseded_at` / `superseded_by`.
+ *
+ * Note: storage objects from the superseded upload remain on disk — they are
+ * tied to the row id and are also reused if the replacement upload uses the
+ * same storage_prefix. Use `deleteRawReportUpload` if you want a hard delete.
+ */
+export async function supersedeProductIdentityImport(input: {
+  uploadId: string;
+  replacementUploadId?: string | null;
+  actorUserId?: string | null;
+}): Promise<
+  | {
+      ok: true;
+      supersededUploadId: string;
+      removedIdentifierMapRows: number;
+      removedCatalogProductRows: number;
+      removedBacklogRows: number;
+    }
+  | { ok: false; error: string }
+> {
+  const userId = await resolveActorForImportAction(input.actorUserId);
+  const uploadId = input.uploadId?.trim() ?? "";
+  if (!isUuidString(uploadId)) return { ok: false, error: "Invalid upload id." };
+
+  const { data: row, error: fetchErr } = await supabaseServer
+    .from(DB_TABLES.rawReportUploads)
+    .select("id, organization_id, report_type, status, metadata")
+    .eq("id", uploadId)
+    .maybeSingle();
+
+  if (fetchErr || !row) return { ok: false, error: fetchErr?.message ?? "Upload not found." };
+  const orgId = String((row as { organization_id?: unknown }).organization_id ?? "").trim();
+  if (!isUuidString(orgId)) return { ok: false, error: "Upload row has invalid organization_id." };
+
+  const reportType = String((row as { report_type?: unknown }).report_type ?? "");
+  if (reportType !== "PRODUCT_IDENTITY") {
+    return {
+      ok: false,
+      error: `Refusing to supersede a non-Product-Identity upload (report_type=${reportType}).`,
+    };
+  }
+
+  const replacementUploadId = input.replacementUploadId?.trim();
+  const replacementOk = replacementUploadId && isUuidString(replacementUploadId)
+    ? replacementUploadId
+    : null;
+
+  const productIdentitySources = ["PRODUCT_IDENTITY_IMPORT", "PRODUCT_IDENTITY"] as const;
+
+  // ── Scoped DELETEs (no destructive cross-tenant queries) ───────────────
+  const idMapDel = await supabaseServer
+    .from("product_identifier_map")
+    .delete()
+    .eq("organization_id", orgId)
+    .eq("source_upload_id", uploadId)
+    .in("source_report_type", productIdentitySources)
+    .select("id");
+  if (idMapDel.error) return { ok: false, error: idMapDel.error.message };
+
+  const catalogDel = await supabaseServer
+    .from("catalog_products")
+    .delete()
+    .eq("organization_id", orgId)
+    .eq("source_upload_id", uploadId)
+    .in("source_report_type", productIdentitySources)
+    .select("id");
+  if (catalogDel.error) return { ok: false, error: catalogDel.error.message };
+
+  const backlogDel = await supabaseServer
+    .from("catalog_identity_unresolved_backlog")
+    .delete()
+    .eq("organization_id", orgId)
+    .eq("source_upload_id", uploadId)
+    .in("source_report_type", productIdentitySources)
+    .select("id");
+  if (backlogDel.error) return { ok: false, error: backlogDel.error.message };
+
+  // ── Mark the upload row superseded (status + metadata audit trail) ────
+  const now = new Date().toISOString();
+  const supersedeMetaPatch: Record<string, unknown> = {
+    superseded_at: now,
+    error_message: "",
+  };
+  if (replacementOk) supersedeMetaPatch.superseded_by_upload_id = replacementOk;
+
+  const merged = mergeUploadMetadata((row as { metadata?: unknown }).metadata, supersedeMetaPatch);
+  const { error: upErr } = await supabaseServer
+    .from(DB_TABLES.rawReportUploads)
+    .update({ status: "superseded", metadata: merged, updated_at: now })
+    .eq("id", uploadId)
+    .eq("organization_id", orgId);
+  if (upErr) return { ok: false, error: upErr.message };
+
+  await audit(orgId, userId, "import.product_identity.superseded", uploadId, {
+    removedIdentifierMapRows: idMapDel.data?.length ?? 0,
+    removedCatalogProductRows: catalogDel.data?.length ?? 0,
+    removedBacklogRows: backlogDel.data?.length ?? 0,
+    replacement_upload_id: replacementOk,
+  });
+
+  return {
+    ok: true,
+    supersededUploadId: uploadId,
+    removedIdentifierMapRows: idMapDel.data?.length ?? 0,
+    removedCatalogProductRows: catalogDel.data?.length ?? 0,
+    removedBacklogRows: backlogDel.data?.length ?? 0,
+  };
 }
 
 /** True if any prior upload in this org has the same content fingerprint in `metadata.md5_hash`. */
@@ -331,12 +586,20 @@ export async function listRawReportUploads(input?: {
         }
       }
 
-      const { data: authData, error: authErr } =
-        await supabaseServer.auth.admin.listUsers({ perPage: 1000 });
+      // Prefer per-upload `getUserById` over `listUsers(1000)`: polling History calls this
+      // every few seconds; bulk listUsers taxed Auth APIs and triggered timeouts/non-JSON
+      // responses that surfaced as fetchServerAction "unexpected response".
       const emailById = new Map<string, string>();
-      if (!authErr && authData?.users) {
-        for (const u of authData.users) {
-          emailById.set(u.id, u.email ?? "");
+      for (const uid of uploaderIds) {
+        try {
+          const { data: udat, error: uidErr } =
+            await supabaseServer.auth.admin.getUserById(uid);
+          if (!uidErr && udat?.user?.email) {
+            const em = String(udat.user.email).trim();
+            if (em) emailById.set(uid, em);
+          }
+        } catch {
+          /* Auth edge cases — rely on profile full_name below */
         }
       }
       for (const row of rows) {
@@ -378,15 +641,79 @@ export async function createRawReportUploadSession(input: {
   initialStatus?: "uploading" | "pending";
   actorUserId?: string | null;
   /**
-   * Explicit tenant scope (e.g. the "Target store" the user selected in the UI).
+   * Explicit tenant scope (e.g. the page-level "Organization scope" the user selected in the UI).
    * Super-admins may pass any org UUID; regular admins are scoped to their own org.
    */
   organizationId?: string | null;
+  /**
+   * Target store the row will be associated with (`stores.id`). Persisted into
+   * `metadata.import_store_id` / `metadata.ledger_store_id` so the entire pipeline
+   * (raw_report_uploads → process → sync → products / catalog_products /
+   * product_identifier_map) carries the same tenant + store scope.
+   *
+   * SAFETY: when provided, the server treats `stores.organization_id` as the
+   * preferred tenant scope (super_admins may still override via `organizationId`),
+   * and **rejects** the insert when the resolved org does not own the store.
+   * This is what stops Product Identity rows from being written under the
+   * parent/platform organization.
+   */
+  storeId?: string | null;
+  /**
+   * Product Identity idempotency guard.
+   *
+   * Default `false`: if an active (non-failed, non-superseded) Product Identity
+   * upload already exists for the same (organization_id, store_id, content_sha256),
+   * the insert is refused with a structured error so the UI can prompt the user.
+   *
+   * Set to `true` AFTER calling `supersedeProductIdentityImport(...)` on the
+   * existing duplicate — this records that the caller already replaced the prior
+   * row and is allowed to create a fresh one.
+   */
+  supersedeExistingDuplicate?: boolean | null;
 }): Promise<
-  { ok: true; id: string; storagePrefix: string } | { ok: false; error: string }
+  | { ok: true; id: string; storagePrefix: string }
+  | {
+      ok: false;
+      error: string;
+      /** Set when refusal was specifically the Product Identity duplicate guard. */
+      duplicate?: ExistingProductIdentityUpload | null;
+    }
 > {
   const userId = await resolveActorForImportAction(input.actorUserId);
-  const orgId = await resolveWriteOrganizationId(userId, input.organizationId?.trim() ?? null);
+  const requestedOrg = input.organizationId?.trim() ?? null;
+  const storeOwnerOrg = await lookupStoreOrganizationId(input.storeId);
+
+  // Tenant resolution priority for imports:
+  //   1. UI-supplied `organizationId` (super_admin scope picker)
+  //   2. The owner org of the selected target store (`stores.organization_id`)
+  //   3. The actor's profile org (legacy single-tenant fallback)
+  // We never silently default to the parent/platform org for super_admins —
+  // either the picker or the store's own organization wins.
+  const preferred = requestedOrg ?? storeOwnerOrg ?? null;
+  const orgId = await resolveWriteOrganizationId(userId, preferred);
+
+  // Hard guard: when a store is specified, it MUST belong to the resolved org.
+  // Without this, a super_admin whose profile lives in the platform/parent org
+  // could create import rows under the parent while selecting a tenant store —
+  // the exact bug that shipped Product Identity rows under the wrong org.
+  const storeIdRaw = input.storeId?.trim() ?? "";
+  if (storeIdRaw) {
+    if (!isUuidString(storeIdRaw)) {
+      return { ok: false, error: "Invalid store id." };
+    }
+    if (!storeOwnerOrg) {
+      return { ok: false, error: "Selected target store does not exist." };
+    }
+    if (storeOwnerOrg !== orgId) {
+      return {
+        ok: false,
+        error:
+          "Selected target store belongs to a different organization than the import scope. " +
+          "Pick a store that belongs to the selected organization (or change the organization scope).",
+      };
+    }
+  }
+
   const storagePrefix = `${orgId}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
   /** Plain JSON object for `column_mapping` JSONB (PostgREST). */
@@ -408,6 +735,36 @@ export async function createRawReportUploadSession(input: {
       ? input.contentSha256.trim().toLowerCase()
       : undefined;
 
+  // ── Product Identity idempotency guard (defense-in-depth) ───────────────
+  // The UI runs the same check up-front and prompts the user to Replace; this
+  // server-side check exists so a stale/buggy client cannot still create a
+  // second active session for the same (org, store, content_sha256). Other
+  // report types (FBA Returns, Removals, listings, etc.) keep their existing
+  // behavior because their idempotency is enforced at sync time via
+  // `(organization_id, source_file_sha256, source_physical_row_number)`.
+  if (
+    input.reportType === "PRODUCT_IDENTITY" &&
+    sha &&
+    storeIdRaw &&
+    !input.supersedeExistingDuplicate
+  ) {
+    const dup = await findActiveProductIdentityImport({
+      organizationId: orgId,
+      storeId: storeIdRaw,
+      contentSha256: sha,
+      actorUserId: userId,
+    });
+    if (dup.ok && dup.existing) {
+      return {
+        ok: false,
+        error:
+          "This file was already imported for this store and is still active. " +
+          "Replace the previous import to re-upload, or pick a different file.",
+        duplicate: dup.existing,
+      };
+    }
+  }
+
   const metadata = mergeUploadMetadata(null, {
     total_bytes: input.totalBytes,
     storage_prefix: storagePrefix,
@@ -422,6 +779,12 @@ export async function createRawReportUploadSession(input: {
     upload_chunks_count: input.uploadChunksCount,
     ...(input.csvHeaders && input.csvHeaders.length > 0
       ? { csv_headers: input.csvHeaders }
+      : {}),
+    // Lock the tenant + store pair into metadata at create-time so every
+    // downstream phase (process / sync / generic) reads the same scope even
+    // if the user navigates away before classification finishes.
+    ...(storeIdRaw && isUuidString(storeIdRaw)
+      ? { ledger_store_id: storeIdRaw, import_store_id: storeIdRaw }
       : {}),
   });
 
@@ -542,6 +905,22 @@ export async function updateUploadSessionClassification(input: {
     metaPatch.upload_chunks_count = 1;
   }
   if (input.storeId && isUuidString(input.storeId)) {
+    // Defense-in-depth: if classification ever tries to associate the upload
+    // with a store that lives in a different organization than the upload row,
+    // refuse the patch. Stops cross-tenant store_id from leaking via the
+    // classification step (the only other code path that writes import_store_id).
+    const storeOwnerOrg = await lookupStoreOrganizationId(input.storeId);
+    if (!storeOwnerOrg) {
+      return { ok: false, error: "Selected target store does not exist." };
+    }
+    if (storeOwnerOrg !== orgId) {
+      return {
+        ok: false,
+        error:
+          "Selected target store belongs to a different organization than this upload. " +
+          "Re-select a store from the upload's organization.",
+      };
+    }
     metaPatch.ledger_store_id = input.storeId;
     metaPatch.import_store_id = input.storeId;
   }
@@ -611,12 +990,25 @@ export async function createAmazonLedgerUploadSession(input: {
   store_id?: string | null;
 }): Promise<{ ok: true; id: string } | { ok: false; error: string }> {
   const userId = await resolveActorForImportAction(input.actorUserId);
+  const sid = input.store_id?.trim() ?? "";
+  const storeOwnerOrg = await lookupStoreOrganizationId(sid);
   const requested =
     (input.organization_id ?? input.requestedOrganizationId)?.trim() ?? null;
-  const orgId = await resolveWriteOrganizationId(userId, requested);
+  // Same priority as createRawReportUploadSession: explicit picker → store owner → actor.
+  const orgId = await resolveWriteOrganizationId(userId, requested ?? storeOwnerOrg);
   if (!isUuidString(orgId)) return { ok: false, error: "Invalid tenant scope." };
 
-  const sid = input.store_id?.trim() ?? "";
+  if (sid) {
+    if (!isUuidString(sid)) return { ok: false, error: "Invalid store id." };
+    if (!storeOwnerOrg) return { ok: false, error: "Selected target store does not exist." };
+    if (storeOwnerOrg !== orgId) {
+      return {
+        ok: false,
+        error:
+          "Selected target store belongs to a different organization than the import scope.",
+      };
+    }
+  }
   const metadata = mergeUploadMetadata(null, {
     total_bytes: input.fileSizeBytes,
     upload_progress: 0,

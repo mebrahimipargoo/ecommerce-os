@@ -81,6 +81,16 @@ const REPORTS_REPOSITORY_FALLBACK_ALIASES: Record<string, string[]> = {
   total_amount:      ["total", "Total", "total-amount", "total amount"],
 };
 
+const PRODUCT_IDENTITY_FALLBACK_ALIASES: Record<string, string[]> = {
+  seller_sku:      ["Seller SKU", "seller-sku", "seller sku", "sku", "MSKU", "msku"],
+  product_name:    ["Product Name", "product-name", "item-name", "item name", "title", "description"],
+  vendor:          ["Vendor", "vendor-name", "vendor name", "brand"],
+  mfg_part_number: ["Mfg #", "Mfg#", "Mfg No", "Mfg Number", "Manufacturer Part Number", "mfg_part_number"],
+  upc:             ["UPC", "UPC Code", "upc_code", "barcode", "gtin"],
+  fnsku:           ["FNSKU", "fulfillment-network-sku", "fulfillment channel sku"],
+  asin:            ["ASIN", "asin1", "product-id", "product id"],
+};
+
 const REMOVAL_SHIPMENT_FALLBACK_ALIASES: Record<string, string[]> = {
   order_id:      ["removal-order-id", "order-id", "order_id", "removal_order_id"],
   sku:           ["sku"],
@@ -218,6 +228,24 @@ function applyReportsRepositoryFallbackMapping(
   return result;
 }
 
+function applyProductIdentityFallbackMapping(
+  headers: string[],
+  existing: Record<string, string>,
+): Record<string, string> {
+  const result = { ...existing };
+  for (const [canonical, aliases] of Object.entries(PRODUCT_IDENTITY_FALLBACK_ALIASES)) {
+    if (result[canonical]) continue;
+    const normalizedAliases = aliases.map(normH);
+    for (const header of headers) {
+      if (normalizedAliases.includes(normH(header))) {
+        result[canonical] = header;
+        break;
+      }
+    }
+  }
+  return result;
+}
+
 /**
  * POST /api/settings/imports/classify-headers
  *
@@ -268,6 +296,7 @@ export async function POST(req: Request): Promise<Response> {
       SAFET_CLAIMS:       "Amazon SAFE-T Claims Report",
       TRANSACTIONS:       "Amazon Transactions Report",
       REPORTS_REPOSITORY: "Amazon Reports Repository Export",
+      PRODUCT_IDENTITY:   "Product Identity CSV",
       CATEGORY_LISTINGS:  "Amazon Category Listings Report",
       ALL_LISTINGS:       "Amazon All Listings Report",
       ACTIVE_LISTINGS:    "Amazon Active Listings Report",
@@ -366,6 +395,8 @@ export async function POST(req: Request): Promise<Response> {
       column_mapping = applyTransactionsFallbackMapping(headers, merged);
     } else if ((reportType as string) === "REPORTS_REPOSITORY") {
       column_mapping = applyReportsRepositoryFallbackMapping(headers, merged);
+    } else if ((reportType as string) === "PRODUCT_IDENTITY") {
+      column_mapping = applyProductIdentityFallbackMapping(headers, merged);
     } else if (
       (reportType as string) === "CATEGORY_LISTINGS" ||
       (reportType as string) === "ALL_LISTINGS" ||

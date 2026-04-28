@@ -16,6 +16,7 @@ export type AmazonSyncKind =
   | "SAFET_CLAIMS"
   | "TRANSACTIONS"
   | "REPORTS_REPOSITORY"
+  | "PRODUCT_IDENTITY"
   | "ALL_ORDERS"
   | "REPLACEMENTS"
   | "FBA_GRADE_AND_RESELL"
@@ -49,6 +50,7 @@ export type AmazonReportFamily =
   | "listing"
   | "safet"
   | "repository"
+  | "identity"
   | "archive"
   | "unknown";
 
@@ -239,6 +241,24 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     progress_strategy: "batch_csv_stream",
     physical_identity_strategy: "source_line_hash",
     business_identity_strategy: "line_hash_unique",
+  },
+  PRODUCT_IDENTITY: {
+    staging: "amazon_staging",
+    domainTable: "product_identifier_map",
+    dedupeMode: "source_line_hash",
+    conflictColumns: null,
+    postSyncEnrichment: "none",
+    generateWorklistAfterSync: false,
+    report_family: "identity",
+    phase_model: "unified_v1",
+    stage_target_table: "amazon_staging",
+    sync_target_table: "product_identifier_map",
+    generic_target_table: null,
+    supports_generic: false,
+    supports_worklist: false,
+    progress_strategy: "batch_csv_stream",
+    physical_identity_strategy: "file_sha256_plus_physical_row_number",
+    business_identity_strategy: "product_identity_sku_identifiers",
   },
   ALL_ORDERS: {
     staging: "amazon_staging",
@@ -532,6 +552,7 @@ export function resolveAmazonImportSyncKind(reportType: string | null | undefine
   if (rt === "SAFET_CLAIMS" || rt === "safe_t_claims") return "SAFET_CLAIMS";
   if (rt === "TRANSACTIONS" || rt === "transaction_view") return "TRANSACTIONS";
   if (rt === "REPORTS_REPOSITORY") return "REPORTS_REPOSITORY";
+  if (rt === "PRODUCT_IDENTITY" || rt === "PRODUCT_IDENTITY_CSV") return "PRODUCT_IDENTITY";
   if (rt === "ALL_ORDERS") return "ALL_ORDERS";
   if (rt === "REPLACEMENTS") return "REPLACEMENTS";
   if (rt === "FBA_GRADE_AND_RESELL") return "FBA_GRADE_AND_RESELL";

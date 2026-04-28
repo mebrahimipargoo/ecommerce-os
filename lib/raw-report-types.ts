@@ -20,6 +20,7 @@ export const RAW_REPORT_TYPES = [
   "SAFET_CLAIMS",
   "TRANSACTIONS",
   "REPORTS_REPOSITORY",
+  "PRODUCT_IDENTITY",
   // ── Additional report types (raw-archive landing tables) ─────────────────
   "ALL_ORDERS",
   "REPLACEMENTS",

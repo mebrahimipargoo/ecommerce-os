@@ -143,6 +143,12 @@ export const REPORT_TYPE_SPECS: Record<
       "total",
     ],
   },
+  PRODUCT_IDENTITY: {
+    canonicalKey: "seller_sku",
+    shortLabel: "Product Identity CSV",
+    description: "Seller SKU identity file — upserts products, catalog_products, and identifier map",
+    aliases: ["Seller SKU", "seller sku", "Product Name", "UPC", "Vendor", "Mfg #", "FNSKU", "ASIN"],
+  },
   ALL_ORDERS: {
     canonicalKey: "amazon-order-id",
     shortLabel: "All Orders",

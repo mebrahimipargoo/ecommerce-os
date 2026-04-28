@@ -69,6 +69,8 @@ SUPPORTED Amazon report types (report_type must be one of these):
   canonical: transaction_type, total_product_charges, order_id, sku, posted_date
 - REPORTS_REPOSITORY: signals = "date/time" AND "settlement id" AND "type" AND "order id" AND "sku" AND "description" AND "total"
   canonical: date_time, settlement_id, transaction_type, order_id, sku, description, total_amount
+- PRODUCT_IDENTITY: signals = "Seller SKU" AND ("Product Name" OR "item name") AND any of ("UPC", "Vendor", "Mfg #", "FNSKU", "ASIN")
+  canonical: seller_sku, product_name, vendor, mfg_part_number, upc, fnsku, asin
 - ALL_ORDERS: signals = "amazon-order-id" AND "purchase-date" AND "order-status"
   canonical: order_id, purchase_date, order_status, fulfillment_channel, sales_channel
 - REPLACEMENTS: signals = "replacement-order-id" OR ("original-order-id" AND "replacement")
@@ -99,7 +101,7 @@ SUPPORTED Amazon report types (report_type must be one of these):
 
 Respond ONLY with a single valid JSON object:
 {
-  "report_type": "FBA_RETURNS" | "REMOVAL_ORDER" | "REMOVAL_SHIPMENT" | "INVENTORY_LEDGER" | "REIMBURSEMENTS" | "SETTLEMENT" | "SAFET_CLAIMS" | "TRANSACTIONS" | "REPORTS_REPOSITORY" | "ALL_ORDERS" | "REPLACEMENTS" | "FBA_GRADE_AND_RESELL" | "MANAGE_FBA_INVENTORY" | "FBA_INVENTORY" | "INBOUND_PERFORMANCE" | "AMAZON_FULFILLED_INVENTORY" | "RESERVED_INVENTORY" | "FEE_PREVIEW" | "MONTHLY_STORAGE_FEES" | "CATEGORY_LISTINGS" | "ALL_LISTINGS" | "ACTIVE_LISTINGS" | "UNKNOWN",
+  "report_type": "FBA_RETURNS" | "REMOVAL_ORDER" | "REMOVAL_SHIPMENT" | "INVENTORY_LEDGER" | "REIMBURSEMENTS" | "SETTLEMENT" | "SAFET_CLAIMS" | "TRANSACTIONS" | "REPORTS_REPOSITORY" | "PRODUCT_IDENTITY" | "ALL_ORDERS" | "REPLACEMENTS" | "FBA_GRADE_AND_RESELL" | "MANAGE_FBA_INVENTORY" | "FBA_INVENTORY" | "INBOUND_PERFORMANCE" | "AMAZON_FULFILLED_INVENTORY" | "RESERVED_INVENTORY" | "FEE_PREVIEW" | "MONTHLY_STORAGE_FEES" | "CATEGORY_LISTINGS" | "ALL_LISTINGS" | "ACTIVE_LISTINGS" | "UNKNOWN",
   "detected_file_type": "Human-readable name of the file, e.g. 'Amazon Removal Shipment Detail', 'Walmart Sales Report', 'Shopify Inventory Export', 'Unknown File'",
   "is_supported": true or false (true ONLY if report_type is not UNKNOWN),
   "mapping": { "<canonical_field>": "<exact CSV header string>" },

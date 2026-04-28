@@ -5,13 +5,13 @@
  *
  * Tenant scope:
  * - organizationId (useUserRole): home org from profiles; enforced by server actions for non–super-admins.
- * - superAdminOrgFilter: super_admin / system_employee page-level org dropdown.
- * - selectedStoreId (UniversalImporter): mirrors the importer store into the filter so History stays aligned.
+ * - superAdminOrgFilter: super_admin / system_employee page-level org dropdown — ALWAYS an `organizations.id`.
+ * - The chosen target store lives inside UniversalImporter only. It is NEVER copied into
+ *   `superAdminOrgFilter` (a store id is not an org id, and writing one there breaks the dropdown +
+ *   the tenant scope forwarded back into UniversalImporter on the next render).
  *
- * effectiveOrgId (super_admin): page filter, then importer store, then home org.
- * historyCompanyId: selectedStoreId ?? effectiveOrgId ?? organizationId ?? null (null = all orgs for super_admin).
- *
- * Avoid mixing ?? and || without parentheses: use `a ?? (b || c)` when needed.
+ * effectiveOrgId (super_admin): page filter, otherwise home org. Always an org id.
+ * historyCompanyId: same — feeds RawReportImportsPanel as `organizationId`.
  */
 
 import React, { useCallback, useEffect, useState } from "react";
@@ -39,8 +39,6 @@ export function ImportsClient() {
   const [superAdminOrgFilter, setSuperAdminOrgFilter] = useState<string>("");
   const [orgOptions, setOrgOptions] = useState<WorkspaceOrganizationOption[]>([]);
 
-  const [selectedStoreId, setSelectedStoreId] = useState<string | null>(null);
-
   useEffect(() => {
     if (!isSuperAdmin) return;
     let cancelled = false;
@@ -55,23 +53,31 @@ export function ImportsClient() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isSuperAdmin]);
 
+  // effectiveOrgId is an ORG id — never a store id. Falling back to a store id
+  // here was the bug that caused: pick org → auto-select store → org filter
+  // got overwritten with the store id → dropdown reverted to "All organizations"
+  // and the importer's "No active stores in the selected organization" warning
+  // appeared because it tried to filter stores by an id that is not an org id.
   const effectiveOrgId: string = isSuperAdmin
-    ? (superAdminOrgFilter.trim() || selectedStoreId || organizationId || "")
+    ? (superAdminOrgFilter.trim() || organizationId || "")
     : (organizationId ?? "");
 
-  const historyCompanyId: string | null =
-    selectedStoreId ?? (effectiveOrgId || organizationId) ?? null;
+  // Same reasoning for the History panel: it accepts an `organizationId`, so
+  // we must never pass a store id. listRawReportUploads validates and discards
+  // non-org ids, but only because of a defensive fallback — keeping a clean
+  // contract here avoids relying on that.
+  const historyCompanyId: string | null = effectiveOrgId || organizationId || null;
 
-  const handleStoreChange = useCallback((id: string) => {
-    setSelectedStoreId(id);
-    if (isSuperAdmin && id) setSuperAdminOrgFilter(id);
+  const handleStoreChange = useCallback((_id: string) => {
+    // The store id stays inside UniversalImporter — we do NOT mirror it into
+    // superAdminOrgFilter (a store id is not an organization id) and we do not
+    // need a separate page-level copy for History, which scopes by org only.
+    // Just bump the History panel so its row count reflects the new context.
     refreshHistory();
-  }, [isSuperAdmin, refreshHistory]);
+  }, [refreshHistory]);
 
   const handleOrgFilterChange = useCallback((e: React.ChangeEvent<HTMLSelectElement>) => {
-    const value = e.target.value;
-    setSuperAdminOrgFilter(value);
-    setSelectedStoreId(null);
+    setSuperAdminOrgFilter(e.target.value);
     setHistoryRefreshSignal((k) => k + 1);
   }, []);
 
@@ -142,6 +148,7 @@ export function ImportsClient() {
       <UniversalImporter
         onUploadComplete={refreshHistory}
         onTargetStoreChange={handleStoreChange}
+        organizationId={(effectiveOrgId || organizationId || "").trim() || null}
       />
 
       {/* ── History panel ───────────────────────────────────────────────────── */}

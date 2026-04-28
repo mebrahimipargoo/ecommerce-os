@@ -30,8 +30,11 @@ import {
   createRawReportUploadSession,
   deleteRawReportUpload,
   finalizeRawReportUpload,
+  findActiveProductIdentityImport,
   getImportLedgerActorUserId,
+  supersedeProductIdentityImport,
   updateUploadSessionClassification,
+  type ExistingProductIdentityUpload,
 } from "./import-actions";
 import { createLedgerStorageSignedUploadUrl } from "../lib/amazon-ledger-actions";
 import { classifyCsvHeadersRuleBased } from "../../../lib/csv-import-detected-type";
@@ -80,6 +83,7 @@ type ReportTypeChoice =
   | "SAFET_CLAIMS"
   | "TRANSACTIONS"
   | "TRANSACTIONS_REPORTS_REPO"
+  | "PRODUCT_IDENTITY"
   | "CATEGORY_LISTINGS"
   | "ALL_LISTINGS"
   | "ACTIVE_LISTINGS";
@@ -94,6 +98,7 @@ const REPORT_TYPE_OPTIONS: { value: ReportTypeChoice; label: string }[] = [
   { value: "SAFET_CLAIMS",   label: "SAFE-T Claims" },
   { value: "TRANSACTIONS",   label: "Transactions" },
   { value: "TRANSACTIONS_REPORTS_REPO", label: "Transactions (Reports Repository)" },
+  { value: "PRODUCT_IDENTITY", label: "Product Identity CSV" },
   { value: "CATEGORY_LISTINGS", label: "Category Listings" },
   { value: "ALL_LISTINGS", label: "All Listings" },
   { value: "ACTIVE_LISTINGS", label: "Active Listings" },
@@ -115,11 +120,40 @@ type Phase =
   | "worklisted"      // Worklist done
   | "error";
 
-type StoreOption = { id: string; name: string; platform: string; is_default?: boolean | null };
+type StoreOption = {
+  id: string;
+  name: string;
+  platform: string;
+  is_default?: boolean | null;
+  /** Owner organization (`stores.organization_id`) — required for tenant-scoped filtering. */
+  organization_id: string;
+};
+
+type ProductIdentityImportStats = {
+  rowsRead: number;
+  productsInserted: number;
+  productsUpdated: number;
+  catalogProductsInserted: number;
+  catalogProductsUpdated: number;
+  identifiersInserted: number;
+  invalidAsinCount?: number;
+  invalidFnskuCount?: number;
+  invalidUpcCount?: number;
+  invalidIdentifierCount: number;
+  unresolvedRows: number;
+};
 
 type Props = {
   onUploadComplete?: () => void;
   onTargetStoreChange?: (storeId: string) => void;
+  /**
+   * Tenant scope chosen by the user (page-level "Organization scope" picker for
+   * super_admins; their profile org otherwise). When set, the Target Store
+   * dropdown is filtered to stores in this org and the same id is forwarded to
+   * the server so every pipeline phase writes under the correct tenant org —
+   * NOT the parent/platform org.
+   */
+  organizationId?: string | null;
 };
 
 function formatBytes(n: number): string {
@@ -140,6 +174,31 @@ async function sha256HexFullFile(file: File): Promise<string> {
 /** Legacy 32-hex fingerprint for `md5_hash` validation (first 32 chars of full SHA-256). */
 function first32HexOfSha256(fullSha256: string): string {
   return fullSha256.slice(0, 32).toLowerCase();
+}
+
+function isProductIdentityImportStats(value: unknown): value is ProductIdentityImportStats {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.rowsRead === "number" &&
+    typeof v.productsInserted === "number" &&
+    typeof v.productsUpdated === "number" &&
+    typeof v.catalogProductsInserted === "number" &&
+    typeof v.catalogProductsUpdated === "number" &&
+    typeof v.identifiersInserted === "number" &&
+    typeof v.invalidIdentifierCount === "number" &&
+    typeof v.unresolvedRows === "number"
+  );
+}
+
+function productIdentityStatsFromMetadata(metadata: Record<string, unknown> | null | undefined): ProductIdentityImportStats | null {
+  const nested =
+    metadata?.product_identity_import &&
+    typeof metadata.product_identity_import === "object" &&
+    !Array.isArray(metadata.product_identity_import)
+      ? (metadata.product_identity_import as Record<string, unknown>)
+      : null;
+  return isProductIdentityImportStats(nested?.stats) ? nested.stats : null;
 }
 
 async function getBrowserSessionUserId(): Promise<string | null> {
@@ -163,6 +222,7 @@ function choiceToInitialReportType(choice: ReportTypeChoice): RawReportType {
   if (choice === "SAFET_CLAIMS") return "SAFET_CLAIMS";
   if (choice === "TRANSACTIONS") return "TRANSACTIONS";
   if (choice === "TRANSACTIONS_REPORTS_REPO") return "REPORTS_REPOSITORY";
+  if (choice === "PRODUCT_IDENTITY") return "PRODUCT_IDENTITY";
   if (choice === "CATEGORY_LISTINGS") return "CATEGORY_LISTINGS";
   if (choice === "ALL_LISTINGS") return "ALL_LISTINGS";
   if (choice === "ACTIVE_LISTINGS") return "ACTIVE_LISTINGS";
@@ -196,9 +256,10 @@ async function resolveReportsRepositoryHeaderLineIndexWithFallback(
   return REPORTS_REPOSITORY_PREAMBLE_LINE_COUNT;
 }
 
-export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Props = {}) {
+export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organizationId }: Props = {}) {
   const router = useRouter();
   const { role, actorUserId } = useUserRole();
+  const tenantOrgScope = (organizationId ?? "").trim();
 
   const [reportTypeChoice, setReportTypeChoice] = useState<ReportTypeChoice>("AUTO");
 
@@ -235,6 +296,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
   /** Listing process: raw_archive | canonical_sync | done — from upload metadata while processing. */
   const [listingImportSubphase, setListingImportSubphase] = useState<string | null>(null);
   const [phaseLabel, setPhaseLabel] = useState<string>("");
+  const [productIdentityStats, setProductIdentityStats] = useState<ProductIdentityImportStats | null>(null);
 
   const pollRef2 = useRef<ReturnType<typeof setInterval> | null>(null);
   const isActiveRef = useRef(false);
@@ -293,14 +355,25 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         return;
       }
       console.log("[UniversalImporter] Fetched stores:", res.data.length, "row(s)");
-      const active = res.data
-        .filter((s) => s.is_active !== false)
-        .map((s) => ({
-          id: s.id,
-          name: s.name,
-          platform: s.platform,
-          is_default: s.is_default ?? null,
-        }));
+
+      // Tenant-scope guard: when the page-level Organization scope is set
+      // (super_admin picker, or the user's own org), only show stores that
+      // belong to it. This prevents picking a parent/platform-org store while
+      // the import is meant for a tenant org — exactly the bug that wrote
+      // Product Identity rows under organization 39f5e74f-…-385b instead of
+      // the customer org 00000000-…-001.
+      const candidates = res.data.filter((s) => s.is_active !== false);
+      const filtered = tenantOrgScope
+        ? candidates.filter((s) => s.organization_id === tenantOrgScope)
+        : candidates;
+
+      const active: StoreOption[] = filtered.map((s) => ({
+        id: s.id,
+        name: s.name,
+        platform: s.platform,
+        is_default: s.is_default ?? null,
+        organization_id: s.organization_id,
+      }));
       setStores(active);
 
       // Auto-populate the Target Store dropdown on mount so the user doesn't
@@ -320,12 +393,16 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
           return p.includes("amazon") || p === "fba" || p === "amazon_fba";
         });
         setStoreId((amazon ?? active[0]).id);
+      } else {
+        // No stores in scope — clear any stale selection so the user is forced to pick.
+        setStoreId("");
       }
     });
     return () => {
       cancelled = true;
     };
-  }, []);
+    // Re-fetch / re-filter whenever the page-level org scope changes.
+  }, [tenantOrgScope]);
 
   useEffect(() => {
     if (storeId && isUuidString(storeId)) onTargetStoreChange?.(storeId);
@@ -413,6 +490,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         isLedgerSession: meta?.source === AMAZON_LEDGER_UPLOAD_SOURCE,
       };
       setServerImportInput(input);
+      setProductIdentityStats(productIdentityStatsFromMetadata(meta));
       const built = buildImportUiActionInputForRemovalShipment(input, detectedType);
       const inferred = inferUniversalImporterPhase(built);
       if (inferred != null) setPhase(inferred);
@@ -619,6 +697,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     setProcessedRows(0);
     setProcessPct(0);
     setSyncPct(0);
+    setProductIdentityStats(null);
     stopRef.current = false;
   }
 
@@ -638,6 +717,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     setWorklistBarEpoch(0);
     setListingImportSubphase(null);
     setPhaseLabel("");
+    setProductIdentityStats(null);
     stopRef.current = false;
     if (pollRef2.current) { clearInterval(pollRef2.current); pollRef2.current = null; }
   }
@@ -769,6 +849,9 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         rowsStaged?: number;
         rowsProcessed?: number;
         totalRows?: number;
+        productIdentity?: {
+          stats?: ProductIdentityImportStats;
+        };
         catalogListing?: {
           message?: string;
           data_rows_seen?: number;
@@ -788,7 +871,18 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       setProcessPct(100);
       setProcessedRows(staged);
       if (total > 0) setTotalRows(total);
-      if (useListingProcess) {
+      if (json.productIdentity?.stats) {
+        const stats = json.productIdentity.stats;
+        setProductIdentityStats(stats);
+        setSyncPct(100);
+        setProgressMsg(
+          `Product Identity import complete — ${stats.rowsRead.toLocaleString()} rows read; ` +
+          `${(stats.productsInserted + stats.productsUpdated).toLocaleString()} product row(s), ` +
+          `${(stats.catalogProductsInserted + stats.catalogProductsUpdated).toLocaleString()} catalog row(s), ` +
+          `${stats.identifiersInserted.toLocaleString()} identifier(s) inserted.`,
+        );
+        setPhase("synced");
+      } else if (useListingProcess) {
         setListingImportSubphase("done");
         setProgressMsg(
           total > 0 && total !== staged
@@ -1039,12 +1133,67 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
     const md5Hash = first32HexOfSha256(contentSha256);
     const initialType = choiceToInitialReportType(reportTypeChoice);
 
+    // ── PRE-STEP: Product Identity duplicate-detection preflight ──────────
+    // Before creating a session we ask the server whether the same file
+    // (same content_sha256) is already an active Product Identity import for
+    // this (organization, store). If so, prompt the user to Replace (which
+    // marks the previous upload `superseded` and removes its product
+    // identifier / catalog rows) or Cancel. Other report types skip this.
+    let supersedeDuplicate = false;
+    if (initialType === "PRODUCT_IDENTITY" || reportTypeChoice === "AUTO") {
+      setProgressMsg("Checking for previous import of this file…");
+      const existing = await findActiveProductIdentityImport({
+        organizationId: tenantOrgScope || null,
+        storeId: selectedStore,
+        contentSha256,
+        actorUserId: actor,
+      });
+      if (existing.ok && existing.existing) {
+        const dup = existing.existing;
+        const when = dup.created_at
+          ? new Date(dup.created_at).toLocaleString()
+          : "an earlier session";
+        const ok = window.confirm(
+          `This file ("${dup.file_name}") was already imported for this store on ${when}.\n\n` +
+            `Status: ${dup.status}\n` +
+            "Importing again will replace the previous Product Identity rows for this upload " +
+            "(All Listings rows are NOT touched). Continue?",
+        );
+        if (!ok) {
+          setProgressMsg("Upload cancelled — file was already imported.");
+          setPhase("idle");
+          return;
+        }
+        const sup = await supersedeProductIdentityImport({
+          uploadId: dup.upload_id,
+          actorUserId: actor,
+        });
+        if (!sup.ok) {
+          setErr(`Could not replace previous import: ${sup.error}`);
+          setPhase("error");
+          return;
+        }
+        supersedeDuplicate = true;
+        bumpHistory();
+      }
+    }
+
     // ── STEP 1: Insert DB row FIRST ───────────────────────────────────────────
-    // IMPORTANT: organizationId is intentionally NOT passed here.
-    // The server action derives it from the actor's profile (guaranteeing a valid
-    // organizations FK). Passing storeId directly would cause an FK violation
-    // because stores.id != organizations.id.
-    console.log("[UniversalImporter] creating session — actor:", actor, "store:", selectedStore, "file:", file.name);
+    // organizationId / storeId are forwarded so the server can lock the row to the
+    // correct tenant. Resolution order on the server is:
+    //   page-level organizationId → store's owner org (`stores.organization_id`)
+    //   → actor profile org (single-tenant fallback).
+    // The server then verifies the chosen store actually belongs to the resolved
+    // org and refuses the insert otherwise. This prevents Product Identity (or any
+    // other) imports from being written under the parent/platform organization
+    // when the user picked a tenant-org store.
+    console.log(
+      "[UniversalImporter] creating session — actor:", actor,
+      "org:", tenantOrgScope || "(server resolves)",
+      "store:", selectedStore,
+      "file:", file.name,
+      "supersede:", supersedeDuplicate,
+    );
     const session = await createRawReportUploadSession({
       fileName: file.name,
       totalBytes: file.size,
@@ -1056,10 +1205,39 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       uploadChunksCount: 1,
       initialStatus: "uploading",
       actorUserId: actor,
-      // organizationId deliberately omitted — resolved server-side from actor's profile.
+      organizationId: tenantOrgScope || null,
+      storeId: selectedStore,
+      supersedeExistingDuplicate: supersedeDuplicate,
     });
 
     if (!session.ok) {
+      // The server-side duplicate guard returns a structured `duplicate` field.
+      // If the client preflight raced and missed it, surface the same Replace
+      // prompt here so the user can recover without reloading the page.
+      const sessionWithDup = session as { duplicate?: ExistingProductIdentityUpload | null };
+      if (sessionWithDup.duplicate) {
+        const dup = sessionWithDup.duplicate;
+        const when = dup.created_at ? new Date(dup.created_at).toLocaleString() : "earlier";
+        const ok = window.confirm(
+          `Server detected a previous import of this file for the same store ` +
+            `(${dup.file_name}, ${when}). Replace it and continue?`,
+        );
+        if (ok) {
+          const sup = await supersedeProductIdentityImport({
+            uploadId: dup.upload_id,
+            actorUserId: actor,
+          });
+          if (!sup.ok) {
+            setErr(`Could not replace previous import: ${sup.error}`);
+            setPhase("error");
+            return;
+          }
+          bumpHistory();
+          setErr("Previous import replaced. Click Upload again to retry.");
+          setPhase("idle");
+          return;
+        }
+      }
       setErr(session.error);
       setPhase("error");
       return;
@@ -1232,7 +1410,13 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
       const aiMessage = clsJson.message ?? "";
 
       // ── STEP 6: Update DB — classification + file path + store + row count ──
-      await updateUploadSessionClassification({
+      // Read the result. If the UPDATE was rejected (e.g. CHECK violation on
+      // report_type because the DB is missing a value the TS union already
+      // knows about — that was the silent bug behind the "AI detected but
+      // History shows Unknown / other" mismatch) we surface the error,
+      // park the row in needs_mapping, and stop. Never march on as if the
+      // classification succeeded.
+      const classifyRes = await updateUploadSessionClassification({
         uploadId,
         reportType: resolvedType,
         columnMapping,
@@ -1247,13 +1431,39 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
         headerRowIndex: headerRowIdx,
       });
 
+      if (!classifyRes.ok) {
+        await finalizeRawReportUpload({
+          uploadId,
+          actorUserId: actor,
+          targetStatus: "needs_mapping",
+        }).catch(() => {});
+        const detail = classifyRes.error || "Unknown error.";
+        const looksLikeCheck = /check.*constraint|violates|raw_report_uploads_report_type_check/i.test(detail);
+        setErr(
+          looksLikeCheck
+            ? `Database rejected report type "${resolvedType}": ${detail}. ` +
+              "An admin must run the latest migrations (the CHECK on raw_report_uploads.report_type may be missing this value)."
+            : `Could not save classification: ${detail}`,
+        );
+        setPhase("needs_mapping");
+        bumpHistory();
+        return;
+      }
+
       // ── STEP 7: Set final status ──────────────────────────────────────────────
       const dbTargetStatus = (!isSupported || needsMapping) ? "needs_mapping" : "mapped";
-      await finalizeRawReportUpload({
+      const finalizeRes = await finalizeRawReportUpload({
         uploadId,
         actorUserId: actor,
         targetStatus: dbTargetStatus,
       });
+
+      if (!finalizeRes.ok) {
+        setErr(`Could not finalize upload: ${finalizeRes.error ?? "unknown error"}`);
+        setPhase("needs_mapping");
+        bumpHistory();
+        return;
+      }
 
       // ── STEP 8: Force UI update again ─────────────────────────────────────────
       setDetectedType(resolvedType !== "UNKNOWN" ? resolvedType : null);
@@ -1364,6 +1574,11 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
               </option>
             ))}
           </select>
+          {tenantOrgScope && stores.length === 0 && (
+            <p className="text-[11px] text-amber-600 dark:text-amber-400">
+              No active stores in the selected organization. Add a store for this organization or change the organization scope.
+            </p>
+          )}
         </div>
       </div>
 
@@ -1632,6 +1847,33 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange }: Pro
               <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-300">
                 AI Detected File Type: <span className="font-bold">{detectedType}</span>
               </span>
+            </div>
+          )}
+          {productIdentityStats && (
+            <div className="rounded-xl border border-sky-400/30 bg-sky-500/10 px-4 py-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300">
+                Product Identity Import Stats
+              </p>
+              <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-foreground sm:grid-cols-3">
+                <span>Rows read: <strong>{productIdentityStats.rowsRead.toLocaleString()}</strong></span>
+                <span>
+                  Products:{" "}
+                  <strong>
+                    {productIdentityStats.productsInserted.toLocaleString()} inserted /{" "}
+                    {productIdentityStats.productsUpdated.toLocaleString()} updated
+                  </strong>
+                </span>
+                <span>
+                  Catalog:{" "}
+                  <strong>
+                    {productIdentityStats.catalogProductsInserted.toLocaleString()} inserted /{" "}
+                    {productIdentityStats.catalogProductsUpdated.toLocaleString()} updated
+                  </strong>
+                </span>
+                <span>Identifiers inserted: <strong>{productIdentityStats.identifiersInserted.toLocaleString()}</strong></span>
+                <span>Invalid identifiers: <strong>{productIdentityStats.invalidIdentifierCount.toLocaleString()}</strong></span>
+                <span>Unresolved rows: <strong>{productIdentityStats.unresolvedRows.toLocaleString()}</strong></span>
+              </div>
             </div>
           )}
           {phase === "needs_mapping" && (

@@ -11,6 +11,7 @@ export const CLASSIFIED_REPORT_TYPES = [
   "SAFET_CLAIMS",
   "TRANSACTIONS",
   "REPORTS_REPOSITORY",
+  "PRODUCT_IDENTITY",
   "ALL_ORDERS",
   "REPLACEMENTS",
   "FBA_GRADE_AND_RESELL",
@@ -484,6 +485,50 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
       aliases: ["total", "Total", "total-amount", "total amount"],
     },
   ],
+  PRODUCT_IDENTITY: [
+    {
+      key: "seller_sku",
+      label: "Seller SKU",
+      required: true,
+      aliases: ["Seller SKU", "seller-sku", "seller sku", "sku", "MSKU", "msku"],
+    },
+    {
+      key: "product_name",
+      label: "Product Name",
+      required: false,
+      aliases: ["Product Name", "product-name", "item-name", "item name", "title", "description"],
+    },
+    {
+      key: "vendor",
+      label: "Vendor",
+      required: false,
+      aliases: ["Vendor", "vendor", "vendor-name", "vendor name", "brand"],
+    },
+    {
+      key: "mfg_part_number",
+      label: "Mfg #",
+      required: false,
+      aliases: ["Mfg #", "Mfg#", "Mfg No", "Mfg Number", "Manufacturer Part Number", "mfg_part_number"],
+    },
+    {
+      key: "upc",
+      label: "UPC",
+      required: false,
+      aliases: ["UPC", "upc", "UPC Code", "upc_code", "barcode", "gtin"],
+    },
+    {
+      key: "fnsku",
+      label: "FNSKU",
+      required: false,
+      aliases: ["FNSKU", "fnsku", "fulfillment-network-sku", "fulfillment channel sku"],
+    },
+    {
+      key: "asin",
+      label: "ASIN",
+      required: false,
+      aliases: ["ASIN", "asin", "asin1", "product-id", "product id"],
+    },
+  ],
   CATEGORY_LISTINGS: [
     {
       key: "seller_sku",
@@ -931,6 +976,26 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
     return { reportType: "TRANSACTIONS", matchedRule: "transaction type+total product charges" };
   }
 
+  // Rule 8a: Product Identity CSV (custom item identity import).
+  // Must run before listing rules because it also has seller sku + ASIN, but
+  // its vendor / mfg / UPC fingerprint routes directly to identity tables.
+  {
+    const headerList = [...ds];
+    const hasSellerSku = ds.has("seller sku") || ds.has("sku") || ds.has("msku");
+    const hasProductName = ds.has("product name") || ds.has("item name") || ds.has("title");
+    const hasIdentityFingerprint =
+      ds.has("upc") ||
+      ds.has("upc code") ||
+      ds.has("vendor") ||
+      headerList.some((h) => h === "mfg #" || h === "mfg#" || h.includes("manufacturer part") || h.startsWith("mfg "));
+    if (hasSellerSku && hasProductName && hasIdentityFingerprint) {
+      return {
+        reportType: "PRODUCT_IDENTITY",
+        matchedRule: "seller sku+product name+vendor/mfg/upc identity columns",
+      };
+    }
+  }
+
   // ── Rule INV-A: Manage FBA Inventory (AFN) ──────────────────────────────
   // Anchor: fnsku + afn-fulfillable-quantity, plus at least one AFN flow column.
   // Must run BEFORE listing rules so AFN exports never collapse into ALL/ACTIVE LISTINGS.
@@ -1086,6 +1151,7 @@ export function parseGptReportType(raw: string): RawReportType {
   if (/\bSAFET_CLAIMS\b/.test(u)) return "SAFET_CLAIMS";
   if (/\bTRANSACTIONS\b/.test(u)) return "TRANSACTIONS";
   if (/\bREPORTS_REPOSITORY\b/.test(u)) return "REPORTS_REPOSITORY";
+  if (/\bPRODUCT_IDENTITY(?:_CSV)?\b/.test(u)) return "PRODUCT_IDENTITY";
   if (/\bALL_ORDERS\b/.test(u)) return "ALL_ORDERS";
   if (/\bREPLACEMENTS\b/.test(u)) return "REPLACEMENTS";
   if (/\bFBA_GRADE_AND_RESELL\b/.test(u)) return "FBA_GRADE_AND_RESELL";
