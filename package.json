@@ -7,7 +7,11 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "sync:sidebar": "tsx scripts/sync-sidebar-catalog.ts"
+    "sync:sidebar": "tsx scripts/sync-sidebar-catalog.ts",
+    "dev:reset-import-data": "tsx scripts/dev-reset-import-data.ts",
+    "dev:reset-import-data:dry-run": "tsx scripts/dev-reset-import-data.ts --dry-run",
+    "dev:reset-import-data:execute": "tsx scripts/dev-reset-import-data.ts --execute",
+    "validate:import-checklist": "tsx scripts/validate-import-checklist.ts"
   },
   "dependencies": {
     "@react-pdf/renderer": "^4.3.2",

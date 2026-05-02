@@ -23,6 +23,10 @@ export type ImportRunMetrics = {
   /** Live Phase 3 flush progress (sync route bump). */
   rows_synced?: number;
   total_staging_rows?: number;
+  /** File plan total (parsed / upload metadata), not staging row count. */
+  file_row_total_plan?: number;
+  /** Staging row count query failed or totals could not be reconciled. */
+  sync_count_verification_pending?: boolean;
   rows_invalid?: number;
   rows_skipped_empty?: number;
   rows_skipped_malformed?: number;
@@ -70,6 +74,25 @@ export type ImportRunMetrics = {
   invalid_sku_examples?: { rowNumber: number; rawValue: string; reason: string }[];
   /** Informational note surfaced in import_metrics for debugging. */
   note?: string;
+  /** Phase 2 operator-facing line (Import History / importer card). */
+  phase2_operator_line?: string;
+  /**
+   * Phase 2 UI state — Nano retries, deferred DB count verification, batch exhaustion.
+   */
+  phase2_operator_state?:
+    | "processing"
+    | "retrying_batch"
+    | "waiting_before_retry"
+    | "count_verification_delayed"
+    | "final_verification_pending"
+    | "failed_after_retries"
+    | "resume_available"
+    | "completed";
+  phase2_operator_batch?: number;
+  phase2_operator_row_range?: string;
+  phase2_operator_batch_attempts?: number;
+  /** True when end-of-run DB count could not be confirmed; parser counters trusted. */
+  staging_final_count_verify_pending?: boolean;
   /** Target staging table for the current phase (Product Identity pipeline). */
   stage_target_table?: string;
 };
@@ -105,6 +128,10 @@ export type RawReportUploadMetadata = {
   row_count?: number;
   /** Rows in amazon_staging before Phase 3 (for UI: staged vs synced). */
   staging_row_count?: number;
+  /** Phase 2 CSV stream: contiguous-prefix watermark (not a verified DB row count). */
+  staging_contiguous_watermark?: number;
+  /** Phase 3: staging count vs file plan could not be verified (see sync route). */
+  sync_count_verification_pending?: boolean;
   /** Rows written in Phase 3 after dedupe / shipment archive (see sync route). */
   sync_row_count?: number;
   /** Staging rows where the domain mapper returned null (Phase 3). */

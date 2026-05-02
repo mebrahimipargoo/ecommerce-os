@@ -20,6 +20,7 @@ import {
   resolveAmazonImportSyncKind,
   type AmazonSyncKind,
 } from "./amazon-report-registry";
+import { resolveImportFileRowTotal } from "../import-file-row-total";
 
 /**
  * Five-phase inventory family — these report types ALWAYS render a Generic
@@ -209,13 +210,13 @@ export function buildUnifiedPipeline(input: UnifiedPipelineInput): UnifiedPipeli
     uploadPct = 100;
   }
 
-  const dataRowsTotal = Math.max(0,
-    num(f.data_rows_total, 0) || num(f.file_rows_total, 0) ||
-    num(m.data_rows_seen, 0) || num(m.catalog_listing_data_rows_seen, 0) ||
-    num(m.total_rows, 0));
-  const stagedRows = Math.max(0,
-    num(f.staged_rows_written, 0) || num(f.processed_rows, 0) ||
-    num(m.staging_row_count, 0) || num(m.row_count, 0));
+  const fileRowResolved = resolveImportFileRowTotal({
+    fps: f as Record<string, unknown>,
+    metadata: m as Record<string, unknown>,
+  });
+  const fileRowPlan = fileRowResolved.total;
+  const dataRowsTotal = Math.max(0, fileRowPlan ?? 0);
+  const stagedRows = Math.max(0, num(f.staged_rows_written, 0) || num(f.processed_rows, 0));
 
   const p2pct = (() => {
     const v = num(f.phase2_stage_pct, -1);
@@ -229,7 +230,10 @@ export function buildUnifiedPipeline(input: UnifiedPipelineInput): UnifiedPipeli
 
   const rawWritten = Math.max(0, num(f.raw_rows_written, 0));
   const rawSkipped = Math.max(0, num(f.raw_rows_skipped_existing, 0));
-  const syncDenom = Math.max(1, num(f.staged_rows_written, 0) || num(m.staging_row_count, 0) || dataRowsTotal || stagedRows || 1);
+  const syncDenom = Math.max(
+    1,
+    fileRowPlan ?? Math.max(rawWritten + rawSkipped, stagedRows, num(f.processed_rows, 0), 1),
+  );
   const p3pct = (() => {
     const v = num(f.phase3_raw_sync_pct, -1);
     if (v >= 0) return Math.min(100, Math.round(v));
@@ -311,15 +315,20 @@ export function buildUnifiedPipeline(input: UnifiedPipelineInput): UnifiedPipeli
     !phase2Complete &&
     (p2s === "running" || p2s === "" || curPhase === "staging");
   const processRight = (() => {
+    const pend = fileRowResolved.verificationPending ? " · verification pending" : "";
     if (phase2Complete) {
-      return dataRowsTotal > 0
-        ? `${fmtRows(stagedRows)} / ${fmtRows(dataRowsTotal)} rows`
-        : stagedRows > 0 ? `${fmtRows(stagedRows)} rows` : "done";
+      return fileRowPlan != null
+        ? `${fmtRows(stagedRows)} / ${fmtRows(fileRowPlan)} rows${pend}`
+        : stagedRows > 0
+          ? `${fmtRows(stagedRows)} rows${pend}`
+          : "done";
     }
     if (processActive) {
-      return dataRowsTotal > 0
-        ? `${fmtRows(stagedRows)} / ${fmtRows(dataRowsTotal)} rows · ${p2pct}%`
-        : p2pct > 0 ? `${p2pct}%` : "…";
+      return fileRowPlan != null
+        ? `${fmtRows(stagedRows)} / ${fmtRows(fileRowPlan)} rows · ${p2pct}%${pend}`
+        : p2pct > 0
+          ? `${p2pct}%${pend}`
+          : "…";
     }
     return "—";
   })();
@@ -362,9 +371,10 @@ export function buildUnifiedPipeline(input: UnifiedPipelineInput): UnifiedPipeli
       return "done";
     }
     if (syncActive) {
+      const pend = fileRowResolved.verificationPending ? " · verification pending" : "";
       if (rawWritten + rawSkipped > 0)
-        return `${fmtRows(rawWritten + rawSkipped)} / ${fmtRows(syncDenom)} · ${p3pct}%`;
-      return p3pct > 0 ? `${p3pct}%` : "…";
+        return `${fmtRows(rawWritten + rawSkipped)} / ${fmtRows(syncDenom)} · ${p3pct}%${pend}`;
+      return p3pct > 0 ? `${p3pct}%${pend}` : "…";
     }
     return "—";
   })();

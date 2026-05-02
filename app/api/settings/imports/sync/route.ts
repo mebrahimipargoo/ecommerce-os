@@ -86,6 +86,7 @@ import {
   fpsNextAfterSync,
   fpsPctPhase3,
 } from "../../../../../lib/pipeline/file-processing-status-contract";
+import { resolveImportFileRowTotal } from "../../../../../lib/import-file-row-total";
 import {
   CONFLICT_KEY,
   DOMAIN_TABLE,
@@ -761,11 +762,8 @@ type RemovalShipmentSyncOpts = {
   uploadId: string;
   orgId: string;
   storeId: string;
-  totalStagingRows: number;
   columnMapping: Record<string, string> | null;
-  syncUpserted: { value: number };
-  engine: AmazonImportEngineConfig;
-  reportType: string;
+  syncProgress: SyncProgressOpts;
   duplicateInBatchTotal: { value: number };
 };
 
@@ -810,8 +808,9 @@ async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
   rawRowsWritten: number;
   rawRowsSkippedCrossUpload: number;
 }> {
-  const { uploadId, orgId, storeId, totalStagingRows, columnMapping, syncUpserted, engine, reportType, duplicateInBatchTotal } =
-    opts;
+  const { uploadId, orgId, storeId, columnMapping, syncProgress, duplicateInBatchTotal } = opts;
+  const totalStagingRows = syncProgress.totalStagingRows;
+  const syncUpserted = syncProgress.upserted;
 
   await acquireRemovalPipelineLock(orgId, storeId, uploadId);
 
@@ -1010,15 +1009,7 @@ async function runRemovalShipmentSync(opts: RemovalShipmentSyncOpts): Promise<{
 
       archived += stagingRows.length;
       await bumpSyncProgressMetadata(
-        {
-          uploadId,
-          orgId,
-          totalStagingRows,
-          upserted: syncUpserted,
-          engine,
-          reportType,
-          duplicateInBatchTotal,
-        },
+        syncProgress,
         stagingRows.length,
         {
           rawRowsWritten: shipmentArchiveRowsWritten,
@@ -1632,13 +1623,37 @@ export async function POST(req: Request): Promise<Response> {
       }
     }
 
-    const { count: stagingRowCount } = await supabaseServer
-      .from(STAGING_TABLE)
-      .select("*", { count: "exact", head: true })
-      .eq("upload_id", uploadId)
-      .eq("organization_id", orgId);
+    const metaRec =
+      meta && typeof meta === "object" && !Array.isArray(meta) ? (meta as Record<string, unknown>) : {};
+
+    const [{ count: stagingRowCount }, { data: fpsBeforeSync }] = await Promise.all([
+      supabaseServer
+        .from(STAGING_TABLE)
+        .select("*", { count: "exact", head: true })
+        .eq("upload_id", uploadId)
+        .eq("organization_id", orgId),
+      supabaseServer.from("file_processing_status").select("*").eq("upload_id", uploadId).maybeSingle(),
+    ]);
 
     const totalStagingRows = typeof stagingRowCount === "number" ? stagingRowCount : 0;
+    const fpsRec =
+      fpsBeforeSync && typeof fpsBeforeSync === "object" && !Array.isArray(fpsBeforeSync)
+        ? (fpsBeforeSync as Record<string, unknown>)
+        : {};
+    const fileRowPlanRes = resolveImportFileRowTotal({ fps: fpsRec, metadata: metaRec });
+    const fileRowTotal = fileRowPlanRes.total;
+    const syncCountVerifyPending =
+      fileRowPlanRes.verificationPending || typeof stagingRowCount !== "number";
+    const phase2StagedWatermark = Math.max(
+      0,
+      (typeof fpsRec.staged_rows_written === "number" && Number.isFinite(fpsRec.staged_rows_written)
+        ? Math.floor(fpsRec.staged_rows_written)
+        : 0) ||
+        (typeof fpsRec.processed_rows === "number" && Number.isFinite(fpsRec.processed_rows)
+          ? Math.floor(fpsRec.processed_rows)
+          : 0) ||
+        totalStagingRows,
+    );
 
     // ── REPORTS_REPOSITORY pre-flight: assert physical-line integrity in staging ─
     // Throws a clear, structured error if the staging table is missing rows,
@@ -1662,6 +1677,9 @@ export async function POST(req: Request): Promise<Response> {
       uploadId,
       orgId,
       totalStagingRows,
+      fileRowTotal,
+      phase2StagedWatermark,
+      syncCountVerifyPending,
       upserted: syncUpserted,
       metricTotals: syncMetricTotals,
       duplicateInBatchTotal: duplicateInBatchRef,
@@ -1715,9 +1733,9 @@ export async function POST(req: Request): Promise<Response> {
         phase2_stage_pct: 100,
         phase3_raw_sync_pct: 0,
         phase4_generic_pct: 0,
-        total_rows: totalStagingRows,
+        ...(fileRowTotal != null && fileRowTotal > 0 ? { total_rows: fileRowTotal } : {}),
         processed_rows: 0,
-        staged_rows_written: totalStagingRows,
+        staged_rows_written: phase2StagedWatermark,
         phase3_status: "running",
         phase3_started_at: new Date().toISOString(),
       },
@@ -1739,11 +1757,8 @@ export async function POST(req: Request): Promise<Response> {
         uploadId,
         orgId,
         storeId: importStoreId!,
-        totalStagingRows,
         columnMapping,
-        syncUpserted,
-        engine,
-        reportType: reportTypeRawEarly,
+        syncProgress: syncProgressBase,
         duplicateInBatchTotal: duplicateInBatchRef,
       });
       synced = r.synced;
@@ -1998,11 +2013,15 @@ export async function POST(req: Request): Promise<Response> {
       kind === "REMOVAL_SHIPMENT"
         ? removalShipmentSkippedCross
         : syncMetricTotals.rows_duplicate_against_existing;
-    const finalPhase3Pct = fpsPctPhase3(finalRawW, finalRawSkip, totalStagingRows);
+    const phase3FinalDenom =
+      fileRowTotal != null && fileRowTotal > 0 ? fileRowTotal : Math.max(1, totalStagingRows);
+    const finalPhase3Pct = fpsPctPhase3(finalRawW, finalRawSkip, phase3FinalDenom);
     const importMetrics: ImportRunMetrics = {
       physical_lines_seen: totalStagingRows,
       data_rows_seen: totalStagingRows,
       rows_staged: totalStagingRows,
+      ...(fileRowTotal != null && fileRowTotal > 0 ? { file_row_total_plan: fileRowTotal } : {}),
+      ...(syncCountVerifyPending ? { sync_count_verification_pending: true } : {}),
       rows_synced_upserted: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
       rows_mapper_invalid: mapperNullCount,
       rows_duplicate_in_file: duplicateInBatchRef.value,
@@ -2048,6 +2067,8 @@ export async function POST(req: Request): Promise<Response> {
           {
             row_count: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
             staging_row_count: totalStagingRows,
+            ...(syncCountVerifyPending ? { sync_count_verification_pending: true } : {}),
+            ...(fileRowTotal != null && fileRowTotal > 0 ? { total_rows: fileRowTotal } : {}),
             sync_row_count: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
             sync_mapper_null_count: mapperNullCount,
             sync_collapsed_by_dedupe: syncCollapsedByDedupe,
@@ -2140,8 +2161,8 @@ export async function POST(req: Request): Promise<Response> {
         phase4_generic_pct: needsPhase4 ? 0 : 100,
         phase4_status: needsPhase4 ? "pending" : "complete",
         phase4_completed_at: needsPhase4 ? null : new Date().toISOString(),
-        processed_rows: totalStagingRows,
-        total_rows: totalStagingRows,
+        processed_rows: synced,
+        ...(fileRowTotal != null && fileRowTotal > 0 ? { total_rows: fileRowTotal } : {}),
         raw_rows_written: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : finalRawW,
         raw_rows_skipped_existing:
           kind === "REMOVAL_SHIPMENT"
@@ -2149,7 +2170,7 @@ export async function POST(req: Request): Promise<Response> {
             : syncMetricTotals.rows_duplicate_against_existing,
         duplicate_rows_skipped: duplicateInBatchRef.value,
         rows_eligible_for_generic: rowsEligibleGeneric,
-        staged_rows_written: totalStagingRows,
+        staged_rows_written: phase2StagedWatermark,
         error_message: null,
         import_metrics: importMetrics,
         phase3_status: "complete",
@@ -2314,8 +2335,13 @@ async function deleteFromStaging(ids: string[], organizationId: string): Promise
 type SyncProgressOpts = {
   uploadId: string;
   orgId: string;
+  /** Diagnostic: staging rows present at sync start (count); not used as FPS total_rows. */
   totalStagingRows: number;
-  /** Cumulative staging lines finished this sync (for progress bar denominator). */
+  /** Parsed / upload-metadata plan total; never the staging count. */
+  fileRowTotal: number | null;
+  /** End-of-phase2 watermark / rows staged (constant on FPS during sync). */
+  phase2StagedWatermark: number;
+  syncCountVerifyPending: boolean;
   upserted: { value: number };
   metricTotals?: BatchUpsertMetricDelta;
   duplicateInBatchTotal?: { value: number };
@@ -2328,17 +2354,18 @@ async function bumpSyncProgressMetadata(
   chunkRowCount: number,
   removalShipment?: { rawRowsWritten: number; rawRowsSkippedCrossUpload: number },
 ): Promise<void> {
-  if (opts.totalStagingRows <= 0 || chunkRowCount <= 0) return;
+  if (chunkRowCount <= 0) return;
   opts.upserted.value += chunkRowCount;
   const { data: prevRow } = await supabaseServer
     .from("raw_report_uploads")
     .select("metadata")
     .eq("id", opts.uploadId)
     .maybeSingle();
-  const pct = Math.min(
-    99,
-    Math.round((opts.upserted.value / Math.max(1, opts.totalStagingRows)) * 100),
-  );
+  const denomForPct =
+    opts.fileRowTotal != null && opts.fileRowTotal > 0
+      ? opts.fileRowTotal
+      : Math.max(1, opts.totalStagingRows);
+  const pct = Math.min(99, Math.round((opts.upserted.value / denomForPct) * 100));
   const prevMeta = (prevRow as { metadata?: unknown } | null)?.metadata;
   const prevIm =
     prevMeta && typeof prevMeta === "object" && prevMeta !== null && "import_metrics" in prevMeta
@@ -2365,7 +2392,11 @@ async function bumpSyncProgressMetadata(
     rawSkip = 0;
   }
   const dupBatch = opts.duplicateInBatchTotal?.value ?? 0;
-  const phase3Pct = fpsPctPhase3(rawW, rawSkip, opts.totalStagingRows);
+  const phase3Denom =
+    opts.fileRowTotal != null && opts.fileRowTotal > 0
+      ? opts.fileRowTotal
+      : Math.max(1, opts.totalStagingRows);
+  const phase3Pct = fpsPctPhase3(rawW, rawSkip, phase3Denom);
 
   await supabaseServer
     .from("raw_report_uploads")
@@ -2373,11 +2404,14 @@ async function bumpSyncProgressMetadata(
       metadata: mergeUploadMetadata(prevMeta, {
         sync_progress: pct,
         etl_phase: "sync",
+        ...(opts.syncCountVerifyPending ? { sync_count_verification_pending: true } : {}),
         import_metrics: {
           ...prevIm,
           current_phase: "sync",
           rows_synced: opts.upserted.value,
           total_staging_rows: opts.totalStagingRows,
+          ...(opts.fileRowTotal != null && opts.fileRowTotal > 0 ? { file_row_total_plan: opts.fileRowTotal } : {}),
+          ...(opts.syncCountVerifyPending ? { sync_count_verification_pending: true } : {}),
           ...(removalShipment
             ? {
                 removal_shipment_raw_rows_written: removalShipment.rawRowsWritten,
@@ -2415,8 +2449,8 @@ async function bumpSyncProgressMetadata(
         phase2_stage_pct: 100,
         phase3_raw_sync_pct: phase3Pct,
         processed_rows: opts.upserted.value,
-        total_rows: opts.totalStagingRows,
-        staged_rows_written: opts.totalStagingRows,
+        ...(opts.fileRowTotal != null && opts.fileRowTotal > 0 ? { total_rows: opts.fileRowTotal } : {}),
+        staged_rows_written: opts.phase2StagedWatermark,
         raw_rows_written: rawW,
         raw_rows_skipped_existing: rawSkip,
         duplicate_rows_skipped: dupBatch,
@@ -2424,6 +2458,8 @@ async function bumpSyncProgressMetadata(
           current_phase: "sync",
           rows_synced: opts.upserted.value,
           total_staging_rows: opts.totalStagingRows,
+          ...(opts.fileRowTotal != null && opts.fileRowTotal > 0 ? { file_row_total_plan: opts.fileRowTotal } : {}),
+          ...(opts.syncCountVerifyPending ? { sync_count_verification_pending: true } : {}),
           ...(removalShipment
             ? {
                 removal_shipment_raw_rows_written: removalShipment.rawRowsWritten,

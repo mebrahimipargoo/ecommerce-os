@@ -1382,6 +1382,133 @@ export async function resetStuckUpload(input: {
   return { ok: true };
 }
 
+/**
+ * Clears pipeline artifacts for a single upload: `amazon_staging`, listing raw archive,
+ * `product_identity_staging_rows`, `import_pipeline_locks`, `file_processing_status`, and
+ * `raw_report_import_audit` rows for this upload. Keeps `raw_report_uploads` and storage;
+ * sets status back to `mapped` with cleared progress fields. Use after a failed or
+ * partial import — not a substitute for full delete.
+ */
+export async function clearImportPipelineArtifactsForUpload(input: {
+  uploadId: string;
+  actorUserId?: string | null;
+}): Promise<{ ok: boolean; error?: string; deleted?: Record<string, number> }> {
+  const userId = await resolveActorForImportAction(input.actorUserId);
+  if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
+
+  const { data: row, error: fetchErr } = await supabaseServer
+    .from(DB_TABLES.rawReportUploads)
+    .select("id, organization_id, metadata, status")
+    .eq("id", input.uploadId)
+    .maybeSingle();
+
+  if (fetchErr || !row) return { ok: false, error: fetchErr?.message ?? "Upload not found." };
+  const orgId = String((row as { organization_id?: unknown }).organization_id ?? "").trim();
+  if (!isUuidString(orgId)) return { ok: false, error: "Invalid organization." };
+
+  const currentStatus = String((row as { status?: unknown }).status ?? "");
+  const allowed = ["failed", "processing", "staged"];
+  if (!allowed.includes(currentStatus)) {
+    return {
+      ok: false,
+      error: `Clear staging applies only to failed, processing, or staged uploads (current: "${currentStatus}").`,
+    };
+  }
+
+  const deleted: Record<string, number> = {};
+
+  try {
+    {
+      const { data, error } = await supabaseServer
+        .from("import_pipeline_locks")
+        .delete()
+        .eq("upload_id", input.uploadId)
+        .select("upload_id");
+      if (error) throw new Error(`import_pipeline_locks: ${error.message}`);
+      deleted.import_pipeline_locks = data?.length ?? 0;
+    }
+    {
+      const { data, error } = await supabaseServer
+        .from("file_processing_status")
+        .delete()
+        .eq("upload_id", input.uploadId)
+        .select("upload_id");
+      if (error) throw new Error(`file_processing_status: ${error.message}`);
+      deleted.file_processing_status = data?.length ?? 0;
+    }
+    {
+      const { data, error } = await supabaseServer
+        .from("amazon_listing_report_rows_raw")
+        .delete()
+        .eq("organization_id", orgId)
+        .eq("source_upload_id", input.uploadId)
+        .select("id");
+      if (error) throw new Error(`amazon_listing_report_rows_raw: ${error.message}`);
+      deleted.amazon_listing_report_rows_raw = data?.length ?? 0;
+    }
+    {
+      const { data, error } = await supabaseServer
+        .from("product_identity_staging_rows")
+        .delete()
+        .eq("organization_id", orgId)
+        .eq("upload_id", input.uploadId)
+        .select("id");
+      if (error) throw new Error(`product_identity_staging_rows: ${error.message}`);
+      deleted.product_identity_staging_rows = data?.length ?? 0;
+    }
+    {
+      const { data, error } = await supabaseServer
+        .from(DB_TABLES.amazonLedgerStaging)
+        .delete()
+        .eq("organization_id", orgId)
+        .eq("upload_id", input.uploadId)
+        .select("id");
+      if (error) throw new Error(`amazon_staging: ${error.message}`);
+      deleted.amazon_staging = data?.length ?? 0;
+    }
+    {
+      const { data, error } = await supabaseServer
+        .from("raw_report_import_audit")
+        .delete()
+        .eq("entity_id", input.uploadId)
+        .select("id");
+      if (error) throw new Error(`raw_report_import_audit: ${error.message}`);
+      deleted.raw_report_import_audit = data?.length ?? 0;
+    }
+
+    const metadata = mergeUploadMetadata((row as { metadata?: unknown }).metadata, {
+      error_message: "Staging and progress cleared — click Process to run again.",
+      process_progress: 0,
+      sync_progress: 0,
+      staging_row_count: 0,
+      import_metrics: { current_phase: "upload" },
+    });
+
+    const { error: upErr } = await supabaseServer
+      .from(DB_TABLES.rawReportUploads)
+      .update({
+        status: "mapped",
+        import_pipeline_started_at: null,
+        import_pipeline_completed_at: null,
+        import_pipeline_failed_at: null,
+        metadata,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", input.uploadId)
+      .eq("organization_id", orgId);
+
+    if (upErr) return { ok: false, error: upErr.message };
+
+    await audit(orgId, userId, "import.pipeline_artifacts_cleared", input.uploadId, {
+      previousStatus: currentStatus,
+      deleted,
+    });
+    return { ok: true, deleted };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Clear failed." };
+  }
+}
+
 export async function updateRawReportType(input: {
   uploadId: string;
   reportType: RawReportType;

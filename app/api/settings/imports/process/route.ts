@@ -211,7 +211,13 @@ async function processProductIdentityUpload(params: {
       uploadRow: row,
       metadata,
       onChunkProgress: async ({ staged, total }) => {
-        const pct = total > 0 ? Math.min(99, Math.round((staged / total) * 100)) : 1;
+        const denominator =
+          estimatedTotalRows > 0 && total > 0
+            ? Math.max(estimatedTotalRows, total)
+            : estimatedTotalRows > 0
+              ? estimatedTotalRows
+              : total;
+        const pct = denominator > 0 ? Math.min(99, Math.round((staged / denominator) * 100)) : 1;
         await supabaseServer.from("file_processing_status").upsert({
           upload_id: uploadId,
           organization_id: organizationId,
@@ -221,7 +227,7 @@ async function processProductIdentityUpload(params: {
           process_pct: pct,
           staged_rows_written: staged,
           processed_rows: staged,
-          total_rows: total,
+          total_rows: denominator > 0 ? denominator : null,
           import_metrics: { current_phase: "process", rows_staged: staged },
         }, { onConflict: "upload_id" });
       },

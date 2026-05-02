@@ -3,12 +3,13 @@ import io
 import json
 import logging
 import math
+import time
 import traceback
 import uuid
 import hashlib
 import os
 from collections import defaultdict, deque
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -73,6 +74,64 @@ def _require_supabase() -> Client:
             detail="Database not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
         )
     return supabase
+
+
+# Align with Next.js Phase 2 staging: transient PostgREST / network hiccups (e.g. Nano).
+_IMPORT_RETRY_BACKOFF_SEC = (5.0, 15.0, 30.0, 60.0, 120.0)
+_IMPORT_OP_MAX_ATTEMPTS = 6
+
+
+def _is_transient_supabase_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "timeout",
+        "timed out",
+        "statement timeout",
+        "deadlock",
+        "too many connections",
+        "connection reset",
+        "econnreset",
+        "etimedout",
+        "eai_again",
+        "fetch failed",
+        "network",
+        "socket",
+        "502",
+        "503",
+        "504",
+        "bad gateway",
+        "gateway timeout",
+        "service unavailable",
+        "internal server error",
+        "premature",
+        "cloudflare",
+    )
+    return any(n in msg for n in needles)
+
+
+def _execute_with_import_retries(label: str, fn: Callable[[], Any], max_attempts: int = _IMPORT_OP_MAX_ATTEMPTS) -> Any:
+    last_exc: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if not _is_transient_supabase_error(e) or attempt >= max_attempts:
+                raise
+            idx = min(attempt - 1, len(_IMPORT_RETRY_BACKOFF_SEC) - 1)
+            delay = _IMPORT_RETRY_BACKOFF_SEC[idx]
+            log.warning(
+                "[etl] %s attempt %d/%d failed (%s); sleeping %.1fs before retry",
+                label,
+                attempt,
+                max_attempts,
+                e,
+                delay,
+            )
+            time.sleep(delay)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{label}: retries exhausted with no exception (should not happen)")
 
 
 def _normalize_header(name: str) -> str:
@@ -704,7 +763,10 @@ async def etl_upload_removal(
         inserted = 0
         for i in range(0, len(rows_to_insert), STAGING_INSERT_BATCH):
             chunk = rows_to_insert[i : i + STAGING_INSERT_BATCH]
-            db.table("amazon_staging").insert(chunk).execute()
+            _execute_with_import_retries(
+                f"amazon_staging insert offset={i} size={len(chunk)}",
+                lambda c=chunk: db.table("amazon_staging").insert(c).execute(),
+            )
             inserted += len(chunk)
 
         return {
@@ -805,7 +867,10 @@ async def etl_process_staging(organization_id: str = Form(...)):
                 }
             )
 
-        pal_res = db.table("expected_pallets").insert(pallet_payloads).select("id").execute()
+        pal_res = _execute_with_import_retries(
+            "expected_pallets bulk insert",
+            lambda: db.table("expected_pallets").insert(pallet_payloads).select("id").execute(),
+        )
         pallet_ids = [r["id"] for r in (pal_res.data or [])]
 
         if len(pallet_ids) != len(group_order):
@@ -840,10 +905,16 @@ async def etl_process_staging(organization_id: str = Form(...)):
         if item_rows:
             for i in range(0, len(item_rows), STAGING_INSERT_BATCH):
                 chunk = item_rows[i : i + STAGING_INSERT_BATCH]
-                db.table("expected_items").insert(chunk).execute()
+                _execute_with_import_retries(
+                    f"expected_items insert offset={i} size={len(chunk)}",
+                    lambda c=chunk: db.table("expected_items").insert(c).execute(),
+                )
                 items_created += len(chunk)
 
-        db.table("amazon_staging").delete().eq("organization_id", organization_id).execute()
+        _execute_with_import_retries(
+            "amazon_staging delete by organization_id",
+            lambda: db.table("amazon_staging").delete().eq("organization_id", organization_id).execute(),
+        )
 
         return {
             "status": "success",

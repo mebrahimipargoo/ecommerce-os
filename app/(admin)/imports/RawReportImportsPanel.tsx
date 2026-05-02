@@ -15,6 +15,7 @@ import {
 import { AMAZON_LEDGER_UPLOAD_SOURCE } from "../../../lib/raw-report-upload-metadata";
 import type { RawReportUploadRow } from "../../../lib/raw-report-upload-row";
 import {
+  clearImportPipelineArtifactsForUpload,
   deleteRawReportUpload,
   listRawReportUploads,
   resetStuckUpload,
@@ -203,8 +204,23 @@ export function RawReportImportsPanel({
   useEffect(() => {
     const hasBusy = Object.keys(busyIds).length > 0;
     if (!hasBusy) return;
-    const t = setInterval(() => void refresh(), 1200);
-    return () => clearInterval(t);
+    let cancelled = false;
+    let delayMs = 4000;
+    let timeoutId: ReturnType<typeof setTimeout>;
+    const schedule = () => {
+      timeoutId = setTimeout(async () => {
+        if (cancelled) return;
+        await refresh();
+        if (cancelled) return;
+        delayMs = Math.min(15000, Math.floor(delayMs * 1.25));
+        schedule();
+      }, delayMs);
+    };
+    schedule();
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
   }, [busyIds, refresh]);
 
   // ── Operations ──────────────────────────────────────────────────────────────
@@ -279,8 +295,13 @@ export function RawReportImportsPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ upload_id: r.id }),
       });
-      const json = await readImportApiJson<{ ok?: boolean; error?: string; details?: string }>(res);
-      if (!res.ok || !json.ok) {
+      const json = await readImportApiJson<{
+        ok?: boolean;
+        recoverable?: boolean;
+        error?: string;
+        details?: string;
+      }>(res);
+      if (!res.ok || (!json.ok && !json.recoverable)) {
         setLoadErr(json.details || json.error || "Processing failed.");
       }
       await refresh();
@@ -383,6 +404,28 @@ export function RawReportImportsPanel({
       await refresh();
     } catch (e) {
       setLoadErr(e instanceof Error ? e.message : "Reset failed.");
+    } finally {
+      clearBusy(r.id);
+    }
+  };
+
+  const runClearImportPipeline = async (r: RawReportUploadRow) => {
+    if (
+      !window.confirm(
+        "Clear staging rows, listing raw archive, product-identity staging, progress (FPS), locks, and import audit for this upload? " +
+          "The file record stays in history — click Process to run again.",
+      )
+    ) {
+      return;
+    }
+    markBusy(r.id, "clear-pipeline");
+    setLoadErr(null);
+    try {
+      const res = await clearImportPipelineArtifactsForUpload({ uploadId: r.id, actorUserId });
+      if (!res.ok) setLoadErr(res.error ?? "Clear failed.");
+      await refresh();
+    } catch (e) {
+      setLoadErr(e instanceof Error ? e.message : "Clear failed.");
     } finally {
       clearBusy(r.id);
     }
@@ -564,6 +607,7 @@ export function RawReportImportsPanel({
                     onDelete={() => void runDeleteUpload(r)}
                     onResetStuck={() => void runResetStuck(r)}
                     onResetStuckProductIdentity={() => void runResetStuckProductIdentity(r)}
+                    onClearImportPipeline={() => void runClearImportPipeline(r)}
                     onMapColumns={() => setMappingRow(r)}
                     onReportTypeChange={async (v: RawReportType) => {
                       const prevType = r.report_type;
@@ -633,6 +677,7 @@ type HistoryRowProps = {
   onDelete: () => void;
   onResetStuck: () => void;
   onResetStuckProductIdentity: () => void;
+  onClearImportPipeline: () => void;
   onMapColumns: () => void;
   onReportTypeChange: (v: RawReportType) => void;
   reportTypeSaved: boolean;
@@ -653,6 +698,7 @@ const HistoryRow = React.memo(function HistoryRow({
   onDelete,
   onResetStuck,
   onResetStuckProductIdentity,
+  onClearImportPipeline,
   onMapColumns,
   onReportTypeChange,
   reportTypeSaved
@@ -661,6 +707,14 @@ const HistoryRow = React.memo(function HistoryRow({
   const metaObj =
     r.metadata && typeof r.metadata === "object" && !Array.isArray(r.metadata)
       ? (r.metadata as Record<string, unknown>)
+      : null;
+  const importMetricsPoll =
+    metaObj?.import_metrics && typeof metaObj.import_metrics === "object" && !Array.isArray(metaObj.import_metrics)
+      ? (metaObj.import_metrics as Record<string, unknown>)
+      : null;
+  const phase2OperatorLine =
+    typeof importMetricsPoll?.phase2_operator_line === "string" && importMetricsPoll.phase2_operator_line.trim() !== ""
+      ? importMetricsPoll.phase2_operator_line
       : null;
   const isLedgerSession = metaObj?.source === AMAZON_LEDGER_UPLOAD_SOURCE;
 
@@ -703,6 +757,10 @@ const HistoryRow = React.memo(function HistoryRow({
   const showResetStuckProductIdentity =
     r.report_type === "PRODUCT_IDENTITY" &&
     (r.status === "processing" || r.status === "staged" || r.status === "failed") &&
+    !busy;
+  const showClearImportPipeline =
+    !isLedgerSession &&
+    (r.status === "failed" || r.status === "staged") &&
     !busy;
 
   return (
@@ -809,7 +867,9 @@ const HistoryRow = React.memo(function HistoryRow({
                     ? "Generic…"
                     : busyPhase === "worklist"
                       ? "Worklist…"
-                      : "Working…"}
+                      : busyPhase === "clear-pipeline"
+                        ? "Clearing…"
+                        : "Working…"}
             </span>
           ) : (
             <span
@@ -829,6 +889,14 @@ const HistoryRow = React.memo(function HistoryRow({
               title={r.errorMessage}
             >
               {r.errorMessage}
+            </span>
+          )}
+          {(r.status === "processing" || busyPhase === "processing") && phase2OperatorLine && (
+            <span
+              className="max-w-[200px] break-words text-[9px] leading-snug text-muted-foreground"
+              title={phase2OperatorLine}
+            >
+              {phase2OperatorLine}
             </span>
           )}
         </div>
@@ -948,6 +1016,17 @@ const HistoryRow = React.memo(function HistoryRow({
               small
             >
               Reset&nbsp;PI
+            </ActionButton>
+          )}
+
+          {showClearImportPipeline && (
+            <ActionButton
+              onClick={onClearImportPipeline}
+              disabled={anyBusy}
+              color="amber"
+              small
+            >
+              Clear staging
             </ActionButton>
           )}
 

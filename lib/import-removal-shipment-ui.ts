@@ -3,6 +3,7 @@
  * Does not alter sync/dedupe logic — consumes the same DB/FPS fields as Import History.
  */
 
+import { resolveImportFileRowTotal } from "./import-file-row-total";
 import type { ImportUiActionInput, ImportUiActionState } from "./import-ui-action-state";
 import { resolveImportUiActionState } from "./import-ui-action-state";
 import { resolveAmazonImportSyncKind } from "./pipeline/amazon-report-registry";
@@ -146,20 +147,10 @@ export function buildRemovalShipmentProgressModel(
     ),
   );
 
-  const dataRowsTotal = Math.max(
-    0,
-    num(f.data_rows_total, 0) ||
-      num(f.file_rows_total, 0) ||
-      num(m.data_rows_seen, 0) ||
-      num(m.total_rows, 0),
-  );
-  const stagedRowsWritten = Math.max(
-    0,
-    num(f.staged_rows_written, 0) ||
-      num(f.processed_rows, 0) ||
-      num(m.staging_row_count, 0) ||
-      num(m.row_count, 0),
-  );
+  const fileRowResolved = resolveImportFileRowTotal({ fps: f as Record<string, unknown>, metadata: m });
+  const fileRowPlan = fileRowResolved.total;
+  const dataRowsTotal = Math.max(0, fileRowPlan ?? 0);
+  const stagedRowsWritten = Math.max(0, num(f.staged_rows_written, 0) || num(f.processed_rows, 0));
   const p2f = num(f.phase2_stage_pct, -1);
   const p2proc = num(f.process_pct, -1);
   const phase2Pct = Math.min(
@@ -174,13 +165,10 @@ export function buildRemovalShipmentProgressModel(
 
   const rawRowsWritten = Math.max(0, num(f.raw_rows_written, 0));
   const rawRowsSkippedExisting = Math.max(0, num(f.raw_rows_skipped_existing, 0));
+  const phase3Numer = rawRowsWritten + rawRowsSkippedExisting;
   const syncDenominator = Math.max(
     1,
-    num(f.staged_rows_written, 0) ||
-      num(m.staging_row_count, 0) ||
-      dataRowsTotal ||
-      stagedRowsWritten ||
-      1,
+    fileRowPlan ?? Math.max(phase3Numer, stagedRowsWritten, 1),
   );
   const p3f = num(f.phase3_raw_sync_pct, -1);
   const phase3Pct = Math.min(

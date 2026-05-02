@@ -55,6 +55,7 @@ import type { RawReportType } from "../../../lib/raw-report-types";
 import { isListingReportType } from "../../../lib/raw-report-types";
 import { listStores } from "../../settings/adapters/actions";
 import { formatImportPhaseLabel } from "../../../lib/pipeline/import-phase-labels";
+import { resolveImportFileRowTotal } from "../../../lib/import-file-row-total";
 import { AMAZON_LEDGER_UPLOAD_SOURCE } from "../../../lib/raw-report-upload-metadata";
 import {
   inferUniversalImporterPhase,
@@ -302,6 +303,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [phase, setPhase] = useState<Phase>("idle");
+  const phaseRef = useRef<Phase>("idle");
+  phaseRef.current = phase;
   const [uploadPct, setUploadPct] = useState(0);
   const [progressMsg, setProgressMsg] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -731,8 +734,11 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
       if (liveSyncPct != null) setSyncPct(Math.min(100, Math.max(0, liveSyncPct)));
       const liveUploadPct = num(fpsRow?.upload_pct) ?? num(fpsRow?.phase1_upload_pct);
       if (liveUploadPct != null) setUploadPct(Math.min(100, Math.max(0, liveUploadPct)));
-      const liveTotal = num(fpsRow?.total_rows) ?? num((meta as Record<string, unknown> | null)?.total_rows);
-      if (liveTotal != null && liveTotal > 0) setTotalRows(liveTotal);
+      const filePlan = resolveImportFileRowTotal({
+        fps: fpsRow ?? undefined,
+        metadata: meta ?? undefined,
+      });
+      if (filePlan.total != null && filePlan.total > 0) setTotalRows(filePlan.total);
       const liveProcessed = num(fpsRow?.processed_rows);
       if (liveProcessed != null) setProcessedRows(liveProcessed);
 
@@ -776,11 +782,28 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
       const rt = String(rpu.report_type ?? "").trim();
       if (rt && rt !== "UNKNOWN") setDetectedType(rt);
     }
-    const id = setInterval(() => void tick(), 1500);
-    void tick();
+
+    const pollDelayMs = () => {
+      const p = phaseRef.current;
+      return p === "processing" || p === "syncing" || p === "genericing" || p === "worklisting"
+        ? 6200
+        : 2800;
+    };
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    const scheduleNext = () => {
+      timeoutId = setTimeout(() => {
+        if (cancelled) return;
+        void tick().finally(() => {
+          if (!cancelled) scheduleNext();
+        });
+      }, pollDelayMs());
+    };
+    void tick().finally(() => {
+      if (!cancelled) scheduleNext();
+    });
     return () => {
       cancelled = true;
-      clearInterval(id);
+      if (timeoutId) clearTimeout(timeoutId);
     };
   }, [sessionUploadId, detectedType]);
 
@@ -1098,13 +1121,19 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
             setUploadPct(Math.min(100, Math.max(0, Number(fpsRow.upload_pct))));
           }
           if (typeof fpsRow.processed_rows === "number") setProcessedRows(Number(fpsRow.processed_rows));
-          if (typeof fpsRow.total_rows === "number" && fpsRow.total_rows > 0) setTotalRows(Number(fpsRow.total_rows));
+          const planFromFps = resolveImportFileRowTotal({
+            fps: fpsRow as Record<string, unknown>,
+            metadata: (m as Record<string, unknown> | null) ?? undefined,
+          });
+          if (planFromFps.total != null && planFromFps.total > 0) setTotalRows(planFromFps.total);
           const cp = typeof fpsRow.current_phase === "string" ? fpsRow.current_phase : null;
           if (cp) setPhaseLabel(formatImportPhaseLabel(cp));
         } else if (m) {
           if (typeof m.process_progress === "number") setProcessPct(m.process_progress);
-          if (typeof m.row_count === "number") setProcessedRows(m.row_count);
-          if (typeof m.total_rows === "number" && m.total_rows > 0) setTotalRows(m.total_rows as number);
+          if (typeof m.processed_rows === "number") setProcessedRows(m.processed_rows as number);
+          else if (typeof m.row_count === "number") setProcessedRows(m.row_count as number);
+          const planMetaOnly = resolveImportFileRowTotal({ metadata: m as Record<string, unknown> });
+          if (planMetaOnly.total != null && planMetaOnly.total > 0) setTotalRows(planMetaOnly.total);
           const im = m.import_metrics as { current_phase?: string } | undefined;
           if (im?.current_phase) setPhaseLabel(formatImportPhaseLabel(im.current_phase));
         }
@@ -1115,8 +1144,20 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
             setPhaseLabel(formatImportPhaseLabel(lip === "raw_archive" ? "staging" : lip === "canonical_sync" ? "processing" : lip));
           }
         }
+        const fpsIm = fpsRow?.import_metrics as Record<string, unknown> | undefined;
+        const metaIm = m?.import_metrics as Record<string, unknown> | undefined;
+        const opLine =
+          (typeof fpsIm?.phase2_operator_line === "string" && fpsIm.phase2_operator_line.trim() !== ""
+            ? fpsIm.phase2_operator_line
+            : null) ??
+          (typeof metaIm?.phase2_operator_line === "string" && metaIm.phase2_operator_line.trim() !== ""
+            ? metaIm.phase2_operator_line
+            : null);
+        if (opLine) {
+          setProgressMsg(opLine);
+        }
       });
-    }, listingFromUi ? 350 : 400);
+    }, 3000);
 
     try {
       const { data: upRow } = await supabase
@@ -1143,6 +1184,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
       });
       const json = await readImportApiJson<{
         ok?: boolean;
+        recoverable?: boolean;
         error?: string;
         details?: string;
         rowsStaged?: number;
@@ -1168,7 +1210,15 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
           canonical_invalid_for_merge?: number;
         };
       }>(res);
-      if (!res.ok || !json.ok) throw new Error(json.details || json.error || "Processing failed.");
+      if (!res.ok || (!json.ok && !json.recoverable)) {
+        throw new Error(json.details || json.error || "Processing failed.");
+      }
+      if (!json.ok && json.recoverable) {
+        setProgressMsg(json.error ?? "Click Process again to resume staging.");
+        setPhase("mapped");
+        bumpHistory();
+        return;
+      }
       const staged = json.rowsStaged ?? json.rowsProcessed ?? 0;
       const total = json.totalRows ?? json.catalogListing?.data_rows_seen ?? totalRows;
       setProcessPct(100);
@@ -1246,20 +1296,26 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
         if (fpsRow && typeof fpsRow.current_phase === "string") {
           setPhaseLabel(formatImportPhaseLabel(fpsRow.current_phase));
         }
-        const im = fpsRow?.import_metrics as
-          | { rows_synced?: number; total_staging_rows?: number }
-          | undefined;
-        const tr = fpsRow && typeof fpsRow.total_rows === "number" ? Number(fpsRow.total_rows) : 0;
-        const pr = fpsRow && typeof fpsRow.processed_rows === "number" ? Number(fpsRow.processed_rows) : 0;
-        if (im && typeof im.rows_synced === "number" && typeof im.total_staging_rows === "number") {
-          setProgressMsg(
-            `Syncing… ${im.rows_synced.toLocaleString()} / ${im.total_staging_rows.toLocaleString()} rows`,
-          );
-        } else if (tr > 0 && pr >= 0) {
-          setProgressMsg(`Syncing… ${pr.toLocaleString()} / ${tr.toLocaleString()} rows`);
+        const im = fpsRow?.import_metrics as { rows_synced?: number } | undefined;
+        const mSync = rpu.data?.metadata as Record<string, unknown> | null | undefined;
+        const plan = resolveImportFileRowTotal({
+          fps: (fpsRow as Record<string, unknown> | null | undefined) ?? undefined,
+          metadata: mSync ?? undefined,
+        });
+        const pr =
+          typeof im?.rows_synced === "number"
+            ? im.rows_synced
+            : fpsRow && typeof fpsRow.processed_rows === "number"
+              ? Number(fpsRow.processed_rows)
+              : 0;
+        const pend = plan.verificationPending ? " · verification pending" : "";
+        if (plan.total != null && plan.total > 0 && pr >= 0) {
+          setProgressMsg(`Syncing… ${pr.toLocaleString()} / ${plan.total.toLocaleString()} rows${pend}`);
+        } else if (pr > 0) {
+          setProgressMsg(`Syncing… ${pr.toLocaleString()} rows${pend}`);
         }
       });
-    }, 400);
+    }, 3000);
     try {
       const res = await fetch("/api/settings/imports/sync", {
         method: "POST",
@@ -1392,7 +1448,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
           if (!m) return;
           if (typeof m.worklist_progress === "number") setWorklistPct(m.worklist_progress);
         });
-    }, 400);
+    }, 3000);
 
     try {
       const res = await fetch("/api/settings/imports/generate-worklist", {

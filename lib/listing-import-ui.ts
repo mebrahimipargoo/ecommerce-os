@@ -3,6 +3,7 @@
  * Action gating uses `resolveImportUiActionState` via `resolveListingImportUiState`.
  */
 
+import { resolveImportFileRowTotal } from "./import-file-row-total";
 import { isListingAmazonSyncKind, type AmazonSyncKind } from "./pipeline/amazon-report-registry";
 import type { ImportUiActionInput, ImportUiActionState } from "./import-ui-action-state";
 import { resolveImportUiActionState } from "./import-ui-action-state";
@@ -108,20 +109,10 @@ export function buildListingPipelineSteps(opts: {
   const im = m.import_metrics as { current_phase?: string; rows_synced?: number; total_staging_rows?: number } | undefined;
   const imPhase = norm(im?.current_phase);
 
-  const dataRowsTotal = Math.max(
-    0,
-    num(f.data_rows_total, 0) ||
-      num(f.file_rows_total, 0) ||
-      num(m.data_rows_seen, 0) ||
-      num(m.catalog_listing_data_rows_seen, 0) ||
-      num(m.total_rows, 0),
-  );
-  const stagedRows = Math.max(
-    0,
-    num(f.staged_rows_written, 0) ||
-      num(f.processed_rows, 0) ||
-      num(m.staging_row_count, 0),
-  );
+  const fileRowResolved = resolveImportFileRowTotal({ fps: f as Record<string, unknown>, metadata: m as Record<string, unknown> });
+  const fileRowPlan = fileRowResolved.total;
+  const dataRowsTotal = Math.max(0, fileRowPlan ?? 0);
+  const stagedRows = Math.max(0, num(f.staged_rows_written, 0) || num(f.processed_rows, 0));
   const p2f = num(f.phase2_stage_pct, -1);
   const p2proc = num(f.process_pct, -1);
   let stagingPct = 0;
@@ -129,9 +120,11 @@ export function buildListingPipelineSteps(opts: {
   else if (p2proc >= 0 && (curPhase === "staging" || imPhase === "staging")) stagingPct = Math.min(100, Math.round(p2proc));
   else if (dataRowsTotal > 0 && stagedRows > 0) stagingPct = Math.min(100, Math.round((stagedRows / dataRowsTotal) * 100));
 
-  const totalStaging = Math.max(1, num(f.staged_rows_written, 0) || num(m.staging_row_count, 0) || dataRowsTotal || 1);
+  const totalStaging = Math.max(
+    1,
+    fileRowPlan ?? (num(f.staged_rows_written, 0) || num(f.processed_rows, 0) || dataRowsTotal || 1),
+  );
   const rowsSynced = num(im?.rows_synced, -1);
-  const totalStgMeta = num(im?.total_staging_rows, -1);
   const rawWritten = Math.max(0, num(f.raw_rows_written, 0));
   const rawSkipped = Math.max(0, num(f.raw_rows_skipped_existing, 0));
 
@@ -207,8 +200,13 @@ export function buildListingPipelineSteps(opts: {
         : "Done";
     }
     if (!rawActive) return "—";
-    if (rowsSynced >= 0 && totalStgMeta >= 0) {
-      return `${rowsSynced.toLocaleString()} / ${totalStgMeta.toLocaleString()} rows · ${rawPct}%`;
+    if (rowsSynced >= 0 && fileRowPlan != null) {
+      const pend = fileRowResolved.verificationPending ? " · verification pending" : "";
+      return `${rowsSynced.toLocaleString()} / ${fileRowPlan.toLocaleString()} rows · ${rawPct}%${pend}`;
+    }
+    if (rowsSynced >= 0) {
+      const pend = fileRowResolved.verificationPending ? " · verification pending" : "";
+      return `${rowsSynced.toLocaleString()} rows synced · ${rawPct}%${pend}`;
     }
     return `${rawPct}% · ${(rawWritten + rawSkipped).toLocaleString()} / ${totalStaging.toLocaleString()} lines`;
   })();
@@ -257,10 +255,12 @@ export function buildListingPipelineSteps(opts: {
       subtitle: "amazon_staging",
       pct: stagingComplete ? 100 : stagingActive ? Math.max(4, stagingPct) : 0,
       rightLabel:
-        dataRowsTotal > 0
-          ? `${stagedRows.toLocaleString()} / ${dataRowsTotal.toLocaleString()} rows · ${stagingComplete ? 100 : stagingPct}%`
+        fileRowPlan != null
+          ? `${stagedRows.toLocaleString()} / ${fileRowPlan.toLocaleString()} rows · ${stagingComplete ? 100 : stagingPct}%${
+              fileRowResolved.verificationPending ? " · verification pending" : ""
+            }`
           : stagedRows > 0
-            ? `${stagedRows.toLocaleString()} rows`
+            ? `${stagedRows.toLocaleString()} rows${fileRowResolved.verificationPending ? " · verification pending" : ""}`
             : stagingComplete
               ? "Done"
               : "—",
@@ -346,21 +346,10 @@ export function buildListingImportProgressModel(
     ),
   );
 
-  const dataRowsTotal = Math.max(
-    0,
-    num(f.data_rows_total, 0) ||
-      num(f.file_rows_total, 0) ||
-      num(m.data_rows_seen, 0) ||
-      num(m.catalog_listing_data_rows_seen, 0) ||
-      num(m.total_rows, 0),
-  );
-  const stagedRowsWritten = Math.max(
-    0,
-    num(f.staged_rows_written, 0) ||
-      num(f.processed_rows, 0) ||
-      num(m.staging_row_count, 0) ||
-      num(m.row_count, 0),
-  );
+  const fileRowResolved = resolveImportFileRowTotal({ fps: f as Record<string, unknown>, metadata: m });
+  const fileRowPlan = fileRowResolved.total;
+  const dataRowsTotal = Math.max(0, fileRowPlan ?? 0);
+  const stagedRowsWritten = Math.max(0, num(f.staged_rows_written, 0) || num(f.processed_rows, 0));
   const p2f = num(f.phase2_stage_pct, -1);
   const p2proc = num(f.process_pct, -1);
   const phase2Pct = Math.min(
@@ -380,16 +369,9 @@ export function buildListingImportProgressModel(
   const phase3Numerator = rawRowsWritten + rawRowsSkippedExisting;
   const syncDenominator = Math.max(
     1,
-    num(f.staged_rows_written, 0) ||
-      num(m.staging_row_count, 0) ||
-      dataRowsTotal ||
-      stagedRowsWritten ||
-      1,
+    fileRowPlan ?? Math.max(phase3Numerator, stagedRowsWritten, 1),
   );
-  const phase3StagedDenominator = Math.max(
-    0,
-    num(f.staged_rows_written, 0) || num(m.staging_row_count, 0),
-  );
+  const phase3StagedDenominator = Math.max(0, syncDenominator);
   const p3f = num(f.phase3_raw_sync_pct, -1);
   const phase3Pct = Math.min(
     100,
@@ -402,6 +384,7 @@ export function buildListingImportProgressModel(
   const genericRowsWritten = Math.max(0, num(f.generic_rows_written, 0));
   const catalogEligible = Math.max(
     1,
+    fileRowPlan ?? 0,
     syncDenominator,
     num(m.catalog_listing_file_rows_seen, 0),
     num(f.total_rows, 0),
