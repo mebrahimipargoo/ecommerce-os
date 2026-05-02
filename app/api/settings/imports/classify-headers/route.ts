@@ -3,6 +3,9 @@ import { NextResponse } from "next/server";
 import {
   buildColumnMappingFromHeaders,
   classifyCsvHeadersRuleBased,
+  headersLookLikeAmazonTransactionDetailReport,
+  headersLookLikeProductIdentity,
+  headersLookLikeSimpleTransactionsSummary,
   mappingHasRequiredGaps,
 } from "../../../../../lib/csv-import-detected-type";
 import { classifyImportHeadersWithGpt } from "../../../../../lib/classify-import-headers-openai";
@@ -63,10 +66,14 @@ const SAFET_FALLBACK_ALIASES: Record<string, string[]> = {
 const TRANSACTIONS_FALLBACK_ALIASES: Record<string, string[]> = {
   settlement_id:           ["settlement-id", "settlement id", "Settlement ID"],
   transaction_type:        ["transaction-type", "transaction type", "type"],
-  order_id:                ["order-id", "order id", "amazon-order-id", "amazon order id"],
-  amount:                  ["amount", "Amount", "total", "total-amount", "total amount", "price-amount", "price amount"],
-  total_product_charges:   ["total-product-charges", "total product charges"],
-  posted_date:             ["date/time", "date-time", "posted-date", "posted date"],
+  order_id:                ["order-id", "order id", "amazon-order-id", "amazon order id", "Order ID"],
+  amount:                  [
+    "amount", "Amount", "total", "total-amount", "total amount",
+    "Total (USD)", "total (usd)", "total-usd", "total usd",
+    "price-amount", "price amount",
+  ],
+  total_product_charges:   ["total-product-charges", "total product charges", "Total product charges"],
+  posted_date:             ["date/time", "date-time", "posted-date", "posted date", "date", "Date"],
   sku:                     ["sku", "SKU"],
 };
 
@@ -142,14 +149,41 @@ function applyListingFallbackMapping(
 }
 
 const SETTLEMENT_FLAT_FALLBACK_ALIASES: Record<string, string[]> = {
-  settlement_id:         ["settlement-id", "settlement id", "Settlement ID"],
-  settlement_start_date: ["settlement-start-date", "settlement start date"],
-  settlement_end_date:   ["settlement-end-date", "settlement end date"],
-  deposit_date:          ["deposit-date", "deposit date"],
-  total_amount:          ["total-amount", "total amount"],
-  currency:              ["currency", "Currency"],
-  transaction_status:    ["transaction-type", "transaction type", "transaction-status", "transaction status"],
-  order_id:              ["order-id", "order id", "amazon-order-id", "amazon order id"],
+  settlement_id:           ["settlement-id", "settlement id", "Settlement ID"],
+  settlement_start_date:   ["settlement-start-date", "settlement start date"],
+  settlement_end_date:     ["settlement-end-date", "settlement end date"],
+  deposit_date:            ["deposit-date", "deposit date"],
+  total_amount:            ["total-amount", "total amount"],
+  currency:                ["currency", "Currency"],
+  // For the Transaction / Payment Detail report `transaction_status` is its own
+  // physical column; `transaction_type` keeps the legacy `type` mapping.
+  transaction_type:        ["type", "Type", "transaction-type", "transaction type"],
+  transaction_status:      ["transaction-status", "transaction status", "Transaction Status"],
+  transaction_release_date:["transaction-release-date", "Transaction Release Date"],
+  order_id:                ["order-id", "order id", "amazon-order-id", "amazon order id", "Order ID"],
+  sku:                     ["sku", "SKU"],
+  posted_date:             ["date/time", "Date/Time", "date-time"],
+  description:             ["description", "Description"],
+  quantity:                ["quantity", "Quantity"],
+  marketplace:             ["marketplace", "Marketplace"],
+  account_type:            ["account type", "account-type"],
+  fulfillment_channel:     ["fulfillment", "Fulfillment", "fulfillment-channel", "fulfillment channel"],
+  product_sales:           ["product sales", "product-sales"],
+  product_sales_tax:       ["product sales tax", "product-sales-tax"],
+  shipping_credits:        ["shipping credits", "shipping-credits"],
+  shipping_credits_tax:    ["shipping credits tax", "shipping-credits-tax"],
+  gift_wrap_credits:       ["gift wrap credits", "gift-wrap-credits", "giftwrap credits"],
+  giftwrap_credits_tax:    ["giftwrap credits tax", "giftwrap-credits-tax", "gift wrap credits tax"],
+  regulatory_fee:          ["Regulatory Fee", "regulatory fee", "regulatory-fee"],
+  tax_on_regulatory_fee:   ["Tax On Regulatory Fee", "tax on regulatory fee", "tax-on-regulatory-fee"],
+  promotional_rebates:     ["promotional rebates", "promotional-rebates"],
+  promotional_rebates_tax: ["promotional rebates tax", "promotional-rebates-tax"],
+  marketplace_withheld_tax:["marketplace withheld tax", "marketplace-withheld-tax"],
+  selling_fees:            ["selling fees", "selling-fees"],
+  fba_fees:                ["fba fees", "fba-fees"],
+  other_transaction_fees:  ["other transaction fees", "other-transaction-fees"],
+  other_amount:            ["other", "Other", "other-amount"],
+  amount_total:            ["total", "Total"],
 };
 
 function applySafeTFallbackMapping(
@@ -296,7 +330,7 @@ export async function POST(req: Request): Promise<Response> {
       SAFET_CLAIMS:       "Amazon SAFE-T Claims Report",
       TRANSACTIONS:       "Amazon Transactions Report",
       REPORTS_REPOSITORY: "Amazon Reports Repository Export",
-      PRODUCT_IDENTITY:   "Product Identity CSV",
+      PRODUCT_IDENTITY:   "Product Identity Report",
       CATEGORY_LISTINGS:  "Amazon Category Listings Report",
       ALL_LISTINGS:       "Amazon All Listings Report",
       ACTIVE_LISTINGS:    "Amazon Active Listings Report",
@@ -369,6 +403,20 @@ export async function POST(req: Request): Promise<Response> {
       source = "gpt";
     }
 
+    // Product Identity is intentionally exact-header only. If GPT tries to
+    // classify an inventory/listing report with SKU/FNSKU/ASIN overlap as
+    // PRODUCT_IDENTITY, reject that classification unless the full canonical
+    // Product Identity signature is present.
+    if ((reportType as string) === "PRODUCT_IDENTITY" && !headersLookLikeProductIdentity(headers)) {
+      reportType = "UNKNOWN";
+      aiColumnMapping = {};
+      detectedFileType = "Unknown File";
+      isSupported = false;
+      aiMessage =
+        "This file is not a Product Identity Report because it does not contain the exact Product Identity headers.";
+      source = "rules";
+    }
+
     // ── Step 3: Build rule-based alias mapping for the resolved type ───────────
     const ruleMapping: Record<string, string> =
       (reportType as string) !== "UNKNOWN"
@@ -406,7 +454,28 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     // ── Step 3.6: Filename / content — do not mis-file Reports Repository as Settlement ─
-    if (fileNameSuggestsReportsRepository(fileName)) {
+    //
+    // Two important guards before we override:
+    //   • If the headers carry the Transaction / Payment Detail fingerprint
+    //     (Transaction Status / Transaction Release Date / quantity / account
+    //     type / fulfillment) the file is the Amazon Transaction / Payment
+    //     Detail report — keep it as SETTLEMENT and apply the settlement
+    //     fallback mapping so all the typed columns get filled.
+    //   • If the headers carry the Simple Transactions Summary fingerprint
+    //     (Total (USD) + Transaction type + Order ID + Total product charges)
+    //     keep it as TRANSACTIONS.
+    const isTransactionDetail = headersLookLikeAmazonTransactionDetailReport(headers);
+    const isSimpleSummary = headersLookLikeSimpleTransactionsSummary(headers);
+
+    if (isTransactionDetail) {
+      reportType = "SETTLEMENT";
+      source = "rules";
+      column_mapping = applySettlementFlatFallbackMapping(headers, column_mapping);
+    } else if (isSimpleSummary) {
+      reportType = "TRANSACTIONS";
+      source = "rules";
+      column_mapping = applyTransactionsFallbackMapping(headers, column_mapping);
+    } else if (fileNameSuggestsReportsRepository(fileName)) {
       reportType = "REPORTS_REPOSITORY";
       source = "filename";
       column_mapping = applyReportsRepositoryFallbackMapping(

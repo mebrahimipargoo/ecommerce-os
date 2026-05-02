@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { Readable } from "node:stream";
 
 import { executeAmazonPhase2Staging } from "../../../../../lib/pipeline/amazon-phase2-staging";
 import { resolveAmazonImportSyncKind } from "../../../../../lib/pipeline/amazon-report-registry";
@@ -10,9 +9,7 @@ import {
 } from "../../../../../lib/raw-report-upload-metadata";
 import {
   PRODUCT_IDENTITY_REPORT_TYPE,
-  readProductIdentityCsvRowsFromStream,
-  runProductIdentityImport,
-  type ProductIdentityColumnMapping,
+  processProductIdentityToStaging,
 } from "../../../../../lib/product-identity-import";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
@@ -43,14 +40,35 @@ function numericMeta(value: unknown, fallback = 0): number {
   return fallback;
 }
 
-function productIdentityColumnMapping(value: unknown): ProductIdentityColumnMapping | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const result: ProductIdentityColumnMapping = {};
-  for (const key of ["upc", "vendor", "seller_sku", "mfg_part_number", "fnsku", "asin", "product_name"] as const) {
-    const mapped = (value as Record<string, unknown>)[key];
-    if (typeof mapped === "string" && mapped.trim()) result[key] = mapped.trim();
+function resolveImportStoreId(meta: Record<string, unknown>): string | null {
+  const a = typeof meta.import_store_id === "string" ? meta.import_store_id.trim() : "";
+  if (a && isUuidString(a)) return a;
+  const b = typeof meta.ledger_store_id === "string" ? meta.ledger_store_id.trim() : "";
+  if (b && isUuidString(b)) return b;
+  return null;
+}
+
+async function validateImportStoreBelongsToOrg(params: {
+  organizationId: string;
+  metadata: Record<string, unknown>;
+}): Promise<{ ok: true; storeId: string | null } | { ok: false; error: string }> {
+  const storeId = resolveImportStoreId(params.metadata);
+  if (!storeId) return { ok: true, storeId: null };
+  const { data, error } = await supabaseServer
+    .from("stores")
+    .select("id, organization_id")
+    .eq("id", storeId)
+    .maybeSingle();
+  if (error) return { ok: false, error: `Store validation failed: ${error.message}` };
+  if (!data) return { ok: false, error: "Selected target store does not exist." };
+  const ownerOrg = String((data as { organization_id?: unknown }).organization_id ?? "").trim();
+  if (ownerOrg !== params.organizationId) {
+    return {
+      ok: false,
+      error: "Selected target store belongs to a different organization than the active import organization.",
+    };
   }
-  return Object.keys(result).length > 0 ? result : null;
+  return { ok: true, storeId };
 }
 
 async function failProductIdentityImport(params: {
@@ -99,6 +117,12 @@ async function failProductIdentityImport(params: {
   );
 }
 
+/**
+ * Phase 2 — parse CSV → product_identity_staging_rows only.
+ *
+ * Does NOT write to products / catalog_products / product_identifier_map.
+ * On completion: status = 'staged', next action = Sync.
+ */
 async function processProductIdentityUpload(params: {
   uploadId: string;
   organizationId: string;
@@ -107,56 +131,13 @@ async function processProductIdentityUpload(params: {
 }): Promise<Response> {
   const { uploadId, organizationId, row, metadata } = params;
   const now = new Date().toISOString();
-  const storeId =
-    typeof metadata.import_store_id === "string" && isUuidString(metadata.import_store_id.trim())
-      ? metadata.import_store_id.trim()
-      : typeof metadata.ledger_store_id === "string" && isUuidString(metadata.ledger_store_id.trim())
-        ? metadata.ledger_store_id.trim()
-        : "";
 
-  if (!isUuidString(storeId)) {
-    return NextResponse.json(
-      { ok: false, error: "Product Identity import requires a selected target store." },
-      { status: 400 },
-    );
-  }
+  const detectedHeadersStart = Array.isArray(metadata.csv_headers)
+    ? (metadata.csv_headers as unknown[]).map((h) => String(h ?? "")).filter(Boolean)
+    : [];
+  const estimatedTotalRows = numericMeta(metadata.total_rows, 0);
 
-  const rawFilePath = typeof metadata.raw_file_path === "string" ? metadata.raw_file_path.trim() : "";
-  if (!rawFilePath) {
-    return NextResponse.json(
-      { ok: false, error: "Missing raw_file_path in upload metadata for Product Identity import." },
-      { status: 400 },
-    );
-  }
-
-  const contentSha256 =
-    typeof metadata.content_sha256 === "string" && /^[a-f0-9]{64}$/i.test(metadata.content_sha256.trim())
-      ? metadata.content_sha256.trim().toLowerCase()
-      : "";
-  if (!contentSha256) {
-    return NextResponse.json(
-      { ok: false, error: "Missing content SHA-256 for Product Identity import." },
-      { status: 400 },
-    );
-  }
-
-  const rawFileExt = rawFilePath.split(".").pop()?.toLowerCase() ?? "";
-  const metaFileExt =
-    typeof metadata.file_extension === "string" ? metadata.file_extension.replace(/^\./, "").toLowerCase() : "";
-  const fileExt = metaFileExt || rawFileExt || "csv";
-  if (fileExt === "xlsx" || fileExt === "xls") {
-    return NextResponse.json(
-      { ok: false, error: "Product Identity import currently requires CSV or TXT. Export Excel as CSV and re-upload." },
-      { status: 415 },
-    );
-  }
-  if (fileExt !== "csv" && fileExt !== "txt") {
-    return NextResponse.json(
-      { ok: false, error: `Unsupported Product Identity file type: .${fileExt}` },
-      { status: 415 },
-    );
-  }
-
+  // ── Optimistic lock ───────────────────────────────────────────────────────
   const { data: locked, error: lockErr } = await supabaseServer
     .from("raw_report_uploads")
     .update({
@@ -165,7 +146,13 @@ async function processProductIdentityUpload(params: {
         error_message: "",
         process_progress: 0,
         sync_progress: 0,
-        import_metrics: { current_phase: "process" },
+        import_metrics: {
+          current_phase: "process",
+          detected_headers: detectedHeadersStart,
+          detected_report_type: "PRODUCT_IDENTITY",
+          stage_target_table: "product_identity_staging_rows",
+          note: "Phase 2 — writing to staging only. Final tables written in Phase 3 (Sync).",
+        },
       }),
       import_pipeline_started_at: now,
       import_pipeline_failed_at: null,
@@ -177,121 +164,130 @@ async function processProductIdentityUpload(params: {
     .select("id");
 
   if (lockErr) {
-    return NextResponse.json({ ok: false, error: lockErr.message }, { status: 500 });
+    return NextResponse.json({ ok: false, error: lockErr.message, details: lockErr.message, uploadId, phase: "process" }, { status: 500 });
   }
   if (!locked || locked.length === 0) {
-    return NextResponse.json(
-      { ok: false, error: "Upload is not in a processable state (another operation may be running)." },
-      { status: 409 },
-    );
+    return NextResponse.json({
+      ok: false,
+      error: "Upload is not in a processable state (another operation may be running).",
+      details: "raw_report_uploads.status was not in {mapped, ready, uploaded, pending, failed}.",
+      uploadId,
+      phase: "process",
+    }, { status: 409 });
   }
 
-  await supabaseServer.from("file_processing_status").upsert(
-    {
-      upload_id: uploadId,
-      organization_id: organizationId,
-      status: "processing",
-      current_phase: "process",
-      current_phase_label: "Product Identity import",
-      stage_target_table: "products",
-      sync_target_table: "product_identifier_map",
-      generic_target_table: null,
-      upload_pct: 100,
-      process_pct: 5,
-      phase1_upload_pct: 100,
-      phase2_stage_pct: 5,
-      phase3_raw_sync_pct: 0,
-      sync_pct: 0,
-      processed_rows: 0,
-      total_rows: numericMeta(metadata.total_rows, 0) || null,
-      import_metrics: { current_phase: "process" },
-      error_message: null,
-    },
-    { onConflict: "upload_id" },
-  );
+  // ── Seed file_processing_status ───────────────────────────────────────────
+  await supabaseServer.from("file_processing_status").upsert({
+    upload_id: uploadId,
+    organization_id: organizationId,
+    status: "processing",
+    current_phase: "process",
+    current_phase_label: "Product Identity — staging CSV rows",
+    stage_target_table: "product_identity_staging_rows",
+    sync_target_table: "product_identifier_map",
+    generic_target_table: null,
+    upload_pct: 100,
+    phase1_upload_pct: 100,
+    phase2_stage_pct: 1,
+    phase3_raw_sync_pct: 0,
+    process_pct: 1,
+    sync_pct: 0,
+    processed_rows: 0,
+    staged_rows_written: 0,
+    total_rows: estimatedTotalRows || null,
+    phase2_status: "running",
+    phase2_started_at: now,
+    phase3_status: "pending",
+    import_metrics: { current_phase: "process" },
+    error_message: null,
+  }, { onConflict: "upload_id" });
 
+  // ── Run Phase 2 ───────────────────────────────────────────────────────────
   try {
-    const { data: blob, error: dlErr } = await supabaseServer.storage.from("raw-reports").download(rawFilePath);
-    if (dlErr || !blob) {
-      throw new Error(dlErr?.message ?? `Could not download file from storage: ${rawFilePath}`);
-    }
-
-    const webStream = blob.stream() as unknown as ReadableStream<Uint8Array>;
-    const source = Readable.fromWeb(webStream as Parameters<typeof Readable.fromWeb>[0]);
-    const headerRowIndex =
-      typeof metadata.header_row_index === "number" && metadata.header_row_index > 0
-        ? Math.floor(metadata.header_row_index)
-        : 0;
-    const csvRows = await readProductIdentityCsvRowsFromStream(source, {
-      skipLines: headerRowIndex,
-      separator: fileExt === "txt" ? "\t" : ",",
-    });
-
-    const stats = await runProductIdentityImport({
+    const result = await processProductIdentityToStaging({
       supabase: supabaseServer,
       organizationId,
-      storeId,
       uploadId,
-      csvRows,
-      columnMapping: productIdentityColumnMapping(row.column_mapping),
-      sourceFileSha256: contentSha256,
+      uploadRow: row,
+      metadata,
+      onChunkProgress: async ({ staged, total }) => {
+        const pct = total > 0 ? Math.min(99, Math.round((staged / total) * 100)) : 1;
+        await supabaseServer.from("file_processing_status").upsert({
+          upload_id: uploadId,
+          organization_id: organizationId,
+          status: "processing",
+          current_phase: "process",
+          phase2_stage_pct: pct,
+          process_pct: pct,
+          staged_rows_written: staged,
+          processed_rows: staged,
+          total_rows: total,
+          import_metrics: { current_phase: "process", rows_staged: staged },
+        }, { onConflict: "upload_id" });
+      },
     });
 
-    await supabaseServer.from("file_processing_status").upsert(
-      {
-        upload_id: uploadId,
-        organization_id: organizationId,
-        status: "complete",
-        current_phase: "complete",
-        current_phase_label: "Complete",
-        stage_target_table: "products",
-        sync_target_table: "product_identifier_map",
-        generic_target_table: null,
-        next_action_key: null,
-        next_action_label: null,
-        upload_pct: 100,
-        process_pct: 100,
-        sync_pct: 100,
-        phase1_upload_pct: 100,
-        phase2_stage_pct: 100,
-        phase3_raw_sync_pct: 100,
-        phase4_generic_pct: 0,
-        processed_rows: stats.rowsRead,
-        staged_rows_written: stats.productsInserted + stats.productsUpdated,
-        raw_rows_written: stats.identifiersInserted,
-        total_rows: Math.max(stats.rowsRead, 1),
-        data_rows_total: stats.rowsRead,
-        phase2_status: "complete",
-        phase2_completed_at: new Date().toISOString(),
-        phase3_status: "complete",
-        phase3_completed_at: new Date().toISOString(),
-        error_message: null,
-        import_metrics: {
-          current_phase: "complete",
-          data_rows_seen: stats.rowsRead,
-          rows_synced_upserted:
-            stats.productsInserted +
-            stats.productsUpdated +
-            stats.catalogProductsInserted +
-            stats.catalogProductsUpdated +
-            stats.identifiersInserted,
-          rows_invalid: stats.invalidIdentifierCount,
-        },
+    if (!result.ok) {
+      await failProductIdentityImport({ uploadId, organizationId, metadata, message: result.error });
+      return NextResponse.json({ ok: false, error: result.error, details: result.error, uploadId, phase: "process" }, { status: result.status });
+    }
+
+    const { stats } = result;
+    const doneAt = new Date().toISOString();
+
+    // Phase 2 complete: status=staged so Sync button lights up.
+    await supabaseServer.from("file_processing_status").upsert({
+      upload_id: uploadId,
+      organization_id: organizationId,
+      status: "pending",
+      current_phase: "staged",
+      current_phase_label: "Ready for Sync",
+      phase2_stage_pct: 100,
+      phase2_status: "complete",
+      phase2_completed_at: doneAt,
+      process_pct: 100,
+      phase3_status: "pending",
+      phase3_raw_sync_pct: 0,
+      sync_pct: 0,
+      staged_rows_written: stats.rowsRead,
+      processed_rows: stats.rowsRead,
+      total_rows: stats.rowsRead,
+      data_rows_total: stats.rowsRead,
+      next_action_key: "sync",
+      next_action_label: "Sync",
+      import_metrics: {
+        current_phase: "staged",
+        data_rows_seen: stats.rowsRead,
+        rows_staged: stats.rowsRead,
+        rows_missing_seller_sku: stats.rowsMissingSellerSku,
+        rows_invalid_seller_sku: stats.rowsInvalidSellerSku,
+        rows_skipped: stats.rowsSkipped,
+        detected_report_type: "PRODUCT_IDENTITY",
+        stage_target_table: "product_identity_staging_rows",
       },
-      { onConflict: "upload_id" },
-    );
+      error_message: null,
+    }, { onConflict: "upload_id" });
 
     return NextResponse.json({
       ok: true,
-      rowsProcessed: stats.rowsRead,
+      rowsStaged: stats.rowsRead,
+      rowsSkipped: stats.rowsSkipped,
       totalRows: stats.rowsRead,
-      pipeline: "product_identity_import",
-      productIdentity: { stats },
+      phase: "process",
+      pipeline: "product_identity_staging",
+      nextAction: "sync",
     });
+
   } catch (e) {
-    const message = e instanceof Error ? e.message : "Product Identity import failed.";
+    const message = e instanceof Error ? e.message : "Product Identity staging failed.";
+    console.error("[ProductIdentityProcess] Phase 2 failed", {
+      uploadId, organizationId,
+      storeId: resolveImportStoreId(metadata),
+      reportType: "PRODUCT_IDENTITY", phase: "process",
+      error: message, stack: e instanceof Error ? e.stack : undefined,
+    });
     await failProductIdentityImport({ uploadId, organizationId, metadata, message });
-    throw e;
+    return NextResponse.json({ ok: false, error: message, details: e instanceof Error ? e.stack ?? message : String(e), uploadId, phase: "process" }, { status: 500 });
   }
 }
 
@@ -305,7 +301,10 @@ export async function POST(req: Request): Promise<Response> {
     const body = (await req.json()) as Body;
     const uploadId = typeof body.upload_id === "string" ? body.upload_id.trim() : "";
     if (!isUuidString(uploadId)) {
-      return NextResponse.json({ ok: false, error: "Invalid upload_id." }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "Invalid upload_id.", details: "upload_id must be a UUID.", uploadId: null, phase: "process" },
+        { status: 400 },
+      );
     }
 
     const { data: row, error: fetchErr } = await supabaseServer
@@ -315,12 +314,30 @@ export async function POST(req: Request): Promise<Response> {
       .maybeSingle();
 
     if (fetchErr || !row) {
-      return NextResponse.json({ ok: false, error: "Upload session not found." }, { status: 404 });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Upload session not found.",
+          details: fetchErr?.message ?? "raw_report_uploads.id did not match any row.",
+          uploadId,
+          phase: "process",
+        },
+        { status: 404 },
+      );
     }
 
     const orgId = String((row as { organization_id?: unknown }).organization_id ?? "").trim();
     if (!isUuidString(orgId)) {
-      return NextResponse.json({ ok: false, error: "Invalid upload row (organization_id)." }, { status: 500 });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Invalid upload row (organization_id).",
+          details: "raw_report_uploads.organization_id is not a UUID.",
+          uploadId,
+          phase: "process",
+        },
+        { status: 500 },
+      );
     }
 
     // Stale-lock recovery: a prior worker that exceeded Vercel's maxDuration leaves
@@ -350,6 +367,17 @@ export async function POST(req: Request): Promise<Response> {
     const meta = (row as { metadata?: unknown }).metadata;
     const metaObj = meta && typeof meta === "object" && !Array.isArray(meta) ? (meta as Record<string, unknown>) : {};
 
+    const storeValidation = await validateImportStoreBelongsToOrg({
+      organizationId: orgId,
+      metadata: metaObj,
+    });
+    if (!storeValidation.ok) {
+      return NextResponse.json(
+        { ok: false, error: storeValidation.error, details: storeValidation.error, uploadId, phase: "process" },
+        { status: 422 },
+      );
+    }
+
     if (metaObj.source === AMAZON_LEDGER_UPLOAD_SOURCE) {
       const st = String((row as { status?: unknown }).status ?? "");
       if (st === "synced" || st === "complete") {
@@ -360,6 +388,9 @@ export async function POST(req: Request): Promise<Response> {
           ok: false,
           error:
             "This ledger import is still uploading or processing in the browser. Wait until it finishes, then use Delete if you need to remove it.",
+          details: `Ledger source upload status="${st}".`,
+          uploadId,
+          phase: "process",
         },
         { status: 409 },
       );
@@ -368,7 +399,13 @@ export async function POST(req: Request): Promise<Response> {
     const parsed = parseRawReportMetadata(meta);
     if (parsed.uploadProgress < 100) {
       return NextResponse.json(
-        { ok: false, error: "Upload is not complete yet (wait for 100% upload progress)." },
+        {
+          ok: false,
+          error: "Upload is not complete yet (wait for 100% upload progress).",
+          details: `metadata.upload_progress=${parsed.uploadProgress}`,
+          uploadId,
+          phase: "process",
+        },
         { status: 400 },
       );
     }
@@ -384,6 +421,9 @@ export async function POST(req: Request): Promise<Response> {
             ok: false,
             error:
               'This upload needs column mapping before it can be processed. Click "Map Columns" in the History table to assign fields.',
+            details: `raw_report_uploads.status="${status}"`,
+            uploadId,
+            phase: "process",
           },
           { status: 409 },
         );
@@ -392,6 +432,9 @@ export async function POST(req: Request): Promise<Response> {
         {
           ok: false,
           error: `Cannot process while status is "${status}". Expected one of: ${processableStatuses.join(", ")}.`,
+          details: `raw_report_uploads.status="${status}"`,
+          uploadId,
+          phase: "process",
         },
         { status: 409 },
       );
@@ -404,6 +447,9 @@ export async function POST(req: Request): Promise<Response> {
           ok: false,
           error:
             "Could not determine import kind (FBA returns, removal order, inventory ledger, or listing export). Set the Type in History or re-upload so headers can be classified.",
+          details: `raw_report_uploads.report_type="${reportTypeRaw}"`,
+          uploadId,
+          phase: "process",
         },
         { status: 422 },
       );
@@ -421,6 +467,20 @@ export async function POST(req: Request): Promise<Response> {
     return executeAmazonPhase2Staging(body);
   } catch (e) {
     const message = e instanceof Error ? e.message : "Processing failed.";
-    return NextResponse.json({ ok: false, error: message }, { status: 500 });
+    console.error("[imports/process] unhandled failure", {
+      phase: "process",
+      error: message,
+      stack: e instanceof Error ? e.stack : undefined,
+    });
+    return NextResponse.json(
+      {
+        ok: false,
+        error: message,
+        details: e instanceof Error ? e.stack ?? message : String(e),
+        uploadId: null,
+        phase: "process",
+      },
+      { status: 500 },
+    );
   }
 }

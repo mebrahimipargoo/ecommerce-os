@@ -1,13 +1,24 @@
+import csv
 import io
 import json
 import logging
 import math
 import traceback
 import uuid
+import hashlib
+import os
 from collections import defaultdict, deque
 from typing import Any
 
 import pandas as pd
+from dotenv import load_dotenv
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from supabase import Client, create_client
+
+# Load environment variables securely from .env file
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,85 +26,22 @@ logging.basicConfig(
 )
 log = logging.getLogger("etl")
 
-
-def _pg_text_unique_field(val: Any) -> str | None:
-    """
-    Normalize text fields that participate in PostgreSQL UNIQUE ... NULLS NOT DISTINCT.
-    None, '', and whitespace-only all map to None so Python grouping matches the DB.
-    """
-    if val is None:
-        return None
-    try:
-        if pd.isna(val):
-            return None
-    except TypeError:
-        pass
-    s = str(val).strip()
-    return None if s == "" else s
-
-
-def _safe_int(val: Any) -> int | None:
-    """Coerce any scalar to int; None/NaN/empty → None. Safe for dirty CSV / Supabase JSON."""
-    if val is None:
-        return None
-    try:
-        if pd.isna(val):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if isinstance(val, str) and val.strip() == "":
-        return None
-    try:
-        f = float(str(val).replace(",", "").strip())
-    except (ValueError, TypeError):
-        return None
-    try:
-        if math.isnan(f) or math.isinf(f):
-            return None
-    except TypeError:
-        return None
-    try:
-        return int(f)
-    except (ValueError, OverflowError):
-        return None
-
-
-def _safe_float(val: Any) -> float | None:
-    """Coerce to float for fees; None/NaN/empty → None."""
-    if val is None:
-        return None
-    try:
-        if pd.isna(val):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if isinstance(val, str) and val.strip() == "":
-        return None
-    try:
-        x = float(str(val).replace(",", "").strip())
-    except (ValueError, TypeError):
-        return None
-    if math.isnan(x) or math.isinf(x):
-        return None
-    return x
-
-
-from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
-from supabase import Client, create_client
-
-import os
-
-# Load environment variables securely from .env file
-load_dotenv()
-
+# Initialize FastAPI App
 app = FastAPI(title="Logistics AI Agent API", version="1.0")
 
-# --- Background Task Progress Store ---
-# Maps task_id -> {task_id, status, progress, message}
-task_store: dict[str, dict[str, Any]] = {}
+# --- CORS Middleware ---
+# NOTE: allow_credentials=True + allow_origins=["*"] is invalid per the spec and
+# makes browsers reject preflight. JWT cookies are not used on these ETL routes.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# --- Background Task Progress Store ---
+task_store: dict[str, dict[str, Any]] = {}
 
 def _update_task(task_id: str, progress: int, message: str, status: str = "running") -> None:
     task_store[task_id] = {
@@ -102,7 +50,6 @@ def _update_task(task_id: str, progress: int, message: str, status: str = "runni
         "progress": progress,
         "message": message,
     }
-
 
 # Fetch keys from environment
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -118,7 +65,6 @@ try:
         print("Connected to Supabase Successfully!")
 except Exception as e:
     print(f"Database Connection Error: {e}")
-
 
 def _require_supabase() -> Client:
     if supabase is None:
@@ -138,7 +84,6 @@ def _normalize_header(name: str) -> str:
         .lower()
     )
 
-
 def _cell_to_json_safe(val: Any) -> Any:
     if val is None:
         return None
@@ -157,9 +102,56 @@ def _cell_to_json_safe(val: Any) -> Any:
             pass
     return val
 
+def _safe_int(val: Any) -> int | None:
+    if val is None:
+        return None
+    s = str(val).strip().replace(",", "")
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        return None
+
+def _safe_float(val: Any) -> float | None:
+    if val is None:
+        return None
+    s = str(val).strip().replace(",", "").replace("$", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+def _safe_bool(val: Any) -> bool | None:
+    if val is None:
+        return None
+    s = str(val).strip().lower()
+    if s in {"true", "yes", "y", "1"}:
+        return True
+    if s in {"false", "no", "n", "0"}:
+        return False
+    return None
+
+def _safe_timestamp(val: Any) -> str | None:
+    if val is None:
+        return None
+    try:
+        ts = pd.to_datetime(val, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.isoformat()
+    except Exception:
+        return None
+
+def _safe_date(val: Any) -> str | None:
+    ts = _safe_timestamp(val)
+    if not ts:
+        return None
+    return ts[:10]
 
 def _read_tabular_file(content: bytes) -> pd.DataFrame:
-    """Read CSV or tab-separated text; infer delimiter (comma vs tab)."""
     buf = io.BytesIO(content)
     _csv_kw: dict[str, Any] = {
         "sep": None,
@@ -177,8 +169,40 @@ def _read_tabular_file(content: bytes) -> pd.DataFrame:
         )
 
 
+def _sniff_csv_delimiter(first_line: str) -> str:
+    if "\t" in first_line and first_line.count("\t") >= max(1, first_line.count(",")):
+        return "\t"
+    return ","
+
+
+def _csv_headers_and_row_count_fast(content: bytes) -> tuple[list[str], int]:
+    """
+    One streaming pass over bytes — header cells + data row count.
+    Used by upload-raw only; avoids pandas (huge RAM + double parse) on large files.
+    """
+    if not content:
+        return [], 0
+    sample = content[: min(len(content), 262144)].decode("utf-8-sig", errors="replace")
+    lines = sample.splitlines()
+    if not lines:
+        return [], 0
+    delim = _sniff_csv_delimiter(lines[0])
+    bio = io.BytesIO(content)
+    text_io = io.TextIOWrapper(bio, encoding="utf-8-sig", errors="replace", newline="")
+    try:
+        reader = csv.reader(text_io, delimiter=delim)
+        rows_iter = iter(reader)
+        header_row = next(rows_iter, [])
+        headers = [str(h).strip() for h in header_row if str(h).strip() != ""]
+        if not headers:
+            return [], 0
+        row_count = sum(1 for _ in rows_iter)
+        return headers, row_count
+    finally:
+        text_io.close()
+
+
 def _get_from_row(row: dict[str, Any], *candidates: str) -> str | None:
-    """Match staging raw_row keys flexibly (hyphen / underscore / case)."""
     norm_map = {_normalize_header(k): k for k in row.keys()}
     for cand in candidates:
         key = _normalize_header(cand)
@@ -188,7 +212,6 @@ def _get_from_row(row: dict[str, Any], *candidates: str) -> str | None:
             if s is not None and str(s).strip() != "":
                 return str(s).strip()
     return None
-
 
 def _parse_quantity(row: dict[str, Any]) -> float:
     raw = _get_from_row(
@@ -206,7 +229,6 @@ def _parse_quantity(row: dict[str, Any]) -> float:
         return float(str(raw).replace(",", ""))
     except ValueError:
         return 0.0
-
 
 def _group_key_for_row(row: dict[str, Any]) -> str | None:
     track = _get_from_row(
@@ -230,9 +252,7 @@ def _group_key_for_row(row: dict[str, Any]) -> str | None:
         return f"oid:{oid}"
     return None
 
-
 # --- Removal ETL: field mapping and extraction ---
-
 REMOVAL_FIELD_MAP: dict[str, list[str]] = {
     "order_id":           [
         "order-id",
@@ -270,9 +290,7 @@ _INT_REMOVAL_COLS = {
     "in_process_quantity",
 }
 
-
 def _resolve_import_store_id_from_upload(db: Any, organization_id: str, upload_id: str | None) -> str | None:
-    """Reads import_store_id / ledger_store_id from raw_report_uploads.metadata."""
     if not upload_id:
         return None
     try:
@@ -296,7 +314,6 @@ def _resolve_import_store_id_from_upload(db: Any, organization_id: str, upload_i
         return sid
     except Exception:
         return None
-
 
 def _extract_removal_row(
     raw: dict[str, Any],
@@ -325,21 +342,16 @@ def _extract_removal_row(
         else:
             result[db_col] = val
 
-    # Coalesce SKU from FNSKU when the report only lists FNSKU (distinct 5-column keys).
     if not _pg_text_unique_field(result.get("sku")):
         fn = _get_from_row(raw, "fnsku", "asin")
         if fn:
             result["sku"] = str(fn).strip()
 
-    # Align nullable text columns with DB NULLS NOT DISTINCT semantics before merge/upsert.
     for nullable in ("sku", "fnsku", "disposition", "tracking_number"):
         t = _pg_text_unique_field(result.get(nullable))
         result[nullable] = t
 
     return result
-
-
-# --- Removals UPSERT: one row per amazon_staging line (source_staging_id) — migration 60519 ---
 
 _REMOVALS_CONFLICT = "organization_id,store_id,order_id,sku,fnsku,disposition,requested_quantity,shipped_quantity,disposed_quantity,cancelled_quantity,order_date,order_type"
 _REMOVAL_SHIPMENT_CONFLICT = (
@@ -354,13 +366,9 @@ _REMOVAL_WRITE_COLS = frozenset(REMOVAL_FIELD_MAP.keys()) | {
     "store_id",
 }
 
-# Columns managed exclusively by Postgres — NEVER send these in upsert/update payloads.
-# Sending `id=None` triggers "null value in column 'id' violates not-null constraint".
 _DB_SYSTEM_COLS = frozenset({"id", "created_at", "updated_at"})
 
-
 def _removal_order_date_key(val: Any) -> str | None:
-    """Normalize date column for identity tuples (YYYY-MM-DD or None)."""
     if val is None:
         return None
     try:
@@ -378,9 +386,7 @@ def _removal_order_date_key(val: Any) -> str | None:
         return None
     return s[:10]
 
-
 def _removal_null_slot_match_key(r: dict[str, Any]) -> tuple[Any, ...]:
-    """Match shipment lines to NULL-tracking removal rows — canonical cross-file identity (no qty/date)."""
     sid = r.get("store_id")
     store_part = str(sid).strip() if sid is not None and str(sid).strip() != "" else ""
     return (
@@ -393,13 +399,10 @@ def _removal_null_slot_match_key(r: dict[str, Any]) -> tuple[Any, ...]:
         _pg_text_unique_field(r.get("disposition")),
     )
 
-
 def _removal_row_for_write(row: dict[str, Any]) -> dict[str, Any]:
     return {k: row[k] for k in _REMOVAL_WRITE_COLS if k in row}
 
-
 def _merge_shipment_into_null_slot(existing: dict[str, Any], shipment: dict[str, Any]) -> dict[str, Any]:
-    """Backfill tracking; fill carrier/shipment_date only when existing is empty (Wave 1)."""
     out = dict(existing)
     tn = _pg_text_unique_field(shipment.get("tracking_number"))
     if tn:
@@ -414,8 +417,6 @@ def _merge_shipment_into_null_slot(existing: dict[str, Any], shipment: dict[str,
             out["shipment_date"] = inc_sd
     return out
 
-
-# expected_packages: columns we sync from Amazon (DO UPDATE); all other columns are warehouse-owned.
 EXPECTED_PKG_AMAZON_COLS = frozenset({
     "organization_id",
     "store_id",
@@ -436,7 +437,7 @@ EXPECTED_PKG_AMAZON_COLS = frozenset({
     "carrier",
     "shipment_date",
 })
-# Shipment-derived columns (from amazon_removals after Phase 3 enrichment): merge fill-null only.
+
 _EP_WORKLIST_AMAZON_FILL_NULL = frozenset({
     "tracking_number",
     "carrier",
@@ -446,11 +447,10 @@ _EP_WORKLIST_AMAZON_FILL_NULL = frozenset({
     "store_id",
     "order_type",
 })
-# Matches uq_expected_packages_canonical_cross_file (quantities/dates are attributes, not upsert keys).
+
 _EXPECTED_PKG_CONFLICT = (
     "organization_id,store_id,order_id,order_type,sku,fnsku,disposition"
 )
-
 
 def _ep_value_absent(v: Any) -> bool:
     if v is None:
@@ -459,9 +459,7 @@ def _ep_value_absent(v: Any) -> bool:
         return True
     return False
 
-
 def _expected_pkg_identity_key(row: dict[str, Any]) -> tuple[Any, ...]:
-    """Canonical cross-file key: matches uq_expected_packages_canonical_cross_file (DB)."""
     st = row.get("store_id")
     sid = str(st).strip() if st is not None and str(st).strip() != "" else ""
     return (
@@ -474,8 +472,6 @@ def _expected_pkg_identity_key(row: dict[str, Any]) -> tuple[Any, ...]:
         _pg_text_unique_field(row.get("disposition")),
     )
 
-
-# When merging duplicate expected_packages payloads for one ON CONFLICT key, prefer filled shipment/line fields.
 _EP_UPSERT_COLLAPSE_PREFER_FIELDS = frozenset({
     "tracking_number",
     "carrier",
@@ -484,11 +480,9 @@ _EP_UPSERT_COLLAPSE_PREFER_FIELDS = frozenset({
     "fnsku",
 })
 
-
 def _dedupe_merged_rows_for_expected_packages_upsert(
     merged_rows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
-    """Collapse rows sharing _expected_pkg_identity_key (same as upsert ON CONFLICT) to avoid duplicate-row errors."""
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     key_order: list[tuple[Any, ...]] = []
     for r in merged_rows:
@@ -517,13 +511,7 @@ def _dedupe_merged_rows_for_expected_packages_upsert(
 
     return out, collapsed
 
-
 def _merge_expected_pkg_amazon_only(existing: dict[str, Any], incoming_amazon: dict[str, Any]) -> dict[str, Any]:
-    """Preserve scanner / warehouse fields; overwrite only Amazon-sourced columns.
-
-    For shipment-derived fields already on amazon_removals, propagate into expected_packages but never
-    replace a populated worklist value with null/empty from incoming.
-    """
     out = dict(existing)
     for k, v in incoming_amazon.items():
         if k not in EXPECTED_PKG_AMAZON_COLS:
@@ -536,40 +524,30 @@ def _merge_expected_pkg_amazon_only(existing: dict[str, Any], incoming_amazon: d
             out[k] = v
     return out
 
-
 def _is_return_order_type_for_worklist(row: dict[str, Any]) -> bool:
-    """expected_packages worklist: Return lines only; missing order_type counts as Return (shipment CSV often omits it)."""
     t = _pg_text_unique_field(row.get("order_type"))
     if not t:
         return True
     return t.strip().lower() == "return"
 
-
-# Data Model for Amazon SP-API Sync
 class AmazonOrderSync(BaseModel):
     amazon_order_id: str
     org_id: str
     store_id: str
     raw_data: dict
 
-
 class SyncRemovalsRequest(BaseModel):
     organization_id: str
     upload_id: str | None = None
-
 
 class GenerateWorklistRequest(BaseModel):
     organization_id: str
     upload_id: str | None = None
 
-
-# 1. Root Endpoint (Health Check)
 @app.get("/")
 def read_root():
     return {"status": "Agent Backend is Live!", "service": "AI Logistics"}
 
-
-# 2. Agent Queue Endpoint
 @app.get("/agent/pending-claims")
 async def get_pending_claims():
     db = _require_supabase()
@@ -581,8 +559,6 @@ async def get_pending_claims():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# 3. Landing Zone Endpoint for Live Amazon Data
 @app.post("/sync/order")
 async def save_raw_amazon_order(order: AmazonOrderSync):
     db = _require_supabase()
@@ -599,20 +575,14 @@ async def save_raw_amazon_order(order: AmazonOrderSync):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# --- ETL: Amazon warehouse / removal file staging ---
-
 STAGING_INSERT_BATCH = 500
-# PostgREST caps responses at ~1000 rows unless paged — full-table reads must loop.
 WORKLIST_FETCH_PAGE = 1000
-
 
 def _fetch_org_table_all(
     db: Any,
     table: str,
     organization_id: str,
 ) -> list[dict[str, Any]]:
-    """Fetch every row for an org (paginated). Static snapshot; no deletes between pages."""
     out: list[dict[str, Any]] = []
     offset = 0
     while True:
@@ -631,13 +601,11 @@ def _fetch_org_table_all(
         offset += WORKLIST_FETCH_PAGE
     return out
 
-
 def _fetch_amazon_removal_shipments_by_upload(
     db: Any,
     organization_id: str,
     upload_id: str,
 ) -> list[dict[str, Any]]:
-    """Rows archived for one import session (REMOVAL_SHIPMENT sync target)."""
     out: list[dict[str, Any]] = []
     offset = 0
     while True:
@@ -657,15 +625,12 @@ def _fetch_amazon_removal_shipments_by_upload(
         offset += WORKLIST_FETCH_PAGE
     return out
 
-
 def _removal_like_from_shipment_archive(sh: dict[str, Any]) -> dict[str, Any]:
-    """Map amazon_removal_shipments → amazon_removals-shaped row for the worklist loop."""
     row = dict(sh)
     sid = sh.get("amazon_staging_id")
     if sid is not None and str(sid).strip() != "":
         row["source_staging_id"] = sid
     return row
-
 
 @app.post("/etl/upload-removal")
 async def etl_upload_removal(
@@ -673,11 +638,6 @@ async def etl_upload_removal(
     organization_id: str = Form(...),
     batch_id: str | None = Form(None),
 ):
-    """
-    Accept a CSV or TXT report, parse with pandas, and insert raw rows into
-    `amazon_staging` with a shared batch_id (stored in raw_row and as top-level
-    batch_id when the column exists).
-    """
     db = _require_supabase()
     try:
         uuid.UUID(organization_id)
@@ -761,13 +721,8 @@ async def etl_upload_removal(
             detail=f"ETL upload failed: {e!s}",
         )
 
-
 @app.post("/etl/process-staging")
 async def etl_process_staging(organization_id: str = Form(...)):
-    """
-    Read `amazon_staging`, group rows by tracking_number or (if empty) order_id,
-    create `expected_pallets` + `expected_items`, then clear staging for the org.
-    """
     db = _require_supabase()
     try:
         uuid.UUID(organization_id)
@@ -791,7 +746,6 @@ async def etl_process_staging(organization_id: str = Form(...)):
                 "staging_cleared": False,
             }
 
-        # Build groups: group_key -> list of raw_row dicts
         groups: dict[str, list[dict[str, Any]]] = {}
         skipped = 0
         for row in staging_rows:
@@ -907,35 +861,11 @@ async def etl_process_staging(organization_id: str = Form(...)):
             detail=f"ETL process failed: {e!s}",
         )
 
-
-# --- Background task: staging -> amazon_removals ---
-# Must be a plain def (not async) so FastAPI runs it in a thread pool,
-# keeping the synchronous supabase-py client off the event loop.
-# IMPORTANT: never call _require_supabase() here — it raises HTTPException,
-# which is a Starlette request-level exception and will cause
-# "RuntimeError: Caught handled exception, but response already started"
-# when raised outside a request context (i.e., in a background thread).
-
 def _run_sync_removals(
     task_id: str,
     organization_id: str,
     upload_id: str | None,
 ) -> None:
-    """
-    ETL Phase 3: amazon_staging → amazon_removals (+ append-only shipment history).
-
-    Identity: UPSERT uses DB conflict key on amazon_removals (staging + business line).
-
-    Same-key rows in one import are merged: quantity columns are summed; other
-    fields use the last non-null value in file order (Amazon updates win).
-
-    Shipment rows with tracking append to amazon_removal_shipments (full raw history).
-    NULL-tracking DB rows matched on canonical cross-file key (org, store, order_id,
-    order_type, sku, fnsku, disposition) are UPDATED in place
-    (no DELETE) when a shipment line fills in tracking.
-
-    Re-syncs UPSERT so changed order_status / quantities update existing rows.
-    """
     print(f"[sync-removals] START task_id={task_id} org={organization_id} upload_id={upload_id}")
     log.info(
         "[sync-removals] START task_id=%s org=%s upload_id=%s",
@@ -975,7 +905,6 @@ def _run_sync_removals(
     no_tracking_rows: list[dict[str, Any]] = []
 
     try:
-        # ── Phase 1: Fetch staging rows ───────────────────────────────────────────
         _update_task(task_id, 10, "Fetching rows from amazon_staging...")
         query = db.table("amazon_staging").select("*").eq("organization_id", organization_id)
         if upload_id:
@@ -987,7 +916,6 @@ def _run_sync_removals(
             _update_task(task_id, 100, "No staging rows found. Nothing to sync.", status="completed")
             return
 
-        # ── Phase 2: Extract, keep staging id + raw for shipment archive ──────────
         _update_task(task_id, 18, f"Extracting {len(staging_rows)} staging rows...")
 
         packed: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
@@ -1034,7 +962,6 @@ def _run_sync_removals(
             _update_task(task_id, 100, "No valid removal rows extracted (missing order_id).", status="completed")
             return
 
-        # ── Phase 2b: Append-only raw history — one row per staging line (aligned with Next.js REMOVAL_SHIPMENT sync).
         shipment_history_rows: list[dict[str, Any]] = []
         for staging_id, raw, ext in packed:
             row_ship: dict[str, Any] = {
@@ -1071,7 +998,6 @@ def _run_sync_removals(
                 len(shipment_history_rows),
             )
 
-        # ── Phase 3: One removal row per staging line (no pre-merge by logical key) ─
         extracted_rows = [p[2] for p in packed]
         _update_task(task_id, 24, f"Prepared {len(extracted_rows)} removal line(s) (one per staging row)...")
 
@@ -1089,7 +1015,6 @@ def _run_sync_removals(
 
         upserted_total = 0
 
-        # ── Phase 4: Upsert order rows (tracking IS NULL) ─────────────────────────
         if no_tracking_rows:
             n_order = len(no_tracking_rows)
             _update_task(task_id, 28, f"Upserting {n_order} order rows (no tracking)...")
@@ -1103,7 +1028,6 @@ def _run_sync_removals(
                 _update_task(task_id, progress, f"Upserted order rows… {min(i + STAGING_INSERT_BATCH, n_order)}/{n_order}")
             log.info("[sync-removals] Upserted %d order rows into amazon_removals", n_order)
 
-        # ── Phase 5: Shipment rows — UPDATE NULL slots in place; UPSERT the rest ───
         if has_tracking_rows:
             _update_task(
                 task_id, 48,
@@ -1171,8 +1095,6 @@ def _run_sync_removals(
                     ).execute()
                     upserted_total += len(chunk)
 
-        # ── Phase 6: Row-count verification ───────────────────────────────────────
-        # Every extracted staging line must either be upserted as new OR updated in-place.
         staged_line_count = len(extracted_rows)
         accounted_for = upserted_total + enriched_count
         if accounted_for < staged_line_count:
@@ -1202,7 +1124,6 @@ def _run_sync_removals(
                 skipped_no_order_id,
             )
 
-        # ── Phase 7: Clean up staging ─────────────────────────────────────────────
         _update_task(task_id, 82, f"Cleaning up {len(staging_ids)} rows from amazon_staging...")
         log.info("[sync-removals] Deleting %d staging rows by id", len(staging_ids))
         for i in range(0, len(staging_ids), STAGING_INSERT_BATCH):
@@ -1243,10 +1164,6 @@ def _run_sync_removals(
         log.error("[sync-removals] FATAL ERROR:\n%s", traceback.format_exc())
         _update_task(task_id, 0, f"Sync failed: {e!s}", status="failed")
 
-
-# --- Helpers for worklist generation ---
-
-
 def _generate_worklist_core(
     db: Any,
     task_id: str,
@@ -1255,24 +1172,6 @@ def _generate_worklist_core(
     progress_start: int = 0,
     upload_id: str | None = None,
 ) -> None:
-    """
-    Phase 4: amazon_removals → expected_packages (warehouse worklist).
-
-    Only removal rows whose order_type is Return are written to expected_packages
-    (Disposal / Liquidations stay in amazon_removals only).
-
-    Rows are written with INSERT ... ON CONFLICT ... DO UPDATE (via Supabase upsert).
-
-    No wholesale DELETE: warehouse fields (e.g. actual_scanned_count) are merged
-    from existing expected_packages and never overwritten by Amazon-only columns.
-
-    When upload_id is set (Phase 4 from the importer), input rows are scoped to that
-    session: prefer amazon_removals with matching upload_id; if none (REMOVAL_SHIPMENT
-    only wrote amazon_removal_shipments), build from that archive. expected_packages
-    rows are stamped with this upload_id.
-
-    progress_start: baseline when called from POST /etl/generate-worklist.
-    """
 
     def _prog(fraction: float, msg: str) -> None:
         actual = min(int(progress_start + fraction * (100 - progress_start)), 99)
@@ -1281,7 +1180,6 @@ def _generate_worklist_core(
     try:
         session_upload = str(upload_id).strip() if upload_id else None
 
-        # ── 1. Fetch amazon_removals ──────────────────────────────────────────────
         _prog(0.02, "Fetching amazon_removals rows for worklist generation...")
         log.info("[worklist-core] Fetching amazon_removals for org=%s", organization_id)
 
@@ -1318,7 +1216,6 @@ def _generate_worklist_core(
             _update_task(task_id, 100, "No removal or shipment rows for this upload; worklist unchanged.", status="completed")
             return
 
-        # ── 2. Load existing worklist (preserve warehouse columns) ───────────────
         _prog(0.08, "Loading existing expected_packages for merge...")
         try:
             existing_ep = _fetch_org_table_all(db, "expected_packages", organization_id)
@@ -1331,7 +1228,6 @@ def _generate_worklist_core(
         for er in existing_ep:
             existing_by_key[_expected_pkg_identity_key(er)] = er
 
-        # ── 3. Map removals → Amazon column set; merge with existing worklist rows ─
         _prog(0.12, f"Mapping {len(removal_rows)} rows to expected_packages format...")
 
         merged_rows: list[dict[str, Any]] = []
@@ -1399,12 +1295,6 @@ def _generate_worklist_core(
             _update_task(task_id, 100, "No worklist rows produced from amazon_removals.", status="completed")
             return
 
-        log.info(
-            "[worklist-core] rows skipped before insert: no_order=%d non_return=%d",
-            skipped_no_order,
-            skipped_non_return,
-        )
-
         merged_before_dedupe = len(merged_rows)
         merged_rows, merged_collapsed = _dedupe_merged_rows_for_expected_packages_upsert(merged_rows)
         merged_after_dedupe = len(merged_rows)
@@ -1412,16 +1302,11 @@ def _generate_worklist_core(
         log.info("[worklist-core] merged_rows_after_dedupe: %d", merged_after_dedupe)
         log.info("[worklist-core] merged_rows_collapsed_by_conflict_key: %d", merged_collapsed)
 
-        # ── 4. UPSERT (no DELETE) ─────────────────────────────────────────────────
-        # Strip Postgres-managed system columns before upserting.  Sending id=None
-        # (when an existing row was merged then cleared of its PK) triggers the
-        # "null value in column 'id' violates not-null constraint" error.
         _prog(0.28, f"Upserting {len(merged_rows)} rows into expected_packages...")
 
         upserted = 0
         n_pkg = len(merged_rows)
         for i in range(0, n_pkg, STAGING_INSERT_BATCH):
-            # Strip system columns so Postgres manages id/created_at/updated_at itself.
             chunk = [
                 {k: v for k, v in r.items() if k not in _DB_SYSTEM_COLS}
                 for r in merged_rows[i : i + STAGING_INSERT_BATCH]
@@ -1478,7 +1363,6 @@ def _generate_worklist_core(
 
         log.info("[worklist-core] expected_packages rows inserted: %d", upserted)
 
-        # ── Row-count verification ─────────────────────────────────────────────
         if upserted < len(merged_rows):
             log.warning(
                 "[worklist-core] ROW COUNT MISMATCH: prepared %d rows but only %d were upserted.",
@@ -1536,15 +1420,10 @@ def _generate_worklist_core(
         log.exception("[worklist-core] Phase 4 (generate worklist) failed")
         _update_task(task_id, 0, f"Worklist failed: {e!s}", status="failed")
 
-
-# --- Background task: amazon_removals -> expected_packages (standalone trigger) ---
-# Must be a plain def (not async) so FastAPI runs it in a thread pool.
-# Triggered only via POST /etl/generate-worklist (Phase 4 in the Next.js importer).
-
 def _run_generate_worklist(
     task_id: str,
     organization_id: str,
-    upload_id: str | None,  # kept for API compatibility; ignored inside core
+    upload_id: str | None,
 ) -> None:
     print(f"[generate-worklist] START task_id={task_id} org={organization_id}")
     _update_task(task_id, 5, "Task is alive. Connecting to database...")
@@ -1568,18 +1447,11 @@ def _run_generate_worklist(
         log.exception("[generate-worklist] background task crashed")
         _update_task(task_id, 0, "Worklist task crashed — see server logs.", status="failed")
 
-
-# --- ETL Endpoints: Removals Pipeline ---
-
 @app.post("/etl/sync-removals")
 async def etl_sync_removals(
     request: SyncRemovalsRequest,
     background_tasks: BackgroundTasks,
 ):
-    """
-    Move rows from amazon_staging into amazon_removals (archive).
-    Returns a task_id immediately; poll GET /etl/task/{task_id} for progress.
-    """
     try:
         uuid.UUID(request.organization_id)
     except ValueError:
@@ -1596,18 +1468,11 @@ async def etl_sync_removals(
     background_tasks.add_task(_run_sync_removals, task_id, request.organization_id, request.upload_id)
     return {"task_id": task_id, "status": "queued", "poll_url": f"/etl/task/{task_id}"}
 
-
 @app.post("/etl/generate-worklist")
 async def etl_generate_worklist(
     request: GenerateWorklistRequest,
     background_tasks: BackgroundTasks,
 ):
-    """
-    Transform amazon_removals rows into expected_packages (operational worklist).
-    Uses UPSERT on canonical cross-file key (organization_id, store_id, order_id, order_type, sku, fnsku, disposition);
-    quantities/dates are row attributes; warehouse scan fields are preserved on conflict.
-    Returns a task_id immediately; poll GET /etl/task/{task_id} for progress.
-    """
     try:
         uuid.UUID(request.organization_id)
     except ValueError:
@@ -1624,13 +1489,397 @@ async def etl_generate_worklist(
     background_tasks.add_task(_run_generate_worklist, task_id, request.organization_id, request.upload_id)
     return {"task_id": task_id, "status": "queued", "poll_url": f"/etl/task/{task_id}"}
 
-
 @app.get("/etl/task/{task_id}")
 async def get_task_status(task_id: str):
-    """
-    Poll the progress of a background ETL task.
-    Returns: task_id, status (queued|running|completed|failed), progress (0-100), message.
-    """
     if task_id not in task_store:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
     return task_store[task_id]
+
+# -------------------------------------------------------------------------
+# UI ARCHITECTURE ENDPOINTS & DATA ROUTING
+# -------------------------------------------------------------------------
+
+def _get_openai_key(db: Any, org_id: str) -> str | None:
+    """Attempts to retrieve the OpenAI key from the environment first, then the database."""
+    env_key = os.getenv("OPENAI_API_KEY")
+    if env_key and str(env_key).startswith("sk-"):
+        return env_key
+
+    try:
+        res = db.table("organization_api_keys").select("*").eq("organization_id", org_id).execute()
+        if res.data:
+            for row in res.data:
+                for key_field in ["api_key", "key", "token", "openai_api_key", "key_value"]:
+                    if key_field in row and row[key_field]:
+                        val = str(row[key_field])
+                        if val.startswith("sk-"):
+                            return val
+    except Exception as e:
+        log.warning(f"Failed to fetch API key from DB: {e}")
+    
+    return None
+
+def _normalize_to_ui_report_slug(raw: str | None) -> str:
+    """
+    Maps GPT / user / legacy tokens to a small set of UI routing slugs.
+    DB CHECK constraints use different spellings — see _ui_slug_to_db_report_type().
+    """
+    if not raw:
+        return "unknown"
+    s = str(raw).strip().lower()
+    for junk in ('"', "'", "`", ".", ",", ";", ":"):
+        s = s.replace(junk, "")
+    s = s.split()[0] if s else ""
+
+    synonyms: dict[str, str] = {
+        "inventory_ledger": "inventory_ledger",
+        "inventory": "inventory_ledger",
+        "fba_inventory_ledger": "inventory_ledger",
+        "ledger": "inventory_ledger",
+        "inventory-ledger": "inventory_ledger",
+        "reimbursements": "reimbursements",
+        "reimbursement": "reimbursements",
+        "fba_reimbursements": "reimbursements",
+        "removals": "removals",
+        "removal": "removals",
+        "removal_shipment": "removals",
+        "removal_shipments": "removals",
+        "removal_shipment_detail": "removals",
+        "removal_order": "removals",
+        "removal_orders": "removals",
+        "removal-order-id": "removals",
+        "amazon_all_orders": "amazon_all_orders",
+        "all_orders": "amazon_all_orders",
+        # GPT might echo Postgres-safe labels — fold back to UI slug for routing
+        "removal_shipment": "removals",
+        "unknown": "unknown",
+    }
+    return synonyms.get(s, "unknown")
+
+def _normalized_header_set(headers: list[str]) -> set[str]:
+    return {_normalize_header(str(h)) for h in headers if str(h).strip()}
+
+def _detect_report_type_by_rules(headers: list[str]) -> tuple[str, float, str]:
+    """
+    Deterministic first pass. This avoids unnecessary GPT calls for the common
+    Amazon exports and makes the UI feel instant/reliable.
+    """
+    h = _normalized_header_set(headers)
+    if not h:
+        return "unknown", 0.0, "rules"
+
+    if {"date", "fnsku", "asin", "msku", "event_type", "quantity"}.issubset(h):
+        return "inventory_ledger", 0.98, "rules"
+    if {"date_and_time", "fnsku", "asin", "msku", "event_type", "quantity"}.issubset(h):
+        return "inventory_ledger", 0.98, "rules"
+    if {"reimbursement_id", "reason", "sku"}.issubset(h) or {"approval_date", "reimbursement_id"}.issubset(h):
+        return "reimbursements", 0.98, "rules"
+    if {"order_id", "sku", "fnsku", "disposition"}.issubset(h) and (
+        "requested_quantity" in h or "shipped_quantity" in h or "tracking_number" in h
+    ):
+        return "removals", 0.96, "rules"
+    if {"amazon_order_id", "purchase_date", "order_status"}.issubset(h):
+        return "amazon_all_orders", 0.98, "rules"
+    if {"order_id", "purchase_date", "order_status"}.issubset(h):
+        return "amazon_all_orders", 0.9, "rules"
+
+    return "unknown", 0.0, "rules"
+
+
+def _ui_slug_to_db_report_type(ui_slug: str) -> str:
+    """Maps UI slug to a value that satisfies raw_report_uploads.report_type CHECK."""
+    mapping = {
+        "inventory_ledger": "inventory_ledger",
+        "reimbursements": "reimbursements",
+        "removals": "REMOVAL_SHIPMENT",
+        "amazon_all_orders": "ALL_ORDERS",
+        "unknown": "UNKNOWN",
+    }
+    return mapping.get(ui_slug, "UNKNOWN")
+
+
+ALLOWED_UI_REPORT_SLUGS = frozenset(
+    {"inventory_ledger", "reimbursements", "removals", "amazon_all_orders"}
+)
+
+
+def _detect_report_type_with_gpt(headers: list[str], api_key: str) -> tuple[str, float, str]:
+    """Uses GPT to classify the report; returns a normalized UI slug."""
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        header_sample = ", ".join(headers[:80])
+        prompt = (
+            "You classify Amazon Seller Central export CSVs using COLUMN HEADERS ONLY.\n\n"
+            "Reply with exactly ONE lowercase slug from this list (no punctuation, no explanation):\n"
+            "- inventory_ledger — FBA Inventory Ledger / inventory events (SKU, fulfillment center, quantities, event types)\n"
+            "- reimbursements — FBA reimbursements / repayment (reimbursement id, fee/reason, currency amounts)\n"
+            "- removals — Removal orders / removal shipments / disposal (removal-order-id, disposition, shipped quantity)\n"
+            "- amazon_all_orders — All Orders style report (amazon-order-id, order status, purchase date)\n"
+            "- unknown — if none of the above fit\n\n"
+            f"Headers:\n{header_sample}"
+        )
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=24,
+        )
+        raw_out = response.choices[0].message.content
+        detected = _normalize_to_ui_report_slug(raw_out)
+        return detected, 0.8 if detected != "unknown" else 0.0, "gpt"
+    except Exception as e:
+        log.warning(f"GPT detection failed: {e}")
+        return "unknown", 0.0, "gpt"
+
+class DetectHeadersRequest(BaseModel):
+    headers: list[str]
+    organization_id: str
+
+@app.post("/etl/detect-headers")
+async def etl_detect_headers(request: DetectHeadersRequest):
+    """Architectural Route for Client-Side Slicing auto-detection."""
+    db = _require_supabase()
+    rules_type, confidence, method = _detect_report_type_by_rules(request.headers)
+    if rules_type != "unknown":
+        return {
+            "detected_type": rules_type,
+            "confidence": confidence,
+            "method": method,
+        }
+
+    api_key = _get_openai_key(db, request.organization_id)
+    if not api_key:
+        return {"detected_type": "unknown", "confidence": 0.0, "method": "none"}
+
+    detected, confidence, method = _detect_report_type_with_gpt(request.headers, api_key)
+    return {
+        "detected_type": detected,
+        "confidence": confidence,
+        "method": method,
+    }
+
+@app.get("/etl/upload-history/{organization_id}")
+async def etl_upload_history(organization_id: str):
+    """Fetches the upload history for the frontend table + per-upload pipeline progress."""
+    db = _require_supabase()
+    try:
+        uuid.UUID(organization_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid organization ID.")
+
+    try:
+        res = (
+            db.table("raw_report_uploads")
+            .select("*")
+            .eq("organization_id", organization_id)
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute()
+        )
+        rows = list(res.data or [])
+        ids = [r.get("id") for r in rows if r.get("id")]
+        fps_by_upload: dict[str, dict[str, Any]] = {}
+        if ids:
+            try:
+                fps_res = (
+                    db.table("file_processing_status")
+                    .select("*")
+                    .in_("upload_id", ids)
+                    .execute()
+                )
+                for fps in fps_res.data or []:
+                    uid = fps.get("upload_id")
+                    if isinstance(uid, str):
+                        fps_by_upload[uid] = fps
+            except Exception as fe:
+                log.warning(f"file_processing_status join skipped: {fe}")
+        for r in rows:
+            uid = r.get("id")
+            if isinstance(uid, str) and uid in fps_by_upload:
+                r["pipeline"] = fps_by_upload[uid]
+        return {"status": "success", "history": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database fetch error: {e}")
+
+@app.delete("/etl/upload/{upload_id}")
+async def etl_delete_upload(upload_id: str):
+    """Deletes an upload record and its physical file from storage."""
+    db = _require_supabase()
+    try:
+        res = db.table("raw_report_uploads").select("metadata").eq("id", upload_id).execute()
+        if res.data and res.data[0].get("metadata"):
+            storage_path = res.data[0]["metadata"].get("storage_path")
+            if storage_path:
+                try:
+                    db.storage.from_("raw-reports").remove([storage_path])
+                except Exception as e:
+                    log.warning(f"Failed to delete physical file: {e}")
+                    
+        db.table("raw_report_uploads").delete().eq("id", upload_id).execute()
+        return {"status": "success", "message": "Record deleted."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Deletion failed: {e}")
+
+@app.post("/etl/upload-raw")
+async def etl_upload_raw(
+    file: UploadFile = File(...),
+    report_type: str = Form(...),
+    organization_id: str = Form(...),
+    store_id: str = Form(...)
+):
+    db = _require_supabase()
+    
+    try:
+        uuid.UUID(organization_id)
+        uuid.UUID(store_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid UUID format for organization_id or store_id.")
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    file_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+    # Idempotency Check. Only completed/synced uploads are considered duplicates.
+    # Previous failed or stuck "processing" rows must not block a retry because
+    # they may have been created before the raw file reached storage.
+    try:
+        existing_res = (
+            db.table("raw_report_uploads")
+            .select("id, report_type, status, metadata")
+            .eq("organization_id", organization_id)
+            .execute()
+        )
+        for row in existing_res.data:
+            meta = row.get("metadata") or {}
+            status = str(row.get("status") or "").lower()
+            reusable_status = status in {"complete", "synced", "mapped", "ready", "uploaded"}
+            if meta.get("file_hash") == file_hash and reusable_status:
+                return {
+                    "status": "success",
+                    "message": "Duplicate file prevented. File already exists in the system.",
+                    "upload_id": row["id"],
+                    "detected_type": (row.get("metadata") or {}).get("ui_report_slug") or row.get("report_type"),
+                }
+    except Exception as e:
+        log.warning(f"Duplicate check bypassed: {e}")
+
+    headers, row_count = _csv_headers_and_row_count_fast(raw_bytes)
+    if not headers:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not read a header row. Ensure the file is UTF-8 CSV or TSV.",
+        )
+    if row_count < 1:
+        raise HTTPException(status_code=400, detail="No data rows in file.")
+
+    raw_rt = (report_type or "").strip()
+    ui_slug = _normalize_to_ui_report_slug(raw_rt)
+
+    if ui_slug == "unknown" or raw_rt.lower() in (
+        "auto",
+        "auto-detect",
+        "",
+        "null",
+    ):
+        api_key = _get_openai_key(db, organization_id)
+        if api_key:
+            ui_slug, _, _ = _detect_report_type_with_gpt(headers, api_key)
+        else:
+            ui_slug = "unknown"
+
+    if ui_slug not in ALLOWED_UI_REPORT_SLUGS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Report type could not be determined. "
+                "Pick inventory_ledger, reimbursements, removals, or amazon_all_orders from the dropdown."
+            ),
+        )
+
+    db_report_type = _ui_slug_to_db_report_type(ui_slug)
+    target_table_by_slug = {
+        "inventory_ledger": "amazon_inventory_ledger",
+        "reimbursements": "amazon_reimbursements",
+        "removals": "amazon_staging",
+        "amazon_all_orders": "amazon_all_orders",
+    }
+    target_table = target_table_by_slug.get(ui_slug)
+
+    safe_filename = (file.filename or "upload.csv").replace(" ", "_")
+    storage_path = f"{organization_id}/{store_id}/{file_hash}_{safe_filename}"
+
+    try:
+        db.storage.from_("raw-reports").upload(
+            path=storage_path,
+            file=raw_bytes,
+            file_options={
+                "content-type": file.content_type or "text/csv",
+                "upsert": "true",
+            },
+        )
+    except Exception as e:
+        log.exception(f"Storage upload failed for {storage_path}: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not save file to storage. Check bucket 'raw-reports' and service role permissions. ({e})",
+        ) from e
+
+    upload_id: str | None = None
+    try:
+        upload_record = {
+            "organization_id": organization_id,
+            "report_type": db_report_type,
+            "file_name": file.filename or "upload.csv",
+            "metadata": {
+                "file_hash": file_hash,
+                "content_sha256": file_hash,
+                "row_count": row_count,
+                "total_rows": row_count,
+                "import_store_id": store_id,
+                "ledger_store_id": store_id,
+                "storage_path": storage_path,
+                "raw_file_path": storage_path,
+                "upload_chunks_count": 1,
+                "total_parts": 1,
+                "upload_progress": 100,
+                "total_bytes": len(raw_bytes),
+                "uploaded_bytes": len(raw_bytes),
+                "csv_headers": headers,
+                "headers": headers[:15],
+                "ui_report_slug": ui_slug,
+                "target_table": target_table,
+                "etl_source": "amazon_etl_quick_upload",
+            },
+            "status": "mapped",
+        }
+
+        upload_res = db.table("raw_report_uploads").insert(upload_record).execute()
+        if not upload_res.data:
+            raise RuntimeError("Insert returned no row — check raw_report_uploads schema and RLS.")
+        upload_id = str(upload_res.data[0]["id"])
+
+        return {
+            "status": "success",
+            "message": (
+                f"File saved to storage ({row_count:,} data rows). "
+                "Open Imports → find this upload → Process (staging), then Sync (Amazon tables)."
+            ),
+            "upload_id": upload_id,
+            "detected_type": ui_slug,
+            "report_type_db": db_report_type,
+            "next_step": "imports_process",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"Error finalizing upload: {traceback.format_exc()}")
+        if upload_id:
+            try:
+                db.table("raw_report_uploads").update({"status": "failed"}).eq("id", upload_id).execute()
+            except Exception as ue:
+                log.warning(f"Could not mark upload failed: {ue}")
+        raise HTTPException(status_code=500, detail=f"System failed to finalize the upload: {e}") from e

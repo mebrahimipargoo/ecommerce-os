@@ -33,6 +33,10 @@ export function BrandingProvider({ children }: { children: React.ReactNode }) {
   const [logoUrl, setLogoUrl] = useState("");
   const [loading, setLoading] = useState(true);
 
+  // Track the last org+actor pair so we don't re-fetch branding on every
+  // profile-loading cycle that doesn't change the effective identity.
+  const lastFetchedKey = React.useRef<string | null>(null);
+
   const refresh = useCallback(async () => {
     if (!actorUserId?.trim()) {
       setCompanyName("");
@@ -55,8 +59,13 @@ export function BrandingProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (profileLoading) return;
+    // Only re-fetch when the effective identity actually changed — avoids
+    // cascading re-renders when TOKEN_REFRESHED fires on tab focus.
+    const key = `${actorUserId ?? ""}:${organizationId ?? ""}`;
+    if (key === lastFetchedKey.current) return;
+    lastFetchedKey.current = key;
     void refresh();
-  }, [refresh, profileLoading]);
+  }, [refresh, profileLoading, actorUserId, organizationId]);
 
   const value = useMemo(
     () => ({ companyName, logoUrl, loading, refresh }),

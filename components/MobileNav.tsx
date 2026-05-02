@@ -4,7 +4,9 @@ import React, { useState, useEffect } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
 import {
+  Database,
   FileText,
+  FileUp,
   LayoutDashboard,
   RotateCcw,
   ShieldAlert,
@@ -23,6 +25,13 @@ const navLinks = [
       { label: "Returns Processing", icon: RotateCcw, href: "/returns" },
       { label: "Claim Engine", icon: ShieldAlert, href: "/claim-engine" },
       { label: "Report history", icon: FileText, href: "/claim-engine/report-history" },
+    ],
+  },
+  {
+    section: "Imports",
+    items: [
+      { label: "File Import", icon: FileUp,   href: "/dashboard/file-import" },
+      { label: "Amazon ETL",  icon: Database,  href: "/dashboard/amazon-etl"  },
     ],
   },
   {

@@ -4,7 +4,9 @@ import React from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
+  Database,
   FileText,
+  FileUp,
   LayoutDashboard,
   RotateCcw,
   ShieldAlert,
@@ -21,6 +23,13 @@ const NAV_SECTIONS = [
       { label: "Returns Processing",  icon: RotateCcw,       href: "/returns"           },
       { label: "Claim Engine",        icon: ShieldAlert,     href: "/claim-engine"  },
       { label: "Report history",      icon: FileText,        href: "/claim-engine/report-history" },
+    ],
+  },
+  {
+    section: "Imports",
+    items: [
+      { label: "File Import", icon: FileUp,  href: "/dashboard/file-import" },
+      { label: "Amazon ETL",  icon: Database, href: "/dashboard/amazon-etl"  },
     ],
   },
   {

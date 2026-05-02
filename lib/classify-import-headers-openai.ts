@@ -69,7 +69,7 @@ SUPPORTED Amazon report types (report_type must be one of these):
   canonical: transaction_type, total_product_charges, order_id, sku, posted_date
 - REPORTS_REPOSITORY: signals = "date/time" AND "settlement id" AND "type" AND "order id" AND "sku" AND "description" AND "total"
   canonical: date_time, settlement_id, transaction_type, order_id, sku, description, total_amount
-- PRODUCT_IDENTITY: signals = "Seller SKU" AND ("Product Name" OR "item name") AND any of ("UPC", "Vendor", "Mfg #", "FNSKU", "ASIN")
+- PRODUCT_IDENTITY: signals = EXACT canonical identity header set: "UPC", "Vendor", "Seller SKU", "Mfg #", "FNSKU", "ASIN", "Product Name" (all seven headers must be present; do NOT classify inventory/listing exports as PRODUCT_IDENTITY)
   canonical: seller_sku, product_name, vendor, mfg_part_number, upc, fnsku, asin
 - ALL_ORDERS: signals = "amazon-order-id" AND "purchase-date" AND "order-status"
   canonical: order_id, purchase_date, order_status, fulfillment_channel, sales_channel

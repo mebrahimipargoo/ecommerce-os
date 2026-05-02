@@ -37,6 +37,41 @@ export type ImportRunMetrics = {
     | "complete"
     | "failed";
   failure_reason?: string;
+  // ── Product Identity validation metrics (mirrors metadata.product_identity_validation).
+  // Surfaced here so the unified `import_metrics` blob the UI/SQL inspects has the same shape
+  // for every report type that exposes parsed-vs-synced counters.
+  detected_headers?: string[];
+  detected_report_type?: string;
+  rows_parsed?: number;
+  products_upserted?: number;
+  catalog_products_upserted?: number;
+  identifiers_upserted?: number;
+  invalid_identifier_counts?: {
+    asin?: number;
+    fnsku?: number;
+    upc?: number;
+    total?: number;
+  };
+  /** Product Identity intra-batch dedupe counters (see lib/product-identity-import.ts). */
+  normalized_rows_count?: number;
+  unique_product_sku_count?: number;
+  duplicate_sku_count?: number;
+  duplicate_sku_conflict_count?: number;
+  catalog_unique_count?: number;
+  identifier_unique_count?: number;
+  /** Per-row CSV diagnostics (Product Identity). */
+  rows_missing_seller_sku?: number;
+  rows_invalid_seller_sku?: number;
+  rows_skipped?: number;
+  skipped_reason_counts?: {
+    missing_seller_sku?: number;
+    invalid_seller_sku?: number;
+  };
+  invalid_sku_examples?: { rowNumber: number; rawValue: string; reason: string }[];
+  /** Informational note surfaced in import_metrics for debugging. */
+  note?: string;
+  /** Target staging table for the current phase (Product Identity pipeline). */
+  stage_target_table?: string;
 };
 
 export type RawReportUploadMetadata = {
@@ -174,6 +209,42 @@ export type RawReportUploadMetadata = {
   removal_shipment_lines_for_generic?: number;
   /** REMOVAL_SHIPMENT Phase 4: shipment lines used as generic progress denominator. */
   removal_shipment_phase4_generic_rows_written?: number;
+  /**
+   * Product Identity validation block — written by the process / sync routes
+   * for `report_type = 'PRODUCT_IDENTITY'`. Mirrors the same keys exposed
+   * inside `metadata.import_metrics` so the validation SQL can read either.
+   */
+  product_identity_validation?: {
+    detected_headers: string[];
+    detected_report_type: "PRODUCT_IDENTITY";
+    rows_parsed: number;
+    rows_synced: number;
+    products_upserted: number;
+    catalog_products_upserted: number;
+    identifiers_upserted: number;
+    invalid_identifier_counts: {
+      asin: number;
+      fnsku: number;
+      upc: number;
+      total: number;
+    };
+    /** Intra-batch dedupe stats (see lib/product-identity-import.ts). */
+    normalized_rows_count?: number;
+    unique_product_sku_count?: number;
+    duplicate_sku_count?: number;
+    duplicate_sku_conflict_count?: number;
+    catalog_unique_count?: number;
+    identifier_unique_count?: number;
+    /** Per-row CSV diagnostics (Product Identity). */
+    rows_missing_seller_sku?: number;
+    rows_invalid_seller_sku?: number;
+    rows_skipped?: number;
+    skipped_reason_counts?: {
+      missing_seller_sku?: number;
+      invalid_seller_sku?: number;
+    };
+    invalid_sku_examples?: { rowNumber: number; rawValue: string; reason: string }[];
+  };
 };
 
 function num(v: unknown, fallback = 0): number {

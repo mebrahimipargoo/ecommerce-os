@@ -18,6 +18,7 @@ import {
   deleteRawReportUpload,
   listRawReportUploads,
   resetStuckUpload,
+  resetStuckProductIdentityUpload,
   updateRawReportType,
 } from "./import-actions";
 import { ColumnMappingModal } from "./ColumnMappingModal";
@@ -47,6 +48,28 @@ const LEGACY_REPORT_TYPE: Record<string, RawReportType> = {
 function coerceReportType(v: string): RawReportType {
   if (RAW_REPORT_TYPE_ORDER.includes(v as RawReportType)) return v as RawReportType;
   return LEGACY_REPORT_TYPE[v] ?? "UNKNOWN";
+}
+
+async function readImportApiJson<T extends { ok?: boolean; error?: string; details?: string }>(
+  res: Response,
+): Promise<T> {
+  const text = await res.text();
+  if (!text.trim()) {
+    return {
+      ok: false,
+      error: `Import API returned an empty ${res.status} response.`,
+      details: "",
+    } as T;
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return {
+      ok: false,
+      error: `Import API returned non-JSON ${res.status} response.`,
+      details: text.slice(0, 2000),
+    } as T;
+  }
 }
 
 // ── Compact pipeline cell ─────────────────────────────────────────────────────
@@ -167,7 +190,11 @@ export function RawReportImportsPanel({
   }, [refresh, refreshSignal]);
 
   useEffect(() => {
-    pollRef.current = setInterval(() => void refresh(), 5000);
+    // 10s instead of 5s — the active pipeline card in UniversalImporter
+    // already polls by upload_id every 1.5s. The history panel only needs
+    // to catch newly-uploaded files from other sessions or status changes
+    // that the active card poller doesn't see.
+    pollRef.current = setInterval(() => void refresh(), 10000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
@@ -252,9 +279,9 @@ export function RawReportImportsPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ upload_id: r.id }),
       });
-      const json = (await res.json()) as { ok?: boolean; error?: string };
+      const json = await readImportApiJson<{ ok?: boolean; error?: string; details?: string }>(res);
       if (!res.ok || !json.ok) {
-        setLoadErr(json.error ?? "Processing failed.");
+        setLoadErr(json.details || json.error || "Processing failed.");
       }
       await refresh();
     } catch (e) {
@@ -273,9 +300,9 @@ export function RawReportImportsPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ upload_id: r.id }),
       });
-      const json = (await res.json()) as { ok?: boolean; error?: string };
+      const json = await readImportApiJson<{ ok?: boolean; error?: string; details?: string }>(res);
       if (!res.ok || !json.ok) {
-        setLoadErr(json.error ?? "Sync failed.");
+        setLoadErr(json.details || json.error || "Sync failed.");
       }
       await refresh();
     } catch (e) {
@@ -294,9 +321,9 @@ export function RawReportImportsPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ upload_id: r.id }),
       });
-      const json = (await res.json()) as { ok?: boolean; error?: string };
+      const json = await readImportApiJson<{ ok?: boolean; error?: string; details?: string }>(res);
       if (!res.ok || !json.ok) {
-        setLoadErr(json.error ?? "Generic phase failed.");
+        setLoadErr(json.details || json.error || "Generic phase failed.");
       }
       await refresh();
     } catch (e) {
@@ -315,9 +342,9 @@ export function RawReportImportsPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ upload_id: r.id }),
       });
-      const json = (await res.json()) as { ok?: boolean; error?: string };
+      const json = await readImportApiJson<{ ok?: boolean; error?: string; details?: string }>(res);
       if (!res.ok || !json.ok) {
-        setLoadErr(json.error ?? "Generate Worklist failed.");
+        setLoadErr(json.details || json.error || "Generate Worklist failed.");
       }
       await refresh();
     } catch (e) {
@@ -335,6 +362,24 @@ export function RawReportImportsPanel({
     try {
       const res = await resetStuckUpload({ uploadId: r.id, actorUserId });
       if (!res.ok) setLoadErr(res.error ?? "Reset failed.");
+      await refresh();
+    } catch (e) {
+      setLoadErr(e instanceof Error ? e.message : "Reset failed.");
+    } finally {
+      clearBusy(r.id);
+    }
+  };
+
+  const runResetStuckProductIdentity = async (r: RawReportUploadRow) => {
+    markBusy(r.id, "resetting-pi");
+    setLoadErr(null);
+    try {
+      const res = await resetStuckProductIdentityUpload({ uploadId: r.id, actorUserId });
+      if (!res.ok) {
+        setLoadErr(res.error ?? "Reset failed.");
+      } else if (res.stagingRowsDeleted != null) {
+        setLoadErr(null);
+      }
       await refresh();
     } catch (e) {
       setLoadErr(e instanceof Error ? e.message : "Reset failed.");
@@ -518,6 +563,7 @@ export function RawReportImportsPanel({
                     onWorklist={() => void runWorklist(r)}
                     onDelete={() => void runDeleteUpload(r)}
                     onResetStuck={() => void runResetStuck(r)}
+                    onResetStuckProductIdentity={() => void runResetStuckProductIdentity(r)}
                     onMapColumns={() => setMappingRow(r)}
                     onReportTypeChange={async (v: RawReportType) => {
                       const prevType = r.report_type;
@@ -586,6 +632,7 @@ type HistoryRowProps = {
   onWorklist: () => void;
   onDelete: () => void;
   onResetStuck: () => void;
+  onResetStuckProductIdentity: () => void;
   onMapColumns: () => void;
   onReportTypeChange: (v: RawReportType) => void;
   reportTypeSaved: boolean;
@@ -605,6 +652,7 @@ const HistoryRow = React.memo(function HistoryRow({
   onWorklist,
   onDelete,
   onResetStuck,
+  onResetStuckProductIdentity,
   onMapColumns,
   onReportTypeChange,
   reportTypeSaved
@@ -651,7 +699,11 @@ const HistoryRow = React.memo(function HistoryRow({
     pipeline.nextAction === "worklist" &&
     !busy;
   const showResetStuck =
-    r.status === "processing" && !busy;
+    r.status === "processing" && !busy && r.report_type !== "PRODUCT_IDENTITY";
+  const showResetStuckProductIdentity =
+    r.report_type === "PRODUCT_IDENTITY" &&
+    (r.status === "processing" || r.status === "staged" || r.status === "failed") &&
+    !busy;
 
   return (
     <tr
@@ -884,6 +936,18 @@ const HistoryRow = React.memo(function HistoryRow({
               small
             >
               Reset
+            </ActionButton>
+          )}
+
+          {showResetStuckProductIdentity && (
+            <ActionButton
+              onClick={onResetStuckProductIdentity}
+              disabled={anyBusy}
+              color="amber"
+              icon={<RotateCcw className="h-3 w-3" aria-hidden />}
+              small
+            >
+              Reset&nbsp;PI
             </ActionButton>
           )}
 

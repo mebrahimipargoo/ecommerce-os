@@ -26,20 +26,29 @@ function formatStoreDisplayName(row: Record<string, unknown>): string {
 }
 
 /**
- * Active stores the actor may target for Amazon Ledger uploads (`stores.organization_id` = tenant).
- * - `super_admin`: all rows in `public.stores`
+ * Active stores the actor may target for imports (`stores.organization_id` = tenant).
+ * - `super_admin`: stores for the selected workspace organization when provided
  * - others: only stores for `profiles.organization_id`
  */
 export async function listStoresForImports(
   actorUserId?: string | null,
+  targetOrganizationId?: string | null,
 ): Promise<{ ok: true; rows: StoreImportOption[] } | { ok: false; error: string }> {
   try {
     const aid = actorUserId?.trim();
+    const requestedOrgId = targetOrganizationId?.trim();
 
-    async function fetchAllStores(): Promise<{ ok: true; rows: StoreImportOption[] } | { ok: false; error: string }> {
+    async function fetchStoresForOrganization(
+      organizationId: string,
+    ): Promise<{ ok: true; rows: StoreImportOption[] } | { ok: false; error: string }> {
+      if (!organizationId || !isUuidString(organizationId)) {
+        return { ok: true, rows: [] };
+      }
+
       const { data, error } = await supabaseServer
         .from(DB_TABLES.stores)
         .select("id, organization_id, name, platform, is_active")
+        .eq("organization_id", organizationId)
         .eq("is_active", true)
         .order("name", { ascending: true });
 
@@ -65,7 +74,7 @@ export async function listStoresForImports(
     }
 
     if (isSuperAdminRole(profile.role)) {
-      return fetchAllStores();
+      return fetchStoresForOrganization(requestedOrgId ?? profile.organization_id.trim());
     }
 
     const cid = profile.organization_id.trim();
@@ -73,22 +82,11 @@ export async function listStoresForImports(
       return { ok: true, rows: [] };
     }
 
-    const { data, error } = await supabaseServer
-      .from(DB_TABLES.stores)
-      .select("id, organization_id, name, platform, is_active")
-      .eq("organization_id", cid)
-      .eq("is_active", true)
-      .order("name", { ascending: true });
+    if (requestedOrgId && requestedOrgId !== cid) {
+      return { ok: true, rows: [] };
+    }
 
-    if (error) return { ok: false, error: error.message };
-
-    const rows = (data ?? []) as Record<string, unknown>[];
-    const out: StoreImportOption[] = rows.map((r) => ({
-      id: String(r.id ?? ""),
-      organization_id: String(r.organization_id ?? ""),
-      display_name: formatStoreDisplayName(r),
-    }));
-    return { ok: true, rows: out };
+    return fetchStoresForOrganization(cid);
   } catch (e) {
     return {
       ok: false,

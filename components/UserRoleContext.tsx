@@ -451,14 +451,46 @@ export function UserRoleProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => { void loadProfile(); }, [loadProfile]);
 
-  // Keep profile/role in sync with auth transitions (login/logout/token refresh).
+  // Keep profile/role in sync with **identity** transitions only.
+  //
+  // Why this is selective:
+  //   Supabase JS emits `TOKEN_REFRESHED` (and `INITIAL_SESSION` /
+  //   `USER_UPDATED`) on tab focus / visibility, often without changing the
+  //   user identity. Re-running `loadProfile()` on those events flips
+  //   `profileLoading` → true and re-sets every consumer-visible piece of
+  //   context, which triggered a cascade of useEffects across the app — the
+  //   visible symptom being the Imports page "re-rendering" and dropping its
+  //   active pipeline card every time the user switched tabs.
+  //
+  //   We only re-run loadProfile when the signed-in user identity actually
+  //   changes (SIGNED_IN with a new id, SIGNED_OUT, USER_UPDATED). All other
+  //   token-lifecycle events are still observed by the Supabase client —
+  //   we just do not propagate them as profile reloads here.
   useEffect(() => {
-    const { data: subscription } = supabase.auth.onAuthStateChange(() => {
+    let lastSeenAuthUserId = actorUserId;
+    const { data: subscription } = supabase.auth.onAuthStateChange((event, session) => {
+      const currentUid = session?.user?.id ?? null;
+      const isMeaningful =
+        event === "SIGNED_IN"
+        || event === "SIGNED_OUT"
+        || event === "USER_UPDATED"
+        || event === "PASSWORD_RECOVERY"
+        || (event === "INITIAL_SESSION" && currentUid !== lastSeenAuthUserId);
+
+      if (!isMeaningful && currentUid === lastSeenAuthUserId) {
+        // TOKEN_REFRESHED / focus-driven session check with the same user —
+        // nothing to do. Avoids the "page refreshes on tab switch" cascade.
+        return;
+      }
+      lastSeenAuthUserId = currentUid;
       void loadProfile();
     });
     return () => {
       subscription.subscription.unsubscribe();
     };
+    // actorUserId intentionally NOT in deps — the closure tracks the latest
+    // value via `lastSeenAuthUserId` so we don't tear down the subscription.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadProfile]);
 
   // Reset debug role when debug mode is turned off

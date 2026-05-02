@@ -65,21 +65,29 @@ const BATCH_SIZE = (() => {
  */
 const PROCESSING_STALE_MS = 6 * 60 * 1000;
 /**
- * Soft time budget per request. Vercel `maxDuration` for /process is 300s; we
- * stop accepting new batches at 270s and let the in-flight batch finish, then
- * cleanly mark the upload `failed` with a "time budget exhausted, click Process
- * again to resume" message. This prevents Vercel from hard-killing us mid-batch
- * (which leaves status=`processing` until the stale-lock recovery kicks in).
- * For files larger than ~250K wide rows the user will need to click Process
- * multiple times — each click resumes from the contiguous-prefix watermark.
- * Tune via env var `PHASE2_SOFT_BUDGET_MS` (e.g. 540000 on Vercel Pro 600s).
+ * Soft time budget per request — wall-clock cap for one "Process" HTTP call.
+ *
+ * - **Vercel** (`VERCEL=1`): default ~285s so we stop *before* the platform
+ *   `maxDuration` hard kill and can persist a clean resume state. Large files on
+ *   Hobby (300s cap) may still need multiple Process clicks unless you raise
+ *   `PHASE2_SOFT_BUDGET_MS` and match `maxDuration` on `/imports/process`.
+ * - **Non-Vercel** (local `next dev`, Docker, bare Node): default **8 hours** —
+ *   there is no serverless wall clock; the old 270s default only caused pointless
+ *   "time budget exhausted" loops for big CSVs.
+ *
+ * Override anytime: `PHASE2_SOFT_BUDGET_MS` (milliseconds, min 30s).
  */
-const SOFT_BUDGET_MS = (() => {
+const SOFT_BUDGET_MS = ((): number => {
   const raw = process.env.PHASE2_SOFT_BUDGET_MS;
-  if (!raw) return 270 * 1000;
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return 270 * 1000;
-  return Math.max(30 * 1000, Math.floor(n));
+  if (raw) {
+    const n = Number(raw);
+    if (Number.isFinite(n)) return Math.max(30 * 1000, Math.floor(n));
+  }
+  const onVercel = process.env.VERCEL === "1";
+  if (!onVercel) {
+    return 8 * 60 * 60 * 1000;
+  }
+  return 285 * 1000;
 })();
 /**
  * Throttle progress writes. Without this, every batch caused 3 round-trips
@@ -873,6 +881,19 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
         ? Math.floor(metaObj.header_row_index as number)
         : 0;
 
+    /**
+     * Synthesised headers — set by the importer when the source file has no
+     * header row (e.g. headerless Amazon Inventory Ledger export). When
+     * present, csv-parser is configured with these directly and row 0 is
+     * treated as data, not as a header.
+     */
+    const synthesizedHeaders =
+      Array.isArray(metaObj.synthesized_headers)
+        ? (metaObj.synthesized_headers as unknown[])
+            .map((h) => String(h ?? "").trim())
+            .filter((h) => h !== "")
+        : null;
+
     const rawFileExt = rawFilePath ? (rawFilePath.split(".").pop() ?? "").toLowerCase() : "";
     const metaFileExt =
       typeof metaObj.file_extension === "string" ? metaObj.file_extension.replace(/^\./, "").toLowerCase() : "";
@@ -1220,11 +1241,18 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
       });
     }
 
-    const parser = csv({
-      mapHeaders: ({ header }) => String(header).replace(/^\uFEFF/, "").trim(),
-      skipLines: headerRowIndex,
-      separator: csvSeparator,
-    });
+    const parser = synthesizedHeaders
+      ? csv({
+          // Headerless input — supply headers up front and treat row 0 as data.
+          headers: synthesizedHeaders,
+          skipLines: 0,
+          separator: csvSeparator,
+        })
+      : csv({
+          mapHeaders: ({ header }) => String(header).replace(/^\uFEFF/, "").trim(),
+          skipLines: headerRowIndex,
+          separator: csvSeparator,
+        });
 
     /** Lines that passed the date filter (before per-line dedupe). */
     let dataLinesPassed = 0;
@@ -1612,7 +1640,9 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
     // state that explicitly tells the user (and any automation) the next step.
     const isSoftBudget = rawMessage === "PHASE2_SOFT_BUDGET_EXHAUSTED";
     const message = isSoftBudget
-      ? "Staging time budget exhausted. Click Process again to resume from the last successfully staged row."
+      ? process.env.VERCEL === "1"
+        ? "Staging hit the Vercel wall-clock limit for one Process request. Click Process again to resume from the last staged row — or raise `maxDuration` on `/api/settings/imports/process` and set `PHASE2_SOFT_BUDGET_MS` (ms) a bit below that."
+        : "Staging time budget exhausted. Click Process again to resume from the last successfully staged row."
       : rawMessage;
     if (uploadIdForFail && isUuidString(uploadIdForFail) && isUuidString(orgId)) {
       // Read live cardinality after the failure so the metadata reflects DB truth.

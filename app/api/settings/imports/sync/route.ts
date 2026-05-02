@@ -29,6 +29,7 @@ import { NextResponse } from "next/server";
 
 import {
   applyColumnMappingToRow,
+  mapRowToAmazonAllOrders,
   mapRowToAmazonInventoryLedger,
   mapRowToAmazonReimbursement,
   mapRowToAmazonRemoval,
@@ -96,6 +97,7 @@ import {
   type AmazonSyncKind,
 } from "../../../../../lib/pipeline/amazon-report-registry";
 import { completeInventoryLedgerProductIdentifierMapPhase } from "../../../../../lib/inventory-ledger-generic-completion";
+import { resolveAmazonImportProducts } from "../../../../../lib/amazon-import-product-resolver";
 import { removalShipmentArchiveBusinessKey } from "../../../../../lib/pipeline/removal-shipment-archive-key";
 import {
   measureBatchUpsertMetrics,
@@ -106,6 +108,7 @@ import {
   mergeUploadMetadata,
   type ImportRunMetrics,
 } from "../../../../../lib/raw-report-upload-metadata";
+import { syncProductIdentityFromStaging } from "../../../../../lib/product-identity-import";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 
@@ -571,6 +574,29 @@ function resolveImportStoreId(meta: unknown): string | null {
   const b = typeof m.ledger_store_id === "string" ? m.ledger_store_id.trim() : "";
   if (b && isUuidString(b)) return b;
   return null;
+}
+
+async function validateImportStoreBelongsToOrg(params: {
+  organizationId: string;
+  metadata: unknown;
+}): Promise<{ ok: true; storeId: string | null } | { ok: false; error: string }> {
+  const storeId = resolveImportStoreId(params.metadata);
+  if (!storeId) return { ok: true, storeId: null };
+  const { data, error } = await supabaseServer
+    .from("stores")
+    .select("id, organization_id")
+    .eq("id", storeId)
+    .maybeSingle();
+  if (error) return { ok: false, error: `Store validation failed: ${error.message}` };
+  if (!data) return { ok: false, error: "Selected target store does not exist." };
+  const ownerOrg = String((data as { organization_id?: unknown }).organization_id ?? "").trim();
+  if (ownerOrg !== params.organizationId) {
+    return {
+      ok: false,
+      error: "Selected target store belongs to a different organization than the active import organization.",
+    };
+  }
+  return { ok: true, storeId };
 }
 
 /**
@@ -1129,6 +1155,206 @@ async function audit(
   });
 }
 
+/**
+ * Phase 3 — Sync: read from `product_identity_staging_rows` → upsert final tables.
+ *
+ * This is called when the upload is in `staged` status. Progress is tracked in
+ * `file_processing_status.phase3_raw_sync_pct` so the UI shows real advancement.
+ */
+async function runProductIdentitySyncBranch(opts: {
+  uploadId: string;
+  orgId: string;
+  row: Record<string, unknown>;
+}): Promise<Response> {
+  const { uploadId, orgId, row } = opts;
+  const meta =
+    row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata)
+      ? (row.metadata as Record<string, unknown>)
+      : {};
+
+  const storeValidation = await validateImportStoreBelongsToOrg({
+    organizationId: orgId,
+    metadata: meta,
+  });
+  if (!storeValidation.ok) {
+    return NextResponse.json(
+      { ok: false, error: storeValidation.error, details: storeValidation.error, uploadId, phase: "sync" },
+      { status: 422 },
+    );
+  }
+
+  // Optimistic lock: must be in staged (normal path) or failed (retry).
+  const { data: locked, error: lockErr } = await supabaseServer
+    .from("raw_report_uploads")
+    .update({
+      status: "processing",
+      metadata: mergeUploadMetadata(meta, {
+        error_message: "",
+        sync_progress: 0,
+        import_metrics: {
+          current_phase: "sync" as const,
+          detected_report_type: "PRODUCT_IDENTITY",
+        },
+      }),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", uploadId)
+    .eq("organization_id", orgId)
+    .in("status", ["staged", "failed"])
+    .select("id");
+
+  if (lockErr) {
+    return NextResponse.json({ ok: false, error: lockErr.message, details: lockErr.message, uploadId, phase: "sync" }, { status: 500 });
+  }
+  if (!locked || locked.length === 0) {
+    return NextResponse.json({
+      ok: false,
+      error: "Upload must be in 'staged' status to run Sync. Run Process first.",
+      details: "raw_report_uploads.status was not in {staged, failed}.",
+      uploadId,
+      phase: "sync",
+    }, { status: 409 });
+  }
+
+  const now = new Date().toISOString();
+  await supabaseServer.from("file_processing_status").upsert({
+    upload_id: uploadId,
+    organization_id: orgId,
+    status: "syncing",
+    current_phase: "sync",
+    current_phase_label: "Product Identity — syncing to final tables",
+    stage_target_table: "product_identity_staging_rows",
+    sync_target_table: "product_identifier_map",
+    generic_target_table: null,
+    upload_pct: 100,
+    process_pct: 100,
+    phase1_upload_pct: 100,
+    phase2_stage_pct: 100,
+    phase3_raw_sync_pct: 1,
+    sync_pct: 1,
+    phase3_status: "running",
+    phase3_started_at: now,
+    error_message: null,
+  }, { onConflict: "upload_id" });
+
+  try {
+    const result = await syncProductIdentityFromStaging({
+      supabase: supabaseServer,
+      organizationId: orgId,
+      uploadId,
+      uploadRow: row,
+      metadata: meta,
+      onChunkProgress: async ({ synced, total }) => {
+        const pct = total > 0 ? Math.min(99, Math.round((synced / total) * 100)) : 1;
+        await supabaseServer.from("file_processing_status").upsert({
+          upload_id: uploadId,
+          organization_id: orgId,
+          phase3_raw_sync_pct: pct,
+          sync_pct: pct,
+          raw_rows_written: synced,
+          processed_rows: synced,
+        }, { onConflict: "upload_id" });
+      },
+    });
+
+    if (!result.ok) {
+      await markFailed(uploadId, orgId, result.error);
+      return NextResponse.json({ ok: false, error: result.error, details: result.error, uploadId, phase: "sync" }, { status: result.status });
+    }
+
+    const { stats } = result;
+    const productsUpserted = stats.productsInserted + stats.productsUpdated;
+    const catalogProductsUpserted = stats.catalogProductsInserted + stats.catalogProductsUpdated;
+    const identifiersUpserted = stats.identifiersInserted;
+    const rowsSynced = productsUpserted + catalogProductsUpserted + identifiersUpserted;
+    const doneAt = new Date().toISOString();
+
+    await supabaseServer.from("file_processing_status").upsert({
+      upload_id: uploadId,
+      organization_id: orgId,
+      status: "complete",
+      current_phase: "complete",
+      current_phase_label: "Complete",
+      sync_pct: 100,
+      upload_pct: 100,
+      process_pct: 100,
+      phase1_upload_pct: 100,
+      phase2_stage_pct: 100,
+      phase3_raw_sync_pct: 100,
+      phase4_generic_pct: 0,
+      phase3_status: "complete",
+      phase3_completed_at: doneAt,
+      processed_rows: stats.rowsRead,
+      staged_rows_written: stats.rowsRead,
+      raw_rows_written: identifiersUpserted,
+      total_rows: Math.max(stats.rowsRead, 1),
+      data_rows_total: stats.rowsRead,
+      next_action_key: null,
+      next_action_label: null,
+      error_message: null,
+      import_metrics: {
+        current_phase: "complete",
+        data_rows_seen: stats.rowsRead,
+        rows_synced_upserted: rowsSynced,
+        rows_invalid: stats.invalidIdentifierCount,
+        detected_headers: result.detectedHeaders,
+        detected_report_type: "PRODUCT_IDENTITY",
+        rows_parsed: result.rowsParsed,
+        rows_synced: rowsSynced,
+        products_upserted: productsUpserted,
+        catalog_products_upserted: catalogProductsUpserted,
+        identifiers_upserted: identifiersUpserted,
+        invalid_identifier_counts: {
+          asin: stats.invalidAsinCount,
+          fnsku: stats.invalidFnskuCount,
+          upc: stats.invalidUpcCount,
+          total: stats.invalidIdentifierCount,
+        },
+        normalized_rows_count: stats.normalizedRowsCount,
+        unique_product_sku_count: stats.uniqueProductSkuCount,
+        duplicate_sku_count: stats.duplicateSkuCount,
+        duplicate_sku_conflict_count: stats.duplicateSkuConflictCount,
+        catalog_unique_count: stats.catalogUniqueCount,
+        identifier_unique_count: stats.identifierUniqueCount,
+        rows_missing_seller_sku: stats.rowsMissingSellerSku,
+        rows_invalid_seller_sku: stats.rowsInvalidSellerSku,
+        rows_skipped: stats.rowsSkipped,
+        skipped_reason_counts: stats.skippedReasonCounts,
+        invalid_sku_examples: stats.invalidSkuExamples,
+      },
+    }, { onConflict: "upload_id" });
+
+    await audit(orgId, "import.sync_completed", uploadId, {
+      kind: "PRODUCT_IDENTITY",
+      rowsParsed: result.rowsParsed,
+      rowsSynced,
+      productsUpserted,
+      catalogProductsUpserted,
+      identifiersUpserted,
+    });
+
+    return NextResponse.json({
+      ok: true,
+      kind: "PRODUCT_IDENTITY",
+      rowsSynced,
+      productsUpserted,
+      catalogProductsUpserted,
+      identifiersUpserted,
+      rowsStaged: result.rowsParsed,
+      productIdentity: { stats },
+    });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : "Product Identity sync failed.";
+    console.error("[ProductIdentitySync] Phase 3 failed", {
+      uploadId, organizationId: orgId,
+      storeId: storeValidation.storeId, reportType: "PRODUCT_IDENTITY", phase: "sync",
+      error: message, stack: e instanceof Error ? e.stack : undefined,
+    });
+    await markFailed(uploadId, orgId, message);
+    return NextResponse.json({ ok: false, error: message, details: e instanceof Error ? e.stack ?? message : String(e), uploadId, phase: "sync" }, { status: 500 });
+  }
+}
+
 /** Write a "failed" status back to the upload row (best-effort, never throws). */
 async function markFailed(uploadId: string, orgId: string, message: string): Promise<void> {
   try {
@@ -1178,7 +1404,10 @@ export async function POST(req: Request): Promise<Response> {
     const body = (await req.json()) as Body;
     const uploadId = typeof body.upload_id === "string" ? body.upload_id.trim() : "";
     if (!isUuidString(uploadId)) {
-      return NextResponse.json({ ok: false, error: "Invalid upload_id." }, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "Invalid upload_id.", details: "upload_id must be a UUID.", uploadId: null, phase: "sync" },
+        { status: 400 },
+      );
     }
     uploadIdForFail = uploadId;
 
@@ -1189,18 +1418,53 @@ export async function POST(req: Request): Promise<Response> {
       .maybeSingle();
 
     if (fetchErr || !row) {
-      return NextResponse.json({ ok: false, error: "Upload session not found." }, { status: 404 });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Upload session not found.",
+          details: fetchErr?.message ?? "raw_report_uploads.id did not match any row.",
+          uploadId,
+          phase: "sync",
+        },
+        { status: 404 },
+      );
     }
 
     orgId = String((row as { organization_id?: unknown }).organization_id ?? "").trim();
     if (!isUuidString(orgId)) {
       return NextResponse.json(
-        { ok: false, error: "Invalid upload row (organization_id)." },
+        {
+          ok: false,
+          error: "Invalid upload row (organization_id).",
+          details: "raw_report_uploads.organization_id is not a UUID.",
+          uploadId,
+          phase: "sync",
+        },
         { status: 500 },
       );
     }
 
     const status = String((row as { status?: unknown }).status ?? "");
+    const earlyKind = resolveAmazonImportSyncKind((row as { report_type?: string }).report_type);
+
+    // ── PRODUCT_IDENTITY Phase 3 fast-path ────────────────────────────────
+    //
+    // Product Identity has a dedicated staging table (`product_identity_staging_rows`).
+    // Phase 2 (Process) writes to staging and sets status='staged'.
+    // Phase 3 (Sync)   reads from staging and upserts final tables.
+    //
+    // We intercept here before the generic staged-status guard so:
+    //   * `staged`     → normal Phase 3 path
+    //   * `failed`     → retry Phase 3 (only if staging rows exist)
+    //   * `processing` → stale lock handling (below) then Phase 3
+    if (earlyKind === "PRODUCT_IDENTITY") {
+      return await runProductIdentitySyncBranch({
+        uploadId,
+        orgId,
+        row: row as Record<string, unknown>,
+      });
+    }
+
     if (status !== "staged" && status !== "failed" && status !== "processing") {
       return NextResponse.json(
         {
@@ -1214,12 +1478,15 @@ export async function POST(req: Request): Promise<Response> {
                   ? " Sync has already completed for this upload."
                   : ""
           }`,
+          details: `raw_report_uploads.status="${status}"`,
+          uploadId,
+          phase: "sync",
         },
         { status: 409 },
       );
     }
 
-    const kind = resolveAmazonImportSyncKind((row as { report_type?: string }).report_type);
+    const kind = earlyKind;
     const reportTypeRawEarly = String((row as { report_type?: string }).report_type ?? "").trim();
 
     if (kind === "UNKNOWN") {
@@ -1229,6 +1496,9 @@ export async function POST(req: Request): Promise<Response> {
           error:
             "Cannot sync: report type is not set. " +
             "Open the History table, set the correct report type from the dropdown, then re-run Process and Sync.",
+          details: "resolveAmazonImportSyncKind returned UNKNOWN.",
+          uploadId,
+          phase: "sync",
         },
         { status: 422 },
       );
@@ -1247,13 +1517,27 @@ export async function POST(req: Request): Promise<Response> {
     const meta = (row as { metadata?: unknown }).metadata;
     const sourceFileSha256 = resolveSourceFileSha256(meta, uploadId);
 
-    const importStoreId = resolveImportStoreId(meta);
+    const storeValidation = await validateImportStoreBelongsToOrg({
+      organizationId: orgId,
+      metadata: meta,
+    });
+    if (!storeValidation.ok) {
+      return NextResponse.json(
+        { ok: false, error: storeValidation.error, details: storeValidation.error, uploadId, phase: "sync" },
+        { status: 422 },
+      );
+    }
+
+    const importStoreId = storeValidation.storeId;
     if ((kind === "REMOVAL_ORDER" || kind === "REMOVAL_SHIPMENT") && !importStoreId) {
       return NextResponse.json(
         {
           ok: false,
           error:
             "Imports Target Store is required for removal reports. Choose a target store in the importer, save classification, then run Sync again.",
+          details: "metadata.import_store_id is missing.",
+          uploadId,
+          phase: "sync",
         },
         { status: 422 },
       );
@@ -1278,13 +1562,19 @@ export async function POST(req: Request): Promise<Response> {
       .select("id");
 
     if (lockErr) {
-      return NextResponse.json({ ok: false, error: lockErr.message }, { status: 500 });
+      return NextResponse.json(
+        { ok: false, error: lockErr.message, details: lockErr.message, uploadId, phase: "sync" },
+        { status: 500 },
+      );
     }
     if (!locked || locked.length === 0) {
       return NextResponse.json(
         {
           ok: false,
           error: "Upload is not in a syncable state (another operation may be running).",
+          details: "raw_report_uploads.status was not in {staged, failed} when the lock UPDATE ran. This guards against duplicate concurrent sync calls.",
+          uploadId,
+          phase: "sync",
         },
         { status: 409 },
       );
@@ -1545,8 +1835,17 @@ export async function POST(req: Request): Promise<Response> {
               uploadId,
               importStoreId,
             ) as Record<string, unknown> | null;
+          } else if (kind === "ALL_ORDERS") {
+            // Typed Fulfilled Shipments mapper (migration 20260642). Falls back
+            // to mapRowToAmazonRawArchive only if the typed mapper rejects an
+            // empty row.
+            insertRow = mapRowToAmazonAllOrders(
+              mappedRow,
+              orgId,
+              uploadId,
+              importStoreId,
+            ) as Record<string, unknown> | null;
           } else if (
-            kind === "ALL_ORDERS" ||
             kind === "REPLACEMENTS" ||
             kind === "FBA_GRADE_AND_RESELL" ||
             kind === "RESERVED_INVENTORY" ||
@@ -1872,6 +2171,63 @@ export async function POST(req: Request): Promise<Response> {
       inventoryLedgerRanInlineGeneric = true;
     }
 
+    // ── Post-sync product resolver ────────────────────────────────────────────
+    // For tables added/extended in migration 20260642, attempt to resolve
+    // resolved_product_id via product_identifier_map (sku → fnsku → asin
+    // priority). Failures here are non-fatal — they degrade to "unresolved"
+    // status on the row, never block the sync.
+    try {
+      if (kind === "ALL_ORDERS") {
+        await resolveAmazonImportProducts({
+          supabase: supabaseServer,
+          organizationId: orgId,
+          uploadId,
+          storeId: importStoreId ?? null,
+          table: "amazon_all_orders",
+        });
+      } else if (kind === "SETTLEMENT") {
+        await resolveAmazonImportProducts({
+          supabase: supabaseServer,
+          organizationId: orgId,
+          uploadId,
+          storeId: importStoreId ?? null,
+          table: "amazon_settlements",
+        });
+      } else if (kind === "TRANSACTIONS") {
+        await resolveAmazonImportProducts({
+          supabase: supabaseServer,
+          organizationId: orgId,
+          uploadId,
+          storeId: importStoreId ?? null,
+          table: "amazon_transactions",
+          // Simple Transactions Summary has no SKU/FNSKU/ASIN — inherit from
+          // amazon_all_orders by order_id when possible.
+          joinAllOrders: true,
+        });
+      } else if (kind === "MANAGE_FBA_INVENTORY") {
+        await resolveAmazonImportProducts({
+          supabase: supabaseServer,
+          organizationId: orgId,
+          uploadId,
+          storeId: importStoreId ?? null,
+          table: "amazon_manage_fba_inventory",
+        });
+      } else if (kind === "AMAZON_FULFILLED_INVENTORY") {
+        await resolveAmazonImportProducts({
+          supabase: supabaseServer,
+          organizationId: orgId,
+          uploadId,
+          storeId: importStoreId ?? null,
+          table: "amazon_amazon_fulfilled_inventory",
+        });
+      }
+    } catch (resolverErr) {
+      console.warn(
+        `[sync][${kind}] post-sync product resolver warning: ` +
+          (resolverErr instanceof Error ? resolverErr.message : String(resolverErr)),
+      );
+    }
+
     await audit(orgId, "import.sync_completed", uploadId, {
       rowsSynced: kind === "REMOVAL_SHIPMENT" ? removalShipmentRawWritten : synced,
       kind,
@@ -1920,7 +2276,16 @@ export async function POST(req: Request): Promise<Response> {
       await markFailed(uploadIdForFail, orgId, message);
     }
 
-    return NextResponse.json({ ok: false, error: message }, { status: 500 });
+    return NextResponse.json(
+      {
+        ok: false,
+        error: message,
+        details: e instanceof Error ? e.stack ?? message : String(e),
+        uploadId: uploadIdForFail,
+        phase: "sync",
+      },
+      { status: 500 },
+    );
   }
 }
 

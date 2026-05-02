@@ -788,6 +788,34 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
       aliases: ["fnsku", "FNSKU", "fulfillment-network-sku"] },
     { key: "asin", label: "ASIN", required: false, aliases: ["asin", "ASIN"] },
   ],
+  ALL_ORDERS: [
+    { key: "amazon_order_id", label: "Amazon Order Id", required: true,
+      aliases: ["amazon-order-id", "amazon order id", "Amazon Order Id"] },
+    { key: "merchant_order_id", label: "Merchant Order Id", required: false,
+      aliases: ["merchant-order-id", "merchant order id", "Merchant Order Id"] },
+    { key: "purchase_date", label: "Purchase Date", required: false,
+      aliases: ["purchase-date", "purchase date", "Purchase Date"] },
+    { key: "sku", label: "Merchant SKU", required: false,
+      aliases: ["sku", "SKU", "merchant-sku", "Merchant SKU"] },
+    { key: "product_name", label: "Title", required: false,
+      aliases: ["title", "Title", "product-name", "product name"] },
+    { key: "quantity", label: "Shipped Quantity", required: false,
+      aliases: ["shipped-quantity", "shipped quantity", "Shipped Quantity"] },
+    { key: "currency", label: "Currency", required: false,
+      aliases: ["currency", "Currency"] },
+    { key: "item_price", label: "Item Price", required: false,
+      aliases: ["item-price", "item price", "Item Price"] },
+    { key: "item_tax", label: "Item Tax", required: false,
+      aliases: ["item-tax", "item tax", "Item Tax"] },
+    { key: "shipping_price", label: "Shipping Price", required: false,
+      aliases: ["shipping-price", "shipping price", "Shipping Price"] },
+    { key: "ship_country", label: "Shipping Country Code", required: false,
+      aliases: ["shipping-country-code", "shipping country code", "Shipping Country Code"] },
+    { key: "fulfillment_channel", label: "Fulfillment Channel", required: false,
+      aliases: ["fulfillment-channel", "fulfillment channel", "Fulfillment Channel"] },
+    { key: "sales_channel", label: "Sales Channel", required: false,
+      aliases: ["sales-channel", "sales channel", "Sales Channel"] },
+  ],
   AMAZON_FULFILLED_INVENTORY: [
     { key: "seller_sku", label: "Seller SKU", required: true,
       aliases: ["seller-sku", "seller sku", "sku", "SKU"] },
@@ -874,7 +902,16 @@ export function mappingHasRequiredGaps(
  *                           "description" + "total" (no "transaction type" header)
  *   8. TRANSACTIONS     — "transaction type" AND "total product charges"
  */
-/** Same conditions as rule 7 — used to guard settlement flat-file detection. */
+/**
+ * Same conditions as rule 7 — used to guard settlement flat-file detection.
+ *
+ * IMPORTANT: A file that has BOTH the Reports Repository signature AND extra
+ * `Transaction Status` / `Transaction Release Date` / `account type` columns is
+ * the Amazon Transaction / Payment Detail report (after the 9-line preamble),
+ * which lands in `amazon_settlements`, NOT `amazon_reports_repository`. We
+ * therefore reject the Reports Repository fingerprint when those settlement-
+ * detail columns are present.
+ */
 export function headersLookLikeReportsRepository(headers: string[]): boolean {
   const ds = detectionSet(headers);
   return (
@@ -885,8 +922,131 @@ export function headersLookLikeReportsRepository(headers: string[]): boolean {
     ds.has("sku") &&
     ds.has("description") &&
     ds.has("total") &&
-    !ds.has("transaction type")
+    !ds.has("transaction type") &&
+    // Transaction / Payment Detail report → SETTLEMENT, not REPORTS_REPOSITORY.
+    !ds.has("transaction status") &&
+    !ds.has("transaction release date")
   );
+}
+
+/**
+ * True when the headers look like the Amazon Transaction / Payment Detail
+ * report (Reports Repository preamble + extra settlement-detail columns).
+ *
+ * Used to route this file to SETTLEMENT (table `amazon_settlements`) instead
+ * of REPORTS_REPOSITORY.
+ */
+export function headersLookLikeAmazonTransactionDetailReport(headers: string[]): boolean {
+  const ds = detectionSet(headers);
+  const hasCore =
+    ds.has("date/time") &&
+    ds.has("settlement id") &&
+    ds.has("type") &&
+    ds.has("order id");
+  if (!hasCore) return false;
+  return (
+    ds.has("transaction status") ||
+    ds.has("transaction release date") ||
+    (ds.has("account type") && ds.has("fulfillment"))
+  );
+}
+
+/**
+ * True when the headers indicate a "Simple Transactions Summary" file:
+ * Date, Transaction Status, Transaction type, Order ID, Product Details,
+ * Total product charges, Total promotional rebates, Amazon fees, Other,
+ * Total (USD). Used to ensure the file routes to TRANSACTIONS (not SETTLEMENT
+ * or REPORTS_REPOSITORY) even though it has only a coarse subset of columns.
+ */
+export function headersLookLikeSimpleTransactionsSummary(headers: string[]): boolean {
+  const ds = detectionSet(headers);
+  const hasTotalUsd =
+    ds.has("total (usd)") || ds.has("total usd") || ds.has("total");
+  return (
+    (ds.has("transaction type") || ds.has("type")) &&
+    (ds.has("order id") || ds.has("order")) &&
+    (ds.has("total product charges") ||
+      ds.has("amazon fees") ||
+      ds.has("total promotional rebates")) &&
+    hasTotalUsd
+  );
+}
+
+/**
+ * Headerless Amazon Inventory Ledger probe. The export has no header row;
+ * col1 is an ISO date and col2 is an Amazon FNSKU (`X` followed by 9
+ * alphanumeric chars). When this fingerprint is present we synthesise the
+ * canonical headers in the importer (see UniversalImporter) before staging.
+ */
+export function looksLikeHeaderlessInventoryLedger(firstRowCells: string[]): boolean {
+  if (!Array.isArray(firstRowCells) || firstRowCells.length < 6) return false;
+  const c1 = (firstRowCells[0] ?? "").trim();
+  const c2 = (firstRowCells[1] ?? "").trim();
+  const isIsoDateLike = /^\d{4}-\d{2}-\d{2}/.test(c1) || /^\d{1,2}\/\d{1,2}\/\d{2,4}/.test(c1);
+  const isFnskuLike = /^[A-Z]\d[A-Z0-9]{8}$/.test(c2) || /^[A-Z0-9]{10}$/.test(c2);
+  return isIsoDateLike && isFnskuLike;
+}
+
+/**
+ * Canonical synthetic header order for the headerless Amazon Inventory Ledger
+ * export. Aligned with the column mapping in the user spec:
+ *   col1=event_date, col2=fnsku, col3=asin, col4=sku, col5=product_name,
+ *   col6=event_type, col7=(unused), col8=quantity, col9=location,
+ *   col10=disposition, col11..col14=(unused), col15=event_timestamp.
+ *
+ * The unused slots get distinct synthetic names (col7, col11, ...) so they
+ * land in raw_data without colliding with any aliased canonical key.
+ */
+export const HEADERLESS_INVENTORY_LEDGER_SYNTHETIC_HEADERS = [
+  "event_date",         //  col1
+  "fnsku",              //  col2
+  "asin",               //  col3
+  "sku",                //  col4
+  "product_name",       //  col5
+  "event_type",         //  col6
+  "col7",               //  col7
+  "quantity",           //  col8
+  "location",           //  col9
+  "disposition",        // col10
+  "col11",              // col11
+  "country",            // col12
+  "col13",              // col13
+  "col14",              // col14
+  "event_timestamp",    // col15
+];
+
+/**
+ * Canonical Product Identity header tokens (after `normForDetection`). The fast
+ * path matches these so the exact / near-exact CSV produced by the buyer-side
+ * upload tool — `UPC, Vendor, Seller SKU, Mfg #, FNSKU, ASIN, Product Name` —
+ * always wins over the transactional rules above. Each token is the result of
+ * lowercasing + collapsing whitespace + replacing `-/_` with spaces.
+ */
+const PRODUCT_IDENTITY_CANONICAL_TOKENS = [
+  "upc",
+  "vendor",
+  "seller sku",
+  "mfg #",
+  "fnsku",
+  "asin",
+  "product name",
+] as const;
+
+/**
+ * High-confidence exact Product Identity match.
+ *
+ * Returns `true` only when all seven canonical tokens are present. This is
+ * intentionally strict: inventory exports can contain SKU / FNSKU / ASIN /
+ * product-name-like columns, so Product Identity must require the exact buyer
+ * header signature including UPC, Vendor, and Mfg #.
+ *
+ * Used in `classifyCsvHeadersRuleBased` BEFORE the transactional rules so a
+ * Product Identity export never falls through to TRANSACTIONS, ALL_LISTINGS,
+ * or any other type that shares one anchor column.
+ */
+export function headersLookLikeProductIdentity(headers: string[]): boolean {
+  const ds = detectionSet(headers);
+  return PRODUCT_IDENTITY_CANONICAL_TOKENS.every((tok) => ds.has(tok));
 }
 
 export function classifyCsvHeadersRuleBased(headers: string[]): {
@@ -895,6 +1055,30 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
 } {
   // Space-based set for matching — handles any combination of hyphens/underscores/spaces
   const ds = detectionSet(headers);
+
+  // Rule 0 (fast-path): Product Identity CSV — exact / near-exact match.
+  //
+  // The buyer-side identity tool exports the canonical column set
+  //   UPC, Vendor, Seller SKU, Mfg #, FNSKU, ASIN, Product Name
+  //
+  // We match this BEFORE the transactional rules below because:
+  //   1. The Product Identity file shares "asin" and "seller sku" with both
+  //      ALL_LISTINGS / ACTIVE_LISTINGS exports and is missing the listing-
+  //      anchor columns (status / open date / browse node). A naive ordering
+  //      would route it into ALL_LISTINGS (which has no UPC/Vendor/Mfg # path)
+  //      and silently drop the identity columns.
+  //   2. Rule 8a below also catches this, but only after rules 1-8 fall
+  //      through. The fast-path prevents accidental false positives on rules
+  //      that allow weak fingerprints (e.g. SAFE-T's loose match on "claim").
+  //
+  // Triggers PRODUCT_IDENTITY only when all 7 canonical tokens are present.
+  if (headersLookLikeProductIdentity(headers)) {
+    return {
+      reportType: "PRODUCT_IDENTITY",
+      matchedRule:
+        "Product Identity CSV: exact headers {UPC, Vendor, Seller SKU, Mfg #, FNSKU, ASIN, Product Name}",
+    };
+  }
 
   // Rule 1: FBA Customer Returns
   if (ds.has("license plate number") && ds.has("detailed disposition")) {
@@ -937,7 +1121,19 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
     };
   }
 
-  // Rule 5: Settlement report
+  // Rule 5a: Amazon Transaction / Payment Detail report (post 9-line preamble).
+  // Headers contain settlement id + type + Transaction Status + Transaction
+  // Release Date (or account type + fulfillment) — lands in amazon_settlements,
+  // NOT amazon_reports_repository.
+  if (headersLookLikeAmazonTransactionDetailReport(headers)) {
+    return {
+      reportType: "SETTLEMENT",
+      matchedRule:
+        "settlement id+transaction status/release date (Transaction / Payment Detail report → amazon_settlements, not amazon_reports_repository)",
+    };
+  }
+
+  // Rule 5b: Settlement report (legacy CSV).
   // Guard: Reports Repository CSVs include "Transaction Status" as an extra column but
   // are NOT settlement reports — check Rule 7 fingerprint before committing to SETTLEMENT.
   if (
@@ -946,6 +1142,18 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
     !headersLookLikeReportsRepository(headers)
   ) {
     return { reportType: "SETTLEMENT", matchedRule: "settlement id+transaction status" };
+  }
+
+  // Rule 5c: Simple Transactions Summary report. Has only a coarse subset of
+  // columns (Date, Transaction Status, Transaction type, Order ID, Product
+  // Details, Total product charges, Total promotional rebates, Amazon fees,
+  // Other, Total (USD)) and no SKU/FNSKU/ASIN. Routes to amazon_transactions.
+  if (headersLookLikeSimpleTransactionsSummary(headers)) {
+    return {
+      reportType: "TRANSACTIONS",
+      matchedRule:
+        "Simple Transactions Summary (Date+Transaction type+Order ID+Total (USD)+Total product charges) → amazon_transactions",
+    };
   }
 
   // Rule 6: SAFE-T Claims
@@ -976,24 +1184,23 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
     return { reportType: "TRANSACTIONS", matchedRule: "transaction type+total product charges" };
   }
 
-  // Rule 8a: Product Identity CSV (custom item identity import).
-  // Must run before listing rules because it also has seller sku + ASIN, but
-  // its vendor / mfg / UPC fingerprint routes directly to identity tables.
-  {
-    const headerList = [...ds];
-    const hasSellerSku = ds.has("seller sku") || ds.has("sku") || ds.has("msku");
-    const hasProductName = ds.has("product name") || ds.has("item name") || ds.has("title");
-    const hasIdentityFingerprint =
-      ds.has("upc") ||
-      ds.has("upc code") ||
-      ds.has("vendor") ||
-      headerList.some((h) => h === "mfg #" || h === "mfg#" || h.includes("manufacturer part") || h.startsWith("mfg "));
-    if (hasSellerSku && hasProductName && hasIdentityFingerprint) {
-      return {
-        reportType: "PRODUCT_IDENTITY",
-        matchedRule: "seller sku+product name+vendor/mfg/upc identity columns",
-      };
-    }
+  // Rule 8a intentionally delegates to the strict helper above. Product
+  // Identity must not be inferred from loose SKU / ASIN / product-name overlap
+  // because FBA Inventory and listing exports share those anchors.
+
+  // ── Rule SHIP-A: Amazon Fulfilled Shipments report ──────────────────────
+  // Anchor: amazon order id + shipped quantity + (shipment id OR shipment date)
+  // Routes to amazon_all_orders (typed Fulfilled Shipments mapper).
+  if (
+    ds.has("amazon order id") &&
+    (ds.has("shipped quantity") || ds.has("shipment item id")) &&
+    (ds.has("shipment id") || ds.has("shipment date") || ds.has("merchant order id"))
+  ) {
+    return {
+      reportType: "ALL_ORDERS",
+      matchedRule:
+        "amazon order id+shipped quantity+shipment id/date (Fulfilled Shipments → amazon_all_orders)",
+    };
   }
 
   // ── Rule INV-A: Manage FBA Inventory (AFN) ──────────────────────────────
@@ -1011,6 +1218,27 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
     return {
       reportType: "MANAGE_FBA_INVENTORY",
       matchedRule: "fnsku+afn fulfillable quantity+afn warehouse/inbound flow",
+    };
+  }
+
+  // ── Rule INV-A2: Restock Inventory ──────────────────────────────────────
+  // Anchor: Merchant SKU + Total Units + Available + (Recommended replenishment qty
+  // OR Recommended ship date OR Recommended action). Lands in
+  // amazon_manage_fba_inventory via the typed mapper.
+  if (
+    (ds.has("merchant sku") || ds.has("sku")) &&
+    ds.has("total units") &&
+    ds.has("available") &&
+    (
+      ds.has("recommended replenishment qty") ||
+      ds.has("recommended ship date") ||
+      ds.has("recommended action") ||
+      ds.has("unit storage size")
+    )
+  ) {
+    return {
+      reportType: "MANAGE_FBA_INVENTORY",
+      matchedRule: "Restock Inventory (Merchant SKU+Total Units+Available+Recommended *) → amazon_manage_fba_inventory",
     };
   }
 

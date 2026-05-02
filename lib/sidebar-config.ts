@@ -30,6 +30,7 @@ export type SidebarIconName =
   | "Network"
   | "Shield"
   | "Database"
+  | "FileUp"
   | "ScanLine";
 
 export type SidebarLeaf = {
@@ -156,6 +157,27 @@ export const MAIN_SIDEBAR: SidebarSection[] = [
             icon: "FileText",
             rbac: "canSeeReportHistory",
             order: 3,
+          },
+        ],
+      },
+      {
+        kind: "group",
+        id: "etl_imports",
+        label: "Data Management",
+        icon: "Database",
+        moduleKey: "etl",
+        order: 25,
+        children: [
+          {
+            kind: "leaf",
+            id: "amazon_etl",
+            label: "Amazon ETL",
+            path: "/dashboard/amazon-etl",
+            featureKey: "etl.amazon_etl",
+            permissionBase: "etl.amazon_etl",
+            icon: "Database",
+            rbac: "always",
+            order: 1,
           },
         ],
       },
@@ -325,6 +347,7 @@ export const MODULE_CATALOG: Record<string, { name: string; sort_order: number }
   claims: { name: "Claims", sort_order: 30 },
   settings: { name: "Settings", sort_order: 40 },
   platform: { name: "Platform", sort_order: 50 },
+  etl:          { name: "ETL / Imports", sort_order: 35 },
   tenant_admin: { name: "Tenant admin", sort_order: 60 },
   wms: { name: "WMS", sort_order: 5 },
   tech_debug: { name: "Tech debug", sort_order: 90 },

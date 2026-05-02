@@ -164,6 +164,11 @@ export const NATIVE_COLUMNS_LEDGER = new Set([
   "source_line_hash",
   "source_file_sha256", "source_physical_row_number",
   "fnsku", "disposition", "location", "event_type", "quantity",
+  // Migration 20260642: positional columns from headerless ledger export.
+  "event_date", "event_timestamp", "sku", "asin", "product_name", "country",
+  // Migration 20260620: identifier resolution.
+  "resolved_product_id", "resolved_catalog_product_id",
+  "identifier_resolution_status", "identifier_resolution_confidence",
   "created_at", "raw_data",
 ]);
 
@@ -176,7 +181,7 @@ export const NATIVE_COLUMNS_REIMBURSEMENTS = new Set([
   "created_at", "raw_data",
 ]);
 
-/** amazon_settlements — physical DB columns (legacy + flat .txt settlement report) */
+/** amazon_settlements — physical DB columns (legacy + flat .txt + transaction-detail report) */
 export const NATIVE_COLUMNS_SETTLEMENTS = new Set([
   "id",
   "organization_id",
@@ -199,6 +204,29 @@ export const NATIVE_COLUMNS_SETTLEMENTS = new Set([
   "selling_fees",
   "fba_fees",
   "description",
+  // Migration 20260642 — transaction-detail report typed columns.
+  "quantity",
+  "marketplace",
+  "account_type",
+  "fulfillment_channel",
+  "product_sales_tax",
+  "shipping_credits",
+  "shipping_credits_tax",
+  "gift_wrap_credits",
+  "giftwrap_credits_tax",
+  "regulatory_fee",
+  "tax_on_regulatory_fee",
+  "promotional_rebates",
+  "promotional_rebates_tax",
+  "marketplace_withheld_tax",
+  "other_transaction_fees",
+  "other_amount",
+  "transaction_status",
+  "transaction_release_date",
+  "resolved_product_id",
+  "resolved_catalog_product_id",
+  "identifier_resolution_status",
+  "identifier_resolution_confidence",
   "created_at",
   "raw_data",
 ]);
@@ -218,16 +246,24 @@ export const NATIVE_COLUMNS_TRANSACTIONS = new Set([
   "source_line_hash",
   "source_file_sha256", "source_physical_row_number",
   "settlement_id", "order_id", "transaction_type", "amount", "sku", "posted_date",
+  // Migration 20260642 — identifier resolution columns (joined via amazon_all_orders for the simple summary file).
+  "resolved_product_id", "resolved_catalog_product_id",
+  "identifier_resolution_status", "identifier_resolution_confidence",
   "created_at", "raw_data",
 ]);
 
 // ── New raw-archive tables (migration 20260604) ───────────────────────────────
 
-/** amazon_all_orders — physical DB columns */
+/** amazon_all_orders — physical DB columns. Migration 20260642 adds typed Fulfilled-Shipments columns. */
 export const NATIVE_COLUMNS_ALL_ORDERS = new Set([
   "id", "organization_id", "store_id", "source_upload_id", "source_line_hash",
   "source_file_sha256", "source_physical_row_number",
   "order_id", "purchase_date", "order_status", "fulfillment_channel", "sales_channel",
+  // Migration 20260642 — Fulfilled Shipments typed columns.
+  "amazon_order_id", "merchant_order_id", "sku", "product_name", "quantity",
+  "currency", "item_price", "item_tax", "shipping_price", "ship_country",
+  "resolved_product_id", "resolved_catalog_product_id",
+  "identifier_resolution_status", "identifier_resolution_confidence",
   "raw_data", "created_at", "updated_at",
 ]);
 
@@ -265,6 +301,12 @@ export const NATIVE_COLUMNS_MANAGE_FBA_INVENTORY = new Set([
   "afn_inbound_working_quantity", "afn_inbound_shipped_quantity", "afn_inbound_receiving_quantity",
   "afn_researching_quantity", "afn_reserved_future_supply", "afn_future_supply_buyable",
   "store",
+  // Migration 20260642 — Restock Inventory typed columns.
+  "inbound_quantity", "fc_transfer_quantity", "fc_processing_quantity",
+  "customer_order_quantity", "recommended_replenishment_qty",
+  "recommended_ship_date", "recommended_action", "unit_storage_size",
+  "resolved_product_id", "resolved_catalog_product_id",
+  "identifier_resolution_status", "identifier_resolution_confidence",
   "raw_data", "created_at", "updated_at",
 ]);
 
@@ -323,6 +365,9 @@ export const NATIVE_COLUMNS_AMAZON_FULFILLED_INVENTORY = new Set([
   "source_file_sha256", "source_physical_row_number",
   "seller_sku", "fulfillment_channel_sku", "asin",
   "condition_type", "warehouse_condition_code", "quantity_available",
+  // Migration 20260642 — identifier resolution.
+  "resolved_product_id", "resolved_catalog_product_id",
+  "identifier_resolution_status", "identifier_resolution_confidence",
   "raw_data", "created_at", "updated_at",
 ]);
 
@@ -496,9 +541,47 @@ const AMOUNT_REIMBURSED_ALIASES = [
 
 // ── Settlement aliases ────────────────────────────────────────────────────────
 const SETTLEMENT_ID_ALIASES    = ["settlement-id", "settlement id", "Settlement ID"];
-const TX_TYPE_ALIASES          = ["transaction-type", "transaction type"];
-const DEPOSIT_DATE_ALIASES     = ["deposit-date", "deposit date", "posted-date", "posted date"];
+const TX_TYPE_ALIASES          = ["transaction-type", "transaction type", "type", "Type"];
+const DEPOSIT_DATE_ALIASES     = ["deposit-date", "deposit date", "posted-date", "posted date", "date/time", "Date/Time"];
 const AMOUNT_TOTAL_ALIASES     = ["total", "amount", "net-proceeds", "net proceeds", "amount-total", "amount total"];
+
+// Transaction / Payment Detail report columns (Amazon).
+const SETTLEMENT_QUANTITY_ALIASES        = ["quantity", "Quantity"];
+const SETTLEMENT_MARKETPLACE_ALIASES     = ["marketplace", "Marketplace"];
+const SETTLEMENT_ACCOUNT_TYPE_ALIASES    = ["account type", "account-type", "account_type"];
+const SETTLEMENT_FULFILLMENT_ALIASES     = [
+  "fulfillment", "Fulfillment", "fulfillment-channel", "fulfillment channel",
+];
+const SETTLEMENT_PRODUCT_SALES_ALIASES   = ["product sales", "product-sales", "product_sales"];
+const SETTLEMENT_PRODUCT_SALES_TAX_ALIASES = ["product sales tax", "product-sales-tax"];
+const SETTLEMENT_SHIPPING_CREDITS_ALIASES = ["shipping credits", "shipping-credits"];
+const SETTLEMENT_SHIPPING_CREDITS_TAX_ALIASES = ["shipping credits tax", "shipping-credits-tax"];
+const SETTLEMENT_GIFT_WRAP_CREDITS_ALIASES = ["gift wrap credits", "gift-wrap-credits", "giftwrap credits"];
+const SETTLEMENT_GIFTWRAP_CREDITS_TAX_ALIASES = [
+  "giftwrap credits tax", "giftwrap-credits-tax", "gift wrap credits tax", "gift-wrap-credits-tax",
+];
+const SETTLEMENT_REGULATORY_FEE_ALIASES  = ["Regulatory Fee", "regulatory fee", "regulatory-fee"];
+const SETTLEMENT_TAX_ON_REG_FEE_ALIASES  = [
+  "Tax On Regulatory Fee", "tax on regulatory fee", "tax-on-regulatory-fee",
+];
+const SETTLEMENT_PROMOTIONAL_REBATES_ALIASES = ["promotional rebates", "promotional-rebates"];
+const SETTLEMENT_PROMO_REBATES_TAX_ALIASES = [
+  "promotional rebates tax", "promotional-rebates-tax",
+];
+const SETTLEMENT_MARKETPLACE_WITHHELD_TAX_ALIASES = [
+  "marketplace withheld tax", "marketplace-withheld-tax",
+];
+const SETTLEMENT_SELLING_FEES_ALIASES    = ["selling fees", "selling-fees"];
+const SETTLEMENT_FBA_FEES_ALIASES        = ["fba fees", "fba-fees"];
+const SETTLEMENT_OTHER_TX_FEES_ALIASES   = ["other transaction fees", "other-transaction-fees"];
+const SETTLEMENT_OTHER_AMOUNT_ALIASES    = ["other", "Other", "other-amount"];
+const SETTLEMENT_TX_STATUS_ALIASES       = [
+  "Transaction Status", "transaction-status", "transaction status", "transaction_status",
+];
+const SETTLEMENT_TX_RELEASE_DATE_ALIASES = [
+  "Transaction Release Date", "transaction-release-date", "transaction release date",
+];
+const SETTLEMENT_DESCRIPTION_ALIASES     = ["description", "Description"];
 
 /** Settlement flat-file: settlement id on transaction lines */
 const TX_SETTLEMENT_ID_ALIASES = ["settlement-id", "settlement id", "Settlement ID"];
@@ -521,9 +604,15 @@ const TX_LINE_AMOUNT_ALIAS_GROUPS = [
 ];
 
 // ── Transaction aliases ───────────────────────────────────────────────────────
-// Hard-coded: CSV "amount" column → DB amount (prevents raw_data burial)
-const TX_AMOUNT_ALIASES = ["amount", "Amount", "transaction-amount", "transaction amount"];
-const POSTED_DATE_ALIASES = ["posted-date", "posted date", "date-time", "Date/Time", "date/time"];
+// Hard-coded: CSV "amount" column → DB amount (prevents raw_data burial).
+// Includes "Total (USD)" / "Total" from the simple Transactions Summary report.
+const TX_AMOUNT_ALIASES = [
+  "amount", "Amount", "transaction-amount", "transaction amount",
+  "total (usd)", "Total (USD)", "total-usd", "total usd", "total", "Total",
+];
+const POSTED_DATE_ALIASES = [
+  "posted-date", "posted date", "date-time", "Date/Time", "date/time", "date", "Date",
+];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1202,9 +1291,32 @@ export type AmazonInventoryLedgerInsert = {
   /** Physical DB column: `event_type` (maps from CSV "Event Type") */
   event_type: string | null;
   quantity: number | null;
-  /** All non-physical CSV columns (asin, sku, country, title, …) land here. */
+  /** Headerless ledger col1 — Amazon event date (NOT created_at). Migration 20260642. */
+  event_date: string | null;
+  /** Headerless ledger col15 — Amazon event timestamp. Migration 20260642. */
+  event_timestamp: string | null;
+  sku: string | null;
+  asin: string | null;
+  product_name: string | null;
+  country: string | null;
+  /** All non-physical CSV columns land here. */
   raw_data: Record<string, string> | null;
 };
+
+const LEDGER_EVENT_DATE_ALIASES = [
+  "event-date", "event date", "event_date",
+  "date", "Date", "snapshot-date", "snapshot date",
+];
+const LEDGER_EVENT_TIMESTAMP_ALIASES = [
+  "event-timestamp", "event timestamp", "event_timestamp",
+  "timestamp", "Timestamp",
+];
+const LEDGER_COUNTRY_ALIASES = [
+  "country", "Country", "country-code", "country code", "marketplace-country",
+];
+const LEDGER_PRODUCT_NAME_ALIASES = [
+  "product-name", "product name", "title", "item-name", "item name", "description", "product_name",
+];
 
 export function mapRowToAmazonInventoryLedger(
   row: Record<string, string>,
@@ -1217,17 +1329,18 @@ export function mapRowToAmazonInventoryLedger(
   const fnsku = pickT(row, FNSKU_ALIASES, consumed).trim();
   if (!fnsku) return null;
 
-  // These columns are NOT physical DB columns — consume them so buildRawData()
-  // captures them in the JSONB bucket rather than leaving them unconsumed.
-  pickT(row, ASIN_ALIASES, consumed);
-  pickT(row, SKU_ALIASES, consumed);
-  pickT(row, TITLE_ALIASES, consumed);
-  pickT(row, DATE_ALIASES, consumed);
+  const asin = pickT(row, ASIN_ALIASES, consumed) || null;
+  const sku = pickT(row, SKU_ALIASES, consumed) || null;
+  const product_name = pickT(row, LEDGER_PRODUCT_NAME_ALIASES, consumed) || null;
+  // Date — interpret as event_date (NOT created_at).
+  const event_date_raw = pickT(row, LEDGER_EVENT_DATE_ALIASES, consumed);
+  const event_date = event_date_raw ? parseIsoDate(event_date_raw) : null;
+  const event_timestamp_raw = pickT(row, LEDGER_EVENT_TIMESTAMP_ALIASES, consumed);
+  const event_timestamp = event_timestamp_raw ? parseIsoDateTime(event_timestamp_raw) : null;
+  const country = pickT(row, LEDGER_COUNTRY_ALIASES, consumed) || null;
 
   // Normalise the three constraint columns to trimmed-lowercase so the value
   // stored in Postgres exactly matches the JS dedup key in deduplicateByConflictKey().
-  // This prevents "Sellable" / "SELLABLE" / " Sellable " from creating phantom
-  // duplicate-key collisions at the Postgres layer.
   const disposition = (pickT(row, DISPOSITION_ALIASES, consumed) || "").trim().toLowerCase() || null;
   const location    = (pickT(row, LOCATION_ALIASES, consumed)    || "").trim().toLowerCase() || null;
   const event_type  = (pickT(row, EVENT_TYPE_ALIASES, consumed)  || "").trim().toLowerCase() || null;
@@ -1241,6 +1354,12 @@ export function mapRowToAmazonInventoryLedger(
     location,
     event_type,
     quantity: parseQty(pickT(row, [...QTY_ALIASES, ...ENDING_WH_BAL_ALIASES], consumed)),
+    event_date,
+    event_timestamp,
+    sku,
+    asin,
+    product_name,
+    country,
     raw_data: buildRawData(row, consumed),
   };
 }
@@ -1396,7 +1515,12 @@ function mapRowToAmazonSettlementTxtFlat(
   };
 }
 
-/** Older settlement CSV shape (order/sku/amount_total on physical columns). */
+/**
+ * Settlement CSV shape (legacy + Transaction / Payment Detail report).
+ * Extracts the wide column set defined by migration 20260642 so the typed
+ * physical columns are populated when present, and the original raw row is
+ * preserved in raw_data.
+ */
 function mapRowToAmazonSettlementLegacyCsv(
   row: Record<string, string>,
   orgId: string,
@@ -1409,7 +1533,34 @@ function mapRowToAmazonSettlementLegacyCsv(
   const sku = pickT(row, SKU_ALIASES, consumed) || null;
   const transaction_type = pickT(row, TX_TYPE_ALIASES, consumed) || null;
   const amount_total = parseNum(pickT(row, AMOUNT_TOTAL_ALIASES, consumed));
-  const posted_date = parseIsoDate(pickT(row, DEPOSIT_DATE_ALIASES, consumed));
+  const posted_date = parseIsoDateTime(pickT(row, DEPOSIT_DATE_ALIASES, consumed));
+
+  // Transaction / Payment Detail report typed columns.
+  const quantity = parseQty(pickT(row, SETTLEMENT_QUANTITY_ALIASES, consumed));
+  const marketplace = pickT(row, SETTLEMENT_MARKETPLACE_ALIASES, consumed) || null;
+  const account_type = pickT(row, SETTLEMENT_ACCOUNT_TYPE_ALIASES, consumed) || null;
+  const fulfillment_channel = pickT(row, SETTLEMENT_FULFILLMENT_ALIASES, consumed) || null;
+  const description = pickT(row, SETTLEMENT_DESCRIPTION_ALIASES, consumed) || null;
+  const product_sales = parseNum(pickT(row, SETTLEMENT_PRODUCT_SALES_ALIASES, consumed));
+  const product_sales_tax = parseNum(pickT(row, SETTLEMENT_PRODUCT_SALES_TAX_ALIASES, consumed));
+  const shipping_credits = parseNum(pickT(row, SETTLEMENT_SHIPPING_CREDITS_ALIASES, consumed));
+  const shipping_credits_tax = parseNum(pickT(row, SETTLEMENT_SHIPPING_CREDITS_TAX_ALIASES, consumed));
+  const gift_wrap_credits = parseNum(pickT(row, SETTLEMENT_GIFT_WRAP_CREDITS_ALIASES, consumed));
+  const giftwrap_credits_tax = parseNum(pickT(row, SETTLEMENT_GIFTWRAP_CREDITS_TAX_ALIASES, consumed));
+  const regulatory_fee = parseNum(pickT(row, SETTLEMENT_REGULATORY_FEE_ALIASES, consumed));
+  const tax_on_regulatory_fee = parseNum(pickT(row, SETTLEMENT_TAX_ON_REG_FEE_ALIASES, consumed));
+  const promotional_rebates = parseNum(pickT(row, SETTLEMENT_PROMOTIONAL_REBATES_ALIASES, consumed));
+  const promotional_rebates_tax = parseNum(pickT(row, SETTLEMENT_PROMO_REBATES_TAX_ALIASES, consumed));
+  const marketplace_withheld_tax = parseNum(pickT(row, SETTLEMENT_MARKETPLACE_WITHHELD_TAX_ALIASES, consumed));
+  const selling_fees = parseNum(pickT(row, SETTLEMENT_SELLING_FEES_ALIASES, consumed));
+  const fba_fees = parseNum(pickT(row, SETTLEMENT_FBA_FEES_ALIASES, consumed));
+  const other_transaction_fees = parseNum(pickT(row, SETTLEMENT_OTHER_TX_FEES_ALIASES, consumed));
+  const other_amount = parseNum(pickT(row, SETTLEMENT_OTHER_AMOUNT_ALIASES, consumed));
+  const transaction_status = pickT(row, SETTLEMENT_TX_STATUS_ALIASES, consumed) || null;
+  const transaction_release_date = parseIsoDateTime(
+    pickT(row, SETTLEMENT_TX_RELEASE_DATE_ALIASES, consumed),
+  );
+
   const lineKey = settlementAmazonLineKey([
     "legacy",
     orgId,
@@ -1420,7 +1571,10 @@ function mapRowToAmazonSettlementLegacyCsv(
     transaction_type ?? "",
     String(amount_total ?? ""),
     posted_date ?? "",
+    description ?? "",
+    transaction_status ?? "",
   ]);
+
   return {
     organization_id: orgId,
     upload_id: uploadId,
@@ -1431,6 +1585,28 @@ function mapRowToAmazonSettlementLegacyCsv(
     transaction_type,
     amount_total,
     posted_date,
+    quantity,
+    marketplace,
+    account_type,
+    fulfillment_channel,
+    description,
+    product_sales,
+    product_sales_tax,
+    shipping_credits,
+    shipping_credits_tax,
+    gift_wrap_credits,
+    giftwrap_credits_tax,
+    regulatory_fee,
+    tax_on_regulatory_fee,
+    promotional_rebates,
+    promotional_rebates_tax,
+    marketplace_withheld_tax,
+    selling_fees,
+    fba_fees,
+    other_transaction_fees,
+    other_amount,
+    transaction_status,
+    transaction_release_date,
     raw_data: buildRawData(row, consumed),
   };
 }
@@ -1451,6 +1627,29 @@ export type AmazonSettlementInsert = {
   transaction_type?: string | null;
   amount_total?: number | null;
   posted_date?: string | null;
+  // Migration 20260642 — Transaction / Payment Detail report.
+  quantity?: number | null;
+  marketplace?: string | null;
+  account_type?: string | null;
+  fulfillment_channel?: string | null;
+  description?: string | null;
+  product_sales?: number | null;
+  product_sales_tax?: number | null;
+  shipping_credits?: number | null;
+  shipping_credits_tax?: number | null;
+  gift_wrap_credits?: number | null;
+  giftwrap_credits_tax?: number | null;
+  regulatory_fee?: number | null;
+  tax_on_regulatory_fee?: number | null;
+  promotional_rebates?: number | null;
+  promotional_rebates_tax?: number | null;
+  marketplace_withheld_tax?: number | null;
+  selling_fees?: number | null;
+  fba_fees?: number | null;
+  other_transaction_fees?: number | null;
+  other_amount?: number | null;
+  transaction_status?: string | null;
+  transaction_release_date?: string | null;
   raw_data?: Record<string, string> | null;
 };
 
@@ -1694,6 +1893,107 @@ export type AmazonRawArchiveInsert = {
 };
 
 /**
+ * Amazon Fulfilled Shipments report → amazon_all_orders typed mapper.
+ *
+ * Replaces the generic raw-archive path for ALL_ORDERS so the Fulfilled
+ * Shipments-specific columns land on physical columns (Migration 20260642).
+ *
+ * Shipment-level fields (Shipment ID, Shipment Item Id, Shipment Date,
+ * Carrier, Tracking Number, Estimated Arrival Date, FC, Reporting Date,
+ * Payments Date, Buyer*, Recipient*, Shipping Address*, Billing Address*,
+ * Item Promo Discount, Shipment Promo Discount, etc.) are intentionally NOT
+ * pulled out as physical columns and remain in raw_data so the import is
+ * lossless without bloating the `amazon_all_orders` table.
+ */
+const SHIPMENTS_AMAZON_ORDER_ID_ALIASES = ["amazon-order-id", "amazon order id", "Amazon Order Id"];
+const SHIPMENTS_MERCHANT_ORDER_ID_ALIASES = ["merchant-order-id", "merchant order id", "Merchant Order Id"];
+const SHIPMENTS_PURCHASE_DATE_ALIASES = ["purchase-date", "purchase date", "Purchase Date"];
+const SHIPMENTS_TITLE_ALIASES = ["title", "Title", "product-name", "product name"];
+const SHIPMENTS_QTY_ALIASES = ["shipped-quantity", "shipped quantity", "Shipped Quantity", "quantity"];
+const SHIPMENTS_CURRENCY_ALIASES = ["currency", "Currency"];
+const SHIPMENTS_ITEM_PRICE_ALIASES = ["item-price", "item price", "Item Price"];
+const SHIPMENTS_ITEM_TAX_ALIASES = ["item-tax", "item tax", "Item Tax"];
+const SHIPMENTS_SHIPPING_PRICE_ALIASES = ["shipping-price", "shipping price", "Shipping Price"];
+const SHIPMENTS_SHIP_COUNTRY_ALIASES = [
+  "shipping-country-code", "shipping country code", "Shipping Country Code",
+  "ship-country", "ship country",
+];
+const SHIPMENTS_FULFILLMENT_ALIASES = ["fulfillment-channel", "fulfillment channel", "Fulfillment Channel"];
+const SHIPMENTS_SALES_CHANNEL_ALIASES = ["sales-channel", "sales channel", "Sales Channel"];
+
+export type AmazonAllOrdersInsert = {
+  organization_id: string;
+  store_id: string | null;
+  source_upload_id: string;
+  source_line_hash: string;
+  amazon_order_id: string | null;
+  merchant_order_id: string | null;
+  /** Mirrored from amazon_order_id for legacy joins/queries. */
+  order_id: string | null;
+  purchase_date: string | null;
+  sku: string | null;
+  product_name: string | null;
+  quantity: number | null;
+  currency: string | null;
+  item_price: number | null;
+  item_tax: number | null;
+  shipping_price: number | null;
+  ship_country: string | null;
+  fulfillment_channel: string | null;
+  sales_channel: string | null;
+  raw_data: Record<string, string> | null;
+};
+
+export function mapRowToAmazonAllOrders(
+  row: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+  storeId: string | null,
+): AmazonAllOrdersInsert | null {
+  const hasContent = Object.values(row).some((v) => v?.trim() !== "");
+  if (!hasContent) return null;
+  const source_line_hash = computeSourceLineHash(orgId, row);
+  const consumed = new Set<string>();
+
+  const amazon_order_id = pickT(row, SHIPMENTS_AMAZON_ORDER_ID_ALIASES, consumed) || null;
+  const merchant_order_id = pickT(row, SHIPMENTS_MERCHANT_ORDER_ID_ALIASES, consumed) || null;
+  const purchaseRaw = pickT(row, SHIPMENTS_PURCHASE_DATE_ALIASES, consumed);
+  const purchase_date = purchaseRaw ? parseIsoDateTime(purchaseRaw) : null;
+  const sku = pickT(row, SKU_ALIASES, consumed) || null;
+  const product_name = pickT(row, SHIPMENTS_TITLE_ALIASES, consumed) || null;
+  const quantity = parseQty(pickT(row, SHIPMENTS_QTY_ALIASES, consumed));
+  const currency = pickT(row, SHIPMENTS_CURRENCY_ALIASES, consumed) || null;
+  const item_price = parseNum(pickT(row, SHIPMENTS_ITEM_PRICE_ALIASES, consumed));
+  const item_tax = parseNum(pickT(row, SHIPMENTS_ITEM_TAX_ALIASES, consumed));
+  const shipping_price = parseNum(pickT(row, SHIPMENTS_SHIPPING_PRICE_ALIASES, consumed));
+  const ship_country = pickT(row, SHIPMENTS_SHIP_COUNTRY_ALIASES, consumed) || null;
+  const fulfillment_channel = pickT(row, SHIPMENTS_FULFILLMENT_ALIASES, consumed) || null;
+  const sales_channel = pickT(row, SHIPMENTS_SALES_CHANNEL_ALIASES, consumed) || null;
+
+  return {
+    organization_id: orgId,
+    store_id: storeId || null,
+    source_upload_id: uploadId,
+    source_line_hash,
+    amazon_order_id,
+    merchant_order_id,
+    order_id: amazon_order_id,
+    purchase_date,
+    sku,
+    product_name,
+    quantity,
+    currency,
+    item_price,
+    item_tax,
+    shipping_price,
+    ship_country,
+    fulfillment_channel,
+    sales_channel,
+    raw_data: buildRawData(row, consumed),
+  };
+}
+
+/**
  * Generic raw-archive mapper shared by all 8 new report types.
  * Returns null only if the entire row is blank (skip empty CSV lines).
  */
@@ -1807,6 +2107,15 @@ export type AmazonManageFbaInventoryInsert = {
   afn_reserved_future_supply: number | null;
   afn_future_supply_buyable: number | null;
   store: string | null;
+  // Migration 20260642 — Restock Inventory columns.
+  inbound_quantity: number | null;
+  fc_transfer_quantity: number | null;
+  fc_processing_quantity: number | null;
+  customer_order_quantity: number | null;
+  recommended_replenishment_qty: number | null;
+  recommended_ship_date: string | null;
+  recommended_action: string | null;
+  unit_storage_size: string | null;
   raw_data: Record<string, string> | null;
 };
 
@@ -1849,6 +2158,23 @@ export function mapRowToAmazonManageFbaInventory(
     afn_reserved_future_supply: parseIntSafe(pickT(row, ["afn-reserved-future-supply", "afn reserved future supply"], consumed)),
     afn_future_supply_buyable: parseIntSafe(pickT(row, ["afn-future-supply-buyable", "afn future supply buyable"], consumed)),
     store:              pickT(row, ["store"], consumed) || null,
+    // Restock Inventory typed columns (Restock report).
+    inbound_quantity: parseIntSafe(pickT(row, ["Inbound", "inbound", "inbound-quantity", "inbound quantity"], consumed)),
+    fc_transfer_quantity: parseIntSafe(pickT(row, ["FC transfer", "fc transfer", "fc-transfer-quantity"], consumed)),
+    fc_processing_quantity: parseIntSafe(pickT(row, ["FC Processing", "fc processing", "fc-processing-quantity"], consumed)),
+    customer_order_quantity: parseIntSafe(pickT(row, ["Customer Order", "customer order", "customer-order-quantity"], consumed)),
+    recommended_replenishment_qty: parseIntSafe(pickT(row, [
+      "Recommended replenishment qty", "recommended replenishment qty", "recommended-replenishment-qty",
+    ], consumed)),
+    recommended_ship_date: passThroughDateText(pickT(row, [
+      "Recommended ship date", "recommended ship date", "recommended-ship-date",
+    ], consumed)),
+    recommended_action: pickT(row, [
+      "Recommended action", "recommended action", "recommended-action",
+    ], consumed) || null,
+    unit_storage_size: pickT(row, [
+      "Unit storage size", "unit storage size", "unit-storage-size",
+    ], consumed) || null,
     raw_data:           buildRawData(row, consumed),
   };
 }
