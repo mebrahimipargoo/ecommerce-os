@@ -245,6 +245,12 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
       aliases: ["ending-warehouse-balance", "ending warehouse balance"],
     },
     {
+      key: "sku",
+      label: "MSKU / Seller SKU",
+      required: false,
+      aliases: ["msku", "MSKU", "sku", "merchant-sku", "seller-sku", "seller sku"],
+    },
+    {
       key: "title",
       label: "Product Title / Name",
       required: false,
@@ -261,6 +267,96 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
       label: "ASIN",
       required: false,
       aliases: ["asin", "ASIN"],
+    },
+    {
+      key: "event_type",
+      label: "Event Type",
+      required: false,
+      aliases: ["event-type", "event type", "Event Type", "event_type"],
+    },
+    {
+      key: "quantity",
+      label: "Quantity",
+      required: false,
+      aliases: ["quantity", "Quantity", "qty"],
+    },
+    {
+      key: "location",
+      label: "Fulfillment Center / Location",
+      required: false,
+      aliases: [
+        "fulfillment-center",
+        "fulfillment center",
+        "Fulfillment Center",
+        "fc",
+        "warehouse",
+        "location",
+      ],
+    },
+    {
+      key: "disposition",
+      label: "Disposition",
+      required: false,
+      aliases: ["disposition", "Disposition", "detailed-disposition", "detailed disposition"],
+    },
+    {
+      key: "reference_id",
+      label: "Reference ID",
+      required: false,
+      aliases: ["reference-id", "reference id", "Reference ID", "reference_id"],
+    },
+    {
+      key: "reason_code",
+      label: "Reason",
+      required: false,
+      aliases: ["reason", "Reason", "reason-code", "reason code", "reason_code"],
+    },
+    {
+      key: "country",
+      label: "Country",
+      required: false,
+      aliases: ["country", "Country", "country-code", "country code"],
+    },
+    {
+      key: "reconciled_quantity",
+      label: "Reconciled Quantity",
+      required: false,
+      aliases: [
+        "reconciled-quantity",
+        "reconciled quantity",
+        "Reconciled Quantity",
+        "reconciled_quantity",
+      ],
+    },
+    {
+      key: "unreconciled_quantity",
+      label: "Unreconciled Quantity",
+      required: false,
+      aliases: [
+        "unreconciled-quantity",
+        "unreconciled quantity",
+        "Unreconciled Quantity",
+        "unreconciled_quantity",
+      ],
+    },
+    {
+      key: "event_timestamp",
+      label: "Date and Time",
+      required: false,
+      aliases: [
+        "date-and-time",
+        "date and time",
+        "Date and Time",
+        "event-timestamp",
+        "event timestamp",
+        "timestamp",
+      ],
+    },
+    {
+      key: "store",
+      label: "Store",
+      required: false,
+      aliases: ["store", "Store", "marketplace", "Marketplace"],
     },
   ],
   REIMBURSEMENTS: [
@@ -874,7 +970,8 @@ export function mappingHasRequiredGaps(
  *   1. FBA_RETURNS      — contains "license-plate-number" AND "detailed-disposition"
  *   2. REMOVAL_ORDER    — contains "removal-order-id" OR
  *                         ("requested-quantity" AND "disposed-quantity")
- *   3. INVENTORY_LEDGER — contains "fnsku" AND "ending-warehouse-balance"
+ *   3. INVENTORY_LEDGER — "fnsku" AND ("ending-warehouse-balance" OR event-level:
+ *                         "event-type" + "fulfillment-center" + "disposition")
  *   4. REIMBURSEMENTS   — contains "reimbursement-id" AND "quantity-reimbursed-total"
  *   5. SETTLEMENT       — contains "settlement-id" AND "transaction-status"
  *   6. SAFET_CLAIMS     — contains "safe-t-claim-id" AND "reimbursement-amount"
@@ -895,7 +992,8 @@ export function mappingHasRequiredGaps(
  * Rules (first match wins):
  *   1. FBA_RETURNS      — "license plate number" AND "detailed disposition"
  *   2. REMOVAL_ORDER    — "removal order id" OR ("requested quantity" AND "disposed quantity")
- *   3. INVENTORY_LEDGER — "fnsku" AND "ending warehouse balance"
+ *   3. INVENTORY_LEDGER — "fnsku" AND ("ending warehouse balance" OR
+ *                         "event type"+"fulfillment center"+"disposition")
  *   4. REIMBURSEMENTS   — "reimbursement id" AND "quantity reimbursed total"
  *   5. SETTLEMENT       — "settlement id" AND "transaction status"
  *   6. SAFET_CLAIMS     — "safe t claim id" AND "reimbursement amount"
@@ -1114,9 +1212,24 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
     };
   }
 
-  // Rule 3: Inventory Ledger
+  // Rule 3: Inventory Ledger (classic snapshot export — ending balance column)
   if (ds.has("fnsku") && ds.has("ending warehouse balance")) {
     return { reportType: "INVENTORY_LEDGER", matchedRule: "fnsku+ending warehouse balance" };
+  }
+
+  // Rule 3b: Inventory Ledger — Amazon event-level export ("Last 30 days", etc.):
+  // real files often omit "Ending Warehouse Balance" but include Event Type + FC + Disposition.
+  if (
+    ds.has("fnsku") &&
+    ds.has("event type") &&
+    ds.has("fulfillment center") &&
+    ds.has("disposition")
+  ) {
+    return {
+      reportType: "INVENTORY_LEDGER",
+      matchedRule:
+        "fnsku+event type+fulfillment center+disposition (event-level Inventory Ledger)",
+    };
   }
 
   // Rule 4: Reimbursements

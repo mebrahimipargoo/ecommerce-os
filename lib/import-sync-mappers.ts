@@ -101,6 +101,22 @@ function pickT(
   return "";
 }
 
+/** Like `pickT` but header keys must match an alias exactly after `normKey` (no substring pass). */
+function pickTExact(
+  row: Record<string, string>,
+  aliases: string[],
+  consumed: Set<string>,
+): string {
+  const want = new Set(aliases.map(normKey));
+  for (const [k, v] of Object.entries(row)) {
+    if (want.has(normKey(k))) {
+      consumed.add(k);
+      return String(v ?? "").trim();
+    }
+  }
+  return "";
+}
+
 /** Non-tracking version — kept for backward compat with legacy mappers. */
 function pick(row: Record<string, string>, aliases: string[]): string {
   const dummy = new Set<string>();
@@ -1387,6 +1403,26 @@ const LEDGER_EVENT_DATE_ALIASES = [
 const LEDGER_EVENT_TIMESTAMP_ALIASES = [
   "event-timestamp", "event timestamp", "event_timestamp",
   "timestamp", "Timestamp",
+  "date-and-time", "date and time", "Date and Time",
+  "event_timestamp",
+];
+const LEDGER_REFERENCE_ID_ALIASES = [
+  "reference-id", "reference id", "reference_id", "Reference ID",
+];
+const LEDGER_REASON_CODE_ALIASES = [
+  "reason", "Reason", "reason-code", "reason code", "reason_code",
+];
+const LEDGER_RECONCILED_QTY_ALIASES = [
+  "reconciled-quantity",
+  "reconciled quantity",
+  "reconciled_quantity",
+  "Reconciled Quantity",
+];
+const LEDGER_UNRECONCILED_QTY_ALIASES = [
+  "unreconciled-quantity",
+  "unreconciled quantity",
+  "unreconciled_quantity",
+  "Unreconciled Quantity",
 ];
 const LEDGER_COUNTRY_ALIASES = [
   "country", "Country", "country-code", "country code", "marketplace-country",
@@ -1409,12 +1445,24 @@ export function mapRowToAmazonInventoryLedger(
   const asin = pickT(row, ASIN_ALIASES, consumed) || null;
   const sku = pickT(row, SKU_ALIASES, consumed) || null;
   const product_name = pickT(row, LEDGER_PRODUCT_NAME_ALIASES, consumed) || null;
-  // Date — interpret as event_date (NOT created_at).
-  const event_date_raw = pickT(row, LEDGER_EVENT_DATE_ALIASES, consumed);
+  // Date — interpret as event_date (NOT created_at). Exact match only so "Date and Time"
+  // is not consumed by the bare "date" alias (pickT substring pass).
+  const event_date_raw = pickTExact(row, LEDGER_EVENT_DATE_ALIASES, consumed);
   const event_date = event_date_raw ? parseIsoDate(event_date_raw) : null;
-  const event_timestamp_raw = pickT(row, LEDGER_EVENT_TIMESTAMP_ALIASES, consumed);
+  const event_timestamp_raw = pickTExact(row, LEDGER_EVENT_TIMESTAMP_ALIASES, consumed);
   const event_timestamp = event_timestamp_raw ? parseIsoDateTime(event_timestamp_raw) : null;
   const country = pickT(row, LEDGER_COUNTRY_ALIASES, consumed) || null;
+
+  const reference_id_raw = pickT(row, LEDGER_REFERENCE_ID_ALIASES, consumed);
+  const reference_id = reference_id_raw ? reference_id_raw : null;
+  const reason_code_raw = pickT(row, LEDGER_REASON_CODE_ALIASES, consumed);
+  const reason_code = reason_code_raw ? reason_code_raw : null;
+  const reconciled_quantity = parseLedgerIntQty(
+    pickT(row, LEDGER_RECONCILED_QTY_ALIASES, consumed),
+  );
+  const unreconciled_quantity = parseLedgerIntQty(
+    pickT(row, LEDGER_UNRECONCILED_QTY_ALIASES, consumed),
+  );
 
   // Normalise the three constraint columns to trimmed-lowercase so the value
   // stored in Postgres exactly matches the JS dedup key in deduplicateByConflictKey().
@@ -1438,10 +1486,10 @@ export function mapRowToAmazonInventoryLedger(
     product_name,
     title: product_name,
     country,
-    reference_id: null,
-    reason_code: null,
-    reconciled_quantity: null,
-    unreconciled_quantity: null,
+    reference_id,
+    reason_code,
+    reconciled_quantity,
+    unreconciled_quantity,
     source_file_name: null,
     raw_data: buildRawData(row, consumed),
   };
