@@ -8,6 +8,10 @@ import {
   headersLookLikeSimpleTransactionsSummary,
   mappingHasRequiredGaps,
 } from "../../../../../lib/csv-import-detected-type";
+import {
+  buildPositionalLedgerCanonicalColumnMapping,
+  headersMatchPositionalLedgerStaging,
+} from "../../../../../lib/inventory-ledger-positional";
 import { classifyImportHeadersWithGpt } from "../../../../../lib/classify-import-headers-openai";
 import { resolveWriteOrganizationId } from "../../../../../lib/server-tenant";
 import { supabaseServer } from "../../../../../lib/supabase-server";
@@ -418,10 +422,13 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     // ── Step 3: Build rule-based alias mapping for the resolved type ───────────
-    const ruleMapping: Record<string, string> =
+    let ruleMapping: Record<string, string> =
       (reportType as string) !== "UNKNOWN"
         ? buildColumnMappingFromHeaders(headers, reportType)
         : {};
+    if (reportType === "INVENTORY_LEDGER" && headersMatchPositionalLedgerStaging(headers)) {
+      ruleMapping = { ...ruleMapping, ...buildPositionalLedgerCanonicalColumnMapping() };
+    }
 
     // Merge: rule-based fills gaps; AI mapping wins when both have a key
     const merged: Record<string, string> = { ...ruleMapping, ...aiColumnMapping };

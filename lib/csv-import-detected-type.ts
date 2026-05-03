@@ -1,4 +1,5 @@
 import type { RawReportType } from "./raw-report-types";
+import { headersMatchPositionalLedgerStaging } from "./inventory-ledger-positional";
 
 /** Values written to `raw_report_uploads.report_type` by the header rule engine + GPT fallback. */
 export const CLASSIFIED_REPORT_TYPES = [
@@ -1101,6 +1102,15 @@ export function classifyCsvHeadersRuleBased(headers: string[]): {
       matchedRule: ds.has("removal order id")
         ? "removal order id"
         : "requested quantity+disposed quantity",
+    };
+  }
+
+  // Rule 2c: Headerless Inventory Ledger — strict `ledger_pos_01`…`ledger_pos_15+` (no semantic CSV headers).
+  // Must run BEFORE classic "fnsku + ending warehouse balance" so classify-headers does not fall through to GPT/UNKNOWN.
+  if (headersMatchPositionalLedgerStaging(headers)) {
+    return {
+      reportType: "INVENTORY_LEDGER",
+      matchedRule: "positional staging keys ledger_pos_01..15+ (headerless Amazon export)",
     };
   }
 

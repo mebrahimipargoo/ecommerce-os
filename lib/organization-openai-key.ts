@@ -13,17 +13,23 @@ import { supabaseServer } from "./supabase-server";
 export async function getOrganizationOpenAIApiKey(organizationId: string): Promise<string | null> {
   // 1. Check organization_api_keys (plaintext provider key saved from Settings page)
   try {
-    const { data: keyRow } = await supabaseServer
+    const { data: rows } = await supabaseServer
       .from("organization_api_keys")
-      .select("api_key")
+      .select("api_key, name")
       .eq("organization_id", organizationId)
-      .eq("name", "OpenAI")
       .eq("role", "llm_provider")
       .order("created_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    const dbKey = keyRow?.api_key?.trim();
-    if (dbKey) return dbKey;
+      .limit(12);
+    const list = rows ?? [];
+    const exact = list.find((r) => String(r.name ?? "").trim() === "OpenAI");
+    const dbKeyExact = exact?.api_key?.trim();
+    if (dbKeyExact) return dbKeyExact;
+    for (const r of list) {
+      const n = String(r.name ?? "").toLowerCase();
+      const k = typeof r.api_key === "string" ? r.api_key.trim() : "";
+      if (!k) continue;
+      if (n.includes("openai") || n.includes("gpt") || n === "chatgpt" || n === "llm") return k;
+    }
   } catch {
     /* ignore — fall through to legacy path */
   }
