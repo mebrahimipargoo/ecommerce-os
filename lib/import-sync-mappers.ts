@@ -23,6 +23,11 @@ function normKey(s: string): string {
   return s.replace(/^\uFEFF/, "").trim().toLowerCase().replace(/[\s_]+/g, "-");
 }
 
+/** Same normalization as `pickT` — pre-sync guard must use this for header keys. */
+export function normImportHeaderKey(s: string): string {
+  return normKey(s);
+}
+
 /** Resolve a cell when CSV headers use hyphens but keys were normalized to underscores (or vice versa). */
 function resolveMappedCell(row: Record<string, string>, csvHeader: string): string | undefined {
   const h = String(csvHeader).trim().replace(/^\uFEFF/, "");
@@ -165,7 +170,10 @@ export const NATIVE_COLUMNS_LEDGER = new Set([
   "source_file_sha256", "source_physical_row_number",
   "fnsku", "disposition", "location", "event_type", "quantity",
   // Migration 20260642: positional columns from headerless ledger export.
-  "event_date", "event_timestamp", "sku", "asin", "product_name", "country",
+  "event_date", "event_timestamp", "sku", "asin", "product_name", "title", "country",
+  // Migration 20260702: strict positional col7 / col11 / col13–14.
+  "reference_id", "reason_code", "reconciled_quantity", "unreconciled_quantity",
+  "source_file_name", "updated_at",
   // Migration 20260620: identifier resolution.
   "resolved_product_id", "resolved_catalog_product_id",
   "identifier_resolution_status", "identifier_resolution_confidence",
@@ -186,6 +194,8 @@ export const NATIVE_COLUMNS_SETTLEMENTS = new Set([
   "id",
   "organization_id",
   "upload_id",
+  "store_id",
+  "source_file_name",
   "source_file_sha256",
   "source_physical_row_number",
   "amazon_line_key",
@@ -228,6 +238,7 @@ export const NATIVE_COLUMNS_SETTLEMENTS = new Set([
   "identifier_resolution_status",
   "identifier_resolution_confidence",
   "created_at",
+  "updated_at",
   "raw_data",
 ]);
 
@@ -543,7 +554,21 @@ const AMOUNT_REIMBURSED_ALIASES = [
 const SETTLEMENT_ID_ALIASES    = ["settlement-id", "settlement id", "Settlement ID"];
 const TX_TYPE_ALIASES          = ["transaction-type", "transaction type", "type", "Type"];
 const DEPOSIT_DATE_ALIASES     = ["deposit-date", "deposit date", "posted-date", "posted date", "date/time", "Date/Time"];
-const AMOUNT_TOTAL_ALIASES     = ["total", "amount", "net-proceeds", "net proceeds", "amount-total", "amount total"];
+const AMOUNT_TOTAL_ALIASES = [
+  "total",
+  "Total",
+  "amount",
+  "net-proceeds",
+  "net proceeds",
+  "amount-total",
+  "amount total",
+  "Total Amount",
+  "total amount",
+  "Net Amount",
+  "net amount",
+  "Amount (Total)",
+  "amount (total)",
+];
 
 // Transaction / Payment Detail report columns (Amazon).
 const SETTLEMENT_QUANTITY_ALIASES        = ["quantity", "Quantity"];
@@ -552,8 +577,17 @@ const SETTLEMENT_ACCOUNT_TYPE_ALIASES    = ["account type", "account-type", "acc
 const SETTLEMENT_FULFILLMENT_ALIASES     = [
   "fulfillment", "Fulfillment", "fulfillment-channel", "fulfillment channel",
 ];
-const SETTLEMENT_PRODUCT_SALES_ALIASES   = ["product sales", "product-sales", "product_sales"];
-const SETTLEMENT_PRODUCT_SALES_TAX_ALIASES = ["product sales tax", "product-sales-tax"];
+const SETTLEMENT_PRODUCT_SALES_ALIASES = ["product sales", "product-sales", "product_sales", "Product Sales"];
+const SETTLEMENT_PRODUCT_SALES_TAX_ALIASES = [
+  "product sales tax",
+  "product-sales-tax",
+  "Product Sales Tax",
+  "product sales Tax",
+  "Product tax",
+  "product tax",
+  "Tax: Product Sales",
+  "tax: product sales",
+];
 const SETTLEMENT_SHIPPING_CREDITS_ALIASES = ["shipping credits", "shipping-credits"];
 const SETTLEMENT_SHIPPING_CREDITS_TAX_ALIASES = ["shipping credits tax", "shipping-credits-tax"];
 const SETTLEMENT_GIFT_WRAP_CREDITS_ALIASES = ["gift wrap credits", "gift-wrap-credits", "giftwrap credits"];
@@ -561,8 +595,15 @@ const SETTLEMENT_GIFTWRAP_CREDITS_TAX_ALIASES = [
   "giftwrap credits tax", "giftwrap-credits-tax", "gift wrap credits tax", "gift-wrap-credits-tax",
 ];
 const SETTLEMENT_REGULATORY_FEE_ALIASES  = ["Regulatory Fee", "regulatory fee", "regulatory-fee"];
-const SETTLEMENT_TAX_ON_REG_FEE_ALIASES  = [
-  "Tax On Regulatory Fee", "tax on regulatory fee", "tax-on-regulatory-fee",
+const SETTLEMENT_TAX_ON_REG_FEE_ALIASES = [
+  "Tax On Regulatory Fee",
+  "tax on regulatory fee",
+  "tax-on-regulatory-fee",
+  "Tax on Regulatory Fee",
+  "Tax-On Regulatory Fee",
+  "Regulatory fee tax",
+  "regulatory fee tax",
+  "regulatory-fee-tax",
 ];
 const SETTLEMENT_PROMOTIONAL_REBATES_ALIASES = ["promotional rebates", "promotional-rebates"];
 const SETTLEMENT_PROMO_REBATES_TAX_ALIASES = [
@@ -571,9 +612,37 @@ const SETTLEMENT_PROMO_REBATES_TAX_ALIASES = [
 const SETTLEMENT_MARKETPLACE_WITHHELD_TAX_ALIASES = [
   "marketplace withheld tax", "marketplace-withheld-tax",
 ];
-const SETTLEMENT_SELLING_FEES_ALIASES    = ["selling fees", "selling-fees"];
-const SETTLEMENT_FBA_FEES_ALIASES        = ["fba fees", "fba-fees"];
-const SETTLEMENT_OTHER_TX_FEES_ALIASES   = ["other transaction fees", "other-transaction-fees"];
+const SETTLEMENT_SELLING_FEES_ALIASES = [
+  "selling fees",
+  "selling-fees",
+  "Selling Fees",
+  "Selling Fee",
+  "selling fee",
+  "Selling Fees (Amazon)",
+  "Referral Fee",
+  "referral fee",
+];
+const SETTLEMENT_FBA_FEES_ALIASES = [
+  "fba fees",
+  "fba-fees",
+  "FBA Fees",
+  "FBA Fee",
+  "fba fee",
+  "FBA Transaction Fees",
+  "fba transaction fees",
+  "Amazon FBA fees",
+  "amazon fba fees",
+];
+const SETTLEMENT_OTHER_TX_FEES_ALIASES = [
+  "other transaction fees",
+  "other-transaction-fees",
+  "Other transaction fees",
+  "Other Fees",
+  "other fees",
+  "Other transaction fee",
+  "Misc Transaction Fees",
+  "misc transaction fees",
+];
 const SETTLEMENT_OTHER_AMOUNT_ALIASES    = ["other", "Other", "other-amount"];
 const SETTLEMENT_TX_STATUS_ALIASES       = [
   "Transaction Status", "transaction-status", "transaction status", "transaction_status",
@@ -1298,7 +1367,15 @@ export type AmazonInventoryLedgerInsert = {
   sku: string | null;
   asin: string | null;
   product_name: string | null;
+  title: string | null;
   country: string | null;
+  reference_id: string | null;
+  reason_code: string | null;
+  reconciled_quantity: number | null;
+  unreconciled_quantity: number | null;
+  source_file_name: string | null;
+  /** Set on each upsert so updated_at reflects last sync attempt (migration 20260702). */
+  updated_at?: string | null;
   /** All non-physical CSV columns land here. */
   raw_data: Record<string, string> | null;
 };
@@ -1359,8 +1436,97 @@ export function mapRowToAmazonInventoryLedger(
     sku,
     asin,
     product_name,
+    title: product_name,
     country,
+    reference_id: null,
+    reason_code: null,
+    reconciled_quantity: null,
+    unreconciled_quantity: null,
+    source_file_name: null,
     raw_data: buildRawData(row, consumed),
+  };
+}
+
+function ledgerPosKey(i: number): string {
+  return `ledger_pos_${String(i).padStart(2, "0")}`;
+}
+
+function parseLedgerIntQty(s: string): number | null {
+  const q = parseQty(s);
+  if (q == null || !Number.isFinite(q)) return null;
+  return Math.trunc(q);
+}
+
+/**
+ * Maps `amazon_staging.raw_row` with keys `ledger_pos_01` … `ledger_pos_15` only (strict column order).
+ * Col1=event/snapshot date, 2=fnsku, 3=asin, 4=sku, 5=title, 6=event_type, 7=reference_id, 8=qty,
+ * 9=fc/location, 10=disposition, 11=reason_code, 12=country, 13–14=reconciled/unreconciled qty, 15=event_timestamp.
+ */
+export function mapLedgerPositionalRawRowToAmazonInventoryLedgerInsert(
+  rawRow: Record<string, string>,
+  orgId: string,
+  uploadId: string,
+  opts?: { sourceFileName?: string | null },
+): AmazonInventoryLedgerInsert | null {
+  const cells: string[] = [];
+  for (let i = 1; i <= 15; i++) {
+    cells.push(String(rawRow[ledgerPosKey(i)] ?? "").trim());
+  }
+  const fnsku = cells[1];
+  if (!fnsku) return null;
+
+  const raw_data: Record<string, string> = {};
+  for (const [k, v] of Object.entries(rawRow)) {
+    if (k.startsWith("ledger_pos_")) {
+      raw_data[k] = String(v ?? "");
+    }
+  }
+
+  const source_line_hash = computeSourceLineHash(orgId, raw_data);
+
+  const event_date = cells[0] ? parseIsoDate(cells[0]) : null;
+  const event_timestamp = cells[14] ? parseIsoDateTime(cells[14]) : null;
+  const asin = cells[2] || null;
+  const sku = cells[3] || null;
+  const titleText = cells[4] || null;
+  const event_type = (cells[5] || "").trim().toLowerCase() || null;
+  const reference_id = cells[6] || null;
+  const quantity = parseQty(cells[7]);
+  const location = (cells[8] || "").trim().toLowerCase() || null;
+  const disposition = (cells[9] || "").trim().toLowerCase() || null;
+  const reason_code = cells[10] || null;
+  const country = cells[11] || null;
+  const reconciled_quantity = parseLedgerIntQty(cells[12]);
+  const unreconciled_quantity = parseLedgerIntQty(cells[13]);
+
+  const source_file_name =
+    opts?.sourceFileName != null && String(opts.sourceFileName).trim() !== ""
+      ? String(opts.sourceFileName).trim()
+      : null;
+
+  return {
+    organization_id: orgId,
+    upload_id: uploadId,
+    source_line_hash,
+    fnsku,
+    disposition,
+    location,
+    event_type,
+    quantity,
+    event_date,
+    event_timestamp,
+    sku,
+    asin,
+    product_name: titleText,
+    title: titleText,
+    country,
+    reference_id,
+    reason_code,
+    reconciled_quantity,
+    unreconciled_quantity,
+    source_file_name,
+    updated_at: new Date().toISOString(),
+    raw_data: Object.keys(raw_data).length > 0 ? raw_data : null,
   };
 }
 
@@ -1419,6 +1585,57 @@ const SETTLEMENT_TXT_PHYSICAL_KEYS = new Set([
   "total_amount",
   "currency",
 ]);
+
+/** No native column — values stay in raw_data JSONB; mapping guard still treats header as covered. */
+const SETTLEMENT_RAW_DATA_POLICY_LABELS: string[] = [
+  "tax collection model",
+  "Tax Collection Model",
+  "TAX COLLECTION MODEL",
+  "marketplace facilitator tax",
+  "Marketplace Facilitator Tax",
+];
+
+/** All strings whose normKey is considered "covered" by the settlement mapping guard. */
+const SETTLEMENT_GUARD_ALIAS_SOURCE_STRINGS: string[] = [
+  ...SETTLEMENT_RAW_DATA_POLICY_LABELS,
+  ...SETTLEMENT_ID_ALIASES,
+  ...TX_TYPE_ALIASES,
+  ...DEPOSIT_DATE_ALIASES,
+  ...AMOUNT_TOTAL_ALIASES,
+  ...ORDER_ALIASES,
+  ...SKU_ALIASES,
+  ...CURRENCY_ALIASES,
+  ...SETTLEMENT_QUANTITY_ALIASES,
+  ...SETTLEMENT_MARKETPLACE_ALIASES,
+  ...SETTLEMENT_ACCOUNT_TYPE_ALIASES,
+  ...SETTLEMENT_FULFILLMENT_ALIASES,
+  ...SETTLEMENT_PRODUCT_SALES_ALIASES,
+  ...SETTLEMENT_PRODUCT_SALES_TAX_ALIASES,
+  ...SETTLEMENT_SHIPPING_CREDITS_ALIASES,
+  ...SETTLEMENT_SHIPPING_CREDITS_TAX_ALIASES,
+  ...SETTLEMENT_GIFT_WRAP_CREDITS_ALIASES,
+  ...SETTLEMENT_GIFTWRAP_CREDITS_TAX_ALIASES,
+  ...SETTLEMENT_REGULATORY_FEE_ALIASES,
+  ...SETTLEMENT_TAX_ON_REG_FEE_ALIASES,
+  ...SETTLEMENT_PROMOTIONAL_REBATES_ALIASES,
+  ...SETTLEMENT_PROMO_REBATES_TAX_ALIASES,
+  ...SETTLEMENT_MARKETPLACE_WITHHELD_TAX_ALIASES,
+  ...SETTLEMENT_SELLING_FEES_ALIASES,
+  ...SETTLEMENT_FBA_FEES_ALIASES,
+  ...SETTLEMENT_OTHER_TX_FEES_ALIASES,
+  ...SETTLEMENT_OTHER_AMOUNT_ALIASES,
+  ...SETTLEMENT_TX_STATUS_ALIASES,
+  ...SETTLEMENT_TX_RELEASE_DATE_ALIASES,
+  ...SETTLEMENT_DESCRIPTION_ALIASES,
+];
+
+/** Normalized keys: mapper aliases + flat-file keys + raw_data-only policy labels (tax collection model, …). */
+export const SETTLEMENT_GUARD_COVERED_NORM_KEYS: ReadonlySet<string> = (() => {
+  const out = new Set<string>();
+  for (const x of SETTLEMENT_GUARD_ALIAS_SOURCE_STRINGS) out.add(normImportHeaderKey(x));
+  for (const k of SETTLEMENT_TXT_PHYSICAL_KEYS) out.add(normImportHeaderKey(k));
+  return out;
+})();
 
 /** Deterministic line id (no node:crypto — this module is imported from client + server). */
 function settlementAmazonLineKey(parts: string[]): string {
@@ -1614,6 +1831,8 @@ function mapRowToAmazonSettlementLegacyCsv(
 export type AmazonSettlementInsert = {
   organization_id: string;
   upload_id: string;
+  store_id?: string | null;
+  source_file_name?: string | null;
   settlement_id: string;
   /** Dedupe key for upsert — required on all inserts (migration backfills legacy to id::text). */
   amazon_line_key: string;
@@ -1650,6 +1869,7 @@ export type AmazonSettlementInsert = {
   other_amount?: number | null;
   transaction_status?: string | null;
   transaction_release_date?: string | null;
+  updated_at?: string | null;
   raw_data?: Record<string, string> | null;
 };
 

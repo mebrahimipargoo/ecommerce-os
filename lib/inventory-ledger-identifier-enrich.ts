@@ -2,25 +2,13 @@
  * Phase 4 (Generic) for INVENTORY_LEDGER: enrich `product_identifier_map` from
  * `amazon_inventory_ledger` using org-scoped identifier priority (FNSKU-first).
  *
- * Uses physical `sku` / `asin` / `title` when present, else raw_data (never assumes MSKU column on ledger).
+ * Uses typed columns `sku` / `asin` / `title` / `product_name` only (keyset pages; no bulk raw_data reads).
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import { pickRawPayloadFields } from "./amazon-raw-payload-pick";
 import type { ProductIdentifierMapRow } from "./product-identifier-match";
 import { pickBestProductIdentifierMatch, prefetchIdentifierMapCandidatesForBatch } from "./product-identifier-match";
-
-const LEDGER_SKU_KEYS = ["MSKU", "msku", "sku", "Seller SKU", "seller-sku", "seller_sku"];
-const LEDGER_ASIN_KEYS = ["ASIN", "asin", "asin1"];
-const LEDGER_TITLE_KEYS = [
-  "product-name",
-  "product name",
-  "title",
-  "item-name",
-  "item name",
-  "description",
-];
 
 /** Canonical slug written on ledger-derived bridge rows. */
 const INVENTORY_LEDGER_REPORT_SLUG = "inventory_ledger";
@@ -34,8 +22,8 @@ type LedgerRow = {
   sku: string | null;
   asin: string | null;
   title: string | null;
+  product_name: string | null;
   disposition: string | null;
-  raw_data: Record<string, string> | null;
 };
 
 export type InventoryLedgerIdentifierEnrichMetrics = {
@@ -76,38 +64,42 @@ function isMissingColumnError(message: string): boolean {
   );
 }
 
-async function fetchLedgerBatch(
+async function fetchLedgerBatchKeyset(
   supabase: SupabaseClient,
   organizationId: string,
   uploadId: string,
-  offset: number,
+  cursorId: string | null,
   pageSize: number,
 ): Promise<LedgerRow[]> {
-  const fullSelect = "id, fnsku, sku, asin, title, disposition, raw_data";
-  const { data, error } = await supabase
+  const fullSelect = "id, fnsku, sku, asin, title, product_name, disposition";
+  let q = supabase
     .from("amazon_inventory_ledger")
     .select(fullSelect)
     .eq("organization_id", organizationId)
     .eq("upload_id", uploadId)
-    .range(offset, offset + pageSize - 1);
+    .order("id", { ascending: true })
+    .limit(pageSize);
+  if (cursorId) q = q.gt("id", cursorId);
+  const { data, error } = await q;
 
   if (!error) {
     return (data ?? []) as LedgerRow[];
   }
 
   if (isMissingColumnError(error.message)) {
-    const { data: fallback, error: err2 } = await supabase
+    let fq = supabase
       .from("amazon_inventory_ledger")
-      .select("id, fnsku, disposition, raw_data")
+      .select("id, fnsku, sku, asin, title, disposition")
       .eq("organization_id", organizationId)
       .eq("upload_id", uploadId)
-      .range(offset, offset + pageSize - 1);
+      .order("id", { ascending: true })
+      .limit(pageSize);
+    if (cursorId) fq = fq.gt("id", cursorId);
+    const { data: fallback, error: err2 } = await fq;
     if (err2) throw new Error(`ledger generic: read amazon_inventory_ledger failed: ${err2.message}`);
     return (fallback ?? []).map((r) => ({
       ...(r as LedgerRow),
-      sku: null,
-      asin: null,
-      title: null,
+      product_name: null,
     }));
   }
 
@@ -141,7 +133,7 @@ export async function enrichIdentifierMapFromInventoryLedgerUpload(params: {
   pageSize?: number;
 }): Promise<InventoryLedgerIdentifierEnrichMetrics> {
   const { supabase, organizationId, uploadId, storeId } = params;
-  const pageSize = params.pageSize ?? 500;
+  const pageSize = params.pageSize ?? 2000;
 
   const metrics: InventoryLedgerIdentifierEnrichMetrics = {
     ledger_rows_scanned: 0,
@@ -157,16 +149,16 @@ export async function enrichIdentifierMapFromInventoryLedgerUpload(params: {
     unresolved_ledger_rows_remaining: 0,
   };
 
-  let offset = 0;
+  let cursorId: string | null = null;
   while (true) {
-    const rows = await fetchLedgerBatch(supabase, organizationId, uploadId, offset, pageSize);
+    const rows = await fetchLedgerBatchKeyset(supabase, organizationId, uploadId, cursorId, pageSize);
     if (rows.length === 0) break;
+    cursorId = String(rows[rows.length - 1]?.id ?? "").trim() || null;
 
     const normalized = rows.map((r) => {
-      const raw = r.raw_data && typeof r.raw_data === "object" && !Array.isArray(r.raw_data) ? r.raw_data : {};
-      const sku = n(r.sku) ?? (pickRawPayloadFields(raw, LEDGER_SKU_KEYS) || null);
-      const asin = n(r.asin) ?? (pickRawPayloadFields(raw, LEDGER_ASIN_KEYS) || null);
-      const title = n(r.title) ?? (pickRawPayloadFields(raw, LEDGER_TITLE_KEYS) || null);
+      const sku = n(r.sku);
+      const asin = n(r.asin);
+      const title = n(r.title) ?? n(r.product_name);
       const fnsku = n(r.fnsku);
       const disposition = n(r.disposition);
       return {
@@ -376,7 +368,6 @@ export async function enrichIdentifierMapFromInventoryLedgerUpload(params: {
     }
 
     metrics.ledger_rows_scanned += rows.length;
-    offset += pageSize;
     if (rows.length < pageSize) break;
   }
 

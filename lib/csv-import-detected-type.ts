@@ -988,14 +988,10 @@ export function looksLikeHeaderlessInventoryLedger(firstRowCells: string[]): boo
 }
 
 /**
- * Canonical synthetic header order for the headerless Amazon Inventory Ledger
- * export. Aligned with the column mapping in the user spec:
- *   col1=event_date, col2=fnsku, col3=asin, col4=sku, col5=product_name,
- *   col6=event_type, col7=(unused), col8=quantity, col9=location,
- *   col10=disposition, col11..col14=(unused), col15=event_timestamp.
- *
- * The unused slots get distinct synthetic names (col7, col11, ...) so they
- * land in raw_data without colliding with any aliased canonical key.
+ * @deprecated Legacy semantic header names for headerless ledger probes / tests.
+ * Production staging uses `ledger_pos_01`…`ledger_pos_15` via
+ * `buildInventoryLedgerPositionalStagingHeaders` — do not use this array for
+ * mapping semantics (column order differs from the real Amazon 15-col file).
  */
 export const HEADERLESS_INVENTORY_LEDGER_SYNTHETIC_HEADERS = [
   "event_date",         //  col1

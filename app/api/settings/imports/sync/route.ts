@@ -1,4 +1,4 @@
-/**
+﻿/**
  * POST /api/settings/imports/sync
  *
  * Phase 3 of the 3-phase ETL pipeline.
@@ -31,6 +31,7 @@ import {
   applyColumnMappingToRow,
   mapRowToAmazonAllOrders,
   mapRowToAmazonInventoryLedger,
+  mapLedgerPositionalRawRowToAmazonInventoryLedgerInsert,
   mapRowToAmazonReimbursement,
   mapRowToAmazonRemoval,
   mapRowToAmazonRemovalShipment,
@@ -79,14 +80,18 @@ import { logImportPhase } from "../../../../../lib/pipeline/amazon-import-engine
 import {
   FPS_KEY_COMPLETE,
   FPS_KEY_FAILED,
+  FPS_KEY_PROCESS,
   FPS_KEY_SYNC,
   FPS_LABEL_COMPLETE,
+  FPS_LABEL_PROCESS,
   FPS_NEXT_ACTION_LABEL_GENERIC,
+  FPS_NEXT_ACTION_LABEL_SYNC,
   fpsLabelSync,
   fpsNextAfterSync,
   fpsPctPhase3,
 } from "../../../../../lib/pipeline/file-processing-status-contract";
 import { resolveImportFileRowTotal } from "../../../../../lib/import-file-row-total";
+import { evaluateSettlementMappingGuard } from "../../../../../lib/settlement-mapping-guard";
 import {
   CONFLICT_KEY,
   DOMAIN_TABLE,
@@ -97,6 +102,7 @@ import {
   type AmazonImportEngineConfig,
   type AmazonSyncKind,
 } from "../../../../../lib/pipeline/amazon-report-registry";
+import { rawRowUsesInventoryLedgerPositionalKeys } from "../../../../../lib/inventory-ledger-positional";
 import { completeInventoryLedgerProductIdentifierMapPhase } from "../../../../../lib/inventory-ledger-generic-completion";
 import { resolveAmazonImportProducts } from "../../../../../lib/amazon-import-product-resolver";
 import { removalShipmentArchiveBusinessKey } from "../../../../../lib/pipeline/removal-shipment-archive-key";
@@ -123,7 +129,50 @@ const BATCH_SIZE = 500;
 const UPSERT_CHUNK_SIZE = 500;
 /** Page size for staging reads. Always use range(0, …); do not advance offset after rows are deleted. */
 const STAGING_READ_BATCH = 1000;
+/** Inventory Ledger: larger keyset pages (1k–5k range; keeps latency predictable). */
+const LEDGER_STAGING_READ_BATCH = 2500;
 const STAGING_TABLE = "amazon_staging";
+
+const LEDGER_UPSERT_MAX_ATTEMPTS = 6;
+const LEDGER_UPSERT_BACKOFF_MS = [600, 2400, 5000, 12_000, 24_000] as const;
+
+async function upsertDomainChunkWithLedgerRetry(
+  kind: AmazonSyncKind,
+  table: string,
+  chunk: Record<string, unknown>[],
+  conflictKey: string,
+): Promise<void> {
+  if (chunk.length === 0) return;
+  if (kind !== "INVENTORY_LEDGER") {
+    const { error } = await supabaseServer
+      .from(table)
+      .upsert(chunk, { onConflict: conflictKey, ignoreDuplicates: false });
+    if (error) {
+      throw new Error(
+        `[${kind}] upsert into ${table} failed: ${error.message}` +
+          ` (conflict key: ${conflictKey}, chunk size: ${chunk.length})`,
+      );
+    }
+    return;
+  }
+  for (let attempt = 0; attempt < LEDGER_UPSERT_MAX_ATTEMPTS; attempt++) {
+    const { error } = await supabaseServer
+      .from(table)
+      .upsert(chunk, { onConflict: conflictKey, ignoreDuplicates: false });
+    if (!error) return;
+    const transient = /timeout|statement timeout|57114|ECONNRESET|socket|fetch|502|503|504|429|Too Many Requests|connection|NetworkError/i.test(
+      error.message,
+    );
+    if (!transient || attempt === LEDGER_UPSERT_MAX_ATTEMPTS - 1) {
+      throw new Error(
+        `[INVENTORY_LEDGER] upsert into ${table} failed: ${error.message}` +
+          ` (conflict key: ${conflictKey}, chunk size: ${chunk.length})`,
+      );
+    }
+    const wait = LEDGER_UPSERT_BACKOFF_MS[Math.min(attempt, LEDGER_UPSERT_BACKOFF_MS.length - 1)];
+    await new Promise((r) => setTimeout(r, wait));
+  }
+}
 
 /** File fingerprint from Phase-1 metadata; stable across re-import of the same bytes. */
 function resolveSourceFileSha256(meta: unknown, uploadId: string): string {
@@ -1346,6 +1395,80 @@ async function runProductIdentitySyncBranch(opts: {
   }
 }
 
+type FpsRevertAfterSyncPreflight = {
+  engine: AmazonImportEngineConfig;
+  phase2StagedWatermark: number;
+  fileRowTotal: number | null;
+};
+
+/** Revert optimistic sync lock - upload returns to `staged` after a pre-flight block (no domain writes). */
+async function releaseRawReportSyncLockToStaged(
+  uploadId: string,
+  orgId: string,
+  metaExtras: Record<string, unknown>,
+  fpsRevert?: FpsRevertAfterSyncPreflight,
+): Promise<void> {
+  const { data: prevRow } = await supabaseServer
+    .from("raw_report_uploads")
+    .select("metadata")
+    .eq("id", uploadId)
+    .maybeSingle();
+  await supabaseServer
+    .from("raw_report_uploads")
+    .update({
+      status: "staged",
+      metadata: mergeUploadMetadata((prevRow as { metadata?: unknown } | null)?.metadata, {
+        etl_phase: "staging",
+        sync_progress: 0,
+        error_message: "",
+        ...metaExtras,
+      }),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", uploadId)
+    .eq("organization_id", orgId);
+
+  if (fpsRevert) {
+    const e = fpsRevert.engine;
+    const stageLabel = e.stage_target_table ?? "amazon_staging";
+    await supabaseServer.from("file_processing_status").upsert(
+      {
+        upload_id: uploadId,
+        organization_id: orgId,
+        status: "pending",
+        current_phase: "staged",
+        phase_key: FPS_KEY_PROCESS,
+        phase_label: FPS_LABEL_PROCESS,
+        current_phase_label: "Ready for Sync",
+        next_action_key: "sync",
+        next_action_label: FPS_NEXT_ACTION_LABEL_SYNC,
+        stage_target_table: e.stage_target_table,
+        sync_target_table: e.sync_target_table,
+        generic_target_table: e.generic_target_table,
+        current_target_table: stageLabel,
+        upload_pct: 100,
+        process_pct: 100,
+        sync_pct: 0,
+        phase1_upload_pct: 100,
+        phase2_stage_pct: 100,
+        phase3_raw_sync_pct: 0,
+        phase3_status: "pending",
+        processed_rows: fpsRevert.phase2StagedWatermark,
+        staged_rows_written: fpsRevert.phase2StagedWatermark,
+        raw_rows_written: 0,
+        raw_rows_skipped_existing: 0,
+        duplicate_rows_skipped: 0,
+        ...(fpsRevert.fileRowTotal != null && fpsRevert.fileRowTotal > 0
+          ? { total_rows: fpsRevert.fileRowTotal }
+          : {}),
+        import_metrics: { current_phase: "staged", rows_synced: 0 },
+        error_message: null,
+      },
+      { onConflict: "upload_id" },
+    );
+  }
+}
+
 /** Write a "failed" status back to the upload row (best-effort, never throws). */
 async function markFailed(uploadId: string, orgId: string, message: string): Promise<void> {
   try {
@@ -1390,6 +1513,8 @@ async function markFailed(uploadId: string, orgId: string, message: string): Pro
 export async function POST(req: Request): Promise<Response> {
   let uploadIdForFail: string | null = null;
   let orgId = "";
+  /** Set after report kind is resolved — used by catch to choose staged revert vs failed for ledger. */
+  let activeAmazonSyncKind: AmazonSyncKind | null = null;
 
   try {
     const body = (await req.json()) as Body;
@@ -1478,6 +1603,7 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     const kind = earlyKind;
+    activeAmazonSyncKind = kind;
     const reportTypeRawEarly = String((row as { report_type?: string }).report_type ?? "").trim();
 
     if (kind === "UNKNOWN") {
@@ -1629,7 +1755,7 @@ export async function POST(req: Request): Promise<Response> {
     const [{ count: stagingRowCount }, { data: fpsBeforeSync }] = await Promise.all([
       supabaseServer
         .from(STAGING_TABLE)
-        .select("*", { count: "exact", head: true })
+        .select("id", { count: "exact", head: true })
         .eq("upload_id", uploadId)
         .eq("organization_id", orgId),
       supabaseServer.from("file_processing_status").select("*").eq("upload_id", uploadId).maybeSingle(),
@@ -1663,6 +1789,55 @@ export async function POST(req: Request): Promise<Response> {
     if (kind === "REPORTS_REPOSITORY") {
       await assertReportsRepoStagingPhysicalIntegrity(orgId, uploadId);
     }
+
+    if (kind === "SETTLEMENT" && totalStagingRows > 0) {
+      const { data: guardSamples, error: guardErr } = await supabaseServer
+        .from(STAGING_TABLE)
+        .select("row_number, raw_row")
+        .eq("upload_id", uploadId)
+        .eq("organization_id", orgId)
+        .order("row_number", { ascending: true })
+        .limit(120);
+      if (guardErr) throw new Error(`Settlement mapping guard: staging read failed: ${guardErr.message}`);
+      const guard = evaluateSettlementMappingGuard({
+        stagingSamples: (guardSamples ?? []) as { row_number: number; raw_row: Record<string, string> }[],
+        columnMapping,
+        organizationId: orgId,
+        uploadId,
+      });
+      if (guard.blocked) {
+        await releaseRawReportSyncLockToStaged(
+          uploadId,
+          orgId,
+          {
+            settlement_mapping_guard_blocked: true,
+            settlement_mapping_guard_reason: guard.blockReason ?? "",
+            settlement_mapping_guard_summary: {
+              mapperAcceptedSample: guard.mapperAcceptedSample,
+              mapperRejectedSample: guard.mapperRejectedSample,
+              lowConfidenceFinancialKeys: guard.lowConfidenceFinancialKeys,
+            },
+          },
+          { engine, phase2StagedWatermark, fileRowTotal },
+        );
+        return NextResponse.json(
+          {
+            ok: false,
+            phase: "sync",
+            uploadId,
+            error: "Settlement mapping guard blocked sync.",
+            details: guard.blockReason,
+            settlement_mapping_guard: true,
+            mappingReport: guard.mappingReport,
+            mapperAcceptedSample: guard.mapperAcceptedSample,
+            mapperRejectedSample: guard.mapperRejectedSample,
+            lowConfidenceFinancialKeys: guard.lowConfidenceFinancialKeys,
+          },
+          { status: 422 },
+        );
+      }
+    }
+
     const syncUpserted = { value: 0 };
 
     const syncMetricTotals: BatchUpsertMetricDelta = {
@@ -1766,13 +1941,15 @@ export async function POST(req: Request): Promise<Response> {
       removalShipmentRawWritten = r.rawRowsWritten;
       removalShipmentSkippedCross = r.rawRowsSkippedCrossUpload;
     } else while (true) {
-      // ── Read next chunk: always from the start — prior rows were deleted from staging. ──
+      // ── Read next chunk: rows deleted after successful upsert; ORDER BY id for stable keyset-style paging. ──
+      const stagingLimit = kind === "INVENTORY_LEDGER" ? LEDGER_STAGING_READ_BATCH : STAGING_READ_BATCH;
       const { data: stagingRows, error: readErr } = await supabaseServer
         .from(STAGING_TABLE)
         .select("id, row_number, raw_row, source_line_hash")
         .eq("upload_id", uploadId)
         .eq("organization_id", orgId)
-        .range(0, STAGING_READ_BATCH - 1);
+        .order("id", { ascending: true })
+        .limit(stagingLimit);
 
       if (readErr) throw new Error(`Staging read failed: ${readErr.message}`);
       if (!stagingRows || stagingRows.length === 0) break;
@@ -1808,7 +1985,22 @@ export async function POST(req: Request): Promise<Response> {
             insertRow = mapRowToAmazonRemoval(mappedRow, orgId, uploadId, importStoreId!) as Record<string, unknown> | null;
             if (insertRow) insertRow.source_staging_id = sr.id;
           } else if (kind === "INVENTORY_LEDGER") {
-            insertRow = mapRowToAmazonInventoryLedger(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
+            const rawRowObj = (sr.raw_row ?? {}) as Record<string, string>;
+            if (rawRowUsesInventoryLedgerPositionalKeys(sr.raw_row)) {
+              insertRow = mapLedgerPositionalRawRowToAmazonInventoryLedgerInsert(
+                rawRowObj,
+                orgId,
+                uploadId,
+                {
+                  sourceFileName:
+                    typeof (row as { file_name?: unknown }).file_name === "string"
+                      ? String((row as { file_name: string }).file_name).trim() || null
+                      : null,
+                },
+              ) as Record<string, unknown> | null;
+            } else {
+              insertRow = mapRowToAmazonInventoryLedger(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
+            }
           } else if (kind === "REIMBURSEMENTS") {
             insertRow = mapRowToAmazonReimbursement(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
           } else if (kind === "SETTLEMENT") {
@@ -2111,7 +2303,7 @@ export async function POST(req: Request): Promise<Response> {
     } else if (kind === "INVENTORY_LEDGER") {
       const { count } = await supabaseServer
         .from("amazon_inventory_ledger")
-        .select("*", { count: "exact", head: true })
+        .select("id", { count: "exact", head: true })
         .eq("organization_id", orgId)
         .eq("upload_id", uploadId);
       rowsEligibleGeneric = typeof count === "number" ? count : 0;
@@ -2294,7 +2486,35 @@ export async function POST(req: Request): Promise<Response> {
     // Any staging rows not yet deleted remain intact so the user can retry
     // Phase 3 after fixing the underlying issue.
     if (uploadIdForFail && isUuidString(uploadIdForFail) && isUuidString(orgId)) {
-      await markFailed(uploadIdForFail, orgId, message);
+      if (activeAmazonSyncKind === "INVENTORY_LEDGER") {
+        const { data: fpsRow } = await supabaseServer
+          .from("file_processing_status")
+          .select("staged_rows_written, total_rows")
+          .eq("upload_id", uploadIdForFail)
+          .maybeSingle();
+        const fpsRec = fpsRow && typeof fpsRow === "object" ? (fpsRow as Record<string, unknown>) : {};
+        const wm =
+          typeof fpsRec.staged_rows_written === "number" && Number.isFinite(fpsRec.staged_rows_written)
+            ? Math.floor(fpsRec.staged_rows_written)
+            : 0;
+        const frt =
+          typeof fpsRec.total_rows === "number" && fpsRec.total_rows > 0 ? Math.floor(fpsRec.total_rows as number) : null;
+        await releaseRawReportSyncLockToStaged(
+          uploadIdForFail,
+          orgId,
+          {
+            inventory_ledger_sync_error: message.slice(0, 4000),
+            error_message: message.slice(0, 2000),
+          },
+          {
+            engine: resolveAmazonImportEngineConfig("INVENTORY_LEDGER"),
+            phase2StagedWatermark: wm,
+            fileRowTotal: frt,
+          },
+        );
+      } else {
+        await markFailed(uploadIdForFail, orgId, message);
+      }
     }
 
     return NextResponse.json(
@@ -2380,23 +2600,23 @@ async function bumpSyncProgressMetadata(
 
   let rawW: number;
   let rawSkip: number;
-  if (removalShipment) {
-    rawW = removalShipment.rawRowsWritten;
-    rawSkip = removalShipment.rawRowsSkippedCrossUpload;
-  } else if (opts.metricTotals) {
-    const m = opts.metricTotals;
-    rawW = m.rows_synced_new + m.rows_synced_updated + m.rows_synced_unchanged;
-    rawSkip = m.rows_duplicate_against_existing;
-  } else {
-    rawW = opts.upserted.value;
-    rawSkip = 0;
-  }
-  const dupBatch = opts.duplicateInBatchTotal?.value ?? 0;
+  let phase3Pct: number;
+  const cumWritten = opts.upserted.value;
   const phase3Denom =
     opts.fileRowTotal != null && opts.fileRowTotal > 0
       ? opts.fileRowTotal
       : Math.max(1, opts.totalStagingRows);
-  const phase3Pct = fpsPctPhase3(rawW, rawSkip, phase3Denom);
+  if (removalShipment) {
+    rawW = removalShipment.rawRowsWritten;
+    rawSkip = removalShipment.rawRowsSkippedCrossUpload;
+    phase3Pct = fpsPctPhase3(rawW, rawSkip, phase3Denom);
+  } else {
+    rawW = cumWritten;
+    rawSkip = opts.metricTotals?.rows_duplicate_against_existing ?? 0;
+    // Never show 100% until terminal completion writes sync_pct=100 (avoids UI "done" while work continues).
+    phase3Pct = Math.min(99, Math.round((cumWritten / phase3Denom) * 100));
+  }
+  const dupBatch = opts.duplicateInBatchTotal?.value ?? 0;
 
   await supabaseServer
     .from("raw_report_uploads")
@@ -2412,6 +2632,19 @@ async function bumpSyncProgressMetadata(
           total_staging_rows: opts.totalStagingRows,
           ...(opts.fileRowTotal != null && opts.fileRowTotal > 0 ? { file_row_total_plan: opts.fileRowTotal } : {}),
           ...(opts.syncCountVerifyPending ? { sync_count_verification_pending: true } : {}),
+          ...(opts.metricTotals && !removalShipment
+            ? {
+                rows_synced_new: opts.metricTotals.rows_synced_new,
+                rows_synced_updated: opts.metricTotals.rows_synced_updated,
+                rows_synced_unchanged: opts.metricTotals.rows_synced_unchanged,
+                rows_duplicate_against_existing: opts.metricTotals.rows_duplicate_against_existing,
+                sync_rows_attempted:
+                  opts.metricTotals.rows_synced_new +
+                  opts.metricTotals.rows_synced_updated +
+                  opts.metricTotals.rows_synced_unchanged +
+                  opts.metricTotals.rows_duplicate_against_existing,
+              }
+            : {}),
           ...(removalShipment
             ? {
                 removal_shipment_raw_rows_written: removalShipment.rawRowsWritten,
@@ -2460,6 +2693,19 @@ async function bumpSyncProgressMetadata(
           total_staging_rows: opts.totalStagingRows,
           ...(opts.fileRowTotal != null && opts.fileRowTotal > 0 ? { file_row_total_plan: opts.fileRowTotal } : {}),
           ...(opts.syncCountVerifyPending ? { sync_count_verification_pending: true } : {}),
+          ...(opts.metricTotals && !removalShipment
+            ? {
+                rows_synced_new: opts.metricTotals.rows_synced_new,
+                rows_synced_updated: opts.metricTotals.rows_synced_updated,
+                rows_synced_unchanged: opts.metricTotals.rows_synced_unchanged,
+                rows_duplicate_against_existing: opts.metricTotals.rows_duplicate_against_existing,
+                sync_rows_attempted:
+                  opts.metricTotals.rows_synced_new +
+                  opts.metricTotals.rows_synced_updated +
+                  opts.metricTotals.rows_synced_unchanged +
+                  opts.metricTotals.rows_duplicate_against_existing,
+              }
+            : {}),
           ...(removalShipment
             ? {
                 removal_shipment_raw_rows_written: removalShipment.rawRowsWritten,
@@ -2886,19 +3132,19 @@ async function flushDomainBatch(
   if (conflictKey) {
     for (let off = 0; off < deduped.length; off += UPSERT_CHUNK_SIZE) {
       const chunk = deduped.slice(off, off + UPSERT_CHUNK_SIZE);
-      const { error } = await supabaseServer
-        .from(table)
-        .upsert(chunk, { onConflict: conflictKey, ignoreDuplicates: false });
+      if (kind === "REPORTS_REPOSITORY") {
+        const { error } = await supabaseServer
+          .from(table)
+          .upsert(chunk, { onConflict: conflictKey, ignoreDuplicates: false });
 
-      if (error) {
-        // Structured diagnostic for REPORTS_REPOSITORY duplicate-key failures:
-        // surface the chunk size, distinct physical-line count, sample
-        // conflicting keys, and a hint to check for orphan unique indexes
-        // (uq_amazon_reports_repo_natural / uq_amazon_reports_repo_org_line_hash)
-        // that the migration history claims to drop but may still exist in
-        // some environments — those would also raise duplicate-key errors
-        // even though the application's own ON CONFLICT target is fine.
-        if (kind === "REPORTS_REPOSITORY") {
+        if (error) {
+          // Structured diagnostic for REPORTS_REPOSITORY duplicate-key failures:
+          // surface the chunk size, distinct physical-line count, sample
+          // conflicting keys, and a hint to check for orphan unique indexes
+          // (uq_amazon_reports_repo_natural / uq_amazon_reports_repo_org_line_hash)
+          // that the migration history claims to drop but may still exist in
+          // some environments — those would also raise duplicate-key errors
+          // even though the application's own ON CONFLICT target is fine.
           const distinctPhysical = uniqueReportsRepoFileRowKeyCount(chunk);
           const dupKeys = listDuplicateReportsRepoFileRowKeys(chunk);
           console.error(
@@ -2927,10 +3173,8 @@ async function flushDomainBatch(
               `If chunk_size === distinct, a stale unique index on amazon_reports_repository is the cause — see server logs for diagnostic and verification SQL.`,
           );
         }
-        throw new Error(
-          `[${kind}] upsert into ${table} failed: ${error.message}` +
-            ` (conflict key: ${conflictKey}, chunk size: ${chunk.length})`,
-        );
+      } else {
+        await upsertDomainChunkWithLedgerRetry(kind, table, chunk, conflictKey);
       }
       if (syncProgress) await bumpSyncProgressMetadata(syncProgress, chunk.length);
     }
@@ -2945,6 +3189,15 @@ async function flushDomainBatch(
     }
   }
 
+  console.log(
+    JSON.stringify({
+      event: "sync_batch_completed",
+      kind,
+      table,
+      rows_deduped: deduped.length,
+      rows_collapsed_in_batch: collapsedInBatch,
+    }),
+  );
   return { flushed: deduped.length, collapsedInBatch };
 }
 

@@ -272,6 +272,14 @@ export type RawReportUploadMetadata = {
     };
     invalid_sku_examples?: { rowNumber: number; rawValue: string; reason: string }[];
   };
+  /** SETTLEMENT Phase 3 pre-flight: mapping guard blocked sync (operator reviews mapping report). */
+  settlement_mapping_guard_blocked?: boolean;
+  settlement_mapping_guard_reason?: string;
+  settlement_mapping_guard_summary?: {
+    mapperAcceptedSample?: number;
+    mapperRejectedSample?: number;
+    lowConfidenceFinancialKeys?: string[];
+  };
 };
 
 function num(v: unknown, fallback = 0): number {

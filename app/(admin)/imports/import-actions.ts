@@ -893,6 +893,11 @@ export async function updateUploadSessionClassification(input: {
    * `csv-parser` to use these directly and treat row 0 as data.
    */
   synthesizedHeaders?: string[] | null;
+  /**
+   * When true, staging uses strict `ledger_pos_01`…`ledger_pos_15` keys (real Amazon column order).
+   * Sync maps via `mapLedgerPositionalRawRowToAmazonInventoryLedgerInsert` — not semantic synthetic headers.
+   */
+  inventoryLedgerPositional?: boolean | null;
 }): Promise<{ ok: boolean; error?: string }> {
   const userId = await resolveActorForImportAction(input.actorUserId);
   if (!isUuidString(input.uploadId)) return { ok: false, error: "Invalid upload id." };
@@ -972,6 +977,11 @@ export async function updateUploadSessionClassification(input: {
     metaPatch.synthesized_headers = input.synthesizedHeaders;
     // header_row_index = -1 sentinel: row 0 is a data line, not a header.
     metaPatch.header_row_index = -1;
+  }
+  if (input.inventoryLedgerPositional === true) {
+    metaPatch.inventory_ledger_positional = true;
+  } else if (input.inventoryLedgerPositional === false) {
+    metaPatch.inventory_ledger_positional = false;
   }
 
   const mergedForWrite = mergeUploadMetadata((row as { metadata?: unknown }).metadata, metaPatch);

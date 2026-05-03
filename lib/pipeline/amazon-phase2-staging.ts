@@ -1969,6 +1969,16 @@ export async function executeAmazonPhase2Staging(reqOrBody: Request | StageReque
           }
         }
 
+        if (reportTypeRaw === "INVENTORY_LEDGER" && metaObj.inventory_ledger_positional === true) {
+          const d0 = mappedRow["ledger_pos_01"] ?? "";
+          if (d0) {
+            const d = new Date(String(d0));
+            if (!Number.isNaN(d.getTime())) {
+              stagingRow.snapshot_date = d.toISOString().slice(0, 10);
+            }
+          }
+        }
+
         batch.push(stagingRow);
 
         if (batch.length >= BATCH_SIZE) {

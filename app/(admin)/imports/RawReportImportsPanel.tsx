@@ -321,9 +321,25 @@ export function RawReportImportsPanel({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ upload_id: r.id }),
       });
-      const json = await readImportApiJson<{ ok?: boolean; error?: string; details?: string }>(res);
+      const json = await readImportApiJson<{
+        ok?: boolean;
+        error?: string;
+        details?: string;
+        settlement_mapping_guard?: boolean;
+        lowConfidenceFinancialKeys?: string[];
+      }>(res);
       if (!res.ok || !json.ok) {
-        setLoadErr(json.details || json.error || "Sync failed.");
+        if (json.settlement_mapping_guard) {
+          const keys = json.lowConfidenceFinancialKeys?.length
+            ? ` Unmapped financial-like headers: ${json.lowConfidenceFinancialKeys.join(", ")}.`
+            : "";
+          setLoadErr(
+            `${json.details || json.error || "Settlement mapping guard blocked sync."}${keys}` +
+              " See Network response JSON for full mappingReport.",
+          );
+        } else {
+          setLoadErr(json.details || json.error || "Sync failed.");
+        }
       }
       await refresh();
     } catch (e) {

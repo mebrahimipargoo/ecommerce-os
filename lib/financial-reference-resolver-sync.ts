@@ -97,35 +97,57 @@ function reimbursementTridKey(row: Record<string, unknown>): string {
   return id ? `${base}|rid:${id}` : base;
 }
 
-export async function syncFinancialReferenceResolverForUpload(
-  supabase: SupabaseClient,
-  organizationId: string,
-  uploadId: string,
-  kind: AmazonSyncKind,
-): Promise<{ upserted: number }> {
-  if (kind !== "SETTLEMENT" && kind !== "TRANSACTIONS" && kind !== "REIMBURSEMENTS") {
-    return { upserted: 0 };
+/** Columns required for FRR rows (avoid select * + huge raw payloads / statement timeouts). */
+function domainRowSelectColumns(kind: AmazonSyncKind): string {
+  if (kind === "SETTLEMENT") {
+    // Omit raw_data (large JSONB) — physical currency covers resolver needs; avoids read timeouts.
+    return [
+      "id",
+      "amazon_line_key",
+      "settlement_id",
+      "order_id",
+      "sku",
+      "posted_date",
+      "transaction_type",
+      "amount_total",
+      "source_physical_row_number",
+      "source_file_sha256",
+      "currency",
+    ].join(",");
   }
+  if (kind === "TRANSACTIONS") {
+    return [
+      "id",
+      "settlement_id",
+      "order_id",
+      "sku",
+      "posted_date",
+      "transaction_type",
+      "amount",
+      "source_physical_row_number",
+      "source_file_sha256",
+    ].join(",");
+  }
+  return [
+    "id",
+    "reimbursement_id",
+    "order_id",
+    "sku",
+    "amount_reimbursed",
+    "source_physical_row_number",
+    "source_file_sha256",
+  ].join(",");
+}
 
-  const table =
-    kind === "SETTLEMENT"
-      ? "amazon_settlements"
-      : kind === "TRANSACTIONS"
-        ? "amazon_transactions"
-        : "amazon_reimbursements";
-
-  const { data: rows, error: readErr } = await supabase
-    .from(table)
-    .select("*")
-    .eq("organization_id", organizationId)
-    .eq("upload_id", uploadId);
-
-  if (readErr) throw new Error(`financial_reference_resolver: read ${table} failed: ${readErr.message}`);
-
-  const list = (rows ?? []) as Record<string, unknown>[];
+function buildFinancialReferenceResolverBatch(
+  rows: Record<string, unknown>[],
+  kind: AmazonSyncKind,
+  organizationId: string,
+  sourceTable: string,
+): Record<string, unknown>[] {
   const batch: Record<string, unknown>[] = [];
 
-  for (const row of list) {
+  for (const row of rows) {
     const id = normStr(row.id);
     if (!id) continue;
 
@@ -192,7 +214,7 @@ export async function syncFinancialReferenceResolverForUpload(
     batch.push({
       organization_id: organizationId,
       trid_key,
-      source_table: table,
+      source_table: sourceTable,
       source_row_id: id,
       settlement_id,
       order_id,
@@ -207,16 +229,64 @@ export async function syncFinancialReferenceResolverForUpload(
     });
   }
 
+  return batch;
+}
+
+export async function syncFinancialReferenceResolverForUpload(
+  supabase: SupabaseClient,
+  organizationId: string,
+  uploadId: string,
+  kind: AmazonSyncKind,
+): Promise<{ upserted: number }> {
+  if (kind !== "SETTLEMENT" && kind !== "TRANSACTIONS" && kind !== "REIMBURSEMENTS") {
+    return { upserted: 0 };
+  }
+
+  const table =
+    kind === "SETTLEMENT"
+      ? "amazon_settlements"
+      : kind === "TRANSACTIONS"
+        ? "amazon_transactions"
+        : "amazon_reimbursements";
+
+  const cols = domainRowSelectColumns(kind);
+  // Keyset pagination (id > cursor) — OFFSET range scans time out on huge uploads.
+  const PAGE = 800;
   const CHUNK = 300;
   let upserted = 0;
-  for (let off = 0; off < batch.length; off += CHUNK) {
-    const chunk = batch.slice(off, off + CHUNK);
-    const { error: upErr } = await supabase.from("financial_reference_resolver").upsert(chunk, {
-      onConflict: "organization_id,trid_key,source_table,source_row_id",
-      ignoreDuplicates: false,
-    });
-    if (upErr) throw new Error(`financial_reference_resolver upsert failed: ${upErr.message}`);
-    upserted += chunk.length;
+  let lastId: string | null = null;
+
+  for (;;) {
+    let q = supabase
+      .from(table)
+      .select(cols)
+      .eq("organization_id", organizationId)
+      .eq("upload_id", uploadId)
+      .order("id", { ascending: true })
+      .limit(PAGE);
+    if (lastId) q = q.gt("id", lastId);
+
+    const { data: page, error: readErr } = await q;
+
+    if (readErr) throw new Error(`financial_reference_resolver: read ${table} failed: ${readErr.message}`);
+    const rows = (page ?? []) as unknown as Record<string, unknown>[];
+    if (rows.length === 0) break;
+
+    const lastRowId = normStr(rows[rows.length - 1]?.id);
+    if (lastRowId) lastId = lastRowId;
+
+    const batch = buildFinancialReferenceResolverBatch(rows, kind, organizationId, table);
+    for (let off = 0; off < batch.length; off += CHUNK) {
+      const slice = batch.slice(off, off + CHUNK);
+      const { error: upErr } = await supabase.from("financial_reference_resolver").upsert(slice, {
+        onConflict: "organization_id,trid_key,source_table,source_row_id",
+        ignoreDuplicates: false,
+      });
+      if (upErr) throw new Error(`financial_reference_resolver upsert failed: ${upErr.message}`);
+      upserted += slice.length;
+    }
+
+    if (rows.length < PAGE) break;
   }
 
   console.log(

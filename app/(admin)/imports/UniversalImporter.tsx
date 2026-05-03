@@ -38,10 +38,10 @@ import {
 import { createLedgerStorageSignedUploadUrl } from "../lib/amazon-ledger-actions";
 import {
   classifyCsvHeadersRuleBased,
-  HEADERLESS_INVENTORY_LEDGER_SYNTHETIC_HEADERS,
   headersLookLikeAmazonTransactionDetailReport,
   looksLikeHeaderlessInventoryLedger,
 } from "../../../lib/csv-import-detected-type";
+import { buildInventoryLedgerPositionalStagingHeaders } from "../../../lib/inventory-ledger-positional";
 import { findHeaderRowIndex, parseCsvToMatrix } from "../../../lib/csv-parse-basic";
 import {
   contentSuggestsReportsRepositorySample,
@@ -785,9 +785,8 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
 
     const pollDelayMs = () => {
       const p = phaseRef.current;
-      return p === "processing" || p === "syncing" || p === "genericing" || p === "worklisting"
-        ? 6200
-        : 2800;
+      if (p === "syncing") return 500;
+      return p === "processing" || p === "genericing" || p === "worklisting" ? 6200 : 2800;
     };
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const scheduleNext = () => {
@@ -1280,8 +1279,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
     setProgressMsg("Syncing to final tables…");
     setPhaseLabel("Syncing");
     const uploadIdSnap = sessionUploadId;
-    if (pollRef2.current) clearInterval(pollRef2.current);
-    pollRef2.current = setInterval(() => {
+    const pollSyncProgress = () => {
       void Promise.all([
         supabase.from("raw_report_uploads").select("metadata").eq("id", uploadIdSnap).maybeSingle(),
         supabase.from("file_processing_status").select("*").eq("upload_id", uploadIdSnap).maybeSingle(),
@@ -1315,7 +1313,10 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
           setProgressMsg(`Syncing… ${pr.toLocaleString()} rows${pend}`);
         }
       });
-    }, 3000);
+    };
+    pollSyncProgress();
+    if (pollRef2.current) clearInterval(pollRef2.current);
+    pollRef2.current = setInterval(pollSyncProgress, 500);
     try {
       const res = await fetch("/api/settings/imports/sync", {
         method: "POST",
@@ -1334,8 +1335,23 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
         identifiersUpserted?: number;
         kind?: string;
         productIdentity?: { stats?: ProductIdentityImportStats };
+        settlement_mapping_guard?: boolean;
+        mappingReport?: unknown;
+        lowConfidenceFinancialKeys?: string[];
       }>(res);
-      if (!res.ok || !json.ok) throw new Error(json.details || json.error || "Sync failed.");
+      if (!res.ok || !json.ok) {
+        if (json.settlement_mapping_guard) {
+          setSyncPct(0);
+          const keys = json.lowConfidenceFinancialKeys?.length
+            ? ` Unmapped financial-like headers: ${json.lowConfidenceFinancialKeys.join(", ")}.`
+            : "";
+          throw new Error(
+            `${json.details || json.error || "Settlement mapping guard blocked sync."}${keys}` +
+              " See Network response JSON for full mappingReport.",
+          );
+        }
+        throw new Error(json.details || json.error || "Sync failed.");
+      }
       if (json.kind === "PRODUCT_IDENTITY") {
         if (json.productIdentity?.stats) setProductIdentityStats(json.productIdentity.stats);
         setSyncPct(100);
@@ -1802,19 +1818,14 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
         csvTotalRows = Math.max(0, lineCount - 1);
         setTotalRows(csvTotalRows);
       } else if (isHeaderlessLedger) {
-        // The headerless export starts with data on row 0. We synthesise the
-        // canonical Amazon ledger header order so downstream classifier and
-        // mapper work without changes — col1=event_date, col2=fnsku, etc.
+        // Headerless export: row 0 is data. Use strict positional keys only
+        // (`ledger_pos_01`…`ledger_pos_15`) — sync maps by column index, not by semantic header names.
         const dataMatrix = matrixRaw;
         const widthGuess = Math.max(
-          HEADERLESS_INVENTORY_LEDGER_SYNTHETIC_HEADERS.length,
+          15,
           ...dataMatrix.map((r) => r.length),
         );
-        const synthHeaders = [...HEADERLESS_INVENTORY_LEDGER_SYNTHETIC_HEADERS];
-        for (let i = synthHeaders.length; i < widthGuess; i++) {
-          synthHeaders.push(`col${i + 1}`);
-        }
-        headers = synthHeaders;
+        headers = buildInventoryLedgerPositionalStagingHeaders(widthGuess);
         headerRowIdx = -1; // sentinel: no real header row in the file
         headerlessLedgerOriginalFirstRow = (dataMatrix[0] ?? []).map((c) => c ?? "");
         setProgressMsg("Counting rows…");
@@ -1884,8 +1895,12 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
       } else {
         resolvedType = "UNKNOWN";
       }
-      const columnMapping = (clsRes.ok && clsJson.ok ? clsJson.column_mapping : null) ?? {};
-      const needsMapping = (clsRes.ok && clsJson.ok ? clsJson.needs_mapping : true) ?? true;
+      let columnMapping = (clsRes.ok && clsJson.ok ? clsJson.column_mapping : null) ?? {};
+      let needsMapping = (clsRes.ok && clsJson.ok ? clsJson.needs_mapping : true) ?? true;
+      if (isHeaderlessLedger) {
+        columnMapping = {};
+        needsMapping = false;
+      }
       const detectedFileTypeName = clsJson.detected_file_type ?? (resolvedType !== "UNKNOWN" ? resolvedType : null);
       const isSupported = clsJson.is_supported !== false; // default true for backward-compat
       const aiMessage = clsJson.message ?? "";
@@ -1911,6 +1926,7 @@ export function UniversalImporter({ onUploadComplete, onTargetStoreChange, organ
         endDate: importFullFile ? null : (endDate || null),
         headerRowIndex: headerRowIdx,
         synthesizedHeaders: isHeaderlessLedger ? headers : null,
+        inventoryLedgerPositional: isHeaderlessLedger ? true : null,
       });
       // Reference (no-op) so TS doesn't flag the captured row as unused —
       // useful only when this branch is enabled in the future for diagnostics.

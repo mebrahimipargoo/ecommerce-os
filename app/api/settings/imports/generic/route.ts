@@ -41,6 +41,11 @@ function phase4CompleteDb(v: unknown): boolean {
   return normLower(v) === "complete";
 }
 
+function intOrFiniteInt(v: unknown, fallback: number): number {
+  if (typeof v === "number" && Number.isFinite(v)) return Math.floor(v);
+  return fallback;
+}
+
 function resolveImportStoreId(meta: unknown): string | null {
   const m =
     meta && typeof meta === "object" && !Array.isArray(meta)
@@ -488,7 +493,7 @@ export async function POST(req: Request): Promise<Response> {
       if (domainTable) {
         const { count } = await supabaseServer
           .from(domainTable)
-          .select("*", { count: "exact", head: true })
+          .select("id", { count: "exact", head: true })
           .eq("organization_id", orgId)
           .eq("upload_id", uploadId);
         domainRowCount = typeof count === "number" ? count : 0;
@@ -518,10 +523,19 @@ export async function POST(req: Request): Promise<Response> {
         .eq("id", uploadId)
         .eq("organization_id", orgId);
 
+      const { data: fpsPriorFin } = await supabaseServer
+        .from("file_processing_status")
+        .select("total_rows, processed_rows")
+        .eq("upload_id", uploadId)
+        .maybeSingle();
+      const priorF = (fpsPriorFin ?? {}) as { total_rows?: unknown; processed_rows?: unknown };
+
       await supabaseServer.from("file_processing_status").upsert(
         {
           upload_id: uploadId,
           organization_id: orgId,
+          total_rows: intOrFiniteInt(priorF.total_rows, domainRowCount),
+          processed_rows: intOrFiniteInt(priorF.processed_rows, domainRowCount),
           status: "complete",
           current_phase: "complete",
           phase_key: "complete",
