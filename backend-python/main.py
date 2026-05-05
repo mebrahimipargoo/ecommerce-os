@@ -1622,25 +1622,78 @@ async def get_task_status(task_id: str):
 # UI ARCHITECTURE ENDPOINTS & DATA ROUTING
 # -------------------------------------------------------------------------
 
-def _get_openai_key(db: Any, org_id: str) -> str | None:
-    """Attempts to retrieve the OpenAI key from the environment first, then the database."""
-    env_key = os.getenv("OPENAI_API_KEY")
-    if env_key and str(env_key).startswith("sk-"):
-        return env_key
-
+def _resolve_openai_api_key_from_db(db: Any, org_id: str) -> str | None:
+    """
+    Match Next.js getOrganizationOpenAIApiKey / Settings upsertProviderApiKey:
+    plaintext in api_key, role llm_provider, name often 'OpenAI' (not 'openai_api_key').
+    """
     try:
-        res = db.table("organization_api_keys").select("*").eq("organization_id", org_id).execute()
-        if res.data:
-            for row in res.data:
-                for key_field in ["api_key", "key", "token", "openai_api_key", "key_value"]:
-                    if key_field in row and row[key_field]:
-                        val = str(row[key_field])
-                        if val.startswith("sk-"):
-                            return val
+        res = (
+            db.table("organization_api_keys")
+            .select("api_key, name")
+            .eq("organization_id", org_id)
+            .eq("role", "llm_provider")
+            .order("created_at", desc=True)
+            .limit(24)
+            .execute()
+        )
+        rows = list(res.data or [])
+        for row in rows:
+            if str(row.get("name") or "").strip() == "OpenAI":
+                k = str(row.get("api_key") or "").strip()
+                if k:
+                    return k
+        for row in rows:
+            n = str(row.get("name") or "").strip().lower()
+            k = str(row.get("api_key") or "").strip()
+            if not k:
+                continue
+            if "openai" in n or "gpt" in n or n in ("chatgpt", "llm"):
+                return k
     except Exception as e:
-        log.warning(f"Failed to fetch API key from DB: {e}")
-    
+        log.warning("OpenAI llm_provider key lookup failed org=%s: %s", org_id, e)
+
+    # Legacy: row name exactly openai_api_key (any role)
+    try:
+        res = (
+            db.table("organization_api_keys")
+            .select("api_key")
+            .eq("organization_id", org_id)
+            .eq("name", "openai_api_key")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if res.data and res.data[0].get("api_key"):
+            k = str(res.data[0]["api_key"]).strip()
+            if k:
+                return k
+    except Exception as e:
+        log.warning("OpenAI legacy name=openai_api_key lookup failed org=%s: %s", org_id, e)
+
+    # Last resort: any row for this org whose name suggests OpenAI (mis-set role)
+    try:
+        res = db.table("organization_api_keys").select("api_key, name").eq("organization_id", org_id).execute()
+        for row in res.data or []:
+            n = str(row.get("name") or "").strip().lower()
+            if "openai" not in n and "gpt" not in n:
+                continue
+            k = str(row.get("api_key") or "").strip()
+            if k:
+                return k
+    except Exception as e:
+        log.warning("OpenAI broad name scan failed org=%s: %s", org_id, e)
+
     return None
+
+
+def _get_openai_key(db: Any, org_id: str) -> str | None:
+    """Organization DB first (llm_provider / OpenAI), then OPENAI_API_KEY env."""
+    k = _resolve_openai_api_key_from_db(db, org_id)
+    if k:
+        return k
+    env_key = os.getenv("OPENAI_API_KEY")
+    return env_key.strip() if env_key and str(env_key).strip() else None
 
 def _normalize_to_ui_report_slug(raw: str | None) -> str:
     """
@@ -2021,6 +2074,13 @@ import time
 from datetime import datetime, timezone
 
 def _get_api_credentials(db: Any, org_id: str, api_name: str) -> Any:
+    if api_name == "openai_api_key":
+        k = _resolve_openai_api_key_from_db(db, org_id)
+        if k:
+            return k
+        env_key = os.getenv("OPENAI_API_KEY")
+        return env_key.strip() if env_key and str(env_key).strip() else None
+
     try:
         res = db.table("organization_api_keys").select("api_key").eq("organization_id", org_id).eq("name", api_name).execute()
         if res.data and res.data[0].get("api_key"):
@@ -2030,7 +2090,7 @@ def _get_api_credentials(db: Any, org_id: str, api_name: str) -> Any:
             return key_val
     except Exception as e:
         log.warning(f"Failed to fetch {api_name} key from DB: {e}")
-    return os.getenv("OPENAI_API_KEY") if api_name == "openai_api_key" else None
+    return None
 
 def _fetch_amazon_catalog_data(asin: str, creds: dict) -> dict:
     try:
@@ -2139,7 +2199,11 @@ def _gpt_map_catalog_columns_or_raise(headers: list[str], api_key: str) -> dict[
     if not api_key or not str(api_key).strip():
         raise HTTPException(
             status_code=400,
-            detail="OpenAI API key is required for column mapping. Configure organization_api_keys (openai_api_key).",
+            detail=(
+                "OpenAI API key is required for column mapping. In Settings, save an LLM provider key "
+                "(organization_api_keys: role='llm_provider', name like 'OpenAI', api_key=your sk-… secret), "
+                "or set OPENAI_API_KEY on the ETL server."
+            ),
         )
     try:
         from openai import OpenAI
