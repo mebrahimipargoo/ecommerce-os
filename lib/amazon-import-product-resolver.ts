@@ -38,7 +38,8 @@ export type ResolveOptions = {
   supabase: SupabaseClient;
   organizationId: string;
   uploadId: string;
-  storeId: string | null;
+  /** Imports target store — required so identifier resolution stays store-scoped. */
+  storeId: string;
   table: ResolveTargetTable;
   /** Batch page size for SELECT/UPDATE chunks. */
   pageSize?: number;
@@ -227,6 +228,9 @@ async function patchRow(
 async function runStandardResolve(opts: ResolveOptions): Promise<ResolveMetrics> {
   const { supabase, organizationId, uploadId, storeId, table } = opts;
   const pageSize = opts.pageSize ?? 500;
+  if (!String(storeId ?? "").trim()) {
+    throw new Error("[product-resolver] storeId is required (metadata.import_store_id on the upload).");
+  }
 
   const m: ResolveMetrics = {
     table,
@@ -290,7 +294,7 @@ async function runStandardResolve(opts: ResolveOptions): Promise<ResolveMetrics>
  * Summary file) which has no SKU/FNSKU/ASIN of its own.
  */
 async function runJoinAllOrdersResolve(opts: ResolveOptions, base: ResolveMetrics): Promise<ResolveMetrics> {
-  const { supabase, organizationId, uploadId, table } = opts;
+  const { supabase, organizationId, uploadId, table, storeId } = opts;
   if (table !== "amazon_transactions") return base;
 
   const pageSize = opts.pageSize ?? 500;
@@ -323,6 +327,7 @@ async function runJoinAllOrdersResolve(opts: ResolveOptions, base: ResolveMetric
         .from("amazon_all_orders")
         .select("amazon_order_id, order_id, resolved_product_id, resolved_catalog_product_id")
         .eq("organization_id", organizationId)
+        .eq("store_id", storeId)
         .or(`amazon_order_id.in.(${slice.map((s) => `"${s}"`).join(",")}),order_id.in.(${slice.map((s) => `"${s}"`).join(",")})`)
         .not("resolved_product_id", "is", null);
       if (aoErr) {
@@ -366,6 +371,9 @@ async function runJoinAllOrdersResolve(opts: ResolveOptions, base: ResolveMetric
 }
 
 export async function resolveAmazonImportProducts(opts: ResolveOptions): Promise<ResolveMetrics> {
+  if (!String(opts.storeId ?? "").trim()) {
+    throw new Error("[product-resolver] resolveAmazonImportProducts requires storeId.");
+  }
   const base = await runStandardResolve(opts);
   if (opts.joinAllOrders && opts.table === "amazon_transactions") {
     await runJoinAllOrdersResolve(opts, base);

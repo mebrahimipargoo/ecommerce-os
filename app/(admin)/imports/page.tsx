@@ -1,6 +1,6 @@
-import { ImportsClient } from "./ImportsClient";
+import { redirect } from "next/navigation";
 
-/** Route: `/imports` (route group `(admin)` does not affect the URL). Ledger + raw uploads: `ImportsClient`. */
+/** Bookmark URL `/imports` → primary Imports under Data Management. */
 export default function AdminImportsPage() {
-  return <ImportsClient />;
+  redirect("/dashboard/file-import");
 }

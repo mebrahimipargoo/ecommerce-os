@@ -104,6 +104,7 @@ import {
 } from "../../../../../lib/pipeline/amazon-report-registry";
 import { rawRowUsesInventoryLedgerPositionalKeys } from "../../../../../lib/inventory-ledger-positional";
 import { completeInventoryLedgerProductIdentifierMapPhase } from "../../../../../lib/inventory-ledger-generic-completion";
+import { completeReportsRepositoryGenericPhase } from "../../../../../lib/reports-repository-generic-completion";
 import { resolveAmazonImportProducts } from "../../../../../lib/amazon-import-product-resolver";
 import { removalShipmentArchiveBusinessKey } from "../../../../../lib/pipeline/removal-shipment-archive-key";
 import {
@@ -113,11 +114,13 @@ import {
 import { removeOlderRemovalImportsWithSameFileContent } from "@/app/(admin)/imports/import-actions";
 import {
   mergeUploadMetadata,
+  resolveImportStoreIdFromMetadata,
   type ImportRunMetrics,
 } from "../../../../../lib/raw-report-upload-metadata";
 import { syncProductIdentityFromStaging } from "../../../../../lib/product-identity-import";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
+import { CANONICAL_FIELDS_PER_TYPE } from "../../../../../lib/csv-import-detected-type";
 
 export const runtime = "nodejs";
 /** Large listing files — Phase 3 raw upserts only (catalog is Phase 4 Generic). */
@@ -132,6 +135,31 @@ const STAGING_READ_BATCH = 1000;
 /** Inventory Ledger: larger keyset pages (1k–5k range; keeps latency predictable). */
 const LEDGER_STAGING_READ_BATCH = 2500;
 const STAGING_TABLE = "amazon_staging";
+
+/** Mapping coverage fields for REPORTS_REPOSITORY JSON sync logs (canonical keys only; no CSV cell values). */
+function buildReportsRepositorySyncLogPayload(columnMapping: Record<string, string> | null): {
+  mapped_canonical_keys: number;
+  canonical_field_count: number;
+  coverage_ratio: number;
+  mapped_keys_sample: string[];
+} {
+  const fields = CANONICAL_FIELDS_PER_TYPE.REPORTS_REPOSITORY;
+  const canonical_field_count = Array.isArray(fields) ? fields.length : 0;
+  const entries =
+    columnMapping && typeof columnMapping === "object"
+      ? Object.entries(columnMapping).filter(([k, v]) => k && String(v ?? "").trim() !== "")
+      : [];
+  const mapped_canonical_keys = entries.length;
+  const coverage_ratio =
+    canonical_field_count > 0 ? Math.round((mapped_canonical_keys / canonical_field_count) * 1000) / 1000 : 0;
+  const mapped_keys_sample = entries.map(([k]) => k).slice(0, 12);
+  return {
+    mapped_canonical_keys,
+    canonical_field_count,
+    coverage_ratio,
+    mapped_keys_sample,
+  };
+}
 
 const LEDGER_UPSERT_MAX_ATTEMPTS = 6;
 const LEDGER_UPSERT_BACKOFF_MS = [600, 2400, 5000, 12_000, 24_000] as const;
@@ -610,27 +638,11 @@ function removalLogicalLineDedupKey(row: Record<string, unknown>): string {
   ].join("|");
 }
 
-/**
- * Imports Target Store on `raw_report_uploads.metadata` (Wave 1).
- * Prefer `import_store_id`; fall back to `ledger_store_id` for older sessions.
- */
-function resolveImportStoreId(meta: unknown): string | null {
-  const m =
-    meta && typeof meta === "object" && !Array.isArray(meta)
-      ? (meta as Record<string, unknown>)
-      : {};
-  const a = typeof m.import_store_id === "string" ? m.import_store_id.trim() : "";
-  if (a && isUuidString(a)) return a;
-  const b = typeof m.ledger_store_id === "string" ? m.ledger_store_id.trim() : "";
-  if (b && isUuidString(b)) return b;
-  return null;
-}
-
 async function validateImportStoreBelongsToOrg(params: {
   organizationId: string;
   metadata: unknown;
 }): Promise<{ ok: true; storeId: string | null } | { ok: false; error: string }> {
-  const storeId = resolveImportStoreId(params.metadata);
+  const storeId = resolveImportStoreIdFromMetadata(params.metadata);
   if (!storeId) return { ok: true, storeId: null };
   const { data, error } = await supabaseServer
     .from("stores")
@@ -1646,13 +1658,13 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     const importStoreId = storeValidation.storeId;
-    if ((kind === "REMOVAL_ORDER" || kind === "REMOVAL_SHIPMENT") && !importStoreId) {
+    if (kind !== "REPORTS_REPOSITORY" && !importStoreId) {
       return NextResponse.json(
         {
           ok: false,
           error:
-            "Imports Target Store is required for removal reports. Choose a target store in the importer, save classification, then run Sync again.",
-          details: "metadata.import_store_id is missing.",
+            "Imports Target Store is required for this report. Choose a store in the importer (metadata.import_store_id), save if prompted, then run Process and Sync again.",
+          details: "metadata.import_store_id / metadata.ledger_store_id is missing or invalid.",
           uploadId,
           phase: "sync",
         },
@@ -1788,6 +1800,16 @@ export async function POST(req: Request): Promise<Response> {
     // are kept on purpose to preserve Principal/FBA Fee/Commission granularity.
     if (kind === "REPORTS_REPOSITORY") {
       await assertReportsRepoStagingPhysicalIntegrity(orgId, uploadId);
+      console.log(
+        JSON.stringify({
+          event: "REPORTS_REPOSITORY_sync_start",
+          organization_id: orgId,
+          upload_id: uploadId,
+          staging_rows: totalStagingRows,
+          file_row_total: fileRowTotal ?? null,
+          ...buildReportsRepositorySyncLogPayload(columnMapping),
+        }),
+      );
     }
 
     if (kind === "SETTLEMENT" && totalStagingRows > 0) {
@@ -1980,7 +2002,7 @@ export async function POST(req: Request): Promise<Response> {
               stagingSourceLineHash: String(sr.source_line_hash ?? ""),
             });
           } else if (kind === "FBA_RETURNS") {
-            insertRow = mapRowToAmazonReturn(mappedRow, orgId, uploadId) as Record<string, unknown>;
+            insertRow = mapRowToAmazonReturn(mappedRow, orgId, uploadId, importStoreId!) as Record<string, unknown>;
           } else if (kind === "REMOVAL_ORDER") {
             insertRow = mapRowToAmazonRemoval(mappedRow, orgId, uploadId, importStoreId!) as Record<string, unknown> | null;
             if (insertRow) insertRow.source_staging_id = sr.id;
@@ -1991,6 +2013,7 @@ export async function POST(req: Request): Promise<Response> {
                 rawRowObj,
                 orgId,
                 uploadId,
+                importStoreId!,
                 {
                   sourceFileName:
                     typeof (row as { file_name?: unknown }).file_name === "string"
@@ -1999,21 +2022,25 @@ export async function POST(req: Request): Promise<Response> {
                 },
               ) as Record<string, unknown> | null;
             } else {
-              insertRow = mapRowToAmazonInventoryLedger(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
+              insertRow = mapRowToAmazonInventoryLedger(mappedRow, orgId, uploadId, importStoreId!) as
+                | Record<string, unknown>
+                | null;
             }
           } else if (kind === "REIMBURSEMENTS") {
-            insertRow = mapRowToAmazonReimbursement(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
+            insertRow = mapRowToAmazonReimbursement(mappedRow, orgId, uploadId, importStoreId!) as
+              | Record<string, unknown>
+              | null;
           } else if (kind === "SETTLEMENT") {
             insertRow = mapRowToAmazonSettlement(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
           } else if (kind === "SAFET_CLAIMS") {
-            insertRow = mapRowToAmazonSafetClaim(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
+            insertRow = mapRowToAmazonSafetClaim(mappedRow, orgId, uploadId, importStoreId!) as Record<string, unknown> | null;
           } else if (kind === "TRANSACTIONS") {
-            insertRow = mapRowToAmazonTransaction(mappedRow, orgId, uploadId) as Record<string, unknown> | null;
+            insertRow = mapRowToAmazonTransaction(mappedRow, orgId, uploadId, importStoreId!) as Record<string, unknown> | null;
           } else if (kind === "REPORTS_REPOSITORY") {
             insertRow = mapRowToAmazonReportsRepository(mappedRow, orgId, uploadId) as Record<
               string,
               unknown
-            > | null;
+            >;
           } else if (kind === "MANAGE_FBA_INVENTORY") {
             insertRow = mapRowToAmazonManageFbaInventory(
               mappedRow,
@@ -2140,6 +2167,25 @@ export async function POST(req: Request): Promise<Response> {
         `[sync][${kind}] Row count summary: staging=${totalStagingRows} ` +
           `written=${synced} mapper_null=${mapperNullCount} deduped_in_batch=${Math.max(0, jsDedupedAway)}`,
       );
+      if (kind === "REPORTS_REPOSITORY") {
+        console.log(
+          JSON.stringify({
+            event: "REPORTS_REPOSITORY_sync_complete",
+            organization_id: orgId,
+            upload_id: uploadId,
+            staging_rows: totalStagingRows,
+            rows_flushed: synced,
+            rows_inserted_new: syncMetricTotals.rows_synced_new,
+            rows_updated: syncMetricTotals.rows_synced_updated,
+            rows_unchanged: syncMetricTotals.rows_synced_unchanged,
+            rows_skipped_duplicate_existing: syncMetricTotals.rows_duplicate_against_existing,
+            rows_skipped_mapper_null: mapperNullCount,
+            rows_collapsed_within_batch: duplicateInBatchRef.value,
+            rows_collapsed_within_batch_derived: Math.max(0, jsDedupedAway),
+            ...buildReportsRepositorySyncLogPayload(columnMapping),
+          }),
+        );
+      }
       if (isListingAmazonSyncKind(kind)) {
         const archived = syncMetricTotals.rows_synced_new + syncMetricTotals.rows_synced_updated;
         const skippedExisting = syncMetricTotals.rows_duplicate_against_existing;
@@ -2372,16 +2418,26 @@ export async function POST(req: Request): Promise<Response> {
     );
 
     let inventoryLedgerRanInlineGeneric = false;
+    let reportsRepositoryRanInlineGeneric = false;
     if (kind === "INVENTORY_LEDGER" && needsPhase4) {
       await completeInventoryLedgerProductIdentifierMapPhase({
         supabase: supabaseServer,
         organizationId: orgId,
         uploadId,
-        storeId: importStoreId ?? null,
+        storeId: importStoreId!,
         reportTypeRaw: reportTypeRawEarly,
         engine,
       });
       inventoryLedgerRanInlineGeneric = true;
+    } else if (kind === "REPORTS_REPOSITORY" && needsPhase4) {
+      await completeReportsRepositoryGenericPhase({
+        supabase: supabaseServer,
+        organizationId: orgId,
+        uploadId,
+        engine,
+        reportTypeRaw: reportTypeRawEarly,
+      });
+      reportsRepositoryRanInlineGeneric = true;
     }
 
     // ── Post-sync product resolver ────────────────────────────────────────────
@@ -2395,7 +2451,7 @@ export async function POST(req: Request): Promise<Response> {
           supabase: supabaseServer,
           organizationId: orgId,
           uploadId,
-          storeId: importStoreId ?? null,
+          storeId: importStoreId!,
           table: "amazon_all_orders",
         });
       } else if (kind === "SETTLEMENT") {
@@ -2403,7 +2459,7 @@ export async function POST(req: Request): Promise<Response> {
           supabase: supabaseServer,
           organizationId: orgId,
           uploadId,
-          storeId: importStoreId ?? null,
+          storeId: importStoreId!,
           table: "amazon_settlements",
         });
       } else if (kind === "TRANSACTIONS") {
@@ -2411,7 +2467,7 @@ export async function POST(req: Request): Promise<Response> {
           supabase: supabaseServer,
           organizationId: orgId,
           uploadId,
-          storeId: importStoreId ?? null,
+          storeId: importStoreId!,
           table: "amazon_transactions",
           // Simple Transactions Summary has no SKU/FNSKU/ASIN — inherit from
           // amazon_all_orders by order_id when possible.
@@ -2422,7 +2478,7 @@ export async function POST(req: Request): Promise<Response> {
           supabase: supabaseServer,
           organizationId: orgId,
           uploadId,
-          storeId: importStoreId ?? null,
+          storeId: importStoreId!,
           table: "amazon_manage_fba_inventory",
         });
       } else if (kind === "AMAZON_FULFILLED_INVENTORY") {
@@ -2430,7 +2486,7 @@ export async function POST(req: Request): Promise<Response> {
           supabase: supabaseServer,
           organizationId: orgId,
           uploadId,
-          storeId: importStoreId ?? null,
+          storeId: importStoreId!,
           table: "amazon_amazon_fulfilled_inventory",
         });
       }
@@ -2448,7 +2504,9 @@ export async function POST(req: Request): Promise<Response> {
     });
 
     const syncLogPhaseKey =
-      inventoryLedgerRanInlineGeneric || !needsPhase4 ? FPS_KEY_COMPLETE : FPS_KEY_SYNC;
+      inventoryLedgerRanInlineGeneric || reportsRepositoryRanInlineGeneric || !needsPhase4
+        ? FPS_KEY_COMPLETE
+        : FPS_KEY_SYNC;
 
     logImportPhase({
       report_type: reportTypeRawEarly,

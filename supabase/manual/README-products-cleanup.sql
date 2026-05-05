@@ -1,0 +1,27 @@
+-- =============================================================================
+-- MANUAL ONLY — Products / catalog cleanup (run in Supabase SQL Editor)
+-- =============================================================================
+-- 1. Take a backup or export first (e.g. pg_dump / table export).
+-- 2. Delete dependent rows before products if your FKs require it, e.g.:
+--      product_identifier_map, product_prices, etc. (adjust to your schema).
+-- 3. Replace the placeholder WHERE with your real criteria.
+-- 4. Run inside a transaction and ROLLBACK first to verify row counts.
+--
+-- Example transaction shell:
+--
+-- BEGIN;
+--   -- SELECT count(*) FROM public.products WHERE <your_predicate>;
+--   -- DELETE FROM public.products WHERE <your_predicate>;
+-- ROLLBACK;
+--
+-- When satisfied:
+-- BEGIN;
+--   DELETE FROM public.products
+--   WHERE false  -- TODO: replace with your condition, e.g. organization_id = '...'::uuid AND ...
+--   ;
+-- COMMIT;
+
+-- Optional: preview rows you would delete
+-- SELECT id, organization_id, store_id, sku, product_name, created_at
+-- FROM public.products
+-- WHERE false;  -- TODO: same predicate as DELETE

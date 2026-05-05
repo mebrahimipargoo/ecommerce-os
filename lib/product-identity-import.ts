@@ -132,6 +132,7 @@ type IdentifierMapInsert = {
 
 type ExistingIdentifierMapRow = {
   id: string;
+  product_id: string | null;
   store_id: string | null;
   seller_sku: string | null;
   asin: string | null;
@@ -953,13 +954,13 @@ async function prefetchIdentifierMapRows(
   organizationId: string,
   storeId: string,
   skus: string[],
-): Promise<Map<string, string>> {
-  const byKey = new Map<string, string>();
+): Promise<Map<string, { id: string; product_id: string | null }>> {
+  const byKey = new Map<string, { id: string; product_id: string | null }>();
 
   for (const skuChunk of chunk([...new Set(skus)], 100)) {
     const { data, error } = await supabase
       .from("product_identifier_map")
-      .select("id, store_id, seller_sku, asin, fnsku, upc_code, external_listing_id")
+      .select("id, product_id, store_id, seller_sku, asin, fnsku, upc_code, external_listing_id")
       .eq("organization_id", organizationId)
       .eq("store_id", storeId)
       .in("seller_sku", skuChunk);
@@ -967,7 +968,10 @@ async function prefetchIdentifierMapRows(
     if (error) throw new Error(`product_identifier_map prefetch failed: ${error.message}`);
 
     for (const row of (data ?? []) as ExistingIdentifierMapRow[]) {
-      byKey.set(identifierMapKey(row), row.id);
+      byKey.set(identifierMapKey(row), {
+        id: row.id,
+        product_id: row.product_id != null ? String(row.product_id) : null,
+      });
     }
   }
 
@@ -1042,10 +1046,30 @@ async function upsertIdentifierMap(params: {
 
     for (const mapRow of mapRows) {
       const key = identifierMapKey(mapRow);
-      const existingId = existingByKey.get(key);
-      if (existingId) {
+      const existing = existingByKey.get(key);
+      if (existing) {
+        const newPid = mapRow.product_id != null ? String(mapRow.product_id) : "";
+        const oldPid = existing.product_id != null ? String(existing.product_id) : "";
+        if (oldPid && newPid && oldPid !== newPid) {
+          stats.unresolvedRows += 1;
+          await upsertBacklog(supabase, {
+            organizationId,
+            storeId,
+            sourceUploadId,
+            row,
+            identifierType: "SKU",
+            identifierValue: row.sku,
+            reason: "identifier_map_product_id_conflict",
+            candidateProductIds: [oldPid, newPid],
+            rawPayload: {
+              external_listing_id: mapRow.external_listing_id,
+              existing_map_id: existing.id,
+            },
+          });
+          continue;
+        }
         toUpdate.push({
-          id: existingId,
+          id: existing.id,
           patch: {
             product_id: mapRow.product_id,
             catalog_product_id: mapRow.catalog_product_id,

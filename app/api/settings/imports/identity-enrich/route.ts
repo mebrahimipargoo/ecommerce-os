@@ -44,6 +44,7 @@ import {
   isInventoryFamilyWriteDisabled,
   type InventoryFamilyReportType,
 } from "../../../../../lib/inventory-family-identifier-enrich";
+import { resolveImportStoreIdFromMetadata } from "../../../../../lib/raw-report-upload-metadata";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 
@@ -55,18 +56,6 @@ type Body = {
   /** When true, no Postgres writes are issued. Default false. */
   dry_run?: boolean;
 };
-
-function resolveStoreIdFromMeta(meta: unknown): string | null {
-  const m =
-    meta && typeof meta === "object" && !Array.isArray(meta)
-      ? (meta as Record<string, unknown>)
-      : {};
-  const a = typeof m.import_store_id === "string" ? m.import_store_id.trim() : "";
-  if (a && isUuidString(a)) return a;
-  const b = typeof m.ledger_store_id === "string" ? m.ledger_store_id.trim() : "";
-  if (b && isUuidString(b)) return b;
-  return null;
-}
 
 export async function POST(req: Request): Promise<Response> {
   try {
@@ -131,7 +120,7 @@ export async function POST(req: Request): Promise<Response> {
       );
     }
 
-    const storeId = resolveStoreIdFromMeta((row as { metadata?: unknown }).metadata);
+    const storeId = resolveImportStoreIdFromMetadata((row as { metadata?: unknown }).metadata);
     const requestedDryRun = body.dry_run === true;
     const writeDisabled = isInventoryFamilyWriteDisabled(rt as InventoryFamilyReportType);
     const effectiveDryRun = requestedDryRun || writeDisabled;

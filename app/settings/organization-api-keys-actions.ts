@@ -1,6 +1,7 @@
 "use server";
 
 import { randomBytes } from "crypto";
+import { assertUserCanAccessOrganization } from "../dashboard/products/pim-actions";
 import { hashOrganizationApiKeySecret } from "../../lib/organization-workspace-api-key";
 import { supabaseServer } from "../../lib/supabase-server";
 import { resolveOrganizationId } from "../../lib/organization";
@@ -151,6 +152,50 @@ export async function getProviderApiKey(
     return key || null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Stores Google service account JSON as plaintext in `organization_api_keys` (name `google_sheets_api`),
+ * matching FastAPI `_get_google_creds` / `etl/sync-google-sheets`.
+ */
+export async function upsertGoogleSheetsServiceAccountForOrganization(
+  organizationId: string,
+  rawJson: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!isUuidString(organizationId)) {
+    return { ok: false, error: "Invalid organization." };
+  }
+  const gate = await assertUserCanAccessOrganization(organizationId);
+  if (!gate.ok) return { ok: false, error: gate.error };
+
+  const trimmed = rawJson.trim();
+  if (!trimmed) {
+    return { ok: false, error: "Paste your service account JSON." };
+  }
+  try {
+    JSON.parse(trimmed);
+  } catch {
+    return { ok: false, error: "Invalid JSON." };
+  }
+
+  try {
+    await supabaseServer
+      .from("organization_api_keys")
+      .delete()
+      .eq("organization_id", organizationId)
+      .eq("name", "google_sheets_api");
+
+    const { error } = await supabaseServer.from("organization_api_keys").insert({
+      organization_id: organizationId,
+      name: "google_sheets_api",
+      role: "integration",
+      api_key: trimmed,
+    });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Save failed." };
   }
 }
 

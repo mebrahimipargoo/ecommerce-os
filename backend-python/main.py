@@ -8,8 +8,9 @@ import traceback
 import uuid
 import hashlib
 import os
+import re
 from collections import defaultdict, deque
-from typing import Any, Callable
+from typing import Any, Callable, List
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -1954,3 +1955,951 @@ async def etl_upload_raw(
             except Exception as ue:
                 log.warning(f"Could not mark upload failed: {ue}")
         raise HTTPException(status_code=500, detail=f"System failed to finalize the upload: {e}") from e
+
+
+
+
+
+
+# API GOOGLE SHEETS
+# -------------------------------------------------------------------------
+# PHASE 1: ENTERPRISE CATALOG SEEDING (Live Amazon, GPT Mapping, & Vendors)
+# -------------------------------------------------------------------------
+import requests
+import time
+from datetime import datetime, timezone
+
+def _get_api_credentials(db: Any, org_id: str, api_name: str) -> Any:
+    try:
+        res = db.table("organization_api_keys").select("api_key").eq("organization_id", org_id).eq("name", api_name).execute()
+        if res.data and res.data[0].get("api_key"):
+            key_val = res.data[0]["api_key"]
+            if api_name == "amazon_sp_api":
+                return json.loads(key_val) if isinstance(key_val, str) else key_val
+            return key_val
+    except Exception as e:
+        log.warning(f"Failed to fetch {api_name} key from DB: {e}")
+    return os.getenv("OPENAI_API_KEY") if api_name == "openai_api_key" else None
+
+def _fetch_amazon_catalog_data(asin: str, creds: dict) -> dict:
+    try:
+        token_res = requests.post(
+            "https://api.amazon.com/auth/o2/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": creds.get("refresh_token"),
+                "client_id": creds.get("client_id"),
+                "client_secret": creds.get("client_secret"),
+            },
+        )
+        token_res.raise_for_status()
+        access_token = token_res.json().get("access_token")
+
+        headers = {"x-amz-access-token": access_token, "Content-Type": "application/json"}
+        params = {"marketplaceIds": "ATVPDKIKX0DER", "includedData": "summaries,images"}
+        cat_res = requests.get(
+            f"https://sellingpartnerapi-na.amazon.com/catalog/2022-04-01/items/{asin}",
+            headers=headers,
+            params=params,
+        )
+        cat_res.raise_for_status()
+        item = cat_res.json()
+
+        title = item.get("summaries", [{}])[0].get("itemName")
+        brand = item.get("summaries", [{}])[0].get("brand")
+        images = item.get("images", [{}])[0].get("images", [])
+        image_url = images[0].get("link") if images else None
+
+        return {"product_name": title, "brand": brand, "main_image_url": image_url, "amazon_raw": item}
+    except Exception as e:
+        log.warning(
+            "Amazon SP-API catalog fetch failed asin=%s error=%s",
+            asin,
+            e,
+            exc_info=True,
+        )
+        return {}
+
+
+_PIM_MAP_STANDARD_KEYS = (
+    "vendor",
+    "category",
+    "mfg_part",
+    "product_name",
+    "seller_sku",
+    "asin",
+    "fnsku",
+    "upc",
+    "cost",
+)
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _validate_pim_org_store(organization_id: str, store_id: str) -> tuple[str, str]:
+    oid = (organization_id or "").strip()
+    sid = (store_id or "").strip()
+    if not oid:
+        raise HTTPException(status_code=400, detail="organization_id is required (UUID).")
+    if not sid:
+        raise HTTPException(status_code=400, detail="store_id is required (imports target store UUID).")
+    if not _UUID_RE.match(oid):
+        raise HTTPException(
+            status_code=400,
+            detail=f"organization_id must be a valid UUID (got {oid[:48]!r}).",
+        )
+    if not _UUID_RE.match(sid):
+        raise HTTPException(
+            status_code=400,
+            detail=f"store_id must be a valid UUID (got {sid[:48]!r}).",
+        )
+    return oid, sid
+
+
+def _empty_pim_seed_metrics() -> dict[str, Any]:
+    return {
+        "rows_processed": 0,
+        "vendors_created": 0,
+        "categories_created": 0,
+        "products_created": 0,
+        "products_updated": 0,
+        "identifiers_created": 0,
+        "identifiers_updated": 0,
+        "prices_inserted": 0,
+        "products_enriched_by_amazon": 0,
+        "skipped_no_identity": 0,
+        "skipped_ambiguous": 0,
+        "errors": [],
+    }
+
+
+def _pim_append_error(errors: list[str], row_index: int | None, message: str, cap: int = 200) -> None:
+    if len(errors) >= cap:
+        return
+    prefix = f"row {row_index}: " if row_index is not None else ""
+    errors.append(f"{prefix}{message}")
+
+
+def _gpt_map_catalog_columns_or_raise(headers: list[str], api_key: str) -> dict[str, Any]:
+    if not api_key or not str(api_key).strip():
+        raise HTTPException(
+            status_code=400,
+            detail="OpenAI API key is required for column mapping. Configure organization_api_keys (openai_api_key).",
+        )
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        prompt = (
+            "You are a data mapping AI. Map these CSV/Sheet headers to standard keys: "
+            "'vendor', 'category', 'mfg_part', 'product_name', 'seller_sku', 'asin', 'fnsku', 'upc', 'cost'. "
+            "Values must be EXACT header strings from the list (character-for-character match). "
+            "Omit a key if no column applies. "
+            "Reply ONLY with a valid JSON object mapping standard keys to exact header names. "
+            f"Headers: {json.dumps(headers)}"
+        )
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        raw = res.choices[0].message.content
+        parsed = json.loads(raw) if raw else {}
+        if not isinstance(parsed, dict):
+            raise ValueError("OpenAI returned non-object JSON")
+        return parsed
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("OpenAI column mapping failed")
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "column_mapping_failed",
+                "message": str(e),
+                "headers": headers,
+            },
+        ) from e
+
+
+def _validate_gpt_column_map(column_map: dict[str, Any], original_headers: list[str]) -> None:
+    inv = set(original_headers)
+    bad: list[str] = []
+    for std in _PIM_MAP_STANDARD_KEYS:
+        v = column_map.get(std)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        h = str(v).strip()
+        if h not in inv:
+            bad.append(f"{std} -> {h!r} (not in headers)")
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_column_mapping",
+                "message": "Mapped column names must exist exactly in the file headers.",
+                "invalid_mappings": bad,
+                "headers": original_headers,
+                "mapping": {k: column_map.get(k) for k in _PIM_MAP_STANDARD_KEYS if column_map.get(k) is not None},
+            },
+        )
+
+
+def _pim_handles_from_map(column_map: dict[str, Any], original_headers: list[str]) -> dict[str, str | None]:
+    inv = set(original_headers)
+    out: dict[str, str | None] = {k: None for k in _PIM_MAP_STANDARD_KEYS}
+    for std in _PIM_MAP_STANDARD_KEYS:
+        v = column_map.get(std)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
+        h = str(v).strip()
+        if h in inv:
+            out[std] = h
+    return out
+
+
+def _pim_load_vendor_index(db: Any, organization_id: str) -> dict[str, str]:
+    idx: dict[str, str] = {}
+    try:
+        r = db.table("vendors").select("id,name").eq("organization_id", organization_id).execute()
+        for row in r.data or []:
+            n = str(row.get("name") or "").strip()
+            if n:
+                idx[n.lower()] = str(row["id"])
+    except Exception as e:
+        log.exception("Failed to load vendors for org=%s", organization_id)
+        raise HTTPException(status_code=500, detail=f"Failed to load vendors: {e}") from e
+    return idx
+
+
+def _pim_ensure_vendor(
+    db: Any,
+    organization_id: str,
+    raw_label: str | None,
+    index: dict[str, str],
+    metrics: dict[str, Any],
+    errors: list[str],
+    row_index: int | None,
+) -> str | None:
+    name = (raw_label or "").strip() or "Unknown Vendor"
+    key = name.lower()
+    if key in index:
+        return index[key]
+    try:
+        ins = db.table("vendors").insert({"organization_id": organization_id, "name": name}).execute()
+        if not ins.data:
+            _pim_append_error(errors, row_index, "vendor insert returned no row")
+            return None
+        vid = str(ins.data[0]["id"])
+        index[key] = vid
+        metrics["vendors_created"] += 1
+        return vid
+    except Exception as e:
+        log.warning("vendor insert failed (possible duplicate) org=%s name=%s: %s", organization_id, name, e)
+        try:
+            r = db.table("vendors").select("id,name").eq("organization_id", organization_id).execute()
+            for row in r.data or []:
+                n = str(row.get("name") or "").strip()
+                if n:
+                    index[n.lower()] = str(row["id"])
+            if key in index:
+                return index[key]
+        except Exception as e2:
+            log.exception("vendor refetch after insert failure")
+            _pim_append_error(errors, row_index, f"vendor resolution failed: {e2}")
+            return None
+        _pim_append_error(errors, row_index, f"vendor upsert failed: {name}: {e}")
+        return None
+
+
+def _pim_load_category_index(db: Any, organization_id: str) -> dict[str, str]:
+    idx: dict[str, str] = {}
+    try:
+        r = db.table("product_categories").select("id,name").eq("organization_id", organization_id).execute()
+        for row in r.data or []:
+            n = str(row.get("name") or "").strip()
+            if n:
+                idx[n.lower()] = str(row["id"])
+    except Exception as e:
+        log.exception("Failed to load product_categories for org=%s", organization_id)
+        raise HTTPException(status_code=500, detail=f"Failed to load categories: {e}") from e
+    return idx
+
+
+def _pim_ensure_category(
+    db: Any,
+    organization_id: str,
+    raw_label: str | None,
+    index: dict[str, str],
+    metrics: dict[str, Any],
+    errors: list[str],
+    row_index: int | None,
+) -> str | None:
+    name = (raw_label or "").strip()
+    if not name:
+        return None
+    key = name.lower()
+    if key in index:
+        return index[key]
+    try:
+        ins = db.table("product_categories").insert({"organization_id": organization_id, "name": name}).execute()
+        if not ins.data:
+            _pim_append_error(errors, row_index, "category insert returned no row")
+            return None
+        cid = str(ins.data[0]["id"])
+        index[key] = cid
+        metrics["categories_created"] += 1
+        return cid
+    except Exception as e:
+        log.warning("category insert failed org=%s name=%s: %s", organization_id, name, e)
+        try:
+            r = db.table("product_categories").select("id,name").eq("organization_id", organization_id).execute()
+            for row in r.data or []:
+                n = str(row.get("name") or "").strip()
+                if n:
+                    index[n.lower()] = str(row["id"])
+            if key in index:
+                return index[key]
+        except Exception as e2:
+            log.exception("category refetch failed")
+            _pim_append_error(errors, row_index, f"category resolution failed: {e2}")
+            return None
+        _pim_append_error(errors, row_index, f"category upsert failed: {name}: {e}")
+        return None
+
+
+def _clean_identifier(val: Any) -> str | None:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if s.lower() in ["x", "n/a", "na", "-", "none", "null", ""] or (len(s) < 2 and s.lower() == "x"):
+        return None
+    return s
+
+
+def _pim_cell(row_cells: dict[str, Any], header: str | None) -> Any:
+    if not header:
+        return None
+    return row_cells.get(header)
+
+
+def _pim_resolve_product(
+    db: Any,
+    organization_id: str,
+    store_id: str,
+    seller_sku: str | None,
+    fnsku: str | None,
+    asin: str | None,
+) -> tuple[str | None, str, str | None]:
+    """Returns (product_id_or_none, resolution, sku_for_insert_or_none).
+    resolution: update | insert | ambiguous | no_identity
+    """
+    if seller_sku:
+        r = (
+            db.table("products")
+            .select("id")
+            .eq("organization_id", organization_id)
+            .eq("store_id", store_id)
+            .eq("sku", seller_sku)
+            .limit(10)
+            .execute()
+        )
+        rows = r.data or []
+        if len(rows) > 1:
+            return None, "ambiguous", None
+        if len(rows) == 1:
+            return str(rows[0]["id"]), "update", None
+        return None, "insert", seller_sku
+    if fnsku:
+        r = (
+            db.table("products")
+            .select("id")
+            .eq("organization_id", organization_id)
+            .eq("store_id", store_id)
+            .eq("fnsku", fnsku)
+            .limit(10)
+            .execute()
+        )
+        rows = r.data or []
+        if len(rows) > 1:
+            return None, "ambiguous", None
+        if len(rows) == 1:
+            return str(rows[0]["id"]), "update", None
+        return None, "insert", fnsku
+    if asin:
+        r = (
+            db.table("products")
+            .select("id")
+            .eq("organization_id", organization_id)
+            .eq("store_id", store_id)
+            .eq("asin", asin)
+            .limit(20)
+            .execute()
+        )
+        rows = r.data or []
+        if len(rows) > 1:
+            return None, "ambiguous", None
+        if len(rows) == 1:
+            return str(rows[0]["id"]), "update", None
+        return None, "insert", asin
+    return None, "no_identity", None
+
+
+def _pim_upsert_identifier_map(
+    db: Any,
+    organization_id: str,
+    store_id: str,
+    product_id: str,
+    seller_sku: str | None,
+    asin: str | None,
+    fnsku: str | None,
+    upc: str | None,
+    match_source: str,
+    metrics: dict[str, Any],
+    errors: list[str],
+    row_index: int,
+) -> None:
+    if not (seller_sku or asin or fnsku or upc):
+        return
+    try:
+        q = (
+            db.table("product_identifier_map")
+            .select("*")
+            .eq("organization_id", organization_id)
+            .eq("store_id", store_id)
+            .eq("product_id", product_id)
+        )
+        if seller_sku:
+            q = q.eq("seller_sku", seller_sku)
+        elif fnsku:
+            q = q.eq("fnsku", fnsku)
+        elif asin:
+            q = q.eq("asin", asin)
+        existing = q.limit(5).execute()
+        rows = existing.data or []
+        if not rows:
+            db.table("product_identifier_map").insert(
+                {
+                    "organization_id": organization_id,
+                    "store_id": store_id,
+                    "product_id": product_id,
+                    "seller_sku": seller_sku,
+                    "asin": asin,
+                    "fnsku": fnsku,
+                    "upc_code": upc,
+                    "match_source": match_source,
+                }
+            ).execute()
+            metrics["identifiers_created"] += 1
+            return
+        rec = rows[0]
+        mid = str(rec["id"])
+        payload: dict[str, Any] = {}
+        if asin and not rec.get("asin"):
+            payload["asin"] = asin
+        if fnsku and not rec.get("fnsku"):
+            payload["fnsku"] = fnsku
+        if seller_sku and not rec.get("seller_sku"):
+            payload["seller_sku"] = seller_sku
+        if upc and not rec.get("upc_code"):
+            payload["upc_code"] = upc
+        if payload:
+            db.table("product_identifier_map").update(payload).eq("id", mid).eq("organization_id", organization_id).eq(
+                "store_id", store_id
+            ).execute()
+            metrics["identifiers_updated"] += 1
+    except Exception as e:
+        log.exception("product_identifier_map upsert failed product_id=%s", product_id)
+        _pim_append_error(errors, row_index, f"identifier map: {e}")
+
+
+def _pim_insert_price_if_present(
+    db: Any,
+    organization_id: str,
+    store_id: str,
+    product_id: str,
+    cost_raw: Any,
+    price_source: str,
+    metrics: dict[str, Any],
+    errors: list[str],
+    row_index: int,
+) -> None:
+    if cost_raw is None:
+        return
+    s = str(cost_raw).strip()
+    if not s or s.lower() in ("x", "n/a", "na", "-", "none", "null"):
+        return
+    try:
+        amt = float(s.replace("$", "").replace(",", ""))
+    except (TypeError, ValueError):
+        _pim_append_error(errors, row_index, f"invalid price/cost value: {s[:40]!r}")
+        return
+    try:
+        db.table("product_prices").insert(
+            {
+                "organization_id": organization_id,
+                "store_id": store_id,
+                "product_id": product_id,
+                "amount": amt,
+                "currency": "USD",
+                "source": price_source,
+            }
+        ).execute()
+        metrics["prices_inserted"] += 1
+    except Exception as e:
+        log.exception("product_prices insert failed product_id=%s", product_id)
+        _pim_append_error(errors, row_index, f"price insert: {e}")
+
+
+def _process_pim_seed_row(
+    db: Any,
+    organization_id: str,
+    store_id: str,
+    row_cells: dict[str, Any],
+    handles: dict[str, str | None],
+    amazon_creds: Any,
+    price_source: str,
+    match_source: str,
+    metrics: dict[str, Any],
+    errors: list[str],
+    row_index: int,
+    vendor_index: dict[str, str],
+    category_index: dict[str, str],
+) -> None:
+    metrics["rows_processed"] += 1
+
+    seller_sku = _clean_identifier(_pim_cell(row_cells, handles.get("seller_sku")))
+    asin = _clean_identifier(_pim_cell(row_cells, handles.get("asin")))
+    fnsku = _clean_identifier(_pim_cell(row_cells, handles.get("fnsku")))
+    upc = _clean_identifier(_pim_cell(row_cells, handles.get("upc")))
+    sheet_product_name = _clean_identifier(_pim_cell(row_cells, handles.get("product_name")))
+    mfg_part = _clean_identifier(_pim_cell(row_cells, handles.get("mfg_part")))
+    cost_col = handles.get("cost")
+    cost_raw = _pim_cell(row_cells, cost_col) if cost_col else None
+
+    vendor_id = _pim_ensure_vendor(
+        db,
+        organization_id,
+        _clean_identifier(_pim_cell(row_cells, handles.get("vendor"))),
+        vendor_index,
+        metrics,
+        errors,
+        row_index,
+    )
+    category_id = _pim_ensure_category(
+        db,
+        organization_id,
+        _clean_identifier(_pim_cell(row_cells, handles.get("category"))),
+        category_index,
+        metrics,
+        errors,
+        row_index,
+    )
+
+    if not seller_sku and not fnsku and not asin:
+        metrics["skipped_no_identity"] += 1
+        _pim_append_error(
+            errors,
+            row_index,
+            "skipped: need at least one of seller_sku, fnsku, or asin for store-scoped product identity",
+        )
+        return
+
+    amazon_data: dict[str, Any] = {}
+    if asin and amazon_creds:
+        amazon_data = _fetch_amazon_catalog_data(asin, amazon_creds)
+        time.sleep(0.2)
+        if amazon_data:
+            metrics["products_enriched_by_amazon"] += 1
+        elif asin:
+            _pim_append_error(errors, row_index, f"Amazon enrichment returned no data for ASIN {asin}")
+
+    final_name = (
+        amazon_data.get("product_name")
+        or sheet_product_name
+        or f"Pending Details ({asin or seller_sku or fnsku})"
+    )
+    final_brand = amazon_data.get("brand")
+    main_image = amazon_data.get("main_image_url")
+    amazon_raw = amazon_data.get("amazon_raw") if amazon_data else None
+
+    prod_id, resolution, sku_insert = _pim_resolve_product(db, organization_id, store_id, seller_sku, fnsku, asin)
+    if resolution == "ambiguous":
+        metrics["skipped_ambiguous"] += 1
+        _pim_append_error(
+            errors,
+            row_index,
+            f"ambiguous product match org+store+identifiers (sku={seller_sku!r} fnsku={fnsku!r} asin={asin!r})",
+        )
+        return
+    if resolution == "no_identity":
+        metrics["skipped_no_identity"] += 1
+        _pim_append_error(errors, row_index, "no_identity: missing seller_sku, fnsku, and asin")
+        return
+
+    sync_iso = datetime.now(timezone.utc).isoformat()
+
+    try:
+        if resolution == "update" and prod_id:
+            upd: dict[str, Any] = {
+                "vendor_id": vendor_id,
+                "category_id": category_id,
+                "mfg_part_number": mfg_part,
+                "product_name": final_name,
+                "brand": final_brand,
+                "main_image_url": main_image,
+                "amazon_raw": amazon_raw or {},
+                "last_catalog_sync_at": sync_iso,
+            }
+            if seller_sku:
+                upd["sku"] = seller_sku
+            if asin:
+                upd["asin"] = asin
+            if fnsku:
+                upd["fnsku"] = fnsku
+            if upc:
+                upd["upc_code"] = upc
+            db.table("products").update(upd).eq("id", prod_id).eq("organization_id", organization_id).eq(
+                "store_id", store_id
+            ).execute()
+            metrics["products_updated"] += 1
+        elif resolution == "insert" and sku_insert:
+            ins = (
+                db.table("products")
+                .insert(
+                    {
+                        "organization_id": organization_id,
+                        "store_id": store_id,
+                        "sku": sku_insert,
+                        "vendor_id": vendor_id,
+                        "category_id": category_id,
+                        "mfg_part_number": mfg_part,
+                        "product_name": final_name,
+                        "brand": final_brand,
+                        "main_image_url": main_image,
+                        "amazon_raw": amazon_raw if amazon_raw is not None else {},
+                        "asin": asin,
+                        "fnsku": fnsku,
+                        "upc_code": upc,
+                        "last_catalog_sync_at": sync_iso,
+                    }
+                )
+                .execute()
+            )
+            if not ins.data:
+                _pim_append_error(errors, row_index, "product insert returned no row")
+                return
+            prod_id = str(ins.data[0]["id"])
+            metrics["products_created"] += 1
+        else:
+            metrics["skipped_no_identity"] += 1
+            _pim_append_error(errors, row_index, "could not determine sku for new product")
+            return
+    except Exception as e:
+        log.exception("product upsert failed row=%s", row_index)
+        _pim_append_error(errors, row_index, f"product upsert: {e}")
+        return
+
+    _pim_upsert_identifier_map(
+        db,
+        organization_id,
+        store_id,
+        prod_id,
+        seller_sku,
+        asin,
+        fnsku,
+        upc,
+        match_source,
+        metrics,
+        errors,
+        row_index,
+    )
+    _pim_insert_price_if_present(
+        db, organization_id, store_id, prod_id, cost_raw, price_source, metrics, errors, row_index
+    )
+
+
+def _pim_row_cells_from_series(row: Any, headers: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for h in headers:
+        try:
+            if h in row.index:
+                out[h] = _cell_to_json_safe(row[h])
+            else:
+                out[h] = None
+        except Exception:
+            out[h] = None
+    return out
+
+
+# --- Google Sheets Sync helpers (used by etl_sync_google_sheets) ---
+def _extract_google_sheet_id_from_module_configs(module_configs: Any) -> str | None:
+    if not module_configs or not isinstance(module_configs, dict):
+        return None
+    cat = module_configs.get("catalog")
+    if isinstance(cat, dict):
+        sid = cat.get("google_sheet_id")
+        if isinstance(sid, str) and sid.strip():
+            return sid.strip()
+    return None
+
+
+def _get_google_sheet_id_from_workspace(db: Any, organization_id: str) -> str | None:
+    """Resolve google_sheet_id from workspace_settings.module_configs.catalog (Next app shape), with fallbacks."""
+    try:
+        res = (
+            db.table("workspace_settings")
+            .select("module_configs")
+            .eq("organization_id", organization_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            found = _extract_google_sheet_id_from_module_configs(res.data[0].get("module_configs"))
+            if found:
+                return found
+    except Exception as e:
+        log.debug("workspace_settings by organization_id: %s", e)
+    try:
+        res = db.table("workspace_settings").select("module_configs").limit(1).execute()
+        if res.data:
+            found = _extract_google_sheet_id_from_module_configs(res.data[0].get("module_configs"))
+            if found:
+                return found
+    except Exception as e:
+        log.debug("workspace_settings singleton: %s", e)
+    try:
+        res = (
+            db.table("workspace_settings")
+            .select("value")
+            .eq("organization_id", organization_id)
+            .eq("key", "google_sheet_id")
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            v = res.data[0].get("value")
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    except Exception as e:
+        log.debug("workspace_settings legacy key/value: %s", e)
+    return None
+
+
+def _enrich_products_with_vendor_names(db: Any, rows: List[dict[str, Any]]) -> List[dict[str, Any]]:
+    if not rows:
+        return rows
+    seen: set[str] = set()
+    vendor_ids: list[str] = []
+    for r in rows:
+        vid = r.get("vendor_id")
+        if vid is None:
+            continue
+        sid = str(vid)
+        if sid not in seen:
+            seen.add(sid)
+            vendor_ids.append(sid)
+    id_to_name: dict[str, str] = {}
+    if vendor_ids:
+        try:
+            vr = db.table("vendors").select("id, name").in_("id", vendor_ids).execute()
+            for v in vr.data or []:
+                if v.get("id") is not None:
+                    id_to_name[str(v["id"])] = str(v.get("name") or "").strip()
+        except Exception as e:
+            log.warning("Vendor name enrichment failed: %s", e)
+    for r in rows:
+        if r.get("vendor_name"):
+            continue
+        vid = r.get("vendor_id")
+        r["vendor_name"] = id_to_name.get(str(vid)) if vid else None
+    return rows
+
+
+def _get_google_creds(db: Any, org_id: str):
+    """Fetches Google Service Account JSON from organization_api_keys."""
+    try:
+        from google.oauth2 import service_account
+    except ModuleNotFoundError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Google Sheets dependencies are not installed. Run: "
+                "python -m pip install google-api-python-client google-auth"
+            ),
+        ) from e
+
+    try:
+        res = (
+            db.table("organization_api_keys")
+            .select("api_key")
+            .eq("organization_id", org_id)
+            .eq("name", "google_sheets_api")
+            .execute()
+        )
+        if res.data:
+            creds_info = json.loads(res.data[0]["api_key"])
+            return service_account.Credentials.from_service_account_info(creds_info)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("Failed to load Google credentials: %s", e)
+    return None
+
+
+@app.post("/etl/seed-products")
+async def etl_seed_products(file: UploadFile = File(...), organization_id: str = Form(...), store_id: str = Form(...)):
+    organization_id, store_id = _validate_pim_org_store(organization_id, store_id)
+    db = _require_supabase()
+    try:
+        raw_bytes = await file.read()
+        df = _read_tabular_file(raw_bytes)
+        original_headers = [str(c).strip() for c in df.columns]
+
+        openai_key = _get_api_credentials(db, organization_id, "openai_api_key")
+        amazon_creds = _get_api_credentials(db, organization_id, "amazon_sp_api")
+        column_map = _gpt_map_catalog_columns_or_raise(original_headers, openai_key)
+        _validate_gpt_column_map(column_map, original_headers)
+        handles = _pim_handles_from_map(column_map, original_headers)
+
+        metrics = _empty_pim_seed_metrics()
+        errors: list[str] = metrics["errors"]
+        vendor_index = _pim_load_vendor_index(db, organization_id)
+        category_index = _pim_load_category_index(db, organization_id)
+
+        for i, (_, row) in enumerate(df.iterrows()):
+            row_cells = _pim_row_cells_from_series(row, original_headers)
+            _process_pim_seed_row(
+                db,
+                organization_id,
+                store_id,
+                row_cells,
+                handles,
+                amazon_creds,
+                "etl_seed_products",
+                "etl_seed_products_csv",
+                metrics,
+                errors,
+                i + 2,
+                vendor_index,
+                category_index,
+            )
+
+        return {"status": "success", "message": "Catalog import finished.", "metrics": metrics}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("etl_seed_products failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/etl/sync-google-sheets")
+async def etl_sync_google_sheets(organization_id: str = Form(...), store_id: str = Form(...)):
+    organization_id, store_id = _validate_pim_org_store(organization_id, store_id)
+    db = _require_supabase()
+
+    sheet_id = _get_google_sheet_id_from_workspace(db, organization_id)
+    if not sheet_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Google Sheet ID not found. Configure catalog.google_sheet_id in workspace module_configs "
+                "or legacy workspace_settings key google_sheet_id."
+            ),
+        )
+
+    creds = _get_google_creds(db, organization_id)
+    if not creds:
+        raise HTTPException(status_code=401, detail="Google API Key not configured in Organization Keys.")
+
+    try:
+        try:
+            from googleapiclient.discovery import build
+        except ModuleNotFoundError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Google Sheets dependencies are not installed. Run: "
+                    "python -m pip install google-api-python-client google-auth"
+                ),
+            ) from e
+
+        service = build("sheets", "v4", credentials=creds)
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        sheets = sheet_metadata.get("sheets", [])
+
+        metrics = _empty_pim_seed_metrics()
+        metrics["sheets_processed"] = 0
+        errors: list[str] = metrics["errors"]
+
+        vendor_index = _pim_load_vendor_index(db, organization_id)
+        category_index = _pim_load_category_index(db, organization_id)
+        openai_key = _get_api_credentials(db, organization_id, "openai_api_key")
+        amazon_creds = _get_api_credentials(db, organization_id, "amazon_sp_api")
+
+        for sheet in sheets:
+            sheet_name = sheet["properties"]["title"]
+            result = service.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"'{sheet_name}'!A:Z").execute()
+            values = result.get("values", [])
+
+            if not values or len(values) < 2:
+                log.info(
+                    "Skipping empty Google Sheet tab tab=%r spreadsheet=%r",
+                    sheet_name,
+                    sheet_id,
+                )
+                continue
+
+            metrics["sheets_processed"] += 1
+            headers = [str(c).strip() for c in values[0]]
+            rows = [row + [""] * (len(headers) - len(row)) for row in values[1:]]
+            df = pd.DataFrame(rows, columns=headers)
+            original_headers = headers
+
+            column_map = _gpt_map_catalog_columns_or_raise(original_headers, openai_key)
+            _validate_gpt_column_map(column_map, original_headers)
+            handles = _pim_handles_from_map(column_map, original_headers)
+
+            for j, (_, row) in enumerate(df.iterrows()):
+                row_cells = _pim_row_cells_from_series(row, original_headers)
+                _process_pim_seed_row(
+                    db,
+                    organization_id,
+                    store_id,
+                    row_cells,
+                    handles,
+                    amazon_creds,
+                    "etl_google_sheets",
+                    "etl_google_sheets",
+                    metrics,
+                    errors,
+                    j + 2,
+                    vendor_index,
+                    category_index,
+                )
+
+        return {
+            "status": "success",
+            "message": f"Google Sheets sync finished ({metrics['sheets_processed']} non-empty tabs).",
+            "metrics": metrics,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("etl_sync_google_sheets failed")
+        raise HTTPException(status_code=500, detail=f"Google Sync Failed: {e}") from e
+
+
+# --- 2. Real Product List Endpoint ---
+@app.get("/etl/products/{organization_id}")
+async def get_real_products(organization_id: str):
+    db = _require_supabase()
+    # Fetch from products table with their current prices and identifiers
+    res = db.table("products").select("*, product_identifier_map(*), product_prices(*)").eq("organization_id", organization_id).execute()
+    rows = list(res.data or [])
+    rows = _enrich_products_with_vendor_names(db, rows)
+    return {"status": "success", "products": rows}

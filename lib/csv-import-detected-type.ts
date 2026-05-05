@@ -542,7 +542,7 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
     {
       key: "date_time",
       label: "Date / Time",
-      required: true,
+      required: false,
       aliases: ["date/time", "date-time", "datetime", "posted-date", "posted date"],
     },
     {
@@ -554,7 +554,7 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
     {
       key: "transaction_type",
       label: "Type",
-      required: true,
+      required: false,
       aliases: ["type", "transaction-type", "transaction type"],
     },
     {
@@ -580,6 +580,160 @@ export const CANONICAL_FIELDS_PER_TYPE: Record<string, CanonicalField[]> = {
       label: "Total",
       required: false,
       aliases: ["total", "Total", "total-amount", "total amount"],
+    },
+    {
+      key: "quantity",
+      label: "Quantity",
+      required: false,
+      aliases: ["quantity", "Quantity"],
+    },
+    {
+      key: "marketplace",
+      label: "Marketplace",
+      required: false,
+      aliases: ["marketplace", "Marketplace"],
+    },
+    {
+      key: "account_type",
+      label: "Account Type",
+      required: false,
+      aliases: ["account-type", "account type", "Account Type"],
+    },
+    {
+      key: "fulfillment",
+      label: "Fulfillment",
+      required: false,
+      aliases: ["fulfillment", "Fulfillment"],
+    },
+    {
+      key: "order_city",
+      label: "Order City",
+      required: false,
+      aliases: ["order-city", "order city", "Order City"],
+    },
+    {
+      key: "order_state",
+      label: "Order State",
+      required: false,
+      aliases: ["order-state", "order state", "Order State"],
+    },
+    {
+      key: "order_postal",
+      label: "Order Postal",
+      required: false,
+      aliases: ["order-postal", "order postal", "Order Postal"],
+    },
+    {
+      key: "tax_collection_model",
+      label: "Tax Collection Model",
+      required: false,
+      aliases: ["tax-collection-model", "tax collection model", "Tax Collection Model"],
+    },
+    {
+      key: "product_sales",
+      label: "Product Sales",
+      required: false,
+      aliases: ["product-sales", "product sales", "Product Sales"],
+    },
+    {
+      key: "product_sales_tax",
+      label: "Product Sales Tax",
+      required: false,
+      aliases: ["product-sales-tax", "product sales tax", "Product Sales Tax"],
+    },
+    {
+      key: "shipping_credits",
+      label: "Shipping Credits",
+      required: false,
+      aliases: ["shipping-credits", "shipping credits", "Shipping Credits"],
+    },
+    {
+      key: "shipping_credits_tax",
+      label: "Shipping Credits Tax",
+      required: false,
+      aliases: ["shipping-credits-tax", "shipping credits tax", "Shipping Credits Tax"],
+    },
+    {
+      key: "gift_wrap_credits",
+      label: "Gift Wrap Credits",
+      required: false,
+      aliases: ["gift-wrap-credits", "gift wrap credits", "Gift Wrap Credits"],
+    },
+    {
+      key: "giftwrap_credits_tax",
+      label: "Giftwrap Credits Tax",
+      required: false,
+      aliases: ["giftwrap-credits-tax", "giftwrap credits tax", "Giftwrap Credits Tax"],
+    },
+    {
+      key: "regulatory_fee",
+      label: "Regulatory Fee",
+      required: false,
+      aliases: ["regulatory-fee", "regulatory fee", "Regulatory Fee"],
+    },
+    {
+      key: "tax_on_regulatory_fee",
+      label: "Tax On Regulatory Fee",
+      required: false,
+      aliases: ["tax-on-regulatory-fee", "tax on regulatory fee", "Tax On Regulatory Fee"],
+    },
+    {
+      key: "promotional_rebates",
+      label: "Promotional Rebates",
+      required: false,
+      aliases: ["promotional-rebates", "promotional rebates", "Promotional Rebates"],
+    },
+    {
+      key: "promotional_rebates_tax",
+      label: "Promotional Rebates Tax",
+      required: false,
+      aliases: ["promotional-rebates-tax", "promotional rebates tax", "Promotional Rebates Tax"],
+    },
+    {
+      key: "marketplace_withheld_tax",
+      label: "Marketplace Withheld Tax",
+      required: false,
+      aliases: ["marketplace-withheld-tax", "marketplace withheld tax", "Marketplace Withheld Tax"],
+    },
+    {
+      key: "selling_fees",
+      label: "Selling Fees",
+      required: false,
+      aliases: ["selling-fees", "selling fees", "Selling Fees"],
+    },
+    {
+      key: "fba_fees",
+      label: "FBA Fees",
+      required: false,
+      aliases: ["fba-fees", "fba fees", "FBA Fees"],
+    },
+    {
+      key: "other_transaction_fees",
+      label: "Other Transaction Fees",
+      required: false,
+      aliases: ["other-transaction-fees", "other transaction fees", "Other Transaction Fees"],
+    },
+    {
+      key: "other_amount",
+      label: "Other",
+      required: false,
+      aliases: ["other", "Other"],
+    },
+    {
+      key: "transaction_status",
+      label: "Transaction Status",
+      required: false,
+      aliases: ["transaction-status", "transaction status", "Transaction Status"],
+    },
+    {
+      key: "transaction_release_date",
+      label: "Transaction Release Date",
+      required: false,
+      aliases: [
+        "transaction-release-date",
+        "transaction release date",
+        "Transaction Release Date",
+      ],
     },
   ],
   PRODUCT_IDENTITY: [
@@ -1013,7 +1167,7 @@ export function mappingHasRequiredGaps(
  */
 export function headersLookLikeReportsRepository(headers: string[]): boolean {
   const ds = detectionSet(headers);
-  return (
+  const core =
     ds.has("date/time") &&
     ds.has("settlement id") &&
     ds.has("type") &&
@@ -1021,11 +1175,20 @@ export function headersLookLikeReportsRepository(headers: string[]): boolean {
     ds.has("sku") &&
     ds.has("description") &&
     ds.has("total") &&
-    !ds.has("transaction type") &&
-    // Transaction / Payment Detail report → SETTLEMENT, not REPORTS_REPOSITORY.
-    !ds.has("transaction status") &&
-    !ds.has("transaction release date")
-  );
+    !ds.has("transaction type");
+  if (!core) return false;
+  // Fee Preview / standard transactions use "transaction type" — excluded above.
+  // When Amazon adds Transaction Status / Release Date to the wide Repository CSV,
+  // require a fee-column fingerprint so Rule 5a (SETTLEMENT) does not steal the file.
+  if (ds.has("transaction status") || ds.has("transaction release date")) {
+    return (
+      ds.has("product sales") ||
+      ds.has("fba fees") ||
+      ds.has("selling fees") ||
+      ds.has("shipping credits")
+    );
+  }
+  return true;
 }
 
 /**
@@ -1036,6 +1199,9 @@ export function headersLookLikeReportsRepository(headers: string[]): boolean {
  * of REPORTS_REPOSITORY.
  */
 export function headersLookLikeAmazonTransactionDetailReport(headers: string[]): boolean {
+  // Wide Reports Repository exports (Jan 2025+) share "Transaction Status" columns
+  // but are not Payment Detail settlement files — route them via Rule 7 instead.
+  if (headersLookLikeReportsRepository(headers)) return false;
   const ds = detectionSet(headers);
   const hasCore =
     ds.has("date/time") &&

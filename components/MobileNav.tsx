@@ -4,10 +4,10 @@ import React, { useState, useEffect } from "react";
 import { createPortal } from "react-dom";
 import Link from "next/link";
 import {
-  Database,
   FileText,
   FileUp,
   LayoutDashboard,
+  Package,
   RotateCcw,
   ShieldAlert,
   Settings,
@@ -25,14 +25,12 @@ const navLinks = [
       { label: "Returns Processing", icon: RotateCcw, href: "/returns" },
       { label: "Claim Engine", icon: ShieldAlert, href: "/claim-engine" },
       { label: "Report history", icon: FileText, href: "/claim-engine/report-history" },
+      { label: "Product Information Management", icon: Package, href: "/dashboard/products" },
     ],
   },
   {
-    section: "Imports",
-    items: [
-      { label: "File Import", icon: FileUp,   href: "/dashboard/file-import" },
-      { label: "Amazon ETL",  icon: Database,  href: "/dashboard/amazon-etl"  },
-    ],
+    section: "Data Management",
+    items: [{ label: "Imports", icon: FileUp, href: "/dashboard/file-import" }],
   },
   {
     section: "Integrations",
@@ -49,7 +47,7 @@ export function MobileNav() {
   const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
-    setMounted(true);
+    queueMicrotask(() => setMounted(true));
   }, []);
 
   // Prevent body scroll when drawer is open

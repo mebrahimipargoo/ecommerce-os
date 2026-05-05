@@ -110,6 +110,9 @@ export async function resolveProductIdentifierMapMatch(
 ): Promise<ProductIdentifierMatchResult> {
   const organizationId = hints.organizationId;
   const storeId = n(hints.storeId);
+  if (!storeId) {
+    throw new Error("resolveProductIdentifierMapMatch requires storeId (imports target store).");
+  }
   const fnsku = n(hints.fnsku);
   const msku = n(hints.msku) ?? n(hints.sku);
   const asin = n(hints.asin);
@@ -134,7 +137,7 @@ export async function resolveProductIdentifierMapMatch(
 export function resolveIdentifierMapForInventoryLedgerRow(
   supabase: SupabaseClient,
   organizationId: string,
-  storeId: string | null,
+  storeId: string,
   row: { fnsku?: unknown; msku?: unknown; sku?: unknown; asin?: unknown; raw_data?: unknown },
 ): Promise<ProductIdentifierMatchResult> {
   return resolveProductIdentifierMapMatch(supabase, {

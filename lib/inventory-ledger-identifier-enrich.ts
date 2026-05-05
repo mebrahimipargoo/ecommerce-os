@@ -129,7 +129,7 @@ export async function enrichIdentifierMapFromInventoryLedgerUpload(params: {
   supabase: SupabaseClient;
   organizationId: string;
   uploadId: string;
-  storeId: string | null;
+  storeId: string;
   pageSize?: number;
 }): Promise<InventoryLedgerIdentifierEnrichMetrics> {
   const { supabase, organizationId, uploadId, storeId } = params;

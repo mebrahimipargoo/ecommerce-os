@@ -6,6 +6,7 @@ import {
   AMAZON_LEDGER_UPLOAD_SOURCE,
   mergeUploadMetadata,
   parseRawReportMetadata,
+  resolveImportStoreIdFromMetadata,
 } from "../../../../../lib/raw-report-upload-metadata";
 import {
   PRODUCT_IDENTITY_REPORT_TYPE,
@@ -40,19 +41,11 @@ function numericMeta(value: unknown, fallback = 0): number {
   return fallback;
 }
 
-function resolveImportStoreId(meta: Record<string, unknown>): string | null {
-  const a = typeof meta.import_store_id === "string" ? meta.import_store_id.trim() : "";
-  if (a && isUuidString(a)) return a;
-  const b = typeof meta.ledger_store_id === "string" ? meta.ledger_store_id.trim() : "";
-  if (b && isUuidString(b)) return b;
-  return null;
-}
-
 async function validateImportStoreBelongsToOrg(params: {
   organizationId: string;
   metadata: Record<string, unknown>;
 }): Promise<{ ok: true; storeId: string | null } | { ok: false; error: string }> {
-  const storeId = resolveImportStoreId(params.metadata);
+  const storeId = resolveImportStoreIdFromMetadata(params.metadata);
   if (!storeId) return { ok: true, storeId: null };
   const { data, error } = await supabaseServer
     .from("stores")
@@ -288,7 +281,7 @@ async function processProductIdentityUpload(params: {
     const message = e instanceof Error ? e.message : "Product Identity staging failed.";
     console.error("[ProductIdentityProcess] Phase 2 failed", {
       uploadId, organizationId,
-      storeId: resolveImportStoreId(metadata),
+      storeId: resolveImportStoreIdFromMetadata(metadata),
       reportType: "PRODUCT_IDENTITY", phase: "process",
       error: message, stack: e instanceof Error ? e.stack : undefined,
     });

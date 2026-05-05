@@ -3,6 +3,8 @@
  * Do not rely on legacy columns (total_bytes, upload_progress, storage_prefix, etc.).
  */
 
+import { isUuidString } from "./uuid";
+
 /** Client ledger sessions — must live outside `"use server"` modules (only async exports allowed there). */
 export const AMAZON_LEDGER_UPLOAD_SOURCE = "amazon_ledger_uploader" as const;
 
@@ -335,4 +337,27 @@ export function mergeUploadMetadata(
       ? { ...(prev as Record<string, unknown>) }
       : {};
   return { ...base, ...patch } as RawReportUploadMetadata;
+}
+
+/** Imports Target Store: Wave-1 metadata on `raw_report_uploads`. */
+export function resolveImportStoreIdFromMetadata(metadata: unknown): string | null {
+  const m =
+    metadata && typeof metadata === "object" && !Array.isArray(metadata)
+      ? (metadata as Record<string, unknown>)
+      : {};
+  const a = typeof m.import_store_id === "string" ? m.import_store_id.trim() : "";
+  if (a && isUuidString(a)) return a;
+  const b = typeof m.ledger_store_id === "string" ? m.ledger_store_id.trim() : "";
+  if (b && isUuidString(b)) return b;
+  return null;
+}
+
+export function requireImportStoreIdFromMetadata(metadata: unknown, ctx = "Import"): string {
+  const id = resolveImportStoreIdFromMetadata(metadata);
+  if (!id) {
+    throw new Error(
+      `${ctx} requires metadata.import_store_id or metadata.ledger_store_id (UUID). Choose Imports Target Store in the importer.`,
+    );
+  }
+  return id;
 }

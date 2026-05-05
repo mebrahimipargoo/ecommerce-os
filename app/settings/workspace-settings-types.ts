@@ -47,10 +47,17 @@ export interface ClaimAgentConfig {
   logistics_sync_interval_hours?: number;
 }
 
+/** PIM / catalog integrations (e.g. Google Sheets ID read by FastAPI `etl/sync-google-sheets`). */
+export interface CatalogModuleConfig {
+  google_sheet_id?: string;
+}
+
 export interface ModuleConfigs {
   inventory?: InventoryModuleConfig;
   reports?:   ReportsModuleConfig;
   claim_agent_config?: ClaimAgentConfig;
+  /** Optional: `google_sheet_id` for ETL Google Sheets sync. */
+  catalog?: CatalogModuleConfig;
   [key: string]: unknown;
 }
 

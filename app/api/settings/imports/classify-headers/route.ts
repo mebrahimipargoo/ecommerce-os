@@ -5,6 +5,7 @@ import {
   classifyCsvHeadersRuleBased,
   headersLookLikeAmazonTransactionDetailReport,
   headersLookLikeProductIdentity,
+  headersLookLikeReportsRepository,
   headersLookLikeSimpleTransactionsSummary,
   mappingHasRequiredGaps,
 } from "../../../../../lib/csv-import-detected-type";
@@ -83,13 +84,54 @@ const TRANSACTIONS_FALLBACK_ALIASES: Record<string, string[]> = {
 
 /** Gap-fill for Reports Repository transaction CSV (lowercase headers, column "type"). */
 const REPORTS_REPOSITORY_FALLBACK_ALIASES: Record<string, string[]> = {
-  date_time:         ["date/time", "date-time", "datetime", "posted-date", "posted date"],
-  settlement_id:     ["settlement-id", "settlement id", "Settlement ID"],
-  transaction_type:  ["type", "transaction-type", "transaction type"],
-  order_id:          ["order-id", "order id", "amazon-order-id", "amazon order id"],
-  sku:               ["sku", "SKU", "merchant-sku", "msku"],
-  description:       ["description", "Description"],
-  total_amount:      ["total", "Total", "total-amount", "total amount"],
+  date_time: ["date/time", "date-time", "datetime", "posted-date", "posted date"],
+  settlement_id: ["settlement-id", "settlement id", "Settlement ID"],
+  transaction_type: ["type", "transaction-type", "transaction type"],
+  order_id: ["order-id", "order id", "amazon-order-id", "amazon order id"],
+  sku: ["sku", "SKU", "merchant-sku", "msku"],
+  description: ["description", "Description"],
+  total_amount: ["total", "Total", "total-amount", "total amount"],
+  quantity: ["quantity", "Quantity"],
+  marketplace: ["marketplace", "Marketplace"],
+  account_type: ["account-type", "account type", "Account Type"],
+  fulfillment: ["fulfillment", "Fulfillment"],
+  order_city: ["order-city", "order city", "Order City"],
+  order_state: ["order-state", "order state", "Order State"],
+  order_postal: ["order-postal", "order postal", "Order Postal"],
+  tax_collection_model: ["tax-collection-model", "tax collection model", "Tax Collection Model"],
+  product_sales: ["product-sales", "product sales", "Product Sales"],
+  product_sales_tax: ["product-sales-tax", "product sales tax", "Product Sales Tax"],
+  shipping_credits: ["shipping-credits", "shipping credits", "Shipping Credits"],
+  shipping_credits_tax: ["shipping-credits-tax", "shipping credits tax", "Shipping Credits Tax"],
+  gift_wrap_credits: ["gift-wrap-credits", "gift wrap credits", "Gift Wrap Credits"],
+  giftwrap_credits_tax: ["giftwrap-credits-tax", "giftwrap credits tax", "Giftwrap Credits Tax"],
+  regulatory_fee: ["regulatory-fee", "regulatory fee", "Regulatory Fee"],
+  tax_on_regulatory_fee: ["tax-on-regulatory-fee", "tax on regulatory fee", "Tax On Regulatory Fee"],
+  promotional_rebates: ["promotional-rebates", "promotional rebates", "Promotional Rebates"],
+  promotional_rebates_tax: [
+    "promotional-rebates-tax",
+    "promotional rebates tax",
+    "Promotional Rebates Tax",
+  ],
+  marketplace_withheld_tax: [
+    "marketplace-withheld-tax",
+    "marketplace withheld tax",
+    "Marketplace Withheld Tax",
+  ],
+  selling_fees: ["selling-fees", "selling fees", "Selling Fees"],
+  fba_fees: ["fba-fees", "fba fees", "FBA Fees"],
+  other_transaction_fees: [
+    "other-transaction-fees",
+    "other transaction fees",
+    "Other Transaction Fees",
+  ],
+  other_amount: ["other", "Other"],
+  transaction_status: ["transaction-status", "transaction status", "Transaction Status"],
+  transaction_release_date: [
+    "transaction-release-date",
+    "transaction release date",
+    "Transaction Release Date",
+  ],
 };
 
 const PRODUCT_IDENTITY_FALLBACK_ALIASES: Record<string, string[]> = {
@@ -462,19 +504,25 @@ export async function POST(req: Request): Promise<Response> {
 
     // ── Step 3.6: Filename / content — do not mis-file Reports Repository as Settlement ─
     //
-    // Two important guards before we override:
-    //   • If the headers carry the Transaction / Payment Detail fingerprint
-    //     (Transaction Status / Transaction Release Date / quantity / account
-    //     type / fulfillment) the file is the Amazon Transaction / Payment
-    //     Detail report — keep it as SETTLEMENT and apply the settlement
-    //     fallback mapping so all the typed columns get filled.
-    //   • If the headers carry the Simple Transactions Summary fingerprint
-    //     (Total (USD) + Transaction type + Order ID + Total product charges)
-    //     keep it as TRANSACTIONS.
+    // Order matters:
+    //   • Filename + Reports Repository header fingerprint wins over Transaction Detail
+    //     (wide Repository CSVs include Transaction Status / Release Date).
+    //   • Transaction / Payment Detail → SETTLEMENT (when not a Repository file).
+    //   • Simple Transactions Summary → TRANSACTIONS.
     const isTransactionDetail = headersLookLikeAmazonTransactionDetailReport(headers);
     const isSimpleSummary = headersLookLikeSimpleTransactionsSummary(headers);
 
-    if (isTransactionDetail) {
+    const filenameReportsRepoLocked =
+      fileNameSuggestsReportsRepository(fileName) && headersLookLikeReportsRepository(headers);
+
+    if (filenameReportsRepoLocked) {
+      reportType = "REPORTS_REPOSITORY";
+      source = "filename";
+      column_mapping = applyReportsRepositoryFallbackMapping(
+        headers,
+        { ...buildColumnMappingFromHeaders(headers, "REPORTS_REPOSITORY"), ...column_mapping },
+      );
+    } else if (isTransactionDetail) {
       reportType = "SETTLEMENT";
       source = "rules";
       column_mapping = applySettlementFlatFallbackMapping(headers, column_mapping);

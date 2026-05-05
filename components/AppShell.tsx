@@ -142,7 +142,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
     const auto: Record<string, boolean> = {};
     for (const sec of MAIN_SIDEBAR) {
       for (const g of sec.groups) {
-        const key = `nav-${sec.id}-${g.label}`;
+        const key = `nav-${sec.id}-${g.id}`;
         if (g.children.some((c) => isActive(c.path))) {
           auto[key] = true;
         }
@@ -267,7 +267,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
               <span className="flex-1 truncate text-left">{item.label}</span>
               <ChevronDown
                 className={[
-                  "h-4 w-4 shrink-0 opacity-50 transition-transform duration-200",
+                  "h-4 w-4 shrink-0 opacity-50 transition-transform duration-300 ease-out motion-reduce:transition-none",
                   open ? "rotate-0" : "-rotate-90",
                 ].join(" ")}
               />
@@ -288,7 +288,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         {showText && (
           <div
             className={[
-              "grid transition-[grid-template-rows] duration-200 ease-in-out",
+              "grid transition-[grid-template-rows] duration-300 ease-out motion-reduce:transition-none",
               open ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
             ].join(" ")}
           >

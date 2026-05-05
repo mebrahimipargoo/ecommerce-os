@@ -1,13 +1,14 @@
 /**
  * Priority matching for `product_identifier_map` rows (operational imports).
  *
- * Priority 1: organization_id + fnsku
- * Priority 2: organization_id + seller_sku + asin
- * Priority 3: organization_id + seller_sku (or msku column)
- * Priority 4: organization_id + asin
+ * Candidates are always scoped by organization_id + store_id.
+ *
+ * Priority 1: fnsku match
+ * Priority 2: seller_sku + asin
+ * Priority 3: seller_sku (or msku column)
+ * Priority 4: asin
  *
  * Tie-break: exact fnsku > sku/msku + asin > weaker tiers. Multiple equal winners → ambiguous.
- * Matching is org-scoped (no store_id in priority).
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -36,7 +37,7 @@ export type ProductIdentifierMapRow = {
 
 export type IdentifierLookupHints = {
   organizationId: string;
-  /** Ignored for tier scoring; prefetch is org-wide. */
+  /** Required for DB prefetch; matching only considers rows for this store. */
   storeId?: string | null;
   fnsku?: string | null;
   /** MSKU / seller SKU */
@@ -133,7 +134,11 @@ export function pickBestProductIdentifierMatch(
     const id = String(c.id ?? "").trim();
     if (id) uniq.set(id, c);
   }
-  const pool = [...uniq.values()];
+  const scopeStore = n(hints.storeId);
+  let pool = [...uniq.values()];
+  if (scopeStore) {
+    pool = pool.filter((r) => n(r.store_id) === scopeStore);
+  }
   if (pool.length === 0) {
     return { row: null, status: "unresolved", tier: null, confidence: 0, candidatesConsidered: 0 };
   }
@@ -177,13 +182,18 @@ const baseSelect =
   "id, organization_id, product_id, catalog_product_id, store_id, seller_sku, asin, fnsku, msku, external_listing_id, title, disposition, confidence_score, match_source, inventory_source, last_seen_at, linked_from_report_family, linked_from_target_table";
 
 /**
- * Load a bounded candidate set for priority matching (organization only).
+ * Load a bounded candidate set for priority matching (organization + store).
  */
 export async function fetchProductIdentifierMapCandidates(
   supabase: SupabaseClient,
   organizationId: string,
   hints: IdentifierLookupHints,
 ): Promise<ProductIdentifierMapRow[]> {
+  const storeId = n(hints.storeId);
+  if (!storeId) {
+    throw new Error("fetchProductIdentifierMapCandidates requires hints.storeId (imports target store).");
+  }
+
   const fnsku = n(hints.fnsku);
   const msku = n(hints.msku);
   const asin = n(hints.asin);
@@ -205,6 +215,7 @@ export async function fetchProductIdentifierMapCandidates(
       .from("product_identifier_map")
       .select(baseSelect)
       .eq("organization_id", organizationId)
+      .eq("store_id", storeId)
       .eq("fnsku", fnsku)
       .limit(120);
     if (error) throw new Error(`fetchProductIdentifierMapCandidates fnsku: ${error.message}`);
@@ -216,6 +227,7 @@ export async function fetchProductIdentifierMapCandidates(
       .from("product_identifier_map")
       .select(baseSelect)
       .eq("organization_id", organizationId)
+      .eq("store_id", storeId)
       .eq("seller_sku", msku)
       .limit(200);
     if (error) throw new Error(`fetchProductIdentifierMapCandidates msku: ${error.message}`);
@@ -224,6 +236,7 @@ export async function fetchProductIdentifierMapCandidates(
       .from("product_identifier_map")
       .select(baseSelect)
       .eq("organization_id", organizationId)
+      .eq("store_id", storeId)
       .eq("msku", msku)
       .limit(200);
     if (e2) throw new Error(`fetchProductIdentifierMapCandidates msku2: ${e2.message}`);
@@ -235,6 +248,7 @@ export async function fetchProductIdentifierMapCandidates(
       .from("product_identifier_map")
       .select(baseSelect)
       .eq("organization_id", organizationId)
+      .eq("store_id", storeId)
       .eq("asin", asin)
       .limit(200);
     if (error) throw new Error(`fetchProductIdentifierMapCandidates asin: ${error.message}`);
@@ -245,14 +259,19 @@ export async function fetchProductIdentifierMapCandidates(
 }
 
 /**
- * Batch prefetch: union identifiers from many operational rows (organization only).
+ * Batch prefetch: union identifiers from many operational rows (organization + store).
  */
 export async function prefetchIdentifierMapCandidatesForBatch(
   supabase: SupabaseClient,
   organizationId: string,
-  _storeId: string | null,
+  storeId: string | null,
   keys: { fnsku?: string | null; msku?: string | null; asin?: string | null }[],
 ): Promise<ProductIdentifierMapRow[]> {
+  const sid = n(storeId);
+  if (!sid) {
+    return [];
+  }
+
   const fnskus = [...new Set(keys.map((k) => n(k.fnsku)).filter(Boolean))] as string[];
   const mskus = [...new Set(keys.map((k) => n(k.msku)).filter(Boolean))] as string[];
   const asins = [...new Set(keys.map((k) => n(k.asin)).filter(Boolean))] as string[];
@@ -274,6 +293,7 @@ export async function prefetchIdentifierMapCandidatesForBatch(
       .from("product_identifier_map")
       .select(baseSelect)
       .eq("organization_id", organizationId)
+      .eq("store_id", sid)
       .in("fnsku", slice);
     if (error) throw new Error(`prefetchIdentifierMapCandidatesForBatch fnsku: ${error.message}`);
     pushRows(data);
@@ -285,6 +305,7 @@ export async function prefetchIdentifierMapCandidatesForBatch(
       .from("product_identifier_map")
       .select(baseSelect)
       .eq("organization_id", organizationId)
+      .eq("store_id", sid)
       .in("seller_sku", slice);
     if (error) throw new Error(`prefetchIdentifierMapCandidatesForBatch msku: ${error.message}`);
     pushRows(data);
@@ -292,6 +313,7 @@ export async function prefetchIdentifierMapCandidatesForBatch(
       .from("product_identifier_map")
       .select(baseSelect)
       .eq("organization_id", organizationId)
+      .eq("store_id", sid)
       .in("msku", slice);
     if (e2) throw new Error(`prefetchIdentifierMapCandidatesForBatch msku col: ${e2.message}`);
     pushRows(d2);
@@ -303,6 +325,7 @@ export async function prefetchIdentifierMapCandidatesForBatch(
       .from("product_identifier_map")
       .select(baseSelect)
       .eq("organization_id", organizationId)
+      .eq("store_id", sid)
       .in("asin", slice);
     if (error) throw new Error(`prefetchIdentifierMapCandidatesForBatch asin: ${error.message}`);
     pushRows(data);

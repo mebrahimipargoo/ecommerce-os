@@ -22,6 +22,36 @@ function normLine(s: string): string {
     .replace(/\s+/g, " ");
 }
 
+/** Same token normalization as `normForDetection` in csv-import-detected-type (subset). */
+function normHeaderCellForDetection(cell: string): string {
+  return (cell ?? "")
+    .replace(/^\uFEFF/, "")
+    .toLowerCase()
+    .replace(/[-_]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * True when a split header row contains the seven Amazon Reports Repository
+ * anchor columns (after normalization). Avoids treating preamble prose as data.
+ */
+export function headerRowHasReportsRepositoryRequiredTokens(line: string): boolean {
+  const sep = line.includes("\t") ? "\t" : ",";
+  const cells = line.split(sep).map((p) => p.replace(/^"|"$/g, "").trim()).filter(Boolean);
+  if (cells.length < 7) return false;
+  const ds = new Set(cells.map(normHeaderCellForDetection));
+  return (
+    ds.has("date/time") &&
+    ds.has("settlement id") &&
+    ds.has("type") &&
+    ds.has("order id") &&
+    ds.has("sku") &&
+    ds.has("description") &&
+    ds.has("total")
+  );
+}
+
 /**
  * True if this physical line looks like the Reports Repository header row:
  * contains both a date/time column token and settlement id.
@@ -81,7 +111,8 @@ export function findReportsRepositoryHeaderLineIndex(rawText: string): ReportsRe
   const n = Math.min(lines.length, MAX_HEADER_SCAN);
 
   for (let i = 0; i < n; i++) {
-    if (lineLooksLikeReportsRepositoryHeader(lines[i])) {
+    const ln = lines[i];
+    if (lineLooksLikeReportsRepositoryHeader(ln) && headerRowHasReportsRepositoryRequiredTokens(ln)) {
       return { index: i, method: "keyword" };
     }
   }
@@ -114,6 +145,12 @@ export function stripReportsRepositoryPreamble(rawText: string): string {
  */
 export function contentSuggestsReportsRepositorySample(textSample: string): boolean {
   const lines = textSample.split(/\r?\n/).slice(0, 20);
-  if (lines.some((ln) => lineLooksLikeReportsRepositoryHeader(ln))) return true;
+  if (
+    lines.some(
+      (ln) => lineLooksLikeReportsRepositoryHeader(ln) && headerRowHasReportsRepositoryRequiredTokens(ln),
+    )
+  ) {
+    return true;
+  }
   return looksLikeClassicNineLinePreamble(textSample.split(/\r?\n/));
 }

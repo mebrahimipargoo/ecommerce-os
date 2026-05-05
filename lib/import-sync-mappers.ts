@@ -148,7 +148,7 @@ function buildRawData(
 
 /** amazon_returns — physical DB columns */
 export const NATIVE_COLUMNS_RETURNS = new Set([
-  "id", "organization_id", "upload_id", "return_date",
+  "id", "organization_id", "store_id", "upload_id", "return_date",
   "source_file_sha256", "source_physical_row_number",
   "order_id", "sku", "asin", "lpn",
   "product_name", "disposition", "reason", "status",
@@ -181,7 +181,7 @@ export const NATIVE_COLUMNS_REMOVALS = new Set([
  * packPayloadForSupabase() automatically redirects them into the raw_data JSONB.
  */
 export const NATIVE_COLUMNS_LEDGER = new Set([
-  "id", "organization_id", "upload_id",
+  "id", "organization_id", "store_id", "upload_id",
   "source_line_hash",
   "source_file_sha256", "source_physical_row_number",
   "fnsku", "disposition", "location", "event_type", "quantity",
@@ -198,7 +198,7 @@ export const NATIVE_COLUMNS_LEDGER = new Set([
 
 /** amazon_reimbursements — physical DB columns */
 export const NATIVE_COLUMNS_REIMBURSEMENTS = new Set([
-  "id", "organization_id", "upload_id",
+  "id", "organization_id", "store_id", "upload_id",
   "source_line_hash",
   "source_file_sha256", "source_physical_row_number",
   "order_id", "reimbursement_id", "sku", "amount_reimbursed",
@@ -260,7 +260,7 @@ export const NATIVE_COLUMNS_SETTLEMENTS = new Set([
 
 /** amazon_safet_claims — physical DB columns */
 export const NATIVE_COLUMNS_SAFET = new Set([
-  "id", "organization_id", "upload_id", "claim_date",
+  "id", "organization_id", "store_id", "upload_id", "claim_date",
   "source_file_sha256", "source_physical_row_number",
   "safet_claim_id", "order_id", "asin", "item_name",
   "claim_reason", "claim_status", "claim_amount", "total_reimbursement_amount",
@@ -428,7 +428,39 @@ export const NATIVE_COLUMNS_REPORTS_REPOSITORY = new Set([
   "source_line_hash",
   "source_file_sha256", "source_physical_row_number",
   "date_time", "settlement_id", "transaction_type", "order_id", "sku", "description",
-  "total_amount", "created_at", "raw_data",
+  "total_amount",
+  "quantity",
+  "marketplace",
+  "account_type",
+  "fulfillment",
+  "order_city",
+  "order_state",
+  "order_postal",
+  "tax_collection_model",
+  "product_sales",
+  "product_sales_tax",
+  "shipping_credits",
+  "shipping_credits_tax",
+  "gift_wrap_credits",
+  "giftwrap_credits_tax",
+  "regulatory_fee",
+  "tax_on_regulatory_fee",
+  "promotional_rebates",
+  "promotional_rebates_tax",
+  "marketplace_withheld_tax",
+  "selling_fees",
+  "fba_fees",
+  "other_transaction_fees",
+  "other_amount",
+  "transaction_status",
+  "transaction_release_date",
+  "store_id",
+  "product_id",
+  "catalog_product_id",
+  "product_match_method",
+  "product_match_confidence",
+  "product_matched_at",
+  "created_at", "raw_data",
 ]);
 
 // =============================================================================
@@ -1080,6 +1112,7 @@ export function mapRowToCatalogProduct(
 
 export type AmazonReturnInsert = {
   organization_id: string;
+  store_id: string;
   upload_id: string;
   /** Lookup only — import identity is (organization_id, source_file_sha256, source_physical_row_number). */
   lpn: string | null;
@@ -1099,12 +1132,14 @@ export function mapRowToAmazonReturn(
   row: Record<string, string>,
   orgId: string,
   uploadId: string,
+  storeId: string,
 ): AmazonReturnInsert {
   const consumed = new Set<string>();
   const lpnRaw = pickT(row, LPN_ALIASES, consumed);
   const lpn = lpnRaw === "" ? null : lpnRaw;
   return {
     organization_id: orgId,
+    store_id: storeId,
     upload_id: uploadId,
     lpn,
     order_id:     pickT(row, ORDER_ALIASES, consumed) || null,
@@ -1365,6 +1400,7 @@ export function mapRowToAmazonRemoval(
 
 export type AmazonInventoryLedgerInsert = {
   organization_id: string;
+  store_id: string;
   upload_id: string;
   /** Line-level dedupe — full-row fingerprint (migration 20260613). */
   source_line_hash: string;
@@ -1435,6 +1471,7 @@ export function mapRowToAmazonInventoryLedger(
   row: Record<string, string>,
   orgId: string,
   uploadId: string,
+  storeId: string,
 ): AmazonInventoryLedgerInsert | null {
   const source_line_hash = computeSourceLineHash(orgId, row);
   const consumed = new Set<string>();
@@ -1472,6 +1509,7 @@ export function mapRowToAmazonInventoryLedger(
 
   return {
     organization_id: orgId,
+    store_id: storeId,
     upload_id: uploadId,
     source_line_hash,
     fnsku,
@@ -1514,6 +1552,7 @@ export function mapLedgerPositionalRawRowToAmazonInventoryLedgerInsert(
   rawRow: Record<string, string>,
   orgId: string,
   uploadId: string,
+  storeId: string,
   opts?: { sourceFileName?: string | null },
 ): AmazonInventoryLedgerInsert | null {
   const cells: string[] = [];
@@ -1554,6 +1593,7 @@ export function mapLedgerPositionalRawRowToAmazonInventoryLedgerInsert(
 
   return {
     organization_id: orgId,
+    store_id: storeId,
     upload_id: uploadId,
     source_line_hash,
     fnsku,
@@ -1586,6 +1626,7 @@ export function mapLedgerPositionalRawRowToAmazonInventoryLedgerInsert(
 
 export type AmazonReimbursementInsert = {
   organization_id: string;
+  store_id: string;
   upload_id: string;
   source_line_hash: string;
   reimbursement_id: string;
@@ -1601,6 +1642,7 @@ export function mapRowToAmazonReimbursement(
   row: Record<string, string>,
   orgId: string,
   uploadId: string,
+  storeId: string,
 ): AmazonReimbursementInsert | null {
   const source_line_hash = computeSourceLineHash(orgId, row);
   const consumed = new Set<string>();
@@ -1608,6 +1650,7 @@ export function mapRowToAmazonReimbursement(
   if (!reimbursement_id) return null;
   return {
     organization_id:  orgId,
+    store_id: storeId,
     upload_id:        uploadId,
     source_line_hash,
     reimbursement_id,
@@ -1944,6 +1987,7 @@ export function mapRowToAmazonSettlement(
 
 export type AmazonSafetClaimInsert = {
   organization_id: string;
+  store_id: string;
   upload_id: string;
   safet_claim_id: string;
   order_id: string | null;
@@ -1960,6 +2004,7 @@ export function mapRowToAmazonSafetClaim(
   row: Record<string, string>,
   orgId: string,
   uploadId: string,
+  storeId: string,
 ): AmazonSafetClaimInsert | null {
   const consumed = new Set<string>();
   const safet_claim_id = pickT(row, SAFET_CLAIM_ID_ALIASES, consumed);
@@ -1969,6 +2014,7 @@ export function mapRowToAmazonSafetClaim(
   );
   return {
     organization_id: orgId,
+    store_id: storeId,
     upload_id: uploadId,
     safet_claim_id,
     order_id:                  pickT(row, ORDER_ALIASES, consumed) || null,
@@ -1989,6 +2035,7 @@ export function mapRowToAmazonSafetClaim(
 
 export type AmazonTransactionInsert = {
   organization_id: string;
+  store_id: string;
   upload_id: string;
   /** Deterministic content fingerprint — new dedup key replacing the old (org, order_id, tx_type, amount) constraint. */
   source_line_hash: string;
@@ -2006,6 +2053,7 @@ export function mapRowToAmazonTransaction(
   row: Record<string, string>,
   orgId: string,
   uploadId: string,
+  storeId: string,
 ): AmazonTransactionInsert | null {
   const consumed = new Set<string>();
   const base_tx = pickT(row, TX_TYPE_ALIASES, consumed);
@@ -2048,6 +2096,7 @@ export function mapRowToAmazonTransaction(
 
   return {
     organization_id: orgId,
+    store_id: storeId,
     upload_id: uploadId,
     source_line_hash,
     settlement_id,
@@ -2082,6 +2131,76 @@ const REPORTS_REPO_SETTLEMENT_ALIASES = [
 const REPORTS_REPO_TYPE_ALIASES = ["type", "transaction-type", "transaction type", "transaction_type"];
 const REPORTS_REPO_DESC_ALIASES = ["description", "Description"];
 const REPORTS_REPO_TOTAL_ALIASES = ["total", "total-amount", "total amount", "total_amount"];
+const REPORTS_REPO_QTY_ALIASES = ["quantity", "Quantity", "qty"];
+const REPORTS_REPO_MARKETPLACE_ALIASES = ["marketplace", "Marketplace"];
+const REPORTS_REPO_ACCOUNT_TYPE_ALIASES = ["account-type", "account type", "account_type", "Account Type"];
+const REPORTS_REPO_FULFILLMENT_ALIASES = ["fulfillment", "Fulfillment"];
+const REPORTS_REPO_ORDER_CITY_ALIASES = ["order-city", "order city", "Order City"];
+const REPORTS_REPO_ORDER_STATE_ALIASES = ["order-state", "order state", "Order State"];
+const REPORTS_REPO_ORDER_POSTAL_ALIASES = ["order-postal", "order postal", "Order Postal"];
+const REPORTS_REPO_TAX_MODEL_ALIASES = [
+  "tax-collection-model",
+  "tax collection model",
+  "Tax Collection Model",
+  "tax_collection_model",
+];
+const REPORTS_REPO_PRODUCT_SALES_ALIASES = ["product-sales", "product sales", "Product Sales"];
+const REPORTS_REPO_PRODUCT_SALES_TAX_ALIASES = [
+  "product-sales-tax",
+  "product sales tax",
+  "Product Sales Tax",
+];
+const REPORTS_REPO_SHIP_CRED_ALIASES = ["shipping-credits", "shipping credits", "Shipping Credits"];
+const REPORTS_REPO_SHIP_CRED_TAX_ALIASES = [
+  "shipping-credits-tax",
+  "shipping credits tax",
+  "Shipping Credits Tax",
+];
+const REPORTS_REPO_GIFT_WRAP_ALIASES = ["gift-wrap-credits", "gift wrap credits", "Gift Wrap Credits"];
+const REPORTS_REPO_GIFTWRAP_TAX_ALIASES = [
+  "giftwrap-credits-tax",
+  "giftwrap credits tax",
+  "Giftwrap Credits Tax",
+];
+const REPORTS_REPO_REGULATORY_FEE_ALIASES = ["regulatory-fee", "regulatory fee", "Regulatory Fee"];
+const REPORTS_REPO_TAX_ON_REG_ALIASES = [
+  "tax-on-regulatory-fee",
+  "tax on regulatory fee",
+  "Tax On Regulatory Fee",
+];
+const REPORTS_REPO_PROMO_REBATES_ALIASES = [
+  "promotional-rebates",
+  "promotional rebates",
+  "Promotional Rebates",
+];
+const REPORTS_REPO_PROMO_REBATES_TAX_ALIASES = [
+  "promotional-rebates-tax",
+  "promotional rebates tax",
+  "Promotional Rebates Tax",
+];
+const REPORTS_REPO_MARKETPLACE_WH_TAX_ALIASES = [
+  "marketplace-withheld-tax",
+  "marketplace withheld tax",
+  "Marketplace Withheld Tax",
+];
+const REPORTS_REPO_SELLING_FEES_ALIASES = ["selling-fees", "selling fees", "Selling Fees"];
+const REPORTS_REPO_FBA_FEES_ALIASES = ["fba-fees", "fba fees", "FBA Fees"];
+const REPORTS_REPO_OTHER_TXN_FEES_ALIASES = [
+  "other-transaction-fees",
+  "other transaction fees",
+  "Other Transaction Fees",
+];
+const REPORTS_REPO_OTHER_AMOUNT_ALIASES = ["other", "Other"];
+const REPORTS_REPO_TX_STATUS_ALIASES = [
+  "transaction-status",
+  "transaction status",
+  "Transaction Status",
+];
+const REPORTS_REPO_TX_RELEASE_ALIASES = [
+  "transaction-release-date",
+  "transaction release date",
+  "Transaction Release Date",
+];
 
 export type AmazonReportsRepositoryInsert = {
   organization_id: string;
@@ -2094,21 +2213,52 @@ export type AmazonReportsRepositoryInsert = {
   sku: string | null;
   description: string | null;
   total_amount: number;
+  quantity: number | null;
+  marketplace: string | null;
+  account_type: string | null;
+  fulfillment: string | null;
+  order_city: string | null;
+  order_state: string | null;
+  order_postal: string | null;
+  tax_collection_model: string | null;
+  product_sales: number | null;
+  product_sales_tax: number | null;
+  shipping_credits: number | null;
+  shipping_credits_tax: number | null;
+  gift_wrap_credits: number | null;
+  giftwrap_credits_tax: number | null;
+  regulatory_fee: number | null;
+  tax_on_regulatory_fee: number | null;
+  promotional_rebates: number | null;
+  promotional_rebates_tax: number | null;
+  marketplace_withheld_tax: number | null;
+  selling_fees: number | null;
+  fba_fees: number | null;
+  other_transaction_fees: number | null;
+  other_amount: number | null;
+  transaction_status: string | null;
+  transaction_release_date: string | null;
   raw_data: Record<string, string> | null;
 };
+
+function parseNullableNum(raw: string): number | null {
+  const n = parseNum(raw);
+  if (n == null || Number.isNaN(n)) return null;
+  return n;
+}
 
 export function mapRowToAmazonReportsRepository(
   row: Record<string, string>,
   orgId: string,
   uploadId: string,
-): AmazonReportsRepositoryInsert | null {
+): AmazonReportsRepositoryInsert {
   const source_line_hash = computeSourceLineHash(orgId, row);
   const consumed = new Set<string>();
-  const transaction_type = pickT(row, REPORTS_REPO_TYPE_ALIASES, consumed).trim();
-  if (!transaction_type) return null;
+  let transaction_type = pickT(row, REPORTS_REPO_TYPE_ALIASES, consumed).trim();
+  if (!transaction_type) transaction_type = "__unmapped__";
 
-  const date_raw = pickT(row, REPORTS_REPO_DATE_ALIASES, consumed);
-  const date_time = parseIsoDateTime(date_raw) ?? null;
+  const date_raw = pickTExact(row, REPORTS_REPO_DATE_ALIASES, consumed);
+  const date_time = date_raw ? parseIsoDateTime(date_raw) ?? null : null;
 
   const settlement_id = pickT(row, REPORTS_REPO_SETTLEMENT_ALIASES, consumed) || null;
   const order_id = pickT(row, ORDER_ALIASES, consumed) || null;
@@ -2117,6 +2267,35 @@ export function mapRowToAmazonReportsRepository(
 
   const total_raw = pickT(row, REPORTS_REPO_TOTAL_ALIASES, consumed);
   const total_amount = parseNum(total_raw) ?? 0;
+
+  const quantity = parseNullableNum(pickT(row, REPORTS_REPO_QTY_ALIASES, consumed));
+  const marketplace = pickT(row, REPORTS_REPO_MARKETPLACE_ALIASES, consumed) || null;
+  const account_type = pickT(row, REPORTS_REPO_ACCOUNT_TYPE_ALIASES, consumed) || null;
+  const fulfillment = pickT(row, REPORTS_REPO_FULFILLMENT_ALIASES, consumed) || null;
+  const order_city = pickT(row, REPORTS_REPO_ORDER_CITY_ALIASES, consumed) || null;
+  const order_state = pickT(row, REPORTS_REPO_ORDER_STATE_ALIASES, consumed) || null;
+  const order_postal = pickT(row, REPORTS_REPO_ORDER_POSTAL_ALIASES, consumed) || null;
+  const tax_collection_model = pickT(row, REPORTS_REPO_TAX_MODEL_ALIASES, consumed) || null;
+  const product_sales = parseNullableNum(pickT(row, REPORTS_REPO_PRODUCT_SALES_ALIASES, consumed));
+  const product_sales_tax = parseNullableNum(pickT(row, REPORTS_REPO_PRODUCT_SALES_TAX_ALIASES, consumed));
+  const shipping_credits = parseNullableNum(pickT(row, REPORTS_REPO_SHIP_CRED_ALIASES, consumed));
+  const shipping_credits_tax = parseNullableNum(pickT(row, REPORTS_REPO_SHIP_CRED_TAX_ALIASES, consumed));
+  const gift_wrap_credits = parseNullableNum(pickT(row, REPORTS_REPO_GIFT_WRAP_ALIASES, consumed));
+  const giftwrap_credits_tax = parseNullableNum(pickT(row, REPORTS_REPO_GIFTWRAP_TAX_ALIASES, consumed));
+  const regulatory_fee = parseNullableNum(pickT(row, REPORTS_REPO_REGULATORY_FEE_ALIASES, consumed));
+  const tax_on_regulatory_fee = parseNullableNum(pickT(row, REPORTS_REPO_TAX_ON_REG_ALIASES, consumed));
+  const promotional_rebates = parseNullableNum(pickT(row, REPORTS_REPO_PROMO_REBATES_ALIASES, consumed));
+  const promotional_rebates_tax = parseNullableNum(pickT(row, REPORTS_REPO_PROMO_REBATES_TAX_ALIASES, consumed));
+  const marketplace_withheld_tax = parseNullableNum(
+    pickT(row, REPORTS_REPO_MARKETPLACE_WH_TAX_ALIASES, consumed),
+  );
+  const selling_fees = parseNullableNum(pickT(row, REPORTS_REPO_SELLING_FEES_ALIASES, consumed));
+  const fba_fees = parseNullableNum(pickT(row, REPORTS_REPO_FBA_FEES_ALIASES, consumed));
+  const other_transaction_fees = parseNullableNum(pickT(row, REPORTS_REPO_OTHER_TXN_FEES_ALIASES, consumed));
+  const other_amount = parseNullableNum(pickT(row, REPORTS_REPO_OTHER_AMOUNT_ALIASES, consumed));
+  const transaction_status = pickT(row, REPORTS_REPO_TX_STATUS_ALIASES, consumed) || null;
+  const release_raw = pickT(row, REPORTS_REPO_TX_RELEASE_ALIASES, consumed);
+  const transaction_release_date = release_raw ? parseIsoDateTime(release_raw) ?? null : null;
 
   return {
     organization_id: orgId,
@@ -2129,6 +2308,31 @@ export function mapRowToAmazonReportsRepository(
     sku,
     description,
     total_amount,
+    quantity,
+    marketplace,
+    account_type,
+    fulfillment,
+    order_city,
+    order_state,
+    order_postal,
+    tax_collection_model,
+    product_sales,
+    product_sales_tax,
+    shipping_credits,
+    shipping_credits_tax,
+    gift_wrap_credits,
+    giftwrap_credits_tax,
+    regulatory_fee,
+    tax_on_regulatory_fee,
+    promotional_rebates,
+    promotional_rebates_tax,
+    marketplace_withheld_tax,
+    selling_fees,
+    fba_fees,
+    other_transaction_fees,
+    other_amount,
+    transaction_status,
+    transaction_release_date,
     raw_data: buildRawData(row, consumed),
   };
 }

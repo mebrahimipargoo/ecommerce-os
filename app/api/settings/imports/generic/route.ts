@@ -8,6 +8,7 @@ import { NextResponse } from "next/server";
 
 import { syncFinancialReferenceResolverForUpload } from "../../../../../lib/financial-reference-resolver-sync";
 import { completeInventoryLedgerProductIdentifierMapPhase } from "../../../../../lib/inventory-ledger-generic-completion";
+import { completeReportsRepositoryGenericPhase } from "../../../../../lib/reports-repository-generic-completion";
 import { logAmazonImportEngineEvent } from "../../../../../lib/pipeline/amazon-import-engine-log";
 import { FPS_KEY_GENERIC, fpsLabelGeneric } from "../../../../../lib/pipeline/file-processing-status-contract";
 import {
@@ -17,7 +18,7 @@ import {
   resolveAmazonImportSyncKind,
 } from "../../../../../lib/pipeline/amazon-report-registry";
 import { runListingCatalogGenericPhase } from "../../../../../lib/pipeline/listing-import-complete-from-staging";
-import { mergeUploadMetadata } from "../../../../../lib/raw-report-upload-metadata";
+import { mergeUploadMetadata, resolveImportStoreIdFromMetadata } from "../../../../../lib/raw-report-upload-metadata";
 import { supabaseServer } from "../../../../../lib/supabase-server";
 import { isUuidString } from "../../../../../lib/uuid";
 
@@ -44,18 +45,6 @@ function phase4CompleteDb(v: unknown): boolean {
 function intOrFiniteInt(v: unknown, fallback: number): number {
   if (typeof v === "number" && Number.isFinite(v)) return Math.floor(v);
   return fallback;
-}
-
-function resolveImportStoreId(meta: unknown): string | null {
-  const m =
-    meta && typeof meta === "object" && !Array.isArray(meta)
-      ? (meta as Record<string, unknown>)
-      : {};
-  const a = typeof m.import_store_id === "string" ? m.import_store_id.trim() : "";
-  if (a && isUuidString(a)) return a;
-  const b = typeof m.ledger_store_id === "string" ? m.ledger_store_id.trim() : "";
-  if (b && isUuidString(b)) return b;
-  return null;
 }
 
 async function acquireRemovalPipelineLock(orgId: string, storeId: string, uploadId: string): Promise<void> {
@@ -208,7 +197,7 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     const meta = (row as { metadata?: unknown }).metadata;
-    const importStoreId = resolveImportStoreId(meta);
+    const importStoreId = resolveImportStoreIdFromMetadata(meta);
     const failedPhaseRaw =
       meta && typeof meta === "object" && !Array.isArray(meta)
         ? normLower((meta as Record<string, unknown>).failed_phase)
@@ -465,6 +454,16 @@ export async function POST(req: Request): Promise<Response> {
     }
 
     if (kind === "INVENTORY_LEDGER") {
+      if (!importStoreId) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error:
+              "Imports Target Store is required for Inventory Ledger generic phase. Set metadata.import_store_id on the upload, then retry.",
+          },
+          { status: 422 },
+        );
+      }
       const { enriched, mapUpserts } = await completeInventoryLedgerProductIdentifierMapPhase({
         supabase: supabaseServer,
         organizationId: orgId,
@@ -483,6 +482,17 @@ export async function POST(req: Request): Promise<Response> {
           catalog_hits: enriched.ledger_bridge_rows_enriched,
         },
       });
+    }
+
+    if (kind === "REPORTS_REPOSITORY") {
+      const { domainRowCount } = await completeReportsRepositoryGenericPhase({
+        supabase: supabaseServer,
+        organizationId: orgId,
+        uploadId,
+        engine,
+        reportTypeRaw: rt,
+      });
+      return NextResponse.json({ ok: true, kind: "REPORTS_REPOSITORY", domainRowCount });
     }
 
     if (kind === "SETTLEMENT" || kind === "TRANSACTIONS" || kind === "REIMBURSEMENTS") {

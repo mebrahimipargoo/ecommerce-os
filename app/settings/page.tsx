@@ -4,13 +4,15 @@ import React, { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   ArrowLeft, BadgeCheck, BarChart3, Building2, CheckCircle2, CreditCard, Cpu, Crown,
-  Globe, HardDrive, ImageIcon, KeyRound, Loader2, Package, PackageX, Pencil, Plus, Printer,
+  FileSpreadsheet, Globe, HardDrive, ImageIcon, KeyRound, Loader2, Package, PackageX, Pencil, Plus, Printer,
   RefreshCw, RotateCcw, Save, ScanLine, Settings, ShieldAlert, ShieldCheck, Store, Tag, Trash2,
   Truck, TriangleAlert, UserCog, Users, Wifi, X, Zap,
 } from "lucide-react";
 import {
+  getCatalogModuleConfigForOrganization,
   getClaimAgentConfig,
   getFefoSettings,
+  saveCatalogModuleConfigForOrganization,
   saveClaimAgentConfig,
   saveInventoryFefoSettings,
 } from "./workspace-settings-actions";
@@ -22,7 +24,11 @@ import { BRAND_LOGO_IMG_CLASSNAME } from "../../lib/brand-logo-classes";
 import { uploadOrganizationLogoAction } from "./upload-organization-logo-action";
 import { AgentApiKeysSection } from "./AgentApiKeysSection";
 import { RoleTagCombobox } from "./RoleTagCombobox";
-import { upsertProviderApiKey, getProviderApiKey } from "./organization-api-keys-actions";
+import {
+  getProviderApiKey,
+  upsertGoogleSheetsServiceAccountForOrganization,
+  upsertProviderApiKey,
+} from "./organization-api-keys-actions";
 import {
   DEFAULT_CLAIM_AGENT_CONFIG,
   DEFAULT_FEFO,
@@ -94,6 +100,7 @@ type TabId =
   | "billing"
   // ── Infrastructure ──────────────────────────────────────────────────────────
   | "marketplaces"
+  | "catalog_imports"
   | "ai_quotas"
   | "hardware"
   // ── Business Modules ────────────────────────────────────────────────────────
@@ -241,6 +248,29 @@ type NavGroup = {
   items: { id: TabId; label: string; icon: React.ReactNode; proOnly?: boolean }[];
 };
 
+/** URL hash values (without #) that map to a Settings tab; `api` is an alias for AI & OCR. */
+const SETTINGS_HASH_TAB_IDS = new Set<TabId>([
+  "general",
+  "team",
+  "billing",
+  "marketplaces",
+  "catalog_imports",
+  "ai_quotas",
+  "hardware",
+  "returns_processing",
+  "inventory_fefo",
+  "claim_engine",
+  "reports_analytics",
+]);
+
+function settingsTabFromLocationHash(raw: string): TabId | null {
+  const h = raw.replace(/^#/, "").trim();
+  if (!h) return null;
+  if (h === "api") return "ai_quotas";
+  if (SETTINGS_HASH_TAB_IDS.has(h as TabId)) return h as TabId;
+  return null;
+}
+
 const NAV_GROUPS: NavGroup[] = [
   {
     label: "SYSTEM & WORKSPACE",
@@ -254,6 +284,7 @@ const NAV_GROUPS: NavGroup[] = [
     label: "INFRASTRUCTURE",
     items: [
       { id: "marketplaces", label: "Marketplaces & Stores", icon: <Store     className="h-4 w-4" /> },
+      { id: "catalog_imports", label: "Catalog & Google Sheets", icon: <FileSpreadsheet className="h-4 w-4" /> },
       { id: "ai_quotas",    label: "AI & OCR Engine",       icon: <Cpu       className="h-4 w-4" /> },
       { id: "hardware",     label: "Hardware Scanners",     icon: <HardDrive className="h-4 w-4" /> },
     ],
@@ -482,6 +513,13 @@ export default function SettingsPage() {
   const [claimAgentLoading, setClaimAgentLoading] = useState(false);
   const [claimAgentSaving, setClaimAgentSaving] = useState(false);
 
+  const [catalogSheetId, setCatalogSheetId] = useState("");
+  const [googleSaJsonDraft, setGoogleSaJsonDraft] = useState("");
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogSheetSaving, setCatalogSheetSaving] = useState(false);
+  const [googleKeySaving, setGoogleKeySaving] = useState(false);
+  const [catalogImportsSaveError, setCatalogImportsSaveError] = useState<string | null>(null);
+
   const [claimEvidenceLocal, setClaimEvidenceLocal] = useState<Record<ClaimEvidenceKey, boolean>>(() =>
     mergeDefaultClaimEvidence(null),
   );
@@ -554,6 +592,25 @@ export default function SettingsPage() {
       });
     });
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const applyHash = () => {
+      const raw = window.location.hash.replace(/^#/, "").trim();
+      const tab = settingsTabFromLocationHash(raw);
+      if (tab) setActiveTab(tab);
+    };
+    applyHash();
+    window.addEventListener("hashchange", applyHash);
+    return () => window.removeEventListener("hashchange", applyHash);
+  }, []);
+
+  useEffect(() => {
+    if (!mounted || typeof window === "undefined") return;
+    const raw = window.location.hash.replace(/^#/, "").trim();
+    const tab = settingsTabFromLocationHash(raw);
+    if (tab) setActiveTab(tab);
+  }, [mounted]);
 
   // ── Default store: organization_settings.default_store_id is canonical; localStorage is fallback ─
   useEffect(() => {
@@ -638,6 +695,27 @@ export default function SettingsPage() {
     }
     loadClaimAgent();
   }, [mounted]);
+
+  useEffect(() => {
+    if (!mounted || profileLoading || !organizationId?.trim() || !isUuidString(organizationId.trim())) {
+      setCatalogSheetId("");
+      return;
+    }
+    let cancelled = false;
+    const oid = organizationId.trim();
+    setCatalogLoading(true);
+    void getCatalogModuleConfigForOrganization(oid)
+      .then((r) => {
+        if (cancelled || !r.ok) return;
+        setCatalogSheetId(typeof r.config.google_sheet_id === "string" ? r.config.google_sheet_id : "");
+      })
+      .finally(() => {
+        if (!cancelled) setCatalogLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mounted, profileLoading, organizationId]);
 
   // ── Claim queue sync status (Logistics AI Agent) ──────────────────────────
   useEffect(() => {
@@ -1925,6 +2003,145 @@ export default function SettingsPage() {
                     </div>
                   ))}
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* ══════════════ CATALOG & GOOGLE SHEETS ══════════════ */}
+          {activeTab === "catalog_imports" && (
+            <div className="relative space-y-4">
+              <DatabaseTag table="workspace_settings + organization_api_keys" />
+
+              <div className="rounded-2xl border border-border bg-card p-6 shadow-sm space-y-4">
+                <div>
+                  <h2 className="text-base font-bold">Catalog & Google Sheets</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    PIM and the ETL service read the spreadsheet ID from{" "}
+                    <code className="rounded bg-muted px-1 text-[11px]">module_configs.catalog.google_sheet_id</code>{" "}
+                    and the service account from{" "}
+                    <code className="rounded bg-muted px-1 text-[11px]">organization_api_keys</code>{" "}
+                    (<code className="rounded bg-muted px-1 text-[11px]">google_sheets_api</code>).
+                  </p>
+                </div>
+
+                {!organizationId?.trim() || !isUuidString(organizationId.trim()) ? (
+                  <p className="text-sm text-amber-800 dark:text-amber-200">
+                    Select a workspace organization in the header to configure catalog settings.
+                  </p>
+                ) : (
+                  <>
+                    {catalogImportsSaveError ? (
+                      <div
+                        className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                        role="alert"
+                      >
+                        {catalogImportsSaveError}
+                      </div>
+                    ) : null}
+                    <div className="space-y-2">
+                      <label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                        Google Spreadsheet ID
+                      </label>
+                      <input
+                        type="text"
+                        value={catalogSheetId}
+                        onChange={(e) => setCatalogSheetId(e.target.value)}
+                        placeholder="e.g. 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+                        disabled={catalogLoading || catalogSheetSaving}
+                        className="w-full rounded-xl border border-border bg-background px-3 py-2 text-sm font-mono shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        From the spreadsheet URL:{" "}
+                        <span className="font-mono text-foreground/80">docs.google.com/spreadsheets/d/<strong>…</strong>/edit</span>
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={catalogLoading || catalogSheetSaving}
+                      onClick={async () => {
+                        const oid = organizationId.trim();
+                        setCatalogImportsSaveError(null);
+                        setCatalogSheetSaving(true);
+                        try {
+                          const res = await saveCatalogModuleConfigForOrganization(oid, {
+                            google_sheet_id: catalogSheetId.trim(),
+                          });
+                          if (!res.ok) {
+                            const err = res.error ?? "Save failed.";
+                            setCatalogImportsSaveError(err);
+                            showToast(err, false);
+                            return;
+                          }
+                          setCatalogImportsSaveError(null);
+                          showToast("Spreadsheet ID saved.", true);
+                        } finally {
+                          setCatalogSheetSaving(false);
+                        }
+                      }}
+                      className="inline-flex items-center gap-2 rounded-xl border border-sky-200 bg-sky-50 px-4 py-2 text-sm font-semibold text-sky-800 transition hover:bg-sky-100 disabled:opacity-50 dark:border-sky-800/60 dark:bg-sky-950/40 dark:text-sky-200"
+                    >
+                      {catalogSheetSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                      Save spreadsheet ID
+                    </button>
+
+                    <div className="border-t border-border pt-4 space-y-2">
+                      <label className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                        Google service account JSON
+                      </label>
+                      <textarea
+                        value={googleSaJsonDraft}
+                        onChange={(e) => setGoogleSaJsonDraft(e.target.value)}
+                        rows={8}
+                        placeholder='Paste the full JSON key file (starts with { "type": "service_account", ... })'
+                        disabled={googleKeySaving}
+                        className="w-full rounded-xl border border-border bg-background px-3 py-2 text-xs font-mono shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+                        spellCheck={false}
+                      />
+                      <p className="text-[11px] text-muted-foreground">
+                        Stored server-side for Sheets API access. Replacing overwrites the previous key for this organization.
+                      </p>
+                      <button
+                        type="button"
+                        disabled={googleKeySaving || !googleSaJsonDraft.trim()}
+                        onClick={async () => {
+                          const oid = organizationId.trim();
+                          setCatalogImportsSaveError(null);
+                          setGoogleKeySaving(true);
+                          try {
+                            const res = await upsertGoogleSheetsServiceAccountForOrganization(oid, googleSaJsonDraft);
+                            if (!res.ok) {
+                              const err = res.error ?? "Save failed.";
+                              setCatalogImportsSaveError(err);
+                              showToast(err, false);
+                              return;
+                            }
+                            setGoogleSaJsonDraft("");
+                            setCatalogImportsSaveError(null);
+                            showToast("Google service account saved.", true);
+                          } finally {
+                            setGoogleKeySaving(false);
+                          }
+                        }}
+                        className="inline-flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2 text-sm font-semibold text-emerald-900 transition hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-800/60 dark:bg-emerald-950/40 dark:text-emerald-100"
+                      >
+                        {googleKeySaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
+                        Save service account JSON
+                      </button>
+                    </div>
+
+                    <div className="rounded-xl border border-dashed border-border bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
+                      <p className="font-medium text-foreground">Managed product & Amazon file imports</p>
+                      <p className="mt-1">
+                        Multi-sheet Excel, CSV, and other managed imports use the staging pipeline (accurate progress, no
+                        shortcuts). Open{" "}
+                        <Link href="/dashboard/file-import" className="font-semibold text-primary underline-offset-2 hover:underline">
+                          Imports
+                        </Link>{" "}
+                        under Data Management — not this screen.
+                      </p>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           )}

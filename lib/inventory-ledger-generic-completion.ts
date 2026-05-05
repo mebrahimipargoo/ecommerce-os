@@ -14,7 +14,7 @@ export async function completeInventoryLedgerProductIdentifierMapPhase(opts: {
   supabase: SupabaseClient;
   organizationId: string;
   uploadId: string;
-  storeId: string | null;
+  storeId: string;
   reportTypeRaw: string;
   engine: AmazonImportEngineConfig;
 }): Promise<{ enriched: Awaited<ReturnType<typeof enrichIdentifierMapFromInventoryLedgerUpload>>; mapUpserts: number }> {

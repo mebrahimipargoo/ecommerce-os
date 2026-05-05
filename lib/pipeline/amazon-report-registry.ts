@@ -235,8 +235,9 @@ export const AMAZON_REPORT_REGISTRY: Record<AmazonSyncKind, AmazonReportRegistry
     phase_model: "unified_v1",
     stage_target_table: "amazon_staging",
     sync_target_table: "amazon_reports_repository",
-    generic_target_table: null,
-    supports_generic: false,
+    /** Phase 4: non-blocking bookkeeping (physical lines + raw_data already landed in Phase 3). */
+    generic_target_table: "amazon_reports_repository",
+    supports_generic: true,
     supports_worklist: false,
     progress_strategy: "batch_csv_stream",
     physical_identity_strategy: "source_line_hash",

@@ -8,11 +8,13 @@ import { normalizeTenantLogoUrl } from "../../lib/tenant-logo-url";
 import { supabaseServer } from "../../lib/supabase-server";
 import type { TenantWriteContext } from "../../lib/server-tenant";
 import { isUuidString } from "../../lib/uuid";
+import { assertUserCanAccessOrganization } from "../dashboard/products/pim-actions";
 import {
   DEFAULT_CLAIM_AGENT_CONFIG,
   DEFAULT_CORE_SETTINGS,
   DEFAULT_FEFO,
   DEFAULT_WORKSPACE_SETTINGS,
+  type CatalogModuleConfig,
   type ClaimAgentConfig,
   type CoreSettings,
   type InventoryModuleConfig,
@@ -109,6 +111,90 @@ export async function getClaimAgentConfig(): Promise<ClaimAgentConfig> {
     ...DEFAULT_CLAIM_AGENT_CONFIG,
     ...(ws.module_configs.claim_agent_config ?? {}),
   };
+}
+
+/**
+ * Reads `module_configs.catalog` for the tenant workspace row (by `organization_id` when present,
+ * otherwise the first `workspace_settings` row — same resolution order as PIM / FastAPI).
+ */
+export async function getCatalogModuleConfigForOrganization(
+  organizationId: string,
+): Promise<{ ok: true; config: CatalogModuleConfig } | { ok: false; error: string }> {
+  const gate = await assertUserCanAccessOrganization(organizationId);
+  if (!gate.ok) return gate;
+
+  let moduleConfigs: ModuleConfigs | null = null;
+  const byOrg = await supabaseServer
+    .from("workspace_settings")
+    .select("module_configs")
+    .eq("organization_id", organizationId)
+    .maybeSingle();
+  if (!byOrg.error && byOrg.data) {
+    moduleConfigs = (byOrg.data.module_configs as ModuleConfigs) ?? null;
+  }
+  if (!moduleConfigs?.catalog) {
+    const fb = await supabaseServer.from("workspace_settings").select("module_configs").limit(1).maybeSingle();
+    if (!fb.error && fb.data) {
+      moduleConfigs = (fb.data.module_configs as ModuleConfigs) ?? null;
+    }
+  }
+  return { ok: true, config: { ...(moduleConfigs?.catalog ?? {}) } };
+}
+
+export async function saveCatalogModuleConfigForOrganization(
+  organizationId: string,
+  patch: Partial<CatalogModuleConfig>,
+): Promise<{ ok: boolean; error?: string }> {
+  const gate = await assertUserCanAccessOrganization(organizationId);
+  if (!gate.ok) return { ok: false, error: gate.error };
+
+  try {
+    const byOrg = await supabaseServer
+      .from("workspace_settings")
+      .select("id, core_settings, module_configs")
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+
+    let row =
+      !byOrg.error && byOrg.data?.id
+        ? (byOrg.data as { id: string; core_settings?: unknown; module_configs?: unknown })
+        : null;
+
+    if (!row) {
+      const fb = await supabaseServer
+        .from("workspace_settings")
+        .select("id, core_settings, module_configs")
+        .order("id", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+      if (!fb.error && fb.data?.id) {
+        row = fb.data as { id: string; core_settings?: unknown; module_configs?: unknown };
+      }
+    }
+
+    if (!row?.id) {
+      return { ok: false, error: "No workspace_settings row found." };
+    }
+
+    const existingMc = (row.module_configs as ModuleConfigs) ?? {};
+    const mergedCatalog: CatalogModuleConfig = {
+      ...(existingMc.catalog ?? {}),
+      ...patch,
+    };
+    const newModuleConfigs: ModuleConfigs = {
+      ...existingMc,
+      catalog: mergedCatalog,
+    };
+
+    const { error } = await supabaseServer
+      .from("workspace_settings")
+      .update({ module_configs: newModuleConfigs })
+      .eq("id", row.id);
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Unknown error" };
+  }
 }
 
 export async function saveClaimAgentConfig(
