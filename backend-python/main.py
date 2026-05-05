@@ -10,7 +10,7 @@ import hashlib
 import os
 import re
 from collections import defaultdict, deque
-from typing import Any, Callable, List
+from typing import Any, Callable, Iterator, List
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -227,6 +227,57 @@ def _read_tabular_file(content: bytes) -> pd.DataFrame:
         return pd.read_csv(
             buf, sep="\t", encoding="utf-8-sig", dtype=object, keep_default_na=False,
         )
+
+
+def _looks_like_xlsx_bytes(content: bytes, filename: str | None) -> bool:
+    fn = (filename or "").strip().lower()
+    if fn.endswith((".xlsx", ".xlsm")):
+        return True
+    return len(content) >= 4 and content[:4] == b"PK\x03\x04"
+
+
+def _iter_seed_product_frames(content: bytes, filename: str | None) -> Iterator[tuple[str | None, pd.DataFrame]]:
+    """
+    Yield (sheet_name_or_none, dataframe) for seed-products.
+    CSV/TSV: one frame with sheet None. Excel: one frame per non-empty sheet (header row required).
+    """
+    if not _looks_like_xlsx_bytes(content, filename):
+        yield None, _read_tabular_file(content)
+        return
+    try:
+        import openpyxl  # noqa: F401 — pandas read_excel(engine="openpyxl") needs this package at runtime
+    except ModuleNotFoundError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Excel (.xlsx/.xlsm) requires the 'openpyxl' package on the ETL server. "
+                "Install: pip install openpyxl   "
+                "or from repo root: pip install -r backend-python/requirements.txt"
+            ),
+        ) from e
+    bio = io.BytesIO(content)
+    try:
+        xl = pd.ExcelFile(bio, engine="openpyxl")
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not load Excel engine. Install openpyxl: pip install openpyxl "
+                "(see backend-python/requirements.txt)."
+            ),
+        ) from e
+    for sheet in xl.sheet_names:
+        df = pd.read_excel(
+            xl,
+            sheet_name=sheet,
+            header=0,
+            dtype=object,
+            keep_default_na=False,
+        )
+        headers = [str(c).strip() for c in df.columns if str(c).strip() != ""]
+        if df.shape[0] == 0 or not headers:
+            continue
+        yield sheet, df
 
 
 def _sniff_csv_delimiter(first_line: str) -> str:
@@ -2033,35 +2084,36 @@ _PIM_MAP_STANDARD_KEYS = (
     "cost",
 )
 
-_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
-
-
 def _validate_pim_org_store(organization_id: str, store_id: str) -> tuple[str, str]:
+    """Accept any 128-bit UUID string (matches TS `isUuidString` / `uuid.UUID`), not RFC version/variant only."""
     oid = (organization_id or "").strip()
     sid = (store_id or "").strip()
     if not oid:
         raise HTTPException(status_code=400, detail="organization_id is required (UUID).")
     if not sid:
         raise HTTPException(status_code=400, detail="store_id is required (imports target store UUID).")
-    if not _UUID_RE.match(oid):
+    try:
+        uuid.UUID(oid)
+    except ValueError:
         raise HTTPException(
             status_code=400,
             detail=f"organization_id must be a valid UUID (got {oid[:48]!r}).",
-        )
-    if not _UUID_RE.match(sid):
+        ) from None
+    try:
+        uuid.UUID(sid)
+    except ValueError:
         raise HTTPException(
             status_code=400,
             detail=f"store_id must be a valid UUID (got {sid[:48]!r}).",
-        )
+        ) from None
     return oid, sid
 
 
 def _empty_pim_seed_metrics() -> dict[str, Any]:
     return {
         "rows_processed": 0,
+        "sheets_processed": 0,
+        "rows_per_sheet": {},
         "vendors_created": 0,
         "categories_created": 0,
         "products_created": 0,
@@ -2076,7 +2128,7 @@ def _empty_pim_seed_metrics() -> dict[str, Any]:
     }
 
 
-def _pim_append_error(errors: list[str], row_index: int | None, message: str, cap: int = 200) -> None:
+def _pim_append_error(errors: list[str], row_index: int | str | None, message: str, cap: int = 200) -> None:
     if len(errors) >= cap:
         return
     prefix = f"row {row_index}: " if row_index is not None else ""
@@ -2183,7 +2235,7 @@ def _pim_ensure_vendor(
     index: dict[str, str],
     metrics: dict[str, Any],
     errors: list[str],
-    row_index: int | None,
+    row_index: int | str | None,
 ) -> str | None:
     name = (raw_label or "").strip() or "Unknown Vendor"
     key = name.lower()
@@ -2237,7 +2289,7 @@ def _pim_ensure_category(
     index: dict[str, str],
     metrics: dict[str, Any],
     errors: list[str],
-    row_index: int | None,
+    row_index: int | str | None,
 ) -> str | None:
     name = (raw_label or "").strip()
     if not name:
@@ -2361,7 +2413,7 @@ def _pim_upsert_identifier_map(
     match_source: str,
     metrics: dict[str, Any],
     errors: list[str],
-    row_index: int,
+    row_index: int | str,
 ) -> None:
     if not (seller_sku or asin or fnsku or upc):
         return
@@ -2426,7 +2478,7 @@ def _pim_insert_price_if_present(
     price_source: str,
     metrics: dict[str, Any],
     errors: list[str],
-    row_index: int,
+    row_index: int | str,
 ) -> None:
     if cost_raw is None:
         return
@@ -2466,7 +2518,7 @@ def _process_pim_seed_row(
     match_source: str,
     metrics: dict[str, Any],
     errors: list[str],
-    row_index: int,
+    row_index: int | str,
     vendor_index: dict[str, str],
     category_index: dict[str, str],
 ) -> None:
@@ -2757,36 +2809,71 @@ async def etl_seed_products(file: UploadFile = File(...), organization_id: str =
     db = _require_supabase()
     try:
         raw_bytes = await file.read()
-        df = _read_tabular_file(raw_bytes)
-        original_headers = [str(c).strip() for c in df.columns]
+        if not raw_bytes:
+            raise HTTPException(status_code=400, detail="Empty file.")
 
         openai_key = _get_api_credentials(db, organization_id, "openai_api_key")
         amazon_creds = _get_api_credentials(db, organization_id, "amazon_sp_api")
-        column_map = _gpt_map_catalog_columns_or_raise(original_headers, openai_key)
-        _validate_gpt_column_map(column_map, original_headers)
-        handles = _pim_handles_from_map(column_map, original_headers)
 
         metrics = _empty_pim_seed_metrics()
         errors: list[str] = metrics["errors"]
         vendor_index = _pim_load_vendor_index(db, organization_id)
         category_index = _pim_load_category_index(db, organization_id)
 
-        for i, (_, row) in enumerate(df.iterrows()):
-            row_cells = _pim_row_cells_from_series(row, original_headers)
-            _process_pim_seed_row(
-                db,
-                organization_id,
-                store_id,
-                row_cells,
-                handles,
-                amazon_creds,
-                "etl_seed_products",
-                "etl_seed_products_csv",
-                metrics,
-                errors,
-                i + 2,
-                vendor_index,
-                category_index,
+        column_map: dict[str, Any] | None = None
+        handles: dict[str, str | None] | None = None
+        reference_headers: list[str] | None = None
+        saw_any_yield = False
+        saw_frame = False
+        fname = file.filename
+
+        for sheet_label, df in _iter_seed_product_frames(raw_bytes, fname):
+            saw_any_yield = True
+            original_headers = [str(c).strip() for c in df.columns]
+            if not any(h for h in original_headers if h):
+                continue
+            saw_frame = True
+
+            rows_before = int(metrics["rows_processed"])
+            # Reuse GPT map only when header list matches the first sheet exactly (order-sensitive).
+            if column_map is None or reference_headers != original_headers:
+                column_map = _gpt_map_catalog_columns_or_raise(original_headers, openai_key)
+                _validate_gpt_column_map(column_map, original_headers)
+                handles = _pim_handles_from_map(column_map, original_headers)
+                reference_headers = list(original_headers)
+
+            assert handles is not None
+            metrics["sheets_processed"] = int(metrics["sheets_processed"]) + 1
+            match_src = f"etl_seed_products:{sheet_label}" if sheet_label else "etl_seed_products_csv"
+
+            for i, (_, row) in enumerate(df.iterrows()):
+                row_cells = _pim_row_cells_from_series(row, original_headers)
+                row_lbl: int | str = f"{sheet_label}!{i + 2}" if sheet_label else i + 2
+                _process_pim_seed_row(
+                    db,
+                    organization_id,
+                    store_id,
+                    row_cells,
+                    handles,
+                    amazon_creds,
+                    "etl_seed_products",
+                    match_src,
+                    metrics,
+                    errors,
+                    row_lbl,
+                    vendor_index,
+                    category_index,
+                )
+
+            sheet_key = sheet_label or "(csv)"
+            metrics["rows_per_sheet"][sheet_key] = int(metrics["rows_processed"]) - rows_before
+
+        if not saw_any_yield:
+            raise HTTPException(status_code=400, detail="Empty file.")
+        if not saw_frame:
+            raise HTTPException(
+                status_code=400,
+                detail="No readable tabular data: for Excel, add at least one sheet with a header row and data.",
             )
 
         return {"status": "success", "message": "Catalog import finished.", "metrics": metrics}

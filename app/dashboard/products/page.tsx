@@ -5,7 +5,12 @@ import axios, { AxiosError } from "axios";
 import Link from "next/link";
 import { useUserRole } from "../../../components/UserRoleContext";
 import { useRbacPermissions } from "../../../hooks/useRbacPermissions";
-import { getPimIntegrationsSummary, type PimIntegrationsSummary } from "./pim-actions";
+import {
+  getPimIntegrationsSummary,
+  getPimManualProductFormDefaults,
+  type PimIntegrationsSummary,
+  type PimStoreOption,
+} from "./pim-actions";
 import {
   Ban,
   Building2,
@@ -37,6 +42,8 @@ type ImportPhase = "idle" | "selected" | "uploading" | "success" | "error";
 
 type SeedProductsMetrics = {
   rows_processed?: number;
+  sheets_processed?: number;
+  rows_per_sheet?: Record<string, number>;
   vendors_created: number;
   categories_created?: number;
   products_created: number;
@@ -105,7 +112,7 @@ function CatalogSheetsSettingsLink() {
 
 const TABS: { id: TabId; label: string; icon: React.ElementType }[] = [
   { id: "catalog", label: "Catalog Hub", icon: LayoutGrid },
-  { id: "import", label: "Quick CSV & files", icon: Sparkles },
+  { id: "import", label: "Quick file import", icon: Sparkles },
   { id: "integrations", label: "Integrations & API", icon: Plug },
 ];
 
@@ -197,28 +204,35 @@ function AiCsvImportPanel({ organizationId, organizationName, profileLoading }: 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<SeedProductsMetrics | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [etlDefaultStoreId, setEtlDefaultStoreId] = useState<string | null>(null);
-  const [etlStoreSummaryLoading, setEtlStoreSummaryLoading] = useState(false);
+  const [pimStores, setPimStores] = useState<PimStoreOption[]>([]);
+  const [selectedStoreId, setSelectedStoreId] = useState("");
+  const [pimFormLoading, setPimFormLoading] = useState(false);
 
   useEffect(() => {
     const oid = organizationId?.trim();
     if (!oid) {
-      setEtlDefaultStoreId(null);
+      setPimStores([]);
+      setSelectedStoreId("");
       return;
     }
     let cancelled = false;
-    setEtlStoreSummaryLoading(true);
-    void getPimIntegrationsSummary(oid)
+    setPimFormLoading(true);
+    void getPimManualProductFormDefaults(oid)
       .then((r) => {
         if (cancelled) return;
         if (!r.ok) {
-          setEtlDefaultStoreId(null);
+          setPimStores([]);
+          setSelectedStoreId("");
           return;
         }
-        setEtlDefaultStoreId(r.data.defaultStoreId?.trim() || null);
+        setPimStores(r.stores);
+        const def = r.defaultStoreId?.trim() || "";
+        const first = r.stores[0]?.id?.trim() || "";
+        const next = def && r.stores.some((s) => s.id === def) ? def : first;
+        setSelectedStoreId(next);
       })
       .finally(() => {
-        if (!cancelled) setEtlStoreSummaryLoading(false);
+        if (!cancelled) setPimFormLoading(false);
       });
     return () => {
       cancelled = true;
@@ -227,8 +241,8 @@ function AiCsvImportPanel({ organizationId, organizationName, profileLoading }: 
 
   const acceptFile = useCallback((f: File) => {
     const ext = f.name.split(".").pop()?.toLowerCase() ?? "";
-    if (ext !== "csv") {
-      setErrorMsg("Only .csv files are supported.");
+    if (ext !== "csv" && ext !== "xlsx" && ext !== "xlsm") {
+      setErrorMsg("Only .csv, .xlsx, or .xlsm files are supported.");
       setFile(null);
       setPhase("idle");
       return;
@@ -270,9 +284,9 @@ function AiCsvImportPanel({ organizationId, organizationName, profileLoading }: 
 
   async function startIntelligentSync() {
     if (!file || phase === "uploading" || profileLoading || !organizationId) return;
-    const sid = etlDefaultStoreId?.trim();
+    const sid = selectedStoreId.trim();
     if (!sid) {
-      setErrorMsg("Set a default store in Settings → General before CSV seed (ETL requires store_id).");
+      setErrorMsg("Choose a target store for this import (required).");
       setPhase("error");
       return;
     }
@@ -311,7 +325,8 @@ function AiCsvImportPanel({ organizationId, organizationName, profileLoading }: 
 
   const isBusy = phase === "uploading";
   const showDropZone = phase === "idle" || phase === "selected" || phase === "error";
-  const canSync = Boolean(organizationId) && !profileLoading && Boolean(etlDefaultStoreId?.trim());
+  const canSync =
+    Boolean(organizationId) && !profileLoading && Boolean(selectedStoreId.trim()) && pimStores.length > 0;
 
   return (
     <section
@@ -319,12 +334,13 @@ function AiCsvImportPanel({ organizationId, organizationName, profileLoading }: 
       aria-labelledby="import-heading"
     >
       <h2 id="import-heading" className="text-lg font-semibold text-foreground">
-        Quick CSV & file routing
+        Quick catalog file import
       </h2>
       <p className="mt-1 text-sm text-muted-foreground">
-        This tab runs the <strong>fast CSV seed</strong> endpoint only (<code className="rounded bg-muted px-1 text-[11px]">.csv</code>
-        ). For Excel, multiple sheets, text/PDF flows, and the full Amazon-managed pipeline (read → stage → clean →
-        tables → sync with reliable progress), use the dedicated importers — same behavior as the rest of the platform.
+        This tab runs the <strong>fast catalog seed</strong> on your ETL service: <code className="rounded bg-muted px-1 text-[11px]">.csv</code>,{" "}
+        <code className="rounded bg-muted px-1 text-[11px]">.xlsx</code>, or <code className="rounded bg-muted px-1 text-[11px]">.xlsm</code>{" "}
+        (Excel: every non-empty sheet is processed in order; column mapping is reused when headers match the first sheet
+        exactly). For text/PDF and the full managed pipeline with progress UI, use Imports.
       </p>
 
       <div className="mt-4 flex flex-col gap-2 rounded-xl border border-sky-200/80 bg-sky-50/50 px-4 py-3 text-sm dark:border-sky-800/50 dark:bg-sky-950/25">
@@ -351,25 +367,50 @@ function AiCsvImportPanel({ organizationId, organizationName, profileLoading }: 
             No organization in scope. Choose a company from the header (super admins may switch workspace).
           </p>
         ) : null}
-        {!profileLoading && organizationId && !etlStoreSummaryLoading && !etlDefaultStoreId?.trim() ? (
+        {!profileLoading && organizationId && !pimFormLoading && pimStores.length === 0 ? (
           <p className="mt-1 text-amber-800 dark:text-amber-200">
-            CSV seed needs a default store. Set it under Settings → General (organization default store).
+            No stores found for this organization. Create a store before importing (imports are always scoped to one
+            store).
           </p>
         ) : null}
-        {etlStoreSummaryLoading && organizationId ? (
+        {pimFormLoading && organizationId ? (
           <p className="mt-1 flex items-center gap-1.5 text-muted-foreground">
             <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-            Loading default store for ETL…
+            Loading stores…
           </p>
         ) : null}
       </div>
+
+      {organizationId && !profileLoading && pimStores.length > 0 ? (
+        <div className="mt-4 space-y-1.5">
+          <label htmlFor="pim-seed-store" className="text-xs font-medium text-foreground">
+            Target store (required)
+          </label>
+          <select
+            id="pim-seed-store"
+            className="w-full max-w-md rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+            value={selectedStoreId}
+            onChange={(e) => setSelectedStoreId(e.target.value)}
+            disabled={isBusy || pimFormLoading}
+          >
+            {pimStores.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.display_name || s.id}
+              </option>
+            ))}
+          </select>
+          <p className="text-[11px] text-muted-foreground">
+            Rows are written for this store only — pick the correct marketplace/store before starting.
+          </p>
+        </div>
+      ) : null}
 
       <div className="mt-6 space-y-6">
         {showDropZone && (
           <div
             role="button"
             tabIndex={0}
-            aria-label="Drop zone for product CSV"
+            aria-label="Drop zone for product CSV or Excel"
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
@@ -393,7 +434,7 @@ function AiCsvImportPanel({ organizationId, organizationName, profileLoading }: 
             <input
               ref={fileInputRef}
               type="file"
-              accept=".csv"
+              accept=".csv,.xlsx,.xlsm,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
               className="hidden"
               disabled={isBusy}
               onChange={(e) => {
@@ -448,8 +489,8 @@ function AiCsvImportPanel({ organizationId, organizationName, profileLoading }: 
               </>
             ) : (
               <>
-                <p className="text-sm font-medium text-foreground">Drag and drop your .csv here</p>
-                <p className="text-xs text-muted-foreground">or click to browse — CSV only</p>
+                <p className="text-sm font-medium text-foreground">Drag and drop your file here</p>
+                <p className="text-xs text-muted-foreground">or click to browse — .csv, .xlsx, or .xlsm</p>
               </>
             )}
           </div>
@@ -471,6 +512,9 @@ function AiCsvImportPanel({ organizationId, organizationName, profileLoading }: 
               <span>{successMessage}</span>
             </div>
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {typeof metrics.sheets_processed === "number" && metrics.sheets_processed > 0 ? (
+                <MetricCard icon={FileSpreadsheet} label="Sheets processed" value={metrics.sheets_processed} tone="slate" />
+              ) : null}
               {typeof metrics.rows_processed === "number" && (
                 <MetricCard icon={Table2} label="Rows processed" value={metrics.rows_processed} tone="slate" />
               )}
@@ -510,6 +554,18 @@ function AiCsvImportPanel({ organizationId, organizationName, profileLoading }: 
                 <MetricCard icon={Ban} label="Rows skipped (legacy)" value={metrics.skipped_garbage} tone="slate" />
               )}
             </div>
+            {metrics.rows_per_sheet && Object.keys(metrics.rows_per_sheet).length > 0 ? (
+              <div className="rounded-lg border border-border/60 bg-muted/15 px-3 py-2 text-xs text-muted-foreground">
+                <p className="font-medium text-foreground">Rows per sheet</p>
+                <ul className="mt-1 list-inside list-disc space-y-0.5">
+                  {Object.entries(metrics.rows_per_sheet).map(([name, n]) => (
+                    <li key={name}>
+                      {name}: {n}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             {Array.isArray(metrics.errors) && metrics.errors.length > 0 ? (
               <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-950 dark:text-amber-100">
                 <p className="font-medium">Import messages ({metrics.errors.length})</p>

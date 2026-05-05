@@ -3,4 +3,5 @@ uvicorn[standard]
 supabase
 python-dotenv
 pandas
+openpyxl
 python-multipart
